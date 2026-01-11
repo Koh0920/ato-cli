@@ -43,7 +43,7 @@ enum Commands {
         /// Project name
         name: String,
 
-        /// Template type: python, node, hono, rust, shell
+        /// Template type: python, node, hono, rust, go, shell
         #[arg(long, default_value = "python")]
         template: String,
     },

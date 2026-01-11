@@ -85,12 +85,20 @@ pub fn execute(args: InitArgs) -> Result<()> {
     if matches!(info.project_type, detect::ProjectType::Rust) {
         println!("\nNote:");
         println!("   For Rust, build a release binary before packing:");
-        println!("   cargo build --release");
+        if let Some(bin) = release_binary_name(&info) {
+            println!("   cargo build --release && cp target/release/{bin} ./{bin}");
+        } else {
+            println!("   cargo build --release");
+        }
     }
     if matches!(info.project_type, detect::ProjectType::Go) {
         println!("\nNote:");
         println!("   For Go, build a binary before packing:");
-        println!("   go build -o app .");
+        if let Some(bin) = release_binary_name(&info) {
+            println!("   go build -o {bin} .");
+        } else {
+            println!("   go build -o app .");
+        }
     }
 
     Ok(())
@@ -156,20 +164,51 @@ fn add_to_gitignore(dir: &Path) -> Result<()> {
 }
 
 fn maybe_create_capsuleignore(dir: &Path, info: &recipe::ProjectInfo) -> Result<()> {
-    if !matches!(info.project_type, detect::ProjectType::NodeJs) {
-        return Ok(());
-    }
-
-    if !dir.join("node_modules").exists() {
-        return Ok(());
-    }
-
     let capsuleignore_path = dir.join(".capsuleignore");
     if capsuleignore_path.exists() {
         return Ok(());
     }
 
-    fs::write(&capsuleignore_path, "node_modules/\n").context("Failed to write .capsuleignore")?;
-    println!("   ✓ Created .capsuleignore (excludes node_modules/)");
+    match info.project_type {
+        detect::ProjectType::NodeJs => {
+            if !dir.join("node_modules").exists() {
+                return Ok(());
+            }
+
+            fs::write(&capsuleignore_path, "node_modules/\n")
+                .context("Failed to write .capsuleignore")?;
+            println!("   ✓ Created .capsuleignore (excludes node_modules/)");
+        }
+        detect::ProjectType::Rust => {
+            if !dir.join("target").exists() {
+                return Ok(());
+            }
+
+            fs::write(&capsuleignore_path, "target/\n").context("Failed to write .capsuleignore")?;
+            println!("   ✓ Created .capsuleignore (excludes target/)");
+        }
+        _ => {}
+    }
     Ok(())
+}
+
+fn release_binary_name(info: &recipe::ProjectInfo) -> Option<String> {
+    let release = info
+        .node_release_entrypoint
+        .as_ref()
+        .and_then(|v| v.first())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())?;
+
+    // We only try to infer a single-file entrypoint like "./my-app".
+    if release.contains(' ') || release.contains('\t') {
+        return None;
+    }
+
+    let release = release.strip_prefix("./").unwrap_or(release);
+    if release.contains('/') {
+        return None;
+    }
+
+    Some(release.to_string())
 }
