@@ -122,15 +122,15 @@ description = "A new Bun/Node.js capsule application"
 runtime = "source"
 
 # Fallback entrypoint (used if profiles are not supported)
-entrypoint = "bun run dist/server.js"
+entrypoint = "bun run start"
 
 # Development profile (used by `capsule dev`)
 [execution.dev]
-entrypoint = "bun run --hot src/index.ts"
+entrypoint = "bun run dev"
 
 # Release/profile for packaging (used by bundled execution)
 [execution.release]
-entrypoint = "bun run dist/server.js"
+entrypoint = "bun run start"
 
 [storage]
 
@@ -151,7 +151,7 @@ entrypoint = "bun run dist/server.js"
     "type": "module",
     "main": "dist/server.js",
   "scripts": {{
-        "dev": "bun run --hot src/index.ts",
+      "dev": "bun --hot src/index.ts",
         "build": "bun build src/index.ts --outfile dist/server.js --target=bun",
         "start": "bun run dist/server.js"
   }}
