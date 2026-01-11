@@ -17,16 +17,19 @@ cargo build
 cd ../../capsule-cli
 cargo build
 
+# 一度だけ engine を登録（PATH探索は無効化されているため）
+./target/debug/capsule engine register --name default --path ../nacelle/target/debug/nacelle --default
+
 # 1) Create
 ./target/debug/capsule new my-app
 cd my-app
 
 # 2) Run (dev)
 # ホストに Python が無くても OK（必要なら nacelle が JIT で Python を取得）
-NACELLE_PATH=../../nacelle/target/debug/nacelle ../target/debug/capsule dev
+../target/debug/capsule dev
 
 # 3) Ship (bundle)
-NACELLE_PATH=../../nacelle/target/debug/nacelle ../target/debug/capsule pack --bundle
+../target/debug/capsule pack --bundle
 
 # 4) Execute (deploy artifact)
 ./nacelle-bundle
