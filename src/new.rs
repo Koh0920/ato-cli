@@ -39,7 +39,7 @@ pub fn execute(args: NewArgs) -> Result<()> {
     }
 
     create_gitignore(&project_dir)?;
-    create_readme(&project_dir, &args.name)?;
+    create_readme(&project_dir, &args.name, template)?;
 
     println!("\n✨ Project created successfully!");
     println!("\nNext steps:");
@@ -106,54 +106,100 @@ if __name__ == "__main__":
 }
 
 fn create_nodejs_project(dir: &Path, name: &str) -> Result<()> {
-    let manifest = format!(
-        r#"# Capsule Manifest - UARC V1.1.0
+        let manifest = format!(
+                r#"# Capsule Manifest - UARC V1.1.0
 schema_version = "1.0"
 name = "{name}"
 version = "0.1.0"
 type = "app"
 
 [metadata]
-description = "A new capsule application"
+description = "A new Bun/Node.js capsule application"
 
 [requirements]
 
 [execution]
 runtime = "source"
-entrypoint = "node index.js"
+
+# Fallback entrypoint (used if profiles are not supported)
+entrypoint = "bun run dist/server.js"
+
+# Development profile (used by `capsule dev`)
+[execution.dev]
+entrypoint = "bun run --hot src/index.ts"
+
+# Release/profile for packaging (used by bundled execution)
+[execution.release]
+entrypoint = "bun run dist/server.js"
 
 [storage]
 
 [routing]
 "#
-    );
+        );
     fs::write(dir.join("capsule.toml"), manifest)?;
+
+        // Bundle selection is opt-in: this file controls what goes into the bundle.
+        // Keep it minimal (users can edit as needed).
+        fs::write(dir.join(".capsuleignore"), "node_modules/\n")?;
 
     let package_json = format!(
         r#"{{
   "name": "{name}",
   "version": "0.1.0",
-  "main": "index.js",
+    "private": true,
+    "type": "module",
+    "main": "dist/server.js",
   "scripts": {{
-    "start": "node index.js"
+        "dev": "bun run --hot src/index.ts",
+        "build": "bun build src/index.ts --outfile dist/server.js --target=bun",
+        "start": "bun run dist/server.js"
   }}
 }}
 "#
     );
     fs::write(dir.join("package.json"), package_json)?;
 
-    let index_js = r#"/**
- * Main entry point for the capsule application.
- */
+        fs::create_dir_all(dir.join("src"))?;
+        fs::create_dir_all(dir.join("dist"))?;
 
-console.log("Hello from capsule! 🎉");
-console.log("Edit index.js to get started.");
+        let index_ts = r#"import { serve } from "bun";
+
+serve({
+    port: Number(process.env.PORT ?? 8000),
+    fetch(req) {
+        return new Response("Hello from capsule!\n", {
+            headers: { "content-type": "text/plain; charset=utf-8" },
+        });
+    },
+});
+
+console.log(`Started server http://localhost:${process.env.PORT ?? 8000}`);
 "#;
-    fs::write(dir.join("index.js"), index_js)?;
+        fs::write(dir.join("src/index.ts"), index_ts)?;
+
+        // Provide a ready-to-run release artifact so `capsule pack` works immediately.
+        // Users are expected to overwrite this by running `bun run build`.
+        let dist_js = r#"import { serve } from "bun";
+
+serve({
+    port: Number(process.env.PORT ?? 8000),
+    fetch(req) {
+        return new Response("Hello from capsule!\n", {
+            headers: { "content-type": "text/plain; charset=utf-8" },
+        });
+    },
+});
+
+console.log(`Started server http://localhost:${process.env.PORT ?? 8000}`);
+"#;
+        fs::write(dir.join("dist/server.js"), dist_js)?;
 
     println!("   ✓ Created capsule.toml");
+        println!("   ✓ Created .capsuleignore");
     println!("   ✓ Created package.json");
-    println!("   ✓ Created index.js");
+        println!("   ✓ Created src/index.ts");
+        println!("   ✓ Created dist/server.js");
     Ok(())
 }
 
@@ -286,15 +332,28 @@ target/
     Ok(())
 }
 
-fn create_readme(dir: &Path, name: &str) -> Result<()> {
-    let content = format!(
-        r#"# {name}
+fn create_readme(dir: &Path, name: &str, template: &str) -> Result<()> {
+    let quickstart = match template {
+        "node" | "nodejs" | "js" => {
+            r#"```bash
+# Install deps (optional for this minimal template)
+bun install
 
-A capsule application built with UARC V1.1.0.
+# Run locally (dev profile)
+capsule dev
 
-## Quick Start
+# Build release artifact (recommended)
+bun run build
 
-```bash
+# Create a self-extracting bundle (release profile)
+capsule pack --bundle
+
+# Run bundle
+./nacelle-bundle
+```"#
+        }
+        _ => {
+            r#"```bash
 # Run locally (no bundling)
 capsule dev
 
@@ -303,12 +362,23 @@ capsule pack --bundle
 
 # Run bundle
 ./nacelle-bundle
-```
+```"#
+        }
+    };
 
-## Project Structure
+    let content = format!(
+        r#"# {name}
 
-- `capsule.toml` - Capsule manifest (package config, permissions, runtime)
-- Entry file depends on template (main.py, index.js, etc.)
+A capsule application built with UARC V1.1.0.
+
+## Quick Start
+
+{quickstart}
+
+## Notes
+
+- `capsule.toml` supports `execution.dev` and `execution.release` for dev vs packaging.
+- `.capsuleignore` (optional) controls what gets bundled.
 
 ## Learn More
 

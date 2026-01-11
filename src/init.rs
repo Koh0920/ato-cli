@@ -15,6 +15,8 @@ struct ProjectInfo {
     name: String,
     project_type: ProjectType,
     entrypoint: Vec<String>,
+    node_dev_entrypoint: Option<Vec<String>>,
+    node_release_entrypoint: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -98,15 +100,19 @@ fn detect_project(dir: &Path) -> Result<ProjectInfo> {
             name,
             project_type: ProjectType::Python,
             entrypoint,
+            node_dev_entrypoint: None,
+            node_release_entrypoint: None,
         });
     }
 
     if dir.join("package.json").exists() {
-        let entrypoint = detect_nodejs_entrypoint(dir)?;
+        let (release_entrypoint, dev_entrypoint) = detect_nodejs_entrypoints(dir)?;
         return Ok(ProjectInfo {
             name,
             project_type: ProjectType::NodeJs,
-            entrypoint,
+            entrypoint: release_entrypoint.clone(),
+            node_dev_entrypoint: dev_entrypoint,
+            node_release_entrypoint: Some(release_entrypoint),
         });
     }
 
@@ -115,6 +121,8 @@ fn detect_project(dir: &Path) -> Result<ProjectInfo> {
             name,
             project_type: ProjectType::Rust,
             entrypoint: vec!["cargo".to_string(), "run".to_string()],
+            node_dev_entrypoint: None,
+            node_release_entrypoint: None,
         });
     }
 
@@ -123,6 +131,8 @@ fn detect_project(dir: &Path) -> Result<ProjectInfo> {
             name,
             project_type: ProjectType::Go,
             entrypoint: vec!["go".to_string(), "run".to_string(), ".".to_string()],
+            node_dev_entrypoint: None,
+            node_release_entrypoint: None,
         });
     }
 
@@ -132,6 +142,8 @@ fn detect_project(dir: &Path) -> Result<ProjectInfo> {
             name,
             project_type: ProjectType::Ruby,
             entrypoint,
+            node_dev_entrypoint: None,
+            node_release_entrypoint: None,
         });
     }
 
@@ -140,6 +152,8 @@ fn detect_project(dir: &Path) -> Result<ProjectInfo> {
         name,
         project_type: ProjectType::Unknown,
         entrypoint,
+        node_dev_entrypoint: None,
+        node_release_entrypoint: None,
     })
 }
 
@@ -161,29 +175,58 @@ fn detect_python_entrypoint(dir: &Path) -> Vec<String> {
     vec!["python".to_string(), "main.py".to_string()]
 }
 
-fn detect_nodejs_entrypoint(dir: &Path) -> Result<Vec<String>> {
+fn detect_nodejs_entrypoints(dir: &Path) -> Result<(Vec<String>, Option<Vec<String>>)> {
     let package_json_path = dir.join("package.json");
     let content = fs::read_to_string(&package_json_path).context("Failed to read package.json")?;
 
+    let bun_project = dir.join("bun.lockb").exists() || dir.join("bunfig.toml").exists();
+
     if let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&content) {
+        let package_manager = pkg
+            .get("packageManager")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+
+        let is_bun = bun_project || package_manager.starts_with("bun@");
+
         if let Some(scripts) = pkg.get("scripts") {
-            if scripts.get("start").is_some() {
-                return Ok(vec!["npm".to_string(), "start".to_string()]);
+            let has_start = scripts.get("start").is_some();
+            let has_dev = scripts.get("dev").is_some();
+
+            let dev = if has_dev {
+                if is_bun {
+                    Some(vec!["bun".to_string(), "run".to_string(), "dev".to_string()])
+                } else {
+                    Some(vec!["npm".to_string(), "run".to_string(), "dev".to_string()])
+                }
+            } else {
+                None
+            };
+
+            if has_start {
+                let release = if is_bun {
+                    vec!["bun".to_string(), "run".to_string(), "start".to_string()]
+                } else {
+                    vec!["npm".to_string(), "start".to_string()]
+                };
+                return Ok((release, dev));
             }
         }
 
         if let Some(main) = pkg.get("main").and_then(|m| m.as_str()) {
-            return Ok(vec!["node".to_string(), main.to_string()]);
+            let release = vec!["node".to_string(), main.to_string()];
+            return Ok((release, None));
         }
     }
 
     for candidate in ["index.js", "main.js", "app.js", "server.js"] {
         if dir.join(candidate).exists() {
-            return Ok(vec!["node".to_string(), candidate.to_string()]);
+            return Ok((vec!["node".to_string(), candidate.to_string()], None));
         }
     }
 
-    Ok(vec!["npm".to_string(), "start".to_string()])
+    Ok((vec!["npm".to_string(), "start".to_string()], None))
 }
 
 fn detect_ruby_entrypoint(dir: &Path) -> Vec<String> {
@@ -243,6 +286,10 @@ fn prompt_for_details(mut info: ProjectInfo) -> Result<ProjectInfo> {
         let input = input.trim();
         if !input.is_empty() {
             info.entrypoint = input.split_whitespace().map(|s| s.to_string()).collect();
+            if matches!(info.project_type, ProjectType::NodeJs) {
+                info.node_dev_entrypoint = Some(info.entrypoint.clone());
+                info.node_release_entrypoint = Some(info.entrypoint.clone());
+            }
         }
     } else {
         print!("? Entry command: ");
@@ -253,6 +300,10 @@ fn prompt_for_details(mut info: ProjectInfo) -> Result<ProjectInfo> {
         let input = input.trim();
         if !input.is_empty() {
             info.entrypoint = input.split_whitespace().map(|s| s.to_string()).collect();
+            if matches!(info.project_type, ProjectType::NodeJs) {
+                info.node_dev_entrypoint = Some(info.entrypoint.clone());
+                info.node_release_entrypoint = Some(info.entrypoint.clone());
+            }
         }
     }
 
@@ -288,6 +339,30 @@ fn generate_manifest(info: &ProjectInfo) -> String {
         (entry_command, String::new())
     };
 
+    // For Node.js projects, provide explicit dev/release profiles by default.
+    // Use detected scripts when available (e.g. bun/npm), while keeping a single
+    // fallback execution.entrypoint for compatibility.
+    let node_profiles_block = if matches!(info.project_type, ProjectType::NodeJs) {
+        let dev_ep = info
+            .node_dev_entrypoint
+            .as_ref()
+            .map(|v| v.join(" "))
+            .unwrap_or_else(|| execution_entrypoint.clone());
+
+        let release_ep = info
+            .node_release_entrypoint
+            .as_ref()
+            .map(|v| v.join(" "))
+            .unwrap_or_else(|| execution_entrypoint.clone());
+
+        format!(
+            "\n[execution.dev]\nentrypoint = \"{}\"\n\n[execution.release]\nentrypoint = \"{}\"\n",
+            dev_ep, release_ep
+        )
+    } else {
+        String::new()
+    };
+
     format!(
         r#"# Capsule Manifest - UARC V1.1.0
 # Generated by: capsule init
@@ -305,6 +380,7 @@ description = "Capsule generated from existing {project_type} project"
 [execution]
 runtime = "source"
 entrypoint = "{entrypoint}"
+{node_profiles_block}
 {targets_block}
 
 [storage]
@@ -314,6 +390,7 @@ entrypoint = "{entrypoint}"
         name = info.name,
         project_type = info.project_type.as_str(),
     entrypoint = execution_entrypoint,
+    node_profiles_block = node_profiles_block,
     targets_block = targets_block
     )
 }
