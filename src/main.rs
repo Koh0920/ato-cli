@@ -4,8 +4,8 @@ use serde_json::json;
 use std::path::PathBuf;
 use std::process::Command;
 
-mod engine;
 mod config;
+mod engine;
 mod init;
 mod keygen;
 mod new;
@@ -43,7 +43,7 @@ enum Commands {
         /// Project name
         name: String,
 
-        /// Template type: python, node, rust, shell
+        /// Template type: python, node, hono, rust, shell
         #[arg(long, default_value = "python")]
         template: String,
     },
