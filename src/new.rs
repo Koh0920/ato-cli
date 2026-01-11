@@ -4,6 +4,8 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::init::{detect, recipe};
+
 pub struct NewArgs {
     pub name: String,
     pub template: Option<String>,
@@ -27,12 +29,13 @@ pub fn execute(args: NewArgs) -> Result<()> {
     match template {
         "python" | "py" => create_python_project(&project_dir, &args.name)?,
         "node" | "nodejs" | "js" => create_nodejs_project(&project_dir, &args.name)?,
+        "hono" => create_hono_project(&project_dir, &args.name)?,
         "rust" | "rs" => create_rust_project(&project_dir, &args.name)?,
         "shell" | "sh" | "bash" => create_shell_project(&project_dir, &args.name)?,
         _ => {
             anyhow::bail!(
                 "Unknown template: '{}'\n\
-                Available templates: python, node, rust, shell",
+                Available templates: python, node, hono, rust, shell",
                 template
             );
         }
@@ -50,39 +53,6 @@ pub fn execute(args: NewArgs) -> Result<()> {
 }
 
 fn create_python_project(dir: &Path, name: &str) -> Result<()> {
-    let manifest = format!(
-        r#"# Capsule Manifest - UARC V1.1.0
-schema_version = "1.0"
-name = "{name}"
-version = "0.1.0"
-type = "app"
-
-[metadata]
-description = "A new capsule application"
-
-[requirements]
-
-[execution]
-runtime = "source"
-entrypoint = "main.py"
-
-[targets]
-preference = ["source"]
-
-[targets.source]
-language = "python"
-version = "^3.11"
-entrypoint = "main.py"
-dependencies = "requirements.txt"
-dev_mode = true
-
-[storage]
-
-[routing]
-"#
-    );
-    fs::write(dir.join("capsule.toml"), manifest)?;
-
     let main_py = r#"#!/usr/bin/env python3
 """
 Main entry point for the capsule application.
@@ -97,7 +67,23 @@ if __name__ == "__main__":
 "#;
     fs::write(dir.join("main.py"), main_py)?;
 
-    fs::write(dir.join("requirements.txt"), "# Add your dependencies here\n")?;
+    fs::write(
+        dir.join("requirements.txt"),
+        "# Add your dependencies here\n",
+    )?;
+
+    // Generate capsule.toml via the same detect+recipe path as `capsule init`.
+    let detected = detect::detect_project(dir)?;
+    let mut info = recipe::project_info_from_detection(&detected)?;
+    info.name = name.to_string();
+    let manifest = recipe::generate_manifest(
+        &info,
+        recipe::ManifestMeta {
+            generated_by: "capsule new",
+            description: "A new capsule application",
+        },
+    );
+    fs::write(dir.join("capsule.toml"), manifest)?;
 
     println!("   ✓ Created capsule.toml");
     println!("   ✓ Created main.py");
@@ -106,100 +92,171 @@ if __name__ == "__main__":
 }
 
 fn create_nodejs_project(dir: &Path, name: &str) -> Result<()> {
-        let manifest = format!(
-                r#"# Capsule Manifest - UARC V1.1.0
-schema_version = "1.0"
-name = "{name}"
-version = "0.1.0"
-type = "app"
+    // Bundle selection is opt-in: this file controls what goes into the bundle.
+    // Keep it minimal (users can edit as needed).
+    fs::write(dir.join(".capsuleignore"), "node_modules/\n")?;
 
-[metadata]
-description = "A new Bun/Node.js capsule application"
+    // Hint for detection: this is a Bun project.
+    fs::write(dir.join("bun.lockb"), &[])?;
 
-[requirements]
-
-[execution]
-runtime = "source"
-
-# Fallback entrypoint (used if profiles are not supported)
-entrypoint = "bun run start"
-
-# Development profile (used by `capsule dev`)
-[execution.dev]
-entrypoint = "bun run dev"
-
-# Release/profile for packaging (used by bundled execution)
-[execution.release]
-entrypoint = "bun run start"
-
-[storage]
-
-[routing]
+    let package_json = format!(
+        r#"{{
+    "name": "{name}",
+    "version": "0.1.0",
+    "private": true,
+    "type": "module",
+    "packageManager": "bun@1",
+    "main": "dist/server.js",
+    "scripts": {{
+        "dev": "bun --hot src/index.ts",
+        "build": "bun build src/index.ts --outfile dist/server.js --target=bun",
+        "start": "bun run dist/server.js"
+    }}
+}}
 "#
-        );
+    );
+    fs::write(dir.join("package.json"), package_json)?;
+
+    fs::create_dir_all(dir.join("src"))?;
+    fs::create_dir_all(dir.join("dist"))?;
+
+    let index_ts = r#"import { serve } from "bun";
+
+serve({
+    port: Number(process.env.PORT ?? 8000),
+    fetch(req) {
+        return new Response("Hello from capsule!\n", {
+            headers: { "content-type": "text/plain; charset=utf-8" },
+        });
+    },
+});
+
+console.log(`Started server http://localhost:${process.env.PORT ?? 8000}`);
+"#;
+    fs::write(dir.join("src/index.ts"), index_ts)?;
+
+    // Provide a ready-to-run release artifact so `capsule pack` works immediately.
+    // Users are expected to overwrite this by running `bun run build`.
+    let dist_js = r#"import { serve } from "bun";
+
+serve({
+    port: Number(process.env.PORT ?? 8000),
+    fetch(req) {
+        return new Response("Hello from capsule!\n", {
+            headers: { "content-type": "text/plain; charset=utf-8" },
+        });
+    },
+});
+
+console.log(`Started server http://localhost:${process.env.PORT ?? 8000}`);
+"#;
+    fs::write(dir.join("dist/server.js"), dist_js)?;
+
+    // Generate capsule.toml via the same detect+recipe path as `capsule init`.
+    let detected = detect::detect_project(dir)?;
+    let mut info = recipe::project_info_from_detection(&detected)?;
+    info.name = name.to_string();
+    let manifest = recipe::generate_manifest(
+        &info,
+        recipe::ManifestMeta {
+            generated_by: "capsule new",
+            description: "A new Bun/Node.js capsule application",
+        },
+    );
     fs::write(dir.join("capsule.toml"), manifest)?;
 
-        // Bundle selection is opt-in: this file controls what goes into the bundle.
-        // Keep it minimal (users can edit as needed).
-        fs::write(dir.join(".capsuleignore"), "node_modules/\n")?;
+    println!("   ✓ Created capsule.toml");
+    println!("   ✓ Created .capsuleignore");
+    println!("   ✓ Created package.json");
+    println!("   ✓ Created src/index.ts");
+    println!("   ✓ Created dist/server.js");
+    Ok(())
+}
+
+fn create_hono_project(dir: &Path, name: &str) -> Result<()> {
+    // Bundle selection is opt-in: this file controls what goes into the bundle.
+    // Keep it minimal (users can edit as needed).
+    fs::write(dir.join(".capsuleignore"), "node_modules/\n")?;
+
+    // Hint for detection: this is a Bun project.
+    fs::write(dir.join("bun.lockb"), &[])?;
 
     let package_json = format!(
         r#"{{
   "name": "{name}",
   "version": "0.1.0",
-    "private": true,
-    "type": "module",
-    "main": "dist/server.js",
+  "private": true,
+  "type": "module",
+    "packageManager": "bun@1",
+  "main": "dist/server.js",
   "scripts": {{
-      "dev": "bun --hot src/index.ts",
-        "build": "bun build src/index.ts --outfile dist/server.js --target=bun",
-        "start": "bun run dist/server.js"
+    "dev": "bun --hot src/index.ts",
+    "build": "bun build src/index.ts --outfile dist/server.js --target=bun",
+    "start": "bun run dist/server.js"
+  }},
+  "dependencies": {{
+    "hono": "^4"
   }}
 }}
 "#
     );
     fs::write(dir.join("package.json"), package_json)?;
 
-        fs::create_dir_all(dir.join("src"))?;
-        fs::create_dir_all(dir.join("dist"))?;
+    fs::create_dir_all(dir.join("src"))?;
+    fs::create_dir_all(dir.join("dist"))?;
 
-        let index_ts = r#"import { serve } from "bun";
+    let index_ts = r#"import { Hono } from "hono";
+import { serve } from "bun";
+
+const app = new Hono();
+
+app.get("/", (c) => c.text("Hello from capsule!\n"));
 
 serve({
     port: Number(process.env.PORT ?? 8000),
-    fetch(req) {
-        return new Response("Hello from capsule!\n", {
-            headers: { "content-type": "text/plain; charset=utf-8" },
-        });
-    },
+    fetch: app.fetch,
 });
 
 console.log(`Started server http://localhost:${process.env.PORT ?? 8000}`);
 "#;
-        fs::write(dir.join("src/index.ts"), index_ts)?;
+    fs::write(dir.join("src/index.ts"), index_ts)?;
 
-        // Provide a ready-to-run release artifact so `capsule pack` works immediately.
-        // Users are expected to overwrite this by running `bun run build`.
-        let dist_js = r#"import { serve } from "bun";
+    // Provide a ready-to-run release artifact so `capsule pack` works immediately.
+    // Users are expected to overwrite this by running `bun run build`.
+    let dist_js = r#"import { Hono } from "hono";
+import { serve } from "bun";
+
+const app = new Hono();
+
+app.get("/", (c) => c.text("Hello from capsule!\n"));
 
 serve({
     port: Number(process.env.PORT ?? 8000),
-    fetch(req) {
-        return new Response("Hello from capsule!\n", {
-            headers: { "content-type": "text/plain; charset=utf-8" },
-        });
-    },
+    fetch: app.fetch,
 });
 
 console.log(`Started server http://localhost:${process.env.PORT ?? 8000}`);
 "#;
-        fs::write(dir.join("dist/server.js"), dist_js)?;
+    fs::write(dir.join("dist/server.js"), dist_js)?;
+
+    // Generate capsule.toml via the same detect+recipe path as `capsule init`.
+    let detected = detect::detect_project(dir)?;
+    let mut info = recipe::project_info_from_detection(&detected)?;
+    info.name = name.to_string();
+    let manifest = recipe::generate_manifest(
+        &info,
+        recipe::ManifestMeta {
+            generated_by: "capsule new",
+            description: "A new Bun/Hono capsule application",
+        },
+    );
+    fs::write(dir.join("capsule.toml"), manifest)?;
 
     println!("   ✓ Created capsule.toml");
-        println!("   ✓ Created .capsuleignore");
+    println!("   ✓ Created .capsuleignore");
     println!("   ✓ Created package.json");
-        println!("   ✓ Created src/index.ts");
-        println!("   ✓ Created dist/server.js");
+    println!("   ✓ Created src/index.ts");
+    println!("   ✓ Created dist/server.js");
     Ok(())
 }
 
@@ -334,7 +391,7 @@ target/
 
 fn create_readme(dir: &Path, name: &str, template: &str) -> Result<()> {
     let quickstart = match template {
-        "node" | "nodejs" | "js" => {
+        "node" | "nodejs" | "js" | "hono" => {
             r#"```bash
 # Install deps (optional for this minimal template)
 bun install
