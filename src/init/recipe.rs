@@ -1,5 +1,6 @@
 use crate::init::detect::{DetectedProject, NodePackageManager, ProjectType};
 use anyhow::Result;
+use std::fs;
 use std::path::Path;
 
 #[derive(Debug)]
@@ -47,8 +48,12 @@ pub fn generate_manifest(info: &ProjectInfo, meta: ManifestMeta<'_>) -> String {
         (entry_command, String::new())
     };
 
-    // For Node.js projects, provide explicit dev/release profiles by default.
-    let node_profiles_block = if matches!(info.project_type, ProjectType::NodeJs) {
+    // For projects that commonly need different dev/release entrypoints, provide
+    // explicit dev/release profiles by default.
+    let profiles_block = if matches!(
+        info.project_type,
+        ProjectType::NodeJs | ProjectType::Rust | ProjectType::Go
+    ) {
         let dev_ep = info
             .node_dev_entrypoint
             .as_ref()
@@ -87,7 +92,7 @@ description = "{description}"
 [execution]
 runtime = "source"
 entrypoint = "{entrypoint}"
-{node_profiles_block}
+{profiles_block}
 {targets_block}
 
 [storage]
@@ -98,7 +103,7 @@ entrypoint = "{entrypoint}"
         name = toml_escape_string(&info.name),
         description = toml_escape_string(meta.description),
         entrypoint = toml_escape_string(&execution_entrypoint),
-        node_profiles_block = node_profiles_block,
+        profiles_block = profiles_block,
         targets_block = targets_block,
     )
 }
@@ -133,21 +138,31 @@ pub fn project_info_from_detection(detected: &DetectedProject) -> Result<Project
             })
         }
 
-        ProjectType::Rust => Ok(ProjectInfo {
-            name,
-            project_type: ProjectType::Rust,
-            entrypoint: vec!["cargo".to_string(), "run".to_string()],
-            node_dev_entrypoint: None,
-            node_release_entrypoint: None,
-        }),
+        ProjectType::Rust => {
+            let bin = detect_rust_binary_name(&detected.dir, &name);
+            Ok(ProjectInfo {
+                name,
+                project_type: ProjectType::Rust,
+                entrypoint: vec![normalize_relative_executable(&bin)],
+                node_dev_entrypoint: Some(vec!["cargo".to_string(), "run".to_string()]),
+                node_release_entrypoint: Some(vec![normalize_relative_executable(&bin)]),
+            })
+        }
 
-        ProjectType::Go => Ok(ProjectInfo {
-            name,
-            project_type: ProjectType::Go,
-            entrypoint: vec!["go".to_string(), "run".to_string(), ".".to_string()],
-            node_dev_entrypoint: None,
-            node_release_entrypoint: None,
-        }),
+        ProjectType::Go => {
+            let bin = normalize_relative_executable(&name);
+            Ok(ProjectInfo {
+                name,
+                project_type: ProjectType::Go,
+                entrypoint: vec![bin.clone()],
+                node_dev_entrypoint: Some(vec![
+                    "go".to_string(),
+                    "run".to_string(),
+                    ".".to_string(),
+                ]),
+                node_release_entrypoint: Some(vec![bin]),
+            })
+        }
 
         ProjectType::Ruby => Ok(ProjectInfo {
             name,
@@ -301,6 +316,52 @@ fn detect_generic_entrypoint(dir: &Path) -> Vec<String> {
     }
 
     vec![]
+}
+
+fn normalize_relative_executable(name: &str) -> String {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return "./app".to_string();
+    }
+    if trimmed.starts_with("./") || trimmed.contains('/') {
+        return trimmed.to_string();
+    }
+    format!("./{}", trimmed)
+}
+
+fn detect_rust_binary_name(dir: &Path, fallback: &str) -> String {
+    let cargo_toml = dir.join("Cargo.toml");
+    let Ok(content) = fs::read_to_string(&cargo_toml) else {
+        return fallback.to_string();
+    };
+    let Ok(value) = toml::from_str::<toml::Value>(&content) else {
+        return fallback.to_string();
+    };
+
+    // Prefer first [[bin]] name when specified.
+    if let Some(bin0) = value.get("bin").and_then(|b| b.as_array()).and_then(|a| a.first()) {
+        if let Some(name) = bin0
+            .get("name")
+            .and_then(|n| n.as_str())
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            return name.to_string();
+        }
+    }
+
+    // Otherwise use [package].name.
+    if let Some(name) = value
+        .get("package")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        return name.to_string();
+    }
+
+    fallback.to_string()
 }
 
 fn toml_escape_string(input: &str) -> String {

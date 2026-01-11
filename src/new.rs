@@ -31,11 +31,12 @@ pub fn execute(args: NewArgs) -> Result<()> {
         "node" | "nodejs" | "js" => create_nodejs_project(&project_dir, &args.name)?,
         "hono" => create_hono_project(&project_dir, &args.name)?,
         "rust" | "rs" => create_rust_project(&project_dir, &args.name)?,
+        "go" | "golang" => create_go_project(&project_dir, &args.name)?,
         "shell" | "sh" | "bash" => create_shell_project(&project_dir, &args.name)?,
         _ => {
             anyhow::bail!(
                 "Unknown template: '{}'\n\
-                Available templates: python, node, hono, rust, shell",
+                Available templates: python, node, hono, rust, go, shell",
                 template
             );
         }
@@ -261,43 +262,17 @@ console.log(`Started server http://localhost:${process.env.PORT ?? 8000}`);
 }
 
 fn create_rust_project(dir: &Path, name: &str) -> Result<()> {
-    let manifest = format!(
-        r#"# Capsule Manifest - UARC V1.1.0
-schema_version = "1.0"
-name = "{name}"
-version = "0.1.0"
-type = "app"
-
-[metadata]
-description = "A new capsule application"
-
-[requirements]
-
-[execution]
-runtime = "source"
-entrypoint = "cargo run --release"
-
-[storage]
-
-[routing]
-
-# Alternative: Build to Wasm for sandboxed execution
-# [targets.wasm]
-# digest = "sha256:..."
-# world = "wasi:cli/command"
-"#
-    );
-    fs::write(dir.join("capsule.toml"), manifest)?;
+    // Bundle selection is opt-in: this file controls what goes into the bundle.
+    fs::write(dir.join(".capsuleignore"), "target/\n")?;
 
     let cargo_toml = format!(
         r#"[package]
-name = "{}"
+name = "{name}"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-"#,
-        name.replace('-', "_")
+"#
     );
     fs::write(dir.join("Cargo.toml"), cargo_toml)?;
 
@@ -309,9 +284,62 @@ edition = "2021"
 "#;
     fs::write(dir.join("src/main.rs"), main_rs)?;
 
+    // Generate capsule.toml via the same detect+recipe path as `capsule init`.
+    let detected = detect::detect_project(dir)?;
+    let mut info = recipe::project_info_from_detection(&detected)?;
+    info.name = name.to_string();
+    let manifest = recipe::generate_manifest(
+        &info,
+        recipe::ManifestMeta {
+            generated_by: "capsule new",
+            description: "A new Rust capsule application",
+        },
+    );
+    fs::write(dir.join("capsule.toml"), manifest)?;
+
     println!("   ✓ Created capsule.toml");
+    println!("   ✓ Created .capsuleignore");
     println!("   ✓ Created Cargo.toml");
     println!("   ✓ Created src/main.rs");
+    Ok(())
+}
+
+fn create_go_project(dir: &Path, name: &str) -> Result<()> {
+    let go_mod = format!(
+        r#"module example.com/{name}
+
+go 1.22
+"#
+    );
+    fs::write(dir.join("go.mod"), go_mod)?;
+
+    let main_go = r#"package main
+
+import "fmt"
+
+func main() {
+    fmt.Println("Hello from capsule! 🎉")
+    fmt.Println("Edit main.go to get started.")
+}
+"#;
+    fs::write(dir.join("main.go"), main_go)?;
+
+    // Generate capsule.toml via the same detect+recipe path as `capsule init`.
+    let detected = detect::detect_project(dir)?;
+    let mut info = recipe::project_info_from_detection(&detected)?;
+    info.name = name.to_string();
+    let manifest = recipe::generate_manifest(
+        &info,
+        recipe::ManifestMeta {
+            generated_by: "capsule new",
+            description: "A new Go capsule application",
+        },
+    );
+    fs::write(dir.join("capsule.toml"), manifest)?;
+
+    println!("   ✓ Created capsule.toml");
+    println!("   ✓ Created go.mod");
+    println!("   ✓ Created main.go");
     Ok(())
 }
 
@@ -390,7 +418,7 @@ target/
 }
 
 fn create_readme(dir: &Path, name: &str, template: &str) -> Result<()> {
-    let quickstart = match template {
+    let quickstart: String = match template {
         "node" | "nodejs" | "js" | "hono" => {
             r#"```bash
 # Install deps (optional for this minimal template)
@@ -407,7 +435,42 @@ capsule pack --bundle
 
 # Run bundle
 ./nacelle-bundle
+```"#.to_string()
+        }
+        "rust" | "rs" => {
+            format!(
+                r#"```bash
+# Run locally (dev profile)
+capsule dev
+
+# Build release binary for bundling
+cargo build --release
+cp target/release/{name} ./{name}
+
+# Create a self-extracting bundle (release profile)
+capsule pack --bundle
+
+# Run bundle
+./nacelle-bundle
 ```"#
+            )
+        }
+        "go" | "golang" => {
+            format!(
+                r#"```bash
+# Run locally (dev profile)
+capsule dev
+
+# Build release binary for bundling
+go build -o {name} .
+
+# Create a self-extracting bundle (release profile)
+capsule pack --bundle
+
+# Run bundle
+./nacelle-bundle
+```"#
+            )
         }
         _ => {
             r#"```bash
@@ -419,7 +482,7 @@ capsule pack --bundle
 
 # Run bundle
 ./nacelle-bundle
-```"#
+```"#.to_string()
         }
     };
 

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
+use toml;
 
 #[derive(Debug, Clone)]
 pub struct DetectedProject {
@@ -59,11 +60,13 @@ pub struct DetectedNode {
 }
 
 pub fn detect_project(dir: &Path) -> Result<DetectedProject> {
-    let name = dir
+    let base_name = dir
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("my-capsule")
         .to_string();
+
+    let mut name = base_name;
 
     if dir.join("requirements.txt").exists()
         || dir.join("pyproject.toml").exists()
@@ -88,6 +91,10 @@ pub fn detect_project(dir: &Path) -> Result<DetectedProject> {
     }
 
     if dir.join("Cargo.toml").exists() {
+        // Prefer Cargo package name when available (more accurate for Rust binary name).
+        if let Some(pkg) = detect_cargo_package_name(dir) {
+            name = pkg;
+        }
         return Ok(DetectedProject {
             dir: dir.to_path_buf(),
             name,
@@ -120,6 +127,18 @@ pub fn detect_project(dir: &Path) -> Result<DetectedProject> {
         project_type: ProjectType::Unknown,
         node: None,
     })
+}
+
+fn detect_cargo_package_name(dir: &Path) -> Option<String> {
+    let cargo_toml_path = dir.join("Cargo.toml");
+    let content = fs::read_to_string(&cargo_toml_path).ok()?;
+    let value = toml::from_str::<toml::Value>(&content).ok()?;
+    value
+        .get("package")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 fn detect_node(dir: &Path) -> Result<DetectedNode> {
