@@ -5,18 +5,147 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
-pub fn discover_nacelle(explicit: Option<PathBuf>) -> Result<PathBuf> {
-    if let Some(path) = explicit {
-        return Ok(path);
+use crate::config;
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
+pub struct EngineRequest {
+    pub explicit_path: Option<PathBuf>,
+    pub manifest_path: Option<PathBuf>,
+}
+
+pub fn discover_nacelle(req: EngineRequest) -> Result<PathBuf> {
+    // 1) Explicit CLI flag
+    if let Some(path) = req.explicit_path {
+        return validate_engine_path(path);
     }
 
+    // 2) Environment override
     if let Ok(env_path) = std::env::var("NACELLE_PATH") {
         if !env_path.trim().is_empty() {
-            return Ok(PathBuf::from(env_path));
+            return validate_engine_path(PathBuf::from(env_path));
         }
     }
 
-    which::which("nacelle").context("Failed to find nacelle engine (set NACELLE_PATH or add nacelle to PATH)")
+    // 3) Project manifest (capsule.toml)
+    if let Some(manifest_path) = req.manifest_path {
+        if let Some(path) = resolve_from_manifest(&manifest_path)? {
+            return validate_engine_path(path);
+        }
+    }
+
+    // 4) User registry (~/.capsule/config.toml)
+    {
+        let cfg = config::load_config()?;
+        if let Some(default_name) = cfg.default_engine.as_deref() {
+            if let Some(entry) = cfg.engines.get(default_name) {
+                return validate_engine_path(PathBuf::from(&entry.path)).with_context(|| {
+                    format!(
+                        "Default engine '{}' is not usable (path={})",
+                        default_name, entry.path
+                    )
+                });
+            }
+        }
+    }
+
+    // 5) Portable mode: look next to capsule binary
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join("nacelle");
+            if candidate.exists() {
+                return validate_engine_path(candidate);
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "Nacelle engine not found. PATH search is disabled for security.\n\
+\
+Resolve options:\n\
+  - pass --nacelle /absolute/path/to/nacelle\n\
+  - set NACELLE_PATH=/absolute/path/to/nacelle\n\
+  - register a default engine: capsule engine register --name default --path /absolute/path/to/nacelle --default\n\
+  - (portable) place nacelle next to the capsule binary"
+    ))
+}
+
+fn validate_engine_path(path: PathBuf) -> Result<PathBuf> {
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("Failed to resolve engine path: {}", path.display()))?;
+
+    let meta = std::fs::metadata(&canonical)
+        .with_context(|| format!("Failed to stat engine path: {}", canonical.display()))?;
+
+    if !meta.is_file() {
+        anyhow::bail!("Engine path is not a file: {}", canonical.display());
+    }
+
+    #[cfg(unix)]
+    {
+        let mode = meta.permissions().mode();
+        if (mode & 0o111) == 0 {
+            anyhow::bail!("Engine is not executable: {}", canonical.display());
+        }
+    }
+
+    Ok(canonical)
+}
+
+fn resolve_from_manifest(manifest_path: &Path) -> Result<Option<PathBuf>> {
+    if !manifest_path.exists() {
+        return Ok(None);
+    }
+
+    let raw = std::fs::read_to_string(manifest_path)
+        .with_context(|| format!("Failed to read manifest: {}", manifest_path.display()))?;
+    let parsed = toml::from_str::<toml::Value>(&raw)
+        .with_context(|| format!("Failed to parse manifest TOML: {}", manifest_path.display()))?;
+
+    let engine = parsed.get("engine");
+    if engine.is_none() {
+        return Ok(None);
+    }
+
+    let manifest_dir = manifest_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    // [engine]
+    // nacelle_path = "..."   (path; may be relative to manifest)
+    if let Some(path) = engine
+        .and_then(|t| t.get("nacelle_path"))
+        .and_then(|v| v.as_str())
+    {
+        let p = PathBuf::from(path);
+        return Ok(Some(if p.is_absolute() {
+            p
+        } else {
+            manifest_dir.join(p)
+        }));
+    }
+
+    // [engine]
+    // source = "alias"       (registered engine name)
+    if let Some(alias) = engine
+        .and_then(|t| t.get("source"))
+        .and_then(|v| v.as_str())
+    {
+        let cfg = config::load_config()?;
+        if let Some(entry) = cfg.engines.get(alias) {
+            return Ok(Some(PathBuf::from(&entry.path)));
+        }
+        anyhow::bail!(
+            "Engine alias '{}' not registered. Run: capsule engine register --name {} --path /abs/path/to/nacelle",
+            alias,
+            alias
+        );
+    }
+
+    Ok(None)
 }
 
 pub fn run_internal(engine: &Path, subcommand: &str, payload: &Value) -> Result<Value> {
