@@ -1,0 +1,29 @@
+# Rust
+/target
+**/*.rmeta
+**/*.rs.bk
+# If this is an application, you may want to commit Cargo.lock; uncomment to ignore it
+# /Cargo.lock
+
+# Editor directories and files
+.vscode/
+.idea/
+*.swp
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Logs
+*.log
+
+# Build artifacts
+**/build/
+
+# Secrets and envs
+.env
+
+# Ignore npm/node_modules if any (not typical for Rust projects)
+node_modules/
