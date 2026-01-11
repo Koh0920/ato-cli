@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 mod engine;
+mod config;
 mod init;
 mod keygen;
 mod new;
@@ -95,6 +96,21 @@ enum Commands {
 enum EngineCommands {
     /// Show engine capabilities (JSON)
     Features,
+
+    /// Register a nacelle engine binary (writes ~/.capsule/config.toml)
+    Register {
+        /// Registration name (e.g. "default" or "my-custom-nacelle")
+        #[arg(long)]
+        name: String,
+
+        /// Path to nacelle engine binary (if omitted, uses NACELLE_PATH)
+        #[arg(long)]
+        path: Option<PathBuf>,
+
+        /// Set this registration as the default engine
+        #[arg(long, default_value_t = false)]
+        default: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -104,15 +120,62 @@ fn main() -> Result<()> {
         Commands::Engine {
             command: EngineCommands::Features,
         } => {
-            let nacelle = engine::discover_nacelle(cli.nacelle)?;
+            let nacelle = engine::discover_nacelle(engine::EngineRequest {
+                explicit_path: cli.nacelle,
+                manifest_path: None,
+            })?;
             let payload = json!({ "spec_version": "0.1.0" });
             let resp = engine::run_internal(&nacelle, "features", &payload)?;
             println!("{}", serde_json::to_string_pretty(&resp)?);
             Ok(())
         }
 
+        Commands::Engine {
+            command:
+                EngineCommands::Register {
+                    name,
+                    path,
+                    default,
+                },
+        } => {
+            let resolved_path = if let Some(p) = path {
+                p
+            } else if let Ok(env_path) = std::env::var("NACELLE_PATH") {
+                PathBuf::from(env_path)
+            } else {
+                anyhow::bail!("Missing --path and NACELLE_PATH is not set");
+            };
+
+            // Validate path by running the resolver with explicit_path.
+            let validated = engine::discover_nacelle(engine::EngineRequest {
+                explicit_path: Some(resolved_path),
+                manifest_path: None,
+            })?;
+
+            let mut cfg = config::load_config()?;
+            cfg.engines.insert(
+                name.clone(),
+                config::EngineRegistration {
+                    path: validated.display().to_string(),
+                },
+            );
+            if default {
+                cfg.default_engine = Some(name.clone());
+            }
+            config::save_config(&cfg)?;
+
+            println!("✅ Registered engine '{}' -> {}", name, validated.display());
+            if default {
+                println!("✅ Set as default engine");
+            }
+            Ok(())
+        }
+
         Commands::Dev { manifest } => {
-            let nacelle = engine::discover_nacelle(cli.nacelle)?;
+            let nacelle = engine::discover_nacelle(engine::EngineRequest {
+                explicit_path: cli.nacelle,
+                manifest_path: Some(manifest.clone()),
+            })?;
             let manifest_dir = manifest
                 .parent()
                 .map(|p| p.to_path_buf())
@@ -154,7 +217,10 @@ fn main() -> Result<()> {
                 anyhow::bail!("Only bundle output is supported (use --bundle)");
             }
 
-            let nacelle = engine::discover_nacelle(cli.nacelle)?;
+            let nacelle = engine::discover_nacelle(engine::EngineRequest {
+                explicit_path: cli.nacelle,
+                manifest_path: Some(manifest.clone()),
+            })?;
             let manifest_dir = manifest
                 .parent()
                 .map(|p| p.to_path_buf())
