@@ -61,3 +61,35 @@ bun run build
 `.capsuleignore`（オプション）を置くと、bundle に含めるファイルを制御できます。
 
 - Node/Bun の場合は `node_modules/` を除外し、`bun build` の成果物（例: `dist/`）だけを同梱する運用を推奨します。
+
+## build / isolation
+
+`capsule.toml` は packaging-time / runtime-time の追加設定をサポートします。
+
+```toml
+[build]
+# `.capsuleignore` に追加で適用される除外パターン（pack / bundle の両方）
+exclude_libs = ["**/.venv/**", "**/site-packages/torch/**"]
+
+# GPU向けのスキャフォールド/テンプレ選択用（挙動の自動変更はしない）
+gpu = true
+
+[isolation]
+# ホスト環境変数の透過を allowlist 方式で許可（bundle 実行時）
+allow_env = ["HF_TOKEN", "LD_LIBRARY_PATH"]
+
+[execution.env]
+GUMBALL_MODEL = "qwen3-8b"
+```
+
+## Scaffold Docker
+
+self-extracting bundle（`nacelle-bundle`）をコンテナで実行するための雛形を生成します。
+
+```bash
+# capsule.toml の build.gpu を見て Dockerfile を選択
+capsule scaffold docker --manifest capsule.toml
+
+# 既存ファイルを上書き
+capsule scaffold docker --force
+```

@@ -9,6 +9,7 @@ mod engine;
 mod init;
 mod keygen;
 mod new;
+mod scaffold;
 
 #[derive(Parser)]
 #[command(name = "capsule")]
@@ -89,6 +90,34 @@ enum Commands {
     Open {
         /// Path to bundle executable
         path: PathBuf,
+    },
+
+    /// Scaffold supporting files (e.g. Dockerfile)
+    Scaffold {
+        #[command(subcommand)]
+        command: ScaffoldCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum ScaffoldCommands {
+    /// Generate a Dockerfile + .dockerignore for running a self-extracting bundle
+    Docker {
+        /// Path to capsule.toml
+        #[arg(long, default_value = "capsule.toml")]
+        manifest: PathBuf,
+
+        /// Output Dockerfile path (default: <manifest dir>/Dockerfile)
+        #[arg(long)]
+        output: Option<PathBuf>,
+
+        /// Output directory (default: manifest directory). Ignored if --output is set.
+        #[arg(long)]
+        output_dir: Option<PathBuf>,
+
+        /// Overwrite existing files
+        #[arg(long, default_value_t = false)]
+        force: bool,
     },
 }
 
@@ -265,5 +294,20 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+
+        Commands::Scaffold {
+            command:
+                ScaffoldCommands::Docker {
+                    manifest,
+                    output,
+                    output_dir,
+                    force,
+                },
+        } => scaffold::execute_docker(scaffold::ScaffoldDockerArgs {
+            manifest_path: manifest,
+            output_dir,
+            output,
+            force,
+        }),
     }
 }
