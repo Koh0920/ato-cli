@@ -9,7 +9,10 @@ mod engine;
 mod init;
 mod keygen;
 mod new;
+mod policy;      // v3.0: L4 Egress Policy Resolution
 mod scaffold;
+mod signing;     // v3.0: L2 Signature Creation/Verification
+mod validation;  // v3.0: L1 Source Policy Scanning
 
 #[derive(Parser)]
 #[command(name = "capsule")]
@@ -84,6 +87,18 @@ enum Commands {
         /// Use a specific runtime directory (optional)
         #[arg(long)]
         runtime: Option<PathBuf>,
+
+        /// Path to signing key for L2 verification (optional)
+        #[arg(long)]
+        key: Option<PathBuf>,
+
+        /// Skip L1 source policy scan (dangerous!)
+        #[arg(long)]
+        skip_l1: bool,
+
+        /// Skip all validations (use only for testing)
+        #[arg(long)]
+        skip_validation: bool,
     },
 
     /// Run a built self-extracting bundle
@@ -241,19 +256,54 @@ fn main() -> Result<()> {
             bundle,
             output,
             runtime,
+            key,
+            skip_l1,
+            skip_validation,
         } => {
             if !bundle {
                 anyhow::bail!("Only bundle output is supported (use --bundle)");
             }
 
-            let nacelle = engine::discover_nacelle(engine::EngineRequest {
-                explicit_path: cli.nacelle,
-                manifest_path: Some(manifest.clone()),
-            })?;
+            println!("📦 Capsule Pack - Pure Runtime Architecture v3.0");
+            println!("   Performing build-time validations...\n");
+
             let manifest_dir = manifest
                 .parent()
                 .map(|p| p.to_path_buf())
                 .unwrap_or_else(|| PathBuf::from("."));
+
+            // Phase 1: L1 Source Policy Scan
+            if !skip_validation && !skip_l1 {
+                println!("🔍 Phase 1: L1 Source Policy Scan");
+                let source_dir = manifest_dir.join("source");
+                if source_dir.exists() {
+                    let scan_extensions = &["py", "sh", "js", "ts", "go", "rs"];
+                    match validation::source_policy::scan_source_directory(
+                        &source_dir,
+                        scan_extensions,
+                    ) {
+                        Ok(()) => {
+                            println!("   ✅ No dangerous patterns detected\n");
+                        }
+                        Err(e) => {
+                            eprintln!("   ❌ L1 Policy violation: {}", e);
+                            eprintln!("\n💡 Tip: Fix the security issue or use --skip-l1 (not recommended)");
+                            anyhow::bail!("L1 Source Policy check failed");
+                        }
+                    }
+                } else {
+                    println!("   ⚠️  No source/ directory found, skipping scan\n");
+                }
+            } else if skip_l1 {
+                println!("⚠️  Phase 1: L1 Source Policy Scan SKIPPED (--skip-l1)\n");
+            }
+
+            // Phase 2: Call nacelle to create bundle
+            println!("📦 Phase 2: Building bundle with nacelle");
+            let nacelle = engine::discover_nacelle(engine::EngineRequest {
+                explicit_path: cli.nacelle,
+                manifest_path: Some(manifest.clone()),
+            })?;
 
             let payload = json!({
                 "spec_version": "0.1.0",
@@ -278,9 +328,38 @@ fn main() -> Result<()> {
                 .get("artifact")
                 .and_then(|a| a.get("path"))
                 .and_then(|p| p.as_str())
-                .unwrap_or("<unknown>");
+                .map(PathBuf::from)
+                .ok_or_else(|| anyhow::anyhow!("No artifact path in response"))?;
 
-            println!("✅ Bundle created: {}", artifact_path);
+            println!("   ✅ Bundle created: {}\n", artifact_path.display());
+
+            // Phase 3: Generate sandbox_rules.json (TODO: implement egress resolution)
+            println!("🔐 Phase 3: Generating sandbox rules");
+            let bundle_source_dir = artifact_path; // Assuming this is the extracted bundle dir
+            // TODO: Parse capsule.toml to get egress allowlist
+            // let egress_policy = policy::resolve_egress_policy(&domains)?;
+            // Write to .nacelle/sandbox_rules.json
+            println!("   ⚠️  Sandbox rules generation not yet implemented\n");
+
+            // Phase 4: L2 Sign bundle (if key provided)
+            if let Some(key_path) = key {
+                if !skip_validation {
+                    println!("🔐 Phase 4: L2 Signature Generation");
+                    match signing::sign_bundle(&bundle_source_dir, &key_path, "capsule-cli") {
+                        Ok(_) => {
+                            println!("   ✅ Bundle signed successfully\n");
+                        }
+                        Err(e) => {
+                            eprintln!("   ❌ Signing failed: {}", e);
+                            anyhow::bail!("L2 Signature generation failed");
+                        }
+                    }
+                }
+            } else {
+                println!("ℹ️  Phase 4: L2 Signature skipped (no --key provided)\n");
+            }
+
+            println!("✅ Pack complete: {}", bundle_source_dir.display());
             Ok(())
         }
 
