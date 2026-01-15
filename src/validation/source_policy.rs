@@ -3,7 +3,7 @@
 //! Migrated from nacelle/src/verification/verifier.rs
 //! Scans source code for dangerous patterns before packaging.
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use regex::Regex;
 use std::path::Path;
 use tracing::{info, warn};
@@ -115,10 +115,7 @@ pub fn scan_source_directory(
 }
 
 /// Recursively scan directory for dangerous patterns
-fn scan_directory_for_patterns(
-    dir: &Path,
-    scan_extensions: &[&str],
-) -> Result<(), L1PolicyError> {
+fn scan_directory_for_patterns(dir: &Path, scan_extensions: &[&str]) -> Result<(), L1PolicyError> {
     let regex_patterns: Vec<(Regex, &str)> = DANGEROUS_REGEX_PATTERNS
         .iter()
         .map(|(pattern, desc)| (Regex::new(pattern).unwrap(), *desc))
@@ -130,7 +127,7 @@ fn scan_directory_for_patterns(
         .filter_map(|e| e.ok())
     {
         let path = entry.path();
-        
+
         // Skip directories
         if !path.is_file() {
             continue;
@@ -229,7 +226,7 @@ mod tests {
 
         let result = scan_source_directory(temp.path(), &["py"]);
         assert!(result.is_err());
-        
+
         if let Err(L1PolicyError::DangerousPattern { pattern, .. }) = result {
             assert_eq!(pattern, "eval(");
         }
@@ -249,7 +246,7 @@ mod tests {
     fn test_scan_missing_directory() {
         let result = scan_source_directory(Path::new("/nonexistent"), &["py"]);
         assert!(result.is_err());
-        
+
         if let Err(L1PolicyError::BlobNotFound(_)) = result {
             // Expected
         } else {
@@ -260,11 +257,11 @@ mod tests {
     #[test]
     fn test_scan_with_extension_filter() {
         let temp = tempdir().unwrap();
-        
+
         // Create Python file with dangerous pattern
         let py_file = temp.path().join("bad.py");
         fs::write(&py_file, "eval('bad')").unwrap();
-        
+
         // Create JS file (should be ignored)
         let js_file = temp.path().join("safe.js");
         fs::write(&js_file, "eval('ignored')").unwrap();

@@ -38,12 +38,17 @@ pub struct CapsuleSignature {
 ///
 /// # Returns
 /// Signature metadata written to `.signature` file
-pub fn sign_bundle(bundle_path: &Path, key_path: &Path, signer_name: &str) -> Result<CapsuleSignature> {
+pub fn sign_bundle(
+    bundle_path: &Path,
+    key_path: &Path,
+    signer_name: &str,
+) -> Result<CapsuleSignature> {
     // Read the private key
     let key_bytes = std::fs::read(key_path)?;
     let signing_key = SigningKey::from_bytes(
-        &key_bytes.try_into()
-            .map_err(|_| anyhow::anyhow!("Invalid key length (expected 32 bytes)"))?
+        &key_bytes
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("Invalid key length (expected 32 bytes)"))?,
     );
 
     // Read manifest to sign
@@ -98,6 +103,7 @@ pub fn sign_bundle(bundle_path: &Path, key_path: &Path, signer_name: &str) -> Re
 ///
 /// # Returns
 /// Base64-encoded public key string
+#[allow(dead_code)]
 pub fn generate_keypair(output_path: &Path) -> Result<String> {
     let mut rng = rand::thread_rng();
     let signing_key = SigningKey::generate(&mut rng);

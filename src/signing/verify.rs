@@ -5,7 +5,6 @@
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
@@ -19,6 +18,7 @@ use super::sign::CapsuleSignature;
 ///
 /// # Returns
 /// Ok if signature is valid, Err otherwise
+#[allow(dead_code)]
 pub fn verify_bundle(bundle_path: &Path, trusted_public_keys: &[String]) -> Result<()> {
     // Read signature file
     let sig_path = bundle_path.join(".signature");
@@ -58,19 +58,22 @@ pub fn verify_bundle(bundle_path: &Path, trusted_public_keys: &[String]) -> Resu
     // Decode public key
     let pub_key_bytes = BASE64.decode(&sig_data.public_key)?;
     let verifying_key = VerifyingKey::from_bytes(
-        &pub_key_bytes.try_into()
-            .map_err(|_| anyhow!("Invalid public key length"))?
+        &pub_key_bytes
+            .try_into()
+            .map_err(|_| anyhow!("Invalid public key length"))?,
     )?;
 
     // Decode signature
     let sig_bytes = BASE64.decode(&sig_data.signature)?;
     let signature = Signature::from_bytes(
-        &sig_bytes.try_into()
-            .map_err(|_| anyhow!("Invalid signature length"))?
+        &sig_bytes
+            .try_into()
+            .map_err(|_| anyhow!("Invalid signature length"))?,
     );
 
     // Verify signature
-    verifying_key.verify(&manifest_bytes, &signature)
+    verifying_key
+        .verify(&manifest_bytes, &signature)
         .map_err(|e| anyhow!("Signature verification failed: {}", e))?;
 
     tracing::info!("✅ Signature verified:");
@@ -163,7 +166,10 @@ version = "1.0.0"
 
         let result = verify_bundle(&bundle_path, &[other_public_key]);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not in trusted key list"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("not in trusted key list"));
     }
 
     #[test]
@@ -182,6 +188,9 @@ version = "1.0.0"
 
         let result = verify_bundle(&bundle_path, &["dummy_key".to_string()]);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("No signature file found"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("No signature file found"));
     }
 }

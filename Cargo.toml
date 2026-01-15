@@ -26,6 +26,8 @@ base64 = "0.22"        # v3.0: Base64 encoding for signatures
 regex = "1"            # v3.0: L1 pattern matching
 walkdir = "2"          # v3.0: L1 directory traversal
 tracing = "0.1"        # v3.0: Structured logging
+jsonschema = "0.17"    # R3: config.json schema validation
+shell-words = "1.1"    # R3: command parsing for entrypoint
 
 [dev-dependencies]
 tempfile = "3"         # Testing

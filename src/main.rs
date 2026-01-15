@@ -9,10 +9,11 @@ mod engine;
 mod init;
 mod keygen;
 mod new;
-mod policy;      // v3.0: L4 Egress Policy Resolution
+mod policy; // v3.0: L4 Egress Policy Resolution
+mod r3_config;
 mod scaffold;
-mod signing;     // v3.0: L2 Signature Creation/Verification
-mod validation;  // v3.0: L1 Source Policy Scanning
+mod signing; // v3.0: L2 Signature Creation/Verification
+mod validation; // v3.0: L1 Source Policy Scanning // v3.0: R3 Configuration Generator
 
 #[derive(Parser)]
 #[command(name = "capsule")]
@@ -99,6 +100,10 @@ enum Commands {
         /// Skip all validations (use only for testing)
         #[arg(long)]
         skip_validation: bool,
+
+        /// Network enforcement mode for R3 config.json (best_effort or strict)
+        #[arg(long, default_value = "best_effort", value_parser = ["best_effort", "strict"])]
+        enforcement: String,
     },
 
     /// Run a built self-extracting bundle
@@ -259,6 +264,7 @@ fn main() -> Result<()> {
             key,
             skip_l1,
             skip_validation,
+            enforcement,
         } => {
             if !bundle {
                 anyhow::bail!("Only bundle output is supported (use --bundle)");
@@ -298,8 +304,13 @@ fn main() -> Result<()> {
                 println!("⚠️  Phase 1: L1 Source Policy Scan SKIPPED (--skip-l1)\n");
             }
 
-            // Phase 2: Call nacelle to create bundle
-            println!("📦 Phase 2: Building bundle with nacelle");
+            // Phase 2: Generate R3 config.json (services-first)
+            println!("🧭 Phase 2: Generating R3 config.json");
+            let config_path = r3_config::generate_and_write_config(&manifest, Some(enforcement))?;
+            println!("   ✅ config.json generated: {}\n", config_path.display());
+
+            // Phase 3: Call nacelle to create bundle
+            println!("📦 Phase 3: Building bundle with nacelle");
             let nacelle = engine::discover_nacelle(engine::EngineRequest {
                 explicit_path: cli.nacelle,
                 manifest_path: Some(manifest.clone()),
@@ -333,13 +344,7 @@ fn main() -> Result<()> {
 
             println!("   ✅ Bundle created: {}\n", artifact_path.display());
 
-            // Phase 3: Generate sandbox_rules.json (TODO: implement egress resolution)
-            println!("🔐 Phase 3: Generating sandbox rules");
-            let bundle_source_dir = artifact_path; // Assuming this is the extracted bundle dir
-            // TODO: Parse capsule.toml to get egress allowlist
-            // let egress_policy = policy::resolve_egress_policy(&domains)?;
-            // Write to .nacelle/sandbox_rules.json
-            println!("   ⚠️  Sandbox rules generation not yet implemented\n");
+            let bundle_source_dir = artifact_path;
 
             // Phase 4: L2 Sign bundle (if key provided)
             if let Some(key_path) = key {

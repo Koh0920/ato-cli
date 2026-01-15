@@ -184,7 +184,8 @@ fn maybe_create_capsuleignore(dir: &Path, info: &recipe::ProjectInfo) -> Result<
                 return Ok(());
             }
 
-            fs::write(&capsuleignore_path, "target/\n").context("Failed to write .capsuleignore")?;
+            fs::write(&capsuleignore_path, "target/\n")
+                .context("Failed to write .capsuleignore")?;
             println!("   ✓ Created .capsuleignore (excludes target/)");
         }
         _ => {}
