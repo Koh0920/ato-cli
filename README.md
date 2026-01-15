@@ -93,3 +93,7 @@ capsule scaffold docker --manifest capsule.toml
 # 既存ファイルを上書き
 capsule scaffold docker --force
 ```
+
+## License
+
+Apache License 2.0 (SPDX: Apache-2.0). See [LICENSE](LICENSE).
