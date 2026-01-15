@@ -3,10 +3,14 @@
 //! Resolves domain names to IP addresses for egress allowlists.
 //! This pre-resolution happens at pack time so nacelle doesn't need DNS.
 
+#![allow(dead_code)]
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::net::ToSocketAddrs;
 use tracing::{info, warn};
+
+const MAX_EGRESS_RULES: usize = 4096;
 
 /// Egress rule types
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -40,6 +44,8 @@ pub fn resolve_egress_policy(allowed_domains: &[String]) -> Result<ResolvedEgres
     let mut rules = Vec::new();
     let mut resolved_ips = Vec::new();
 
+    let mut rule_count: usize = 0;
+
     for entry in allowed_domains {
         let entry = entry.trim();
 
@@ -53,6 +59,13 @@ pub fn resolve_egress_policy(allowed_domains: &[String]) -> Result<ResolvedEgres
                 value: entry.to_string(),
             });
             resolved_ips.push(entry.to_string());
+            rule_count += 1;
+            if rule_count > MAX_EGRESS_RULES {
+                anyhow::bail!(
+                    "Egress allowlist exceeds {} entries (fail-closed)",
+                    MAX_EGRESS_RULES
+                );
+            }
             continue;
         }
 
@@ -61,6 +74,13 @@ pub fn resolve_egress_policy(allowed_domains: &[String]) -> Result<ResolvedEgres
             rules.push(EgressRule::Cidr {
                 value: entry.to_string(),
             });
+            rule_count += 1;
+            if rule_count > MAX_EGRESS_RULES {
+                anyhow::bail!(
+                    "Egress allowlist exceeds {} entries (fail-closed)",
+                    MAX_EGRESS_RULES
+                );
+            }
             // Note: CIDRs are not resolved to individual IPs
             continue;
         }
@@ -74,9 +94,23 @@ pub fn resolve_egress_policy(allowed_domains: &[String]) -> Result<ResolvedEgres
         match resolve_domain_to_ips(entry) {
             Ok(ips) => {
                 info!("✅ Resolved {}: {} IPs", entry, ips.len());
+                if ips.len() > 1 {
+                    warn!(
+                        "⚠️  Shared IP/CDN risk: domain {} resolved to {} IPs",
+                        entry,
+                        ips.len()
+                    );
+                }
                 for ip in ips {
                     info!("   - {}", ip);
                     resolved_ips.push(ip);
+                    rule_count += 1;
+                    if rule_count > MAX_EGRESS_RULES {
+                        anyhow::bail!(
+                            "Egress allowlist exceeds {} entries (fail-closed)",
+                            MAX_EGRESS_RULES
+                        );
+                    }
                 }
             }
             Err(e) => {
@@ -97,7 +131,7 @@ pub fn resolve_egress_policy(allowed_domains: &[String]) -> Result<ResolvedEgres
 fn resolve_domain_to_ips(domain: &str) -> Result<Vec<String>> {
     // Use port 443 as a hint (HTTPS is most common)
     let addr_string = format!("{}:443", domain);
-    
+
     let addrs: Vec<_> = addr_string
         .to_socket_addrs()?
         .map(|addr| addr.ip().to_string())
@@ -122,7 +156,7 @@ mod tests {
     #[test]
     fn test_resolve_ip_address() {
         let policy = resolve_egress_policy(&["1.1.1.1".to_string()]).unwrap();
-        
+
         assert_eq!(policy.rules.len(), 1);
         assert_eq!(
             policy.rules[0],
@@ -136,7 +170,7 @@ mod tests {
     #[test]
     fn test_resolve_cidr_block() {
         let policy = resolve_egress_policy(&["10.0.0.0/8".to_string()]).unwrap();
-        
+
         assert_eq!(policy.rules.len(), 1);
         assert_eq!(
             policy.rules[0],
@@ -152,13 +186,13 @@ mod tests {
     fn test_resolve_domain() {
         // Use a reliable public domain
         let policy = resolve_egress_policy(&["dns.google".to_string()]).unwrap();
-        
+
         assert_eq!(policy.rules.len(), 1);
         assert!(matches!(policy.rules[0], EgressRule::Domain { .. }));
-        
+
         // Should have resolved to at least one IP
         assert!(!policy.resolved_ips.is_empty());
-        
+
         // All resolved entries should be valid IPs
         for ip in &policy.resolved_ips {
             assert!(ip.parse::<std::net::IpAddr>().is_ok());
@@ -175,13 +209,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(policy.rules.len(), 3);
-        
+
         // First rule is IP
         assert!(matches!(policy.rules[0], EgressRule::Ip { .. }));
-        
+
         // Second rule is CIDR
         assert!(matches!(policy.rules[1], EgressRule::Cidr { .. }));
-        
+
         // Third rule is Domain
         assert!(matches!(policy.rules[2], EgressRule::Domain { .. }));
 
@@ -191,17 +225,35 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_ipv4_ipv6_literals() {
+        let policy = resolve_egress_policy(&["127.0.0.1".to_string(), "::1".to_string()]).unwrap();
+
+        assert!(policy.resolved_ips.contains(&"127.0.0.1".to_string()));
+        assert!(policy.resolved_ips.contains(&"::1".to_string()));
+    }
+
+    #[test]
+    fn test_fail_closed_on_limit() {
+        let mut entries = Vec::new();
+        for i in 0..(MAX_EGRESS_RULES + 1) {
+            entries.push(format!("10.0.{}.{}", i / 255, i % 255));
+        }
+
+        let err = resolve_egress_policy(&entries).unwrap_err();
+        assert!(err.to_string().contains("fail-closed"));
+    }
+
+    #[test]
     fn test_resolve_invalid_domain() {
         // Should not fail, but warn
-        let policy = resolve_egress_policy(&[
-            "this-domain-definitely-does-not-exist-12345.com".to_string(),
-        ])
-        .unwrap();
+        let policy =
+            resolve_egress_policy(&["this-domain-definitely-does-not-exist-12345.com".to_string()])
+                .unwrap();
 
         // Rule should still be added
         assert_eq!(policy.rules.len(), 1);
         assert!(matches!(policy.rules[0], EgressRule::Domain { .. }));
-        
+
         // But no IPs resolved
         assert_eq!(policy.resolved_ips.len(), 0);
     }

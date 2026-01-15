@@ -8,4 +8,3 @@ pub mod verify;
 
 // Re-export common types
 pub use sign::sign_bundle;
-pub use verify::verify_bundle;

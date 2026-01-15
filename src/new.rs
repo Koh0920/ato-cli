@@ -98,7 +98,7 @@ fn create_nodejs_project(dir: &Path, name: &str) -> Result<()> {
     fs::write(dir.join(".capsuleignore"), "node_modules/\n")?;
 
     // Hint for detection: this is a Bun project.
-    fs::write(dir.join("bun.lockb"), &[])?;
+    fs::write(dir.join("bun.lockb"), [])?;
 
     let package_json = format!(
         r#"{{
@@ -180,7 +180,7 @@ fn create_hono_project(dir: &Path, name: &str) -> Result<()> {
     fs::write(dir.join(".capsuleignore"), "node_modules/\n")?;
 
     // Hint for detection: this is a Bun project.
-    fs::write(dir.join("bun.lockb"), &[])?;
+    fs::write(dir.join("bun.lockb"), [])?;
 
     let package_json = format!(
         r#"{{
@@ -419,8 +419,7 @@ target/
 
 fn create_readme(dir: &Path, name: &str, template: &str) -> Result<()> {
     let quickstart: String = match template {
-        "node" | "nodejs" | "js" | "hono" => {
-            r#"```bash
+        "node" | "nodejs" | "js" | "hono" => r#"```bash
 # Install deps (optional for this minimal template)
 bun install
 
@@ -435,8 +434,8 @@ capsule pack --bundle
 
 # Run bundle
 ./nacelle-bundle
-```"#.to_string()
-        }
+```"#
+            .to_string(),
         "rust" | "rs" => {
             format!(
                 r#"```bash
@@ -472,8 +471,7 @@ capsule pack --bundle
 ```"#
             )
         }
-        _ => {
-            r#"```bash
+        _ => r#"```bash
 # Run locally (no bundling)
 capsule dev
 
@@ -482,8 +480,8 @@ capsule pack --bundle
 
 # Run bundle
 ./nacelle-bundle
-```"#.to_string()
-        }
+```"#
+            .to_string(),
     };
 
     let content = format!(
