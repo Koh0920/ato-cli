@@ -339,7 +339,11 @@ fn detect_rust_binary_name(dir: &Path, fallback: &str) -> String {
     };
 
     // Prefer first [[bin]] name when specified.
-    if let Some(bin0) = value.get("bin").and_then(|b| b.as_array()).and_then(|a| a.first()) {
+    if let Some(bin0) = value
+        .get("bin")
+        .and_then(|b| b.as_array())
+        .and_then(|a| a.first())
+    {
         if let Some(name) = bin0
             .get("name")
             .and_then(|n| n.as_str())
