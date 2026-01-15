@@ -4,11 +4,16 @@ use serde_json::json;
 use std::path::PathBuf;
 use std::process::Command;
 
-mod engine;
 mod config;
+mod engine;
 mod init;
 mod keygen;
 mod new;
+mod policy; // v3.0: L4 Egress Policy Resolution
+mod r3_config;
+mod scaffold;
+mod signing; // v3.0: L2 Signature Creation/Verification
+mod validation; // v3.0: L1 Source Policy Scanning // v3.0: R3 Configuration Generator
 
 #[derive(Parser)]
 #[command(name = "capsule")]
@@ -43,7 +48,7 @@ enum Commands {
         /// Project name
         name: String,
 
-        /// Template type: python, node, rust, shell
+        /// Template type: python, node, hono, rust, go, shell
         #[arg(long, default_value = "python")]
         template: String,
     },
@@ -83,12 +88,56 @@ enum Commands {
         /// Use a specific runtime directory (optional)
         #[arg(long)]
         runtime: Option<PathBuf>,
+
+        /// Path to signing key for L2 verification (optional)
+        #[arg(long)]
+        key: Option<PathBuf>,
+
+        /// Skip L1 source policy scan (dangerous!)
+        #[arg(long)]
+        skip_l1: bool,
+
+        /// Skip all validations (use only for testing)
+        #[arg(long)]
+        skip_validation: bool,
+
+        /// Network enforcement mode for R3 config.json (best_effort or strict)
+        #[arg(long, default_value = "best_effort", value_parser = ["best_effort", "strict"])]
+        enforcement: String,
     },
 
     /// Run a built self-extracting bundle
     Open {
         /// Path to bundle executable
         path: PathBuf,
+    },
+
+    /// Scaffold supporting files (e.g. Dockerfile)
+    Scaffold {
+        #[command(subcommand)]
+        command: ScaffoldCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum ScaffoldCommands {
+    /// Generate a Dockerfile + .dockerignore for running a self-extracting bundle
+    Docker {
+        /// Path to capsule.toml
+        #[arg(long, default_value = "capsule.toml")]
+        manifest: PathBuf,
+
+        /// Output Dockerfile path (default: <manifest dir>/Dockerfile)
+        #[arg(long)]
+        output: Option<PathBuf>,
+
+        /// Output directory (default: manifest directory). Ignored if --output is set.
+        #[arg(long)]
+        output_dir: Option<PathBuf>,
+
+        /// Overwrite existing files
+        #[arg(long, default_value_t = false)]
+        force: bool,
     },
 }
 
@@ -212,19 +261,60 @@ fn main() -> Result<()> {
             bundle,
             output,
             runtime,
+            key,
+            skip_l1,
+            skip_validation,
+            enforcement,
         } => {
             if !bundle {
                 anyhow::bail!("Only bundle output is supported (use --bundle)");
             }
 
-            let nacelle = engine::discover_nacelle(engine::EngineRequest {
-                explicit_path: cli.nacelle,
-                manifest_path: Some(manifest.clone()),
-            })?;
+            println!("📦 Capsule Pack - Pure Runtime Architecture v3.0");
+            println!("   Performing build-time validations...\n");
+
             let manifest_dir = manifest
                 .parent()
                 .map(|p| p.to_path_buf())
                 .unwrap_or_else(|| PathBuf::from("."));
+
+            // Phase 1: L1 Source Policy Scan
+            if !skip_validation && !skip_l1 {
+                println!("🔍 Phase 1: L1 Source Policy Scan");
+                let source_dir = manifest_dir.join("source");
+                if source_dir.exists() {
+                    let scan_extensions = &["py", "sh", "js", "ts", "go", "rs"];
+                    match validation::source_policy::scan_source_directory(
+                        &source_dir,
+                        scan_extensions,
+                    ) {
+                        Ok(()) => {
+                            println!("   ✅ No dangerous patterns detected\n");
+                        }
+                        Err(e) => {
+                            eprintln!("   ❌ L1 Policy violation: {}", e);
+                            eprintln!("\n💡 Tip: Fix the security issue or use --skip-l1 (not recommended)");
+                            anyhow::bail!("L1 Source Policy check failed");
+                        }
+                    }
+                } else {
+                    println!("   ⚠️  No source/ directory found, skipping scan\n");
+                }
+            } else if skip_l1 {
+                println!("⚠️  Phase 1: L1 Source Policy Scan SKIPPED (--skip-l1)\n");
+            }
+
+            // Phase 2: Generate R3 config.json (services-first)
+            println!("🧭 Phase 2: Generating R3 config.json");
+            let config_path = r3_config::generate_and_write_config(&manifest, Some(enforcement))?;
+            println!("   ✅ config.json generated: {}\n", config_path.display());
+
+            // Phase 3: Call nacelle to create bundle
+            println!("📦 Phase 3: Building bundle with nacelle");
+            let nacelle = engine::discover_nacelle(engine::EngineRequest {
+                explicit_path: cli.nacelle,
+                manifest_path: Some(manifest.clone()),
+            })?;
 
             let payload = json!({
                 "spec_version": "0.1.0",
@@ -249,9 +339,32 @@ fn main() -> Result<()> {
                 .get("artifact")
                 .and_then(|a| a.get("path"))
                 .and_then(|p| p.as_str())
-                .unwrap_or("<unknown>");
+                .map(PathBuf::from)
+                .ok_or_else(|| anyhow::anyhow!("No artifact path in response"))?;
 
-            println!("✅ Bundle created: {}", artifact_path);
+            println!("   ✅ Bundle created: {}\n", artifact_path.display());
+
+            let bundle_source_dir = artifact_path;
+
+            // Phase 4: L2 Sign bundle (if key provided)
+            if let Some(key_path) = key {
+                if !skip_validation {
+                    println!("🔐 Phase 4: L2 Signature Generation");
+                    match signing::sign_bundle(&bundle_source_dir, &key_path, "capsule-cli") {
+                        Ok(_) => {
+                            println!("   ✅ Bundle signed successfully\n");
+                        }
+                        Err(e) => {
+                            eprintln!("   ❌ Signing failed: {}", e);
+                            anyhow::bail!("L2 Signature generation failed");
+                        }
+                    }
+                }
+            } else {
+                println!("ℹ️  Phase 4: L2 Signature skipped (no --key provided)\n");
+            }
+
+            println!("✅ Pack complete: {}", bundle_source_dir.display());
             Ok(())
         }
 
@@ -265,5 +378,20 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+
+        Commands::Scaffold {
+            command:
+                ScaffoldCommands::Docker {
+                    manifest,
+                    output,
+                    output_dir,
+                    force,
+                },
+        } => scaffold::execute_docker(scaffold::ScaffoldDockerArgs {
+            manifest_path: manifest,
+            output_dir,
+            output,
+            force,
+        }),
     }
 }

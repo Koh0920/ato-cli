@@ -46,7 +46,8 @@ pub fn load_config() -> Result<CapsuleConfig> {
 
 pub fn save_config(cfg: &CapsuleConfig) -> Result<()> {
     let dir = config_dir()?;
-    fs::create_dir_all(&dir).with_context(|| format!("Failed to create config dir: {}", dir.display()))?;
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("Failed to create config dir: {}", dir.display()))?;
 
     let path = config_path()?;
     let toml = toml::to_string_pretty(cfg).context("Failed to serialize config")?;
@@ -57,7 +58,9 @@ pub fn save_config(cfg: &CapsuleConfig) -> Result<()> {
 
 fn write_atomic(path: &Path, content: &[u8]) -> Result<()> {
     let tmp = path.with_extension("toml.tmp");
-    fs::write(&tmp, content).with_context(|| format!("Failed to write temp file: {}", tmp.display()))?;
-    fs::rename(&tmp, path).with_context(|| format!("Failed to rename temp file into place: {}", path.display()))?;
+    fs::write(&tmp, content)
+        .with_context(|| format!("Failed to write temp file: {}", tmp.display()))?;
+    fs::rename(&tmp, path)
+        .with_context(|| format!("Failed to rename temp file into place: {}", path.display()))?;
     Ok(())
 }

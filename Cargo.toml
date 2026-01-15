@@ -1,6 +1,6 @@
 [package]
 name = "capsule-cli"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "capsule CLI (meta-runtime)"
 license = "Apache-2.0"
@@ -22,6 +22,15 @@ hex = "0.4"
 sha2 = "0.10"
 rand = "0.8"
 ed25519-dalek = { version = "2.0", features = ["rand_core"] }
+base64 = "0.22"        # v3.0: Base64 encoding for signatures
+regex = "1"            # v3.0: L1 pattern matching
+walkdir = "2"          # v3.0: L1 directory traversal
+tracing = "0.1"        # v3.0: Structured logging
+jsonschema = "0.17"    # R3: config.json schema validation
+shell-words = "1.1"    # R3: command parsing for entrypoint
+
+[dev-dependencies]
+tempfile = "3"         # Testing
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
