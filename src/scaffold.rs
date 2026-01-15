@@ -10,10 +10,12 @@ pub struct ScaffoldDockerArgs {
 }
 
 pub fn execute_docker(args: ScaffoldDockerArgs) -> Result<()> {
-    let manifest_path = args
-        .manifest_path
-        .canonicalize()
-        .with_context(|| format!("Failed to resolve manifest path: {}", args.manifest_path.display()))?;
+    let manifest_path = args.manifest_path.canonicalize().with_context(|| {
+        format!(
+            "Failed to resolve manifest path: {}",
+            args.manifest_path.display()
+        )
+    })?;
 
     let project_dir = manifest_path
         .parent()
@@ -88,7 +90,8 @@ fn write_if_allowed(path: &Path, content: &str, force: bool) -> Result<()> {
             .with_context(|| format!("Failed to create directory: {}", parent.display()))?;
     }
 
-    fs::write(path, content).with_context(|| format!("Failed to write file: {}", path.display()))?;
+    fs::write(path, content)
+        .with_context(|| format!("Failed to write file: {}", path.display()))?;
     Ok(())
 }
 

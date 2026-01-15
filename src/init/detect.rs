@@ -148,7 +148,7 @@ fn detect_node(dir: &Path) -> Result<DetectedNode> {
     let bun_project = dir.join("bun.lockb").exists() || dir.join("bunfig.toml").exists();
     let pnpm_project = dir.join("pnpm-lock.yaml").exists();
     let yarn_project = dir.join("yarn.lock").exists();
-    let npm_project = dir.join("package-lock.json").exists();
+    let _npm_project = dir.join("package-lock.json").exists();
 
     let mut pm = NodePackageManager::Unknown;
     let mut scripts = NodeScripts {
@@ -205,8 +205,6 @@ fn detect_node(dir: &Path) -> Result<DetectedNode> {
             NodePackageManager::Pnpm
         } else if yarn_project {
             NodePackageManager::Yarn
-        } else if npm_project {
-            NodePackageManager::Npm
         } else {
             NodePackageManager::Npm
         };
