@@ -6,40 +6,20 @@
 //! - `HttpCasClient`: Remote HTTP-based CAS (production)
 
 use async_trait::async_trait;
+use reqwest::StatusCode;
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use thiserror::Error;
 use tracing::{debug, info};
 
-/// Error types for CAS operations
-#[derive(Error, Debug)]
-pub enum CasError {
-    #[error("Blob not found: {digest}")]
-    NotFound { digest: String },
-
-    #[error("Hash mismatch: expected {expected}, got {actual}")]
-    HashMismatch { expected: String, actual: String },
-
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-
-    #[error("HTTP error: {0}")]
-    Http(String),
-
-    #[error("Invalid digest format: {0}")]
-    InvalidDigest(String),
-}
-
-/// Result type for CAS operations
-pub type CasResult<T> = Result<T, CasError>;
+use crate::error::{CapsuleError, Result};
 
 /// Parse a digest string (e.g., "sha256:abc123...") into (algorithm, hash)
-pub fn parse_digest(digest: &str) -> CasResult<(&str, &str)> {
+pub fn parse_digest(digest: &str) -> Result<(&str, &str)> {
     let parts: Vec<&str> = digest.splitn(2, ':').collect();
     if parts.len() != 2 {
-        return Err(CasError::InvalidDigest(format!(
-            "Expected format 'algorithm:hash', got '{}'",
+        return Err(CapsuleError::Config(format!(
+            "Invalid digest format (expected 'algorithm:hash'): {}",
             digest
         )));
     }
@@ -54,15 +34,15 @@ pub trait CasClient: Send + Sync {
     /// Fetch a blob by its digest and return the local path.
     ///
     /// The blob is verified against the digest before returning.
-    async fn fetch_blob(&self, digest: &str) -> CasResult<PathBuf>;
+    async fn fetch_blob(&self, digest: &str) -> Result<PathBuf>;
 
     /// Store a blob and return its digest.
     ///
     /// Returns the SHA256 digest of the stored content.
-    async fn store_blob(&self, path: &Path) -> CasResult<String>;
+    async fn store_blob(&self, path: &Path) -> Result<String>;
 
     /// Check if a blob exists without fetching it.
-    async fn exists(&self, digest: &str) -> CasResult<bool>;
+    async fn exists(&self, digest: &str) -> Result<bool>;
 }
 
 /// Local filesystem-based CAS client.
@@ -77,7 +57,7 @@ pub struct LocalCasClient {
 
 impl LocalCasClient {
     /// Create a new LocalCasClient with the given root directory.
-    pub fn new(root: impl AsRef<Path>) -> CasResult<Self> {
+    pub fn new(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         let blobs_dir = root.join("blobs");
         std::fs::create_dir_all(&blobs_dir)?;
@@ -92,10 +72,10 @@ impl LocalCasClient {
     }
 
     /// Verify a file matches the expected digest
-    fn verify_digest(&self, path: &Path, algorithm: &str, expected_hash: &str) -> CasResult<()> {
+    fn verify_digest(&self, path: &Path, algorithm: &str, expected_hash: &str) -> Result<()> {
         if algorithm != "sha256" {
-            return Err(CasError::InvalidDigest(format!(
-                "Unsupported algorithm: {}",
+            return Err(CapsuleError::Config(format!(
+                "Unsupported digest algorithm: {}",
                 algorithm
             )));
         }
@@ -114,10 +94,10 @@ impl LocalCasClient {
 
         let actual_hash = hex::encode(hasher.finalize());
         if actual_hash != expected_hash {
-            return Err(CasError::HashMismatch {
-                expected: expected_hash.to_string(),
-                actual: actual_hash,
-            });
+            return Err(CapsuleError::HashMismatch(
+                expected_hash.to_string(),
+                actual_hash,
+            ));
         }
 
         Ok(())
@@ -126,14 +106,12 @@ impl LocalCasClient {
 
 #[async_trait]
 impl CasClient for LocalCasClient {
-    async fn fetch_blob(&self, digest: &str) -> CasResult<PathBuf> {
+    async fn fetch_blob(&self, digest: &str) -> Result<PathBuf> {
         let (algorithm, hash) = parse_digest(digest)?;
         let path = self.blob_path(algorithm, hash);
 
         if !path.exists() {
-            return Err(CasError::NotFound {
-                digest: digest.to_string(),
-            });
+            return Err(CapsuleError::NotFound(digest.to_string()));
         }
 
         // Verify integrity
@@ -143,7 +121,7 @@ impl CasClient for LocalCasClient {
         Ok(path)
     }
 
-    async fn store_blob(&self, source_path: &Path) -> CasResult<String> {
+    async fn store_blob(&self, source_path: &Path) -> Result<String> {
         // Calculate SHA256 hash
         let mut file = std::fs::File::open(source_path)?;
         let mut hasher = Sha256::new();
@@ -172,7 +150,7 @@ impl CasClient for LocalCasClient {
         Ok(digest)
     }
 
-    async fn exists(&self, digest: &str) -> CasResult<bool> {
+    async fn exists(&self, digest: &str) -> Result<bool> {
         let (algorithm, hash) = parse_digest(digest)?;
         let path = self.blob_path(algorithm, hash);
         Ok(path.exists())
@@ -195,7 +173,7 @@ impl HttpCasClient {
     /// # Arguments
     /// * `endpoint` - Base URL of the CAS server (e.g., "https://cas.ato.cloud")
     /// * `cache_dir` - Local directory for caching fetched blobs
-    pub fn new(endpoint: impl Into<String>, cache_dir: impl AsRef<Path>) -> CasResult<Self> {
+    pub fn new(endpoint: impl Into<String>, cache_dir: impl AsRef<Path>) -> Result<Self> {
         let cache_dir = cache_dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&cache_dir)?;
 
@@ -217,7 +195,7 @@ impl HttpCasClient {
 
 #[async_trait]
 impl CasClient for HttpCasClient {
-    async fn fetch_blob(&self, digest: &str) -> CasResult<PathBuf> {
+    async fn fetch_blob(&self, digest: &str) -> Result<PathBuf> {
         let (algorithm, hash) = parse_digest(digest)?;
         let cache_path = self.cache_path(algorithm, hash);
 
@@ -236,33 +214,33 @@ impl CasClient for HttpCasClient {
             .get(&url)
             .send()
             .await
-            .map_err(|e| CasError::Http(format!("Failed to fetch blob: {}", e)))?;
+            .map_err(CapsuleError::Network)?;
 
-        if !response.status().is_success() {
-            if response.status() == reqwest::StatusCode::NOT_FOUND {
-                return Err(CasError::NotFound {
-                    digest: digest.to_string(),
-                });
-            }
-            return Err(CasError::Http(format!(
-                "HTTP error: {} for {}",
-                response.status(),
-                url
-            )));
+        let status = response.status();
+        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+            return Err(CapsuleError::AuthRequired(url));
+        }
+        if status == StatusCode::NOT_FOUND {
+            return Err(CapsuleError::NotFound(digest.to_string()));
+        }
+        if !status.is_success() {
+            return Err(CapsuleError::Network(
+                response.error_for_status().unwrap_err(),
+            ));
         }
 
         let bytes = response
             .bytes()
             .await
-            .map_err(|e| CasError::Http(format!("Failed to read response body: {}", e)))?;
+            .map_err(CapsuleError::Network)?;
 
         // Verify hash
         let actual_hash = hex::encode(Sha256::digest(&bytes));
         if actual_hash != hash {
-            return Err(CasError::HashMismatch {
-                expected: hash.to_string(),
-                actual: actual_hash,
-            });
+            return Err(CapsuleError::HashMismatch(
+                hash.to_string(),
+                actual_hash,
+            ));
         }
 
         // Write to cache
@@ -272,7 +250,7 @@ impl CasClient for HttpCasClient {
         Ok(cache_path)
     }
 
-    async fn store_blob(&self, source_path: &Path) -> CasResult<String> {
+    async fn store_blob(&self, source_path: &Path) -> Result<String> {
         // Calculate hash locally first
         let content = std::fs::read(source_path)?;
         let hash = hex::encode(Sha256::digest(&content));
@@ -288,13 +266,19 @@ impl CasClient for HttpCasClient {
             .header("Content-Type", "application/octet-stream")
             .send()
             .await
-            .map_err(|e| CasError::Http(format!("Failed to upload blob: {}", e)))?;
+            .map_err(CapsuleError::Network)?;
 
-        if !response.status().is_success() {
-            return Err(CasError::Http(format!(
-                "Upload failed with status: {}",
-                response.status()
-            )));
+        let status = response.status();
+        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+            return Err(CapsuleError::AuthRequired(url));
+        }
+        if status == StatusCode::NOT_FOUND {
+            return Err(CapsuleError::NotFound(url));
+        }
+        if !status.is_success() {
+            return Err(CapsuleError::Network(
+                response.error_for_status().unwrap_err(),
+            ));
         }
 
         // Also cache locally
@@ -307,7 +291,7 @@ impl CasClient for HttpCasClient {
         Ok(digest)
     }
 
-    async fn exists(&self, digest: &str) -> CasResult<bool> {
+    async fn exists(&self, digest: &str) -> Result<bool> {
         let (algorithm, hash) = parse_digest(digest)?;
 
         // Check cache first
@@ -323,9 +307,17 @@ impl CasClient for HttpCasClient {
             .head(&url)
             .send()
             .await
-            .map_err(|e| CasError::Http(format!("Failed to check blob existence: {}", e)))?;
+            .map_err(CapsuleError::Network)?;
 
-        Ok(response.status().is_success())
+        let status = response.status();
+        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+            return Err(CapsuleError::AuthRequired(url));
+        }
+        if status == StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+
+        Ok(status.is_success())
     }
 }
 
@@ -336,7 +328,7 @@ impl CasClient for HttpCasClient {
 /// - `ATO_CAS_ENDPOINT`: HTTP endpoint for remote CAS
 /// - `ATO_CAS_ROOT`: Root directory for local CAS (default: ~/.nacelle/cas)
 #[allow(dead_code)] // Will be used when CAS integration is enabled
-pub fn create_cas_client_from_env() -> CasResult<Box<dyn CasClient>> {
+pub fn create_cas_client_from_env() -> Result<Box<dyn CasClient>> {
     let cas_type = std::env::var("ATO_CAS_TYPE").unwrap_or_else(|_| "local".to_string());
 
     match cas_type.as_str() {
@@ -409,7 +401,7 @@ mod tests {
         let result = cas
             .fetch_blob("sha256:0000000000000000000000000000000000000000000000000000000000000000")
             .await;
-        assert!(matches!(result, Err(CasError::NotFound { .. })));
+        assert!(matches!(result, Err(CapsuleError::NotFound(_))));
     }
 
     #[test]

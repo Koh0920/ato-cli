@@ -2,12 +2,12 @@
 //!
 //! Migrated from nacelle/src/verification/signing.rs
 
-use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
+use crate::error::{CapsuleError, Result};
 use super::sign::CapsuleSignature;
 
 /// Verify a signed bundle
@@ -23,11 +23,14 @@ pub fn verify_bundle(bundle_path: &Path, trusted_public_keys: &[String]) -> Resu
     // Read signature file
     let sig_path = bundle_path.join(".signature");
     if !sig_path.exists() {
-        return Err(anyhow!("No signature file found in bundle"));
+        return Err(CapsuleError::NotFound(
+            "No signature file found in bundle".to_string(),
+        ));
     }
 
     let sig_json = std::fs::read_to_string(&sig_path)?;
-    let sig_data: CapsuleSignature = serde_json::from_str(&sig_json)?;
+    let sig_data: CapsuleSignature = serde_json::from_str(&sig_json)
+        .map_err(|e| CapsuleError::Crypto(e.to_string()))?;
 
     // Read manifest
     let manifest_path = bundle_path.join("capsule.toml");
@@ -40,41 +43,45 @@ pub fn verify_bundle(bundle_path: &Path, trusted_public_keys: &[String]) -> Resu
     let content_hash = hex::encode(hash);
 
     if content_hash != sig_data.content_hash {
-        return Err(anyhow!(
-            "Content hash mismatch: expected {}, got {}",
+        return Err(CapsuleError::HashMismatch(
             sig_data.content_hash,
-            content_hash
+            content_hash,
         ));
     }
 
     // Check if public key is trusted
     if !trusted_public_keys.contains(&sig_data.public_key) {
-        return Err(anyhow!(
+        return Err(CapsuleError::AuthRequired(format!(
             "Public key {}... is not in trusted key list",
             &sig_data.public_key[..20]
-        ));
+        )));
     }
 
     // Decode public key
-    let pub_key_bytes = BASE64.decode(&sig_data.public_key)?;
+    let pub_key_bytes = BASE64
+        .decode(&sig_data.public_key)
+        .map_err(|e| CapsuleError::Crypto(e.to_string()))?;
     let verifying_key = VerifyingKey::from_bytes(
         &pub_key_bytes
             .try_into()
-            .map_err(|_| anyhow!("Invalid public key length"))?,
-    )?;
+            .map_err(|_| CapsuleError::Crypto("Invalid public key length".to_string()))?,
+    )
+    .map_err(|e| CapsuleError::Crypto(e.to_string()))?;
 
     // Decode signature
-    let sig_bytes = BASE64.decode(&sig_data.signature)?;
+    let sig_bytes = BASE64
+        .decode(&sig_data.signature)
+        .map_err(|e| CapsuleError::Crypto(e.to_string()))?;
     let signature = Signature::from_bytes(
         &sig_bytes
             .try_into()
-            .map_err(|_| anyhow!("Invalid signature length"))?,
+            .map_err(|_| CapsuleError::Crypto("Invalid signature length".to_string()))?,
     );
 
     // Verify signature
     verifying_key
         .verify(&manifest_bytes, &signature)
-        .map_err(|e| anyhow!("Signature verification failed: {}", e))?;
+        .map_err(|e| CapsuleError::Crypto(format!("Signature verification failed: {}", e)))?;
 
     tracing::info!("✅ Signature verified:");
     tracing::info!("   Signer: {}", sig_data.signer);

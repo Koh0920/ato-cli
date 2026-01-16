@@ -2,7 +2,6 @@
 //!
 //! Migrated from nacelle/src/verification/signing.rs
 
-use anyhow::Result;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
@@ -10,6 +9,7 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::error::{CapsuleError, Result};
 /// Capsule signature metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapsuleSignature {
@@ -44,11 +44,11 @@ pub fn sign_bundle(
     signer_name: &str,
 ) -> Result<CapsuleSignature> {
     // Read the private key
-    let key_bytes = std::fs::read(key_path)?;
+    let key_bytes = read_key_bytes(key_path)?;
     let signing_key = SigningKey::from_bytes(
         &key_bytes
             .try_into()
-            .map_err(|_| anyhow::anyhow!("Invalid key length (expected 32 bytes)"))?,
+            .map_err(|_| CapsuleError::Crypto("Invalid key length (expected 32 bytes)".to_string()))?,
     );
 
     // Read manifest to sign
@@ -85,7 +85,8 @@ pub fn sign_bundle(
 
     // Write signature file
     let sig_path = bundle_path.join(".signature");
-    let sig_json = serde_json::to_string_pretty(&sig_data)?;
+    let sig_json = serde_json::to_string_pretty(&sig_data)
+        .map_err(|e| CapsuleError::Crypto(e.to_string()))?;
     std::fs::write(&sig_path, sig_json)?;
 
     tracing::info!("✅ Signed bundle: {}", bundle_path.display());
@@ -105,11 +106,11 @@ pub fn sign_artifact(
     signer_name: &str,
     signature_path: Option<std::path::PathBuf>,
 ) -> Result<std::path::PathBuf> {
-    let key_bytes = std::fs::read(key_path)?;
+    let key_bytes = read_key_bytes(key_path)?;
     let signing_key = SigningKey::from_bytes(
         &key_bytes
             .try_into()
-            .map_err(|_| anyhow::anyhow!("Invalid key length (expected 32 bytes)"))?,
+            .map_err(|_| CapsuleError::Crypto("Invalid key length (expected 32 bytes)".to_string()))?,
     );
 
     let artifact_bytes = std::fs::read(artifact_path)?;
@@ -138,7 +139,8 @@ pub fn sign_artifact(
     };
 
     let sig_path = signature_path.unwrap_or_else(|| default_sig_path(artifact_path));
-    let sig_json = serde_json::to_string_pretty(&sig_data)?;
+    let sig_json = serde_json::to_string_pretty(&sig_data)
+        .map_err(|e| CapsuleError::Crypto(e.to_string()))?;
     std::fs::write(&sig_path, sig_json)?;
 
     tracing::info!("✅ Signed artifact: {}", artifact_path.display());
@@ -195,6 +197,16 @@ pub fn generate_keypair(output_path: &Path) -> Result<String> {
     tracing::info!("   Public key (base64): {}", public_key);
 
     Ok(public_key)
+}
+
+fn read_key_bytes(path: &Path) -> Result<Vec<u8>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(bytes),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(
+            CapsuleError::AuthRequired(format!("Signing key not found: {}", path.display())),
+        ),
+        Err(err) => Err(CapsuleError::Io(err)),
+    }
 }
 
 #[cfg(test)]

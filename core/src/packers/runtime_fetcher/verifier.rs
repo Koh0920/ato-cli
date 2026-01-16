@@ -1,8 +1,9 @@
-use anyhow::Result;
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+
+use crate::error::{CapsuleError, Result};
 
 /// Artifact verification for downloaded runtime archives.
 ///
@@ -31,7 +32,7 @@ impl ArtifactVerifier for ChecksumVerifier {
         let actual = hex::encode(hasher.finalize());
         let expected = expected_hex.trim().to_ascii_lowercase();
         if actual != expected {
-            anyhow::bail!("sha256 mismatch: expected={}, actual={}", expected, actual);
+            return Err(CapsuleError::HashMismatch(expected, actual));
         }
         Ok(())
     }

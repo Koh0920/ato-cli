@@ -6,8 +6,9 @@ use futures_util::stream::StreamExt;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+use crate::error::{CapsuleError, Result};
 use crate::metrics::{MetricsSession, ResourceStats, RuntimeMetadata, UnifiedMetrics};
-use crate::runtime::{Measurable, MetricsError, MetricsResult, RuntimeHandle};
+use crate::runtime::{Measurable, RuntimeHandle};
 
 /// OCI(Docker/Podman) 実行のメトリクスハンドル。
 pub struct OciHandle {
@@ -118,24 +119,24 @@ impl RuntimeHandle for OciHandle {
         &self.container_id
     }
 
-    fn kill(&mut self) -> MetricsResult<()> {
+    fn kill(&mut self) -> Result<()> {
         let docker = self.docker.clone();
         let container_id = self.container_id.clone();
         let runtime =
-            tokio::runtime::Runtime::new().map_err(|err| MetricsError::new(err.to_string()))?;
+            tokio::runtime::Runtime::new().map_err(|err| CapsuleError::Runtime(err.to_string()))?;
 
         runtime.block_on(async move {
             docker
                 .stop_container(&container_id, Some(StopContainerOptions { t: 0 }))
                 .await
-                .map_err(|err| MetricsError::new(err.to_string()))
+                .map_err(map_bollard_error)
         })
     }
 }
 
 #[async_trait]
 impl Measurable for OciHandle {
-    async fn capture_metrics(&self) -> MetricsResult<UnifiedMetrics> {
+    async fn capture_metrics(&self) -> Result<UnifiedMetrics> {
         let mut resources = self.last_resources.lock().await.clone();
         if resources.duration_ms == 0 {
             resources.duration_ms = self.session.elapsed_ms();
@@ -143,14 +144,14 @@ impl Measurable for OciHandle {
         Ok(self.session.snapshot(resources, self.metadata(None)))
     }
 
-    async fn wait_and_finalize(&self) -> MetricsResult<UnifiedMetrics> {
+    async fn wait_and_finalize(&self) -> Result<UnifiedMetrics> {
         let mut wait_stream = self
             .docker
             .wait_container(&self.container_id, None::<WaitContainerOptions<String>>);
         let exit_code = match wait_stream.next().await {
             Some(Ok(response)) => Some(response.status_code as i32),
             Some(Err(BollardError::DockerContainerWaitError { code, .. })) => Some(code as i32),
-            Some(Err(_)) => None,
+            Some(Err(err)) => return Err(map_bollard_error(err)),
             None => None,
         };
 
@@ -158,6 +159,24 @@ impl Measurable for OciHandle {
         resources.duration_ms = self.session.elapsed_ms();
         Ok(self.session.finalize(resources, self.metadata(exit_code)))
     }
+}
+
+fn map_bollard_error(err: BollardError) -> CapsuleError {
+    let message = err.to_string();
+    if is_engine_unavailable(&message) {
+        return CapsuleError::ContainerEngine(message);
+    }
+    CapsuleError::Runtime(message)
+}
+
+fn is_engine_unavailable(message: &str) -> bool {
+    let msg = message.to_ascii_lowercase();
+    msg.contains("cannot connect")
+        || msg.contains("connection refused")
+        || msg.contains("is the docker daemon running")
+        || msg.contains("no such file or directory")
+        || msg.contains("connection error")
+        || msg.contains("timed out")
 }
 
 fn extract_cpu_seconds(stats: &bollard::container::Stats) -> Option<f64> {

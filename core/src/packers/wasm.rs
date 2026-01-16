@@ -1,9 +1,9 @@
-use anyhow::{Context, Result};
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use tracing::warn;
 
+use crate::error::{CapsuleError, Result};
 use crate::router::ManifestData;
 use crate::signing;
 
@@ -61,13 +61,19 @@ pub fn pack(
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .status()
-            .context("Failed to run wasm-opt")?;
+            .map_err(|e| CapsuleError::Pack(format!("Failed to run wasm-opt: {}", e)))?;
         if !status.success() {
-            anyhow::bail!("wasm-opt failed");
+            return Err(CapsuleError::Pack("wasm-opt failed".to_string()));
         }
     } else {
         fs::copy(&source_path, &output_path)
-            .with_context(|| format!("Failed to copy wasm: {}", source_path.display()))?;
+            .map_err(|e| {
+                CapsuleError::Pack(format!(
+                    "Failed to copy wasm: {} ({})",
+                    source_path.display(),
+                    e
+                ))
+            })?;
     }
 
     futures::executor::block_on(
@@ -110,7 +116,9 @@ fn resolve_component(plan: &ManifestData) -> Result<String> {
         }
     }
 
-    anyhow::bail!("Wasm runtime selected but no component path found")
+    Err(CapsuleError::Pack(
+        "Wasm runtime selected but no component path found".to_string(),
+    ))
 }
 
 fn is_wasm_path(value: &str) -> bool {

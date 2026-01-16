@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use crate::error::{CapsuleError, Result};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -28,10 +28,10 @@ pub async fn fetch_resource(
     cfg: FetcherConfig,
 ) -> Result<ResourceFetchResult> {
     if req.resource_id.trim().is_empty() {
-        return Err(anyhow!("resource_id is required"));
+        return Err(CapsuleError::Config("resource_id is required".to_string()));
     }
     if req.url.trim().is_empty() {
-        return Err(anyhow!("url is required"));
+        return Err(CapsuleError::Config("url is required".to_string()));
     }
 
     let cache_dir = cfg.cache_dir;
@@ -40,10 +40,10 @@ pub async fn fetch_resource(
 
     let dest_str = dest_path
         .to_str()
-        .ok_or_else(|| anyhow!("destination path is not valid UTF-8"))?;
+        .ok_or_else(|| CapsuleError::Config("destination path is not valid UTF-8".to_string()))?;
 
     crate::security::validate_path(dest_str, &cfg.allowed_host_paths)
-        .map_err(|e| anyhow!("Invalid destination path: {e}"))?;
+        .map_err(|e| CapsuleError::Config(format!("Invalid destination path: {e}")))?;
 
     if dest_path.exists() {
         if let Some(expected) = req
@@ -51,7 +51,7 @@ pub async fn fetch_resource(
             .as_deref()
             .filter(|s| !s.trim().is_empty())
         {
-            let actual = sha256_hex_of_file(&dest_path).context("failed to hash cached file")?;
+            let actual = sha256_hex_of_file(&dest_path)?;
             if normalize_hex(expected) == actual {
                 return Ok(ResourceFetchResult {
                     local_path: dest_path,
@@ -69,23 +69,22 @@ pub async fn fetch_resource(
         }
     }
 
-    let bytes_downloaded = super::http::download_file(&req.url, dest_str, &cfg.allowed_host_paths)
-        .await
-        .context("download failed")?;
+    let bytes_downloaded =
+        super::http::download_file(&req.url, dest_str, &cfg.allowed_host_paths).await?;
 
     if let Some(expected) = req
         .expected_sha256
         .as_deref()
         .filter(|s| !s.trim().is_empty())
     {
-        let actual = sha256_hex_of_file(&dest_path).context("failed to hash downloaded file")?;
+        let actual = sha256_hex_of_file(&dest_path)?;
         if normalize_hex(expected) != actual {
             let _ = fs::remove_file(&dest_path);
-            return Err(anyhow!(
+            return Err(CapsuleError::Pack(format!(
                 "sha256 mismatch: expected={}, actual={}",
                 normalize_hex(expected),
                 actual
-            ));
+            )));
         }
     }
 
@@ -109,7 +108,7 @@ fn filename_from_url(url: &str) -> Option<String> {
 }
 
 fn sha256_hex_of_file(path: &Path) -> Result<String> {
-    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let bytes = fs::read(path)?;
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
     Ok(hex::encode(hasher.finalize()))

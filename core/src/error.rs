@@ -19,6 +19,24 @@ pub enum CapsuleError {
     #[error("Process execution error: {0}")]
     Execution(String),
 
+    #[error("Hash mismatch: expected {0}, got {1}")]
+    HashMismatch(String, String),
+
+    #[error("Runtime error: {0}")]
+    Runtime(String),
+
+    #[error("Container engine error: {0}")]
+    ContainerEngine(String),
+
+    #[error("Process spawn error: {0}")]
+    ProcessStart(String),
+
+    #[error("Execution timed out")]
+    Timeout,
+
+    #[error("Cryptographic error: {0}")]
+    Crypto(String),
+
     #[error("Resource not found: {0}")]
     NotFound(String),
 

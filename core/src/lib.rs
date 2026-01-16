@@ -29,4 +29,4 @@ pub use runner::{SessionRunner, SessionRunnerConfig};
 pub use runtime::native::NativeHandle;
 pub use runtime::oci::OciHandle;
 pub use runtime::wasm::WasmHandle;
-pub use runtime::{Measurable, MetricsError, MetricsResult, RuntimeHandle};
+pub use runtime::{Measurable, RuntimeHandle};

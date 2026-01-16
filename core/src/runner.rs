@@ -1,11 +1,11 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
 use tokio::time::{interval, timeout};
 
+use crate::error::{CapsuleError, Result};
 use crate::metrics::UnifiedMetrics;
 use crate::reporter::UsageReporter;
-use crate::runtime::{MetricsError, RuntimeHandle};
+use crate::runtime::RuntimeHandle;
 
 #[derive(Debug, Clone)]
 pub struct SessionRunnerConfig {
@@ -76,7 +76,7 @@ where
                     self.last_sample = Some(metrics);
                 }
                 result = &mut wait_fut => {
-                    let metrics = result.map_err(map_metrics_error)?;
+                    let metrics = result?;
                     self.reporter.report_final(&metrics).await?;
                     return Ok(metrics);
                 }
@@ -86,14 +86,11 @@ where
 
     async fn handle_timeout(&mut self) -> Result<UnifiedMetrics> {
         let _ = self.handle.kill();
-        match timeout(
-            self.config.finalize_timeout,
-            self.handle.wait_and_finalize(),
-        )
+        match timeout(self.config.finalize_timeout, self.handle.wait_and_finalize())
         .await
         {
             Ok(result) => {
-                let metrics = result.map_err(map_metrics_error)?;
+                let metrics = result?;
                 self.reporter.report_final(&metrics).await?;
                 Ok(metrics)
             }
@@ -103,21 +100,14 @@ where
                     self.reporter.report_final(&fallback).await?;
                     return Ok(fallback);
                 }
-                Err(anyhow::anyhow!("Timed out waiting for final metrics"))
+                Err(CapsuleError::Timeout)
             }
         }
     }
 
     async fn capture_metrics(&self) -> Result<UnifiedMetrics> {
-        self.handle
-            .capture_metrics()
-            .await
-            .map_err(map_metrics_error)
+        self.handle.capture_metrics().await
     }
-}
-
-fn map_metrics_error(err: MetricsError) -> anyhow::Error {
-    anyhow::anyhow!(err.to_string())
 }
 
 fn now_unix_secs() -> u64 {
