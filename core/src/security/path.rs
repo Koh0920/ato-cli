@@ -97,7 +97,11 @@ pub fn parse_allowed_host_paths_csv(value: &str) -> Vec<String> {
                 return None;
             }
 
-            let normalized = if s.len() > 1 { s.trim_end_matches('/') } else { s };
+            let normalized = if s.len() > 1 {
+                s.trim_end_matches('/')
+            } else {
+                s
+            };
 
             let path = Path::new(normalized);
             if !path.is_absolute() {

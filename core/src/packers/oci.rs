@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use crate::runtime_router::ManifestData;
+use crate::router::ManifestData;
 
 #[derive(Debug, Clone)]
 pub struct OciPackResult {
@@ -16,7 +16,11 @@ enum OciEngine {
     Podman,
 }
 
-pub fn pack(plan: &ManifestData, output: Option<PathBuf>) -> Result<OciPackResult> {
+pub fn pack(
+    plan: &ManifestData,
+    output: Option<PathBuf>,
+    reporter: &dyn crate::reporter::CapsuleReporter,
+) -> Result<OciPackResult> {
     let engine = detect_engine()?;
     let image = resolve_image(plan)?;
 
@@ -58,9 +62,9 @@ pub fn pack(plan: &ManifestData, output: Option<PathBuf>) -> Result<OciPackResul
     };
 
     if archive.is_some() {
-        println!("✅ OCI image saved: {}", image);
+        futures::executor::block_on(reporter.notify(format!("✅ OCI image saved: {}", image)))?;
     } else {
-        println!("✅ OCI image ready: {}", image);
+        futures::executor::block_on(reporter.notify(format!("✅ OCI image ready: {}", image)))?;
     }
 
     Ok(OciPackResult { image, archive })
@@ -143,8 +147,7 @@ fn resolve_dockerfile(plan: &ManifestData) -> Option<PathBuf> {
 }
 
 fn resolve_context(plan: &ManifestData) -> PathBuf {
-    plan
-        .build_context()
+    plan.build_context()
         .map(|p| plan.resolve_path(&p))
         .unwrap_or_else(|| plan.manifest_dir.clone())
 }

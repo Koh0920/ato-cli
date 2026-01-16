@@ -282,7 +282,7 @@ fn build_config_json(
 fn validate_config_json(config: &ConfigJson) -> Result<()> {
     let schema_json: serde_json::Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../schema/config-schema.json"
+        "/../../schema/config-schema.json"
     )))
     .context("Failed to parse config schema")?;
     let schema_json = Box::leak(Box::new(schema_json));

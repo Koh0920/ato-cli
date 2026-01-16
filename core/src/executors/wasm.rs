@@ -2,21 +2,13 @@ use anyhow::{Context, Result};
 use std::process::{Command, Stdio};
 use tracing::warn;
 
-use capsule_core::router::ManifestData;
+use crate::router::ManifestData;
 
-use capsule_core::CapsuleReporter;
-
-pub fn execute(
-    plan: &ManifestData,
-    reporter: std::sync::Arc<crate::reporters::CliReporter>,
-) -> Result<i32> {
+pub fn execute(plan: &ManifestData) -> Result<i32> {
     let component = resolve_component(plan)?;
     let component_path = plan.resolve_path(&component);
 
     if which::which("wasmtime").is_err() {
-        futures::executor::block_on(
-            reporter.warn("wasmtime is not installed or not on PATH".to_string()),
-        )?;
         anyhow::bail!("wasmtime is not installed or not on PATH");
     }
 

@@ -7,6 +7,8 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
 
+use capsule_core::CapsuleReporter;
+
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
@@ -14,7 +16,10 @@ pub struct KeygenArgs {
     pub name: Option<String>,
 }
 
-pub fn execute(args: KeygenArgs) -> Result<()> {
+pub fn execute(
+    args: KeygenArgs,
+    reporter: std::sync::Arc<crate::reporters::CliReporter>,
+) -> Result<()> {
     let key_name = args.name.unwrap_or_else(|| {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -54,19 +59,23 @@ pub fn execute(args: KeygenArgs) -> Result<()> {
     let fingerprint = hasher.finalize();
     let fingerprint_hex: String = fingerprint.iter().map(|b| format!("{:02x}", b)).collect();
 
-    println!("✅ Key generated successfully!");
-    println!();
-    println!("Key name:      {}", key_name);
-    println!("Private key:   {}", secret_key_path.display());
-    println!("Public key:    {}", public_key_path.display());
-    println!();
-    println!("Public key (hex):");
-    println!("{}", hex::encode(public_bytes));
-    println!();
-    println!("Fingerprint (SHA256):");
-    println!("{}", fingerprint_hex);
-    println!();
-    println!("⚠️  Keep your private key secure!");
+    futures::executor::block_on(reporter.notify("✅ Key generated successfully!".to_string()))?;
+    futures::executor::block_on(reporter.notify("".to_string()))?;
+    futures::executor::block_on(reporter.notify(format!("Key name:      {}", key_name)))?;
+    futures::executor::block_on(
+        reporter.notify(format!("Private key:   {}", secret_key_path.display())),
+    )?;
+    futures::executor::block_on(
+        reporter.notify(format!("Public key:    {}", public_key_path.display())),
+    )?;
+    futures::executor::block_on(reporter.notify("".to_string()))?;
+    futures::executor::block_on(reporter.notify("Public key (hex):".to_string()))?;
+    futures::executor::block_on(reporter.notify(hex::encode(public_bytes)))?;
+    futures::executor::block_on(reporter.notify("".to_string()))?;
+    futures::executor::block_on(reporter.notify("Fingerprint (SHA256):".to_string()))?;
+    futures::executor::block_on(reporter.notify(fingerprint_hex))?;
+    futures::executor::block_on(reporter.notify("".to_string()))?;
+    futures::executor::block_on(reporter.notify("⚠️  Keep your private key secure!".to_string()))?;
 
     Ok(())
 }

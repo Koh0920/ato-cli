@@ -278,7 +278,10 @@ fn parse_runtime_kind(value: &str) -> Option<RuntimeKind> {
 }
 
 fn is_oci_runtime(value: &str) -> bool {
-    matches!(value.to_ascii_lowercase().as_str(), "oci" | "docker" | "youki" | "runc")
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "oci" | "docker" | "youki" | "runc"
+    )
 }
 
 fn is_wasm_runtime(value: &str) -> bool {

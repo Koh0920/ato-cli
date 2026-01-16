@@ -9,25 +9,11 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use fs2::FileExt;
 use futures::StreamExt;
-use indicatif::{ProgressBar, ProgressStyle};
+
 use tracing::{debug, info};
 
 struct RuntimeInstallLock {
     _file: File,
-}
-
-fn is_internal_mode() -> bool {
-    std::env::var_os("CAPSULE_INTERNAL").is_some()
-}
-
-macro_rules! toolchain_out {
-    ($($arg:tt)*) => {{
-        if $crate::packers::runtime_fetcher::is_internal_mode() {
-            eprintln!($($arg)*);
-        } else {
-            println!($($arg)*);
-        }
-    }};
 }
 
 mod fetcher;
@@ -39,22 +25,29 @@ pub struct RuntimeFetcher {
     cache_dir: PathBuf,
     verifier: Arc<dyn ArtifactVerifier>,
     fetchers: HashMap<&'static str, Box<dyn fetcher::ToolchainFetcher>>,
+    reporter: Arc<dyn crate::reporter::CapsuleReporter + 'static>,
 }
 
 #[allow(dead_code)]
 impl RuntimeFetcher {
     pub fn new() -> Result<Self> {
-        let cache_dir = toolchain_cache_dir()?;
-        fs::create_dir_all(&cache_dir).context("Failed to create toolchain cache directory")?;
-
-        Ok(Self {
-            cache_dir,
-            verifier: Arc::new(ChecksumVerifier),
-            fetchers: fetcher::default_fetchers(),
-        })
+        Self::new_with_reporter(Arc::new(crate::reporter::NoOpReporter))
     }
 
     pub fn new_with_verifier(verifier: Arc<dyn ArtifactVerifier>) -> Result<Self> {
+        Self::new_with_verifier_and_reporter(verifier, Arc::new(crate::reporter::NoOpReporter))
+    }
+
+    pub fn new_with_reporter(
+        reporter: Arc<dyn crate::reporter::CapsuleReporter + 'static>,
+    ) -> Result<Self> {
+        Self::new_with_verifier_and_reporter(Arc::new(ChecksumVerifier), reporter)
+    }
+
+    pub fn new_with_verifier_and_reporter(
+        verifier: Arc<dyn ArtifactVerifier>,
+        reporter: Arc<dyn crate::reporter::CapsuleReporter + 'static>,
+    ) -> Result<Self> {
         let cache_dir = toolchain_cache_dir()?;
         fs::create_dir_all(&cache_dir).context("Failed to create toolchain cache directory")?;
 
@@ -62,6 +55,7 @@ impl RuntimeFetcher {
             cache_dir,
             verifier,
             fetchers: fetcher::default_fetchers(),
+            reporter,
         })
     }
 
@@ -123,16 +117,19 @@ impl RuntimeFetcher {
             .collect()
     }
 
-    fn lock_path(&self, language: &str, version: &str) -> PathBuf {
-        let lock_dir = self.cache_dir.join(".locks");
+    fn lock_path(cache_dir: &Path, language: &str, version: &str) -> PathBuf {
+        let lock_dir = cache_dir.join(".locks");
         let v = Self::sanitize_lock_component(version);
         lock_dir.join(format!("{}-{}.lock", language, v))
     }
 
-    async fn acquire_install_lock(&self, language: &str, version: &str) -> Result<RuntimeInstallLock> {
-        let lock_path = self.lock_path(language, version);
-        let language = language.to_string();
-        let version = version.to_string();
+    async fn acquire_install_lock(
+        &self,
+        language: &str,
+        version: &str,
+    ) -> Result<RuntimeInstallLock> {
+        let lock_path = Self::lock_path(&self.cache_dir, language, version);
+        let lock_path = lock_path.clone();
 
         tokio::task::spawn_blocking(move || -> Result<RuntimeInstallLock> {
             if let Some(parent) = lock_path.parent() {
@@ -150,12 +147,6 @@ impl RuntimeFetcher {
             match file.try_lock_exclusive() {
                 Ok(()) => Ok(RuntimeInstallLock { _file: file }),
                 Err(e) if e.kind() == fs2::lock_contended_error().kind() => {
-                    toolchain_out!(
-                        "⏳ Another process is provisioning {} {}. Waiting...",
-                        language,
-                        version
-                    );
-
                     file.lock_exclusive()
                         .with_context(|| format!("Failed to wait for lock: {:?}", lock_path))?;
                     Ok(RuntimeInstallLock { _file: file })
@@ -241,8 +232,7 @@ impl RuntimeFetcher {
     }
 
     pub async fn download_bun_runtime(&self, version: &str) -> Result<PathBuf> {
-        self.download_bun_runtime_with_progress(version, true)
-            .await
+        self.download_bun_runtime_with_progress(version, true).await
     }
 
     async fn download_node_runtime_with_progress(
@@ -272,7 +262,11 @@ impl RuntimeFetcher {
             .await
     }
 
-    async fn fetch_expected_sha256(&self, url: &str, filename_hint: Option<&str>) -> Result<String> {
+    async fn fetch_expected_sha256(
+        &self,
+        url: &str,
+        filename_hint: Option<&str>,
+    ) -> Result<String> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
             .build()?;
@@ -363,20 +357,13 @@ impl RuntimeFetcher {
             anyhow::bail!("Download failed: HTTP {} - {}", response.status(), url);
         }
 
-        let total_size = response.content_length().unwrap_or(0);
+        let total_size = response.content_length();
 
-        let pb = if show_progress && total_size > 0 {
-            let pb = ProgressBar::new(total_size);
-            pb.set_style(
-                ProgressStyle::default_bar()
-                    .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
-                    .expect("Invalid progress bar template")
-                    .progress_chars("#>-"),
-            );
-            Some(pb)
-        } else {
-            None
-        };
+        if show_progress {
+            let _ = self
+                .reporter
+                .progress_start(format!("Downloading {}", url), total_size);
+        }
 
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
@@ -384,20 +371,22 @@ impl RuntimeFetcher {
 
         let mut file = File::create(dest).context("Failed to create download file")?;
         let mut stream = response.bytes_stream();
-        let mut downloaded: u64 = 0;
+        let mut _downloaded: u64 = 0;
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.context("Error reading download stream")?;
             file.write_all(&chunk).context("Failed to write to file")?;
-            downloaded += chunk.len() as u64;
+            _downloaded += chunk.len() as u64;
 
-            if let Some(ref pb) = pb {
-                pb.set_position(downloaded);
+            if show_progress {
+                let _ = self.reporter.progress_inc(chunk.len() as u64);
             }
         }
 
-        if let Some(pb) = pb {
-            pb.finish_with_message("Download complete");
+        if show_progress {
+            let _ = self
+                .reporter
+                .progress_finish(Some("Download complete".to_string()));
         }
 
         Ok(())
@@ -624,7 +613,10 @@ impl RuntimeFetcher {
             .context("Failed to download Node index.json")?;
 
         if !response.status().is_success() {
-            anyhow::bail!("Failed to download Node index.json: HTTP {}", response.status());
+            anyhow::bail!(
+                "Failed to download Node index.json: HTTP {}",
+                response.status()
+            );
         }
 
         let json: serde_json::Value = response

@@ -3,6 +3,7 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tar::Builder;
 
 use super::runtime_fetcher::RuntimeFetcher;
@@ -30,7 +31,10 @@ struct RuntimeAlias {
     source_path: PathBuf,
 }
 
-pub async fn build_bundle(args: PackBundleArgs) -> Result<PathBuf> {
+pub async fn build_bundle(
+    args: PackBundleArgs,
+    reporter: Arc<dyn crate::reporter::CapsuleReporter + 'static>,
+) -> Result<PathBuf> {
     let manifest_path = args.manifest_path.canonicalize()?;
     let source_dir = manifest_path
         .parent()
@@ -57,29 +61,50 @@ pub async fn build_bundle(args: PackBundleArgs) -> Result<PathBuf> {
     let runtime_dir = if let Some(runtime) = args.runtime_path {
         runtime
     } else if let Some(spec) = &runtime_to_bundle {
-        let fetcher = RuntimeFetcher::new()?;
+        let fetcher = RuntimeFetcher::new_with_reporter(reporter.clone())?;
         let version = runtime_version_for(spec.language.as_str(), spec.version.as_deref());
         match spec.language.as_str() {
             "python" => {
-                eprintln!("✓ Ensuring Python {} runtime is available...", version);
+                reporter
+                    .notify(format!(
+                        "✓ Ensuring Python {} runtime is available...",
+                        version
+                    ))
+                    .await?;
                 fetcher.download_python_runtime(&version).await?
             }
             "node" => {
-                eprintln!("✓ Ensuring Node {} runtime is available...", version);
+                reporter
+                    .notify(format!(
+                        "✓ Ensuring Node {} runtime is available...",
+                        version
+                    ))
+                    .await?;
                 fetcher.download_node_runtime(&version).await?
             }
             "deno" => {
-                eprintln!("✓ Ensuring Deno {} runtime is available...", version);
+                reporter
+                    .notify(format!(
+                        "✓ Ensuring Deno {} runtime is available...",
+                        version
+                    ))
+                    .await?;
                 fetcher.download_deno_runtime(&version).await?
             }
             "bun" => {
-                eprintln!("✓ Ensuring Bun {} runtime is available...", version);
+                reporter
+                    .notify(format!(
+                        "✓ Ensuring Bun {} runtime is available...",
+                        version
+                    ))
+                    .await?;
                 fetcher.download_bun_runtime(&version).await?
             }
             other => anyhow::bail!("Unsupported runtime language for bundling: {}", other),
         }
     } else {
-        let dir = std::env::temp_dir().join(format!("capsule-empty-runtime-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("capsule-empty-runtime-{}", std::process::id()));
         fs::create_dir_all(&dir)?;
         temp_runtime_dir = Some(dir.clone());
         dir
@@ -87,19 +112,41 @@ pub async fn build_bundle(args: PackBundleArgs) -> Result<PathBuf> {
 
     if let Some(spec) = &runtime_to_bundle {
         let version = runtime_version_for(spec.language.as_str(), spec.version.as_deref());
-        eprintln!("✓ Using runtime: {:?} ({} {})", runtime_dir, spec.language, version);
+        reporter
+            .notify(format!(
+                "✓ Using runtime: {:?} ({} {})",
+                runtime_dir, spec.language, version
+            ))
+            .await?;
     } else {
         if let Some(hint) = &source_target_hint {
-            eprintln!("✓ No runtime bundled (targets.source.language = {}).", hint.language);
+            reporter
+                .notify(format!(
+                    "✓ No runtime bundled (targets.source.language = {}).",
+                    hint.language
+                ))
+                .await?;
         } else {
-            eprintln!("✓ No runtime bundled (entrypoint: {:?})", manifest_entrypoint);
+            reporter
+                .notify(format!(
+                    "✓ No runtime bundled (entrypoint: {:?})",
+                    manifest_entrypoint
+                ))
+                .await?;
         }
-        eprintln!("ℹ️  Note: This bundle will require the entrypoint runtime to be available on the target host.");
+        reporter
+            .warn(
+                "ℹ️  Note: This bundle will require the entrypoint runtime to be available on the target host."
+                    .to_string(),
+            )
+            .await?;
     }
 
     let runtime_alias = build_runtime_alias(runtime_to_bundle.as_ref(), &runtime_dir)?;
 
-    eprintln!("✓ Creating bundle archive...");
+    reporter
+        .notify("✓ Creating bundle archive...".to_string())
+        .await?;
     let build_excludes = read_build_exclude_patterns(&manifest_path)?;
     let source_ignore = load_capsuleignore(source_dir, &build_excludes)?;
     let config_path = source_dir.join("config.json");
@@ -115,28 +162,46 @@ pub async fn build_bundle(args: PackBundleArgs) -> Result<PathBuf> {
         config_ref,
         runtime_alias.as_ref(),
     )?;
-    eprintln!("✓ Archive size: {} MB", archive_data.len() / 1_048_576);
+    reporter
+        .notify(format!(
+            "✓ Archive size: {} MB",
+            archive_data.len() / 1_048_576
+        ))
+        .await?;
 
     if let Some(dir) = temp_runtime_dir {
         let _ = fs::remove_dir_all(dir);
     }
 
-    eprintln!("✓ Compressing with Zstd Level 19...");
+    reporter
+        .notify("✓ Compressing with Zstd Level 19...".to_string())
+        .await?;
     let compressed = compress_with_zstd(&archive_data, 19)?;
-    eprintln!("✓ Compressed size: {} MB", compressed.len() / 1_048_576);
-    eprintln!(
-        "  Compression ratio: {:.1}%",
-        (compressed.len() as f64 / archive_data.len() as f64) * 100.0
-    );
+    reporter
+        .notify(format!(
+            "✓ Compressed size: {} MB",
+            compressed.len() / 1_048_576
+        ))
+        .await?;
+    reporter
+        .notify(format!(
+            "  Compression ratio: {:.1}%",
+            (compressed.len() as f64 / archive_data.len() as f64) * 100.0
+        ))
+        .await?;
 
-    eprintln!("✓ Creating self-extracting executable...");
+    reporter
+        .notify("✓ Creating self-extracting executable...".to_string())
+        .await?;
 
     let nacelle_bin = find_nacelle_binary(args.nacelle_path.as_ref())?;
-    eprintln!(
-        "✓ Using nacelle binary: {:?} ({} KB)",
-        nacelle_bin,
-        fs::metadata(&nacelle_bin)?.len() / 1024
-    );
+    reporter
+        .notify(format!(
+            "✓ Using nacelle binary: {:?} ({} KB)",
+            nacelle_bin,
+            fs::metadata(&nacelle_bin)?.len() / 1024
+        ))
+        .await?;
 
     let mut output = fs::File::create(&output_path)?;
 
@@ -542,12 +607,15 @@ entrypoint = "hello.sh"
         let output = root.join("bundle.out");
         let bundle_path = tokio::runtime::Runtime::new()
             .unwrap()
-            .block_on(build_bundle(PackBundleArgs {
-                manifest_path,
-                runtime_path: None,
-                output: Some(output.clone()),
-                nacelle_path: Some(nacelle_stub),
-            }))
+            .block_on(build_bundle(
+                PackBundleArgs {
+                    manifest_path,
+                    runtime_path: None,
+                    output: Some(output.clone()),
+                    nacelle_path: Some(nacelle_stub),
+                },
+                std::sync::Arc::new(crate::reporter::NoOpReporter),
+            ))
             .unwrap();
 
         assert_eq!(bundle_path, output);

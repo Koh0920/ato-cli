@@ -4,15 +4,22 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::reporters::CliReporter;
+
 use crate::init::{detect, recipe};
+use capsule_core::CapsuleReporter;
 
 pub struct NewArgs {
     pub name: String,
     pub template: Option<String>,
 }
 
-pub fn execute(args: NewArgs) -> Result<()> {
+pub fn execute(
+    args: NewArgs,
+    reporter: std::sync::Arc<crate::reporters::CliReporter>,
+) -> Result<()> {
     let project_dir = PathBuf::from(&args.name);
+    let json_mode = matches!(reporter.as_ref(), CliReporter::Json(_));
 
     if project_dir.exists() {
         anyhow::bail!("Directory '{}' already exists!", args.name);
@@ -20,19 +27,26 @@ pub fn execute(args: NewArgs) -> Result<()> {
 
     let template = args.template.as_deref().unwrap_or("python");
 
-    println!("🎉 Creating new capsule project: {}", args.name);
-    println!("   Template: {}\n", template);
+    maybe_notify(
+        &reporter,
+        format!("🎉 Creating new capsule project: {}", args.name),
+    )?;
+    maybe_notify(&reporter, format!("   Template: {}\n", template))?;
 
     fs::create_dir_all(&project_dir)
         .with_context(|| format!("Failed to create directory: {}", project_dir.display()))?;
 
     match template {
-        "python" | "py" => create_python_project(&project_dir, &args.name)?,
-        "node" | "nodejs" | "js" => create_nodejs_project(&project_dir, &args.name)?,
-        "hono" => create_hono_project(&project_dir, &args.name)?,
-        "rust" | "rs" => create_rust_project(&project_dir, &args.name)?,
-        "go" | "golang" => create_go_project(&project_dir, &args.name)?,
-        "shell" | "sh" | "bash" => create_shell_project(&project_dir, &args.name)?,
+        "python" | "py" => create_python_project(&project_dir, &args.name, reporter.clone())?,
+        "node" | "nodejs" | "js" => {
+            create_nodejs_project(&project_dir, &args.name, reporter.clone())?
+        }
+        "hono" => create_hono_project(&project_dir, &args.name, reporter.clone())?,
+        "rust" | "rs" => create_rust_project(&project_dir, &args.name, reporter.clone())?,
+        "go" | "golang" => create_go_project(&project_dir, &args.name, reporter.clone())?,
+        "shell" | "sh" | "bash" => {
+            create_shell_project(&project_dir, &args.name, reporter.clone())?
+        }
         _ => {
             anyhow::bail!(
                 "Unknown template: '{}'\n\
@@ -42,18 +56,46 @@ pub fn execute(args: NewArgs) -> Result<()> {
         }
     }
 
-    create_gitignore(&project_dir)?;
-    create_readme(&project_dir, &args.name, template)?;
+    create_gitignore(&project_dir, reporter.clone())?;
+    create_readme(&project_dir, &args.name, template, reporter.clone())?;
 
-    println!("\n✨ Project created successfully!");
-    println!("\nNext steps:");
-    println!("   cd {}", args.name);
-    println!("   capsule dev");
+    if json_mode {
+        let absolute_path = fs::canonicalize(&project_dir)
+            .with_context(|| format!("Failed to resolve path: {}", project_dir.display()))?;
+        let payload = serde_json::json!({
+            "success": true,
+            "name": args.name,
+            "path": absolute_path,
+            "template": template,
+        });
+        println!("{}", serde_json::to_string(&payload)?);
+        return Ok(());
+    }
+
+    maybe_notify(&reporter, "\n✨ Project created successfully!")?;
+    maybe_notify(&reporter, "\nNext steps:")?;
+    maybe_notify(&reporter, format!("   cd {}", args.name))?;
+    maybe_notify(&reporter, "   capsule dev")?;
 
     Ok(())
 }
 
-fn create_python_project(dir: &Path, name: &str) -> Result<()> {
+fn maybe_notify(
+    reporter: &std::sync::Arc<crate::reporters::CliReporter>,
+    message: impl Into<String>,
+) -> Result<()> {
+    if matches!(reporter.as_ref(), CliReporter::Json(_)) {
+        return Ok(());
+    }
+    futures::executor::block_on(reporter.notify(message.into()))?;
+    Ok(())
+}
+
+fn create_python_project(
+    dir: &Path,
+    name: &str,
+    reporter: std::sync::Arc<crate::reporters::CliReporter>,
+) -> Result<()> {
     let main_py = r#"#!/usr/bin/env python3
 """
 Main entry point for the capsule application.
@@ -86,13 +128,17 @@ if __name__ == "__main__":
     );
     fs::write(dir.join("capsule.toml"), manifest)?;
 
-    println!("   ✓ Created capsule.toml");
-    println!("   ✓ Created main.py");
-    println!("   ✓ Created requirements.txt");
+    maybe_notify(&reporter, "   ✓ Created capsule.toml")?;
+    maybe_notify(&reporter, "   ✓ Created main.py")?;
+    maybe_notify(&reporter, "   ✓ Created requirements.txt")?;
     Ok(())
 }
 
-fn create_nodejs_project(dir: &Path, name: &str) -> Result<()> {
+fn create_nodejs_project(
+    dir: &Path,
+    name: &str,
+    reporter: std::sync::Arc<crate::reporters::CliReporter>,
+) -> Result<()> {
     // Bundle selection is opt-in: this file controls what goes into the bundle.
     // Keep it minimal (users can edit as needed).
     fs::write(dir.join(".capsuleignore"), "node_modules/\n")?;
@@ -166,15 +212,19 @@ console.log(`Started server http://localhost:${process.env.PORT ?? 8000}`);
     );
     fs::write(dir.join("capsule.toml"), manifest)?;
 
-    println!("   ✓ Created capsule.toml");
-    println!("   ✓ Created .capsuleignore");
-    println!("   ✓ Created package.json");
-    println!("   ✓ Created src/index.ts");
-    println!("   ✓ Created dist/server.js");
+    maybe_notify(&reporter, "   ✓ Created capsule.toml")?;
+    maybe_notify(&reporter, "   ✓ Created .capsuleignore")?;
+    maybe_notify(&reporter, "   ✓ Created package.json")?;
+    maybe_notify(&reporter, "   ✓ Created src/index.ts")?;
+    maybe_notify(&reporter, "   ✓ Created dist/server.js")?;
     Ok(())
 }
 
-fn create_hono_project(dir: &Path, name: &str) -> Result<()> {
+fn create_hono_project(
+    dir: &Path,
+    name: &str,
+    reporter: std::sync::Arc<crate::reporters::CliReporter>,
+) -> Result<()> {
     // Bundle selection is opt-in: this file controls what goes into the bundle.
     // Keep it minimal (users can edit as needed).
     fs::write(dir.join(".capsuleignore"), "node_modules/\n")?;
@@ -253,15 +303,19 @@ console.log(`Started server http://localhost:${process.env.PORT ?? 8000}`);
     );
     fs::write(dir.join("capsule.toml"), manifest)?;
 
-    println!("   ✓ Created capsule.toml");
-    println!("   ✓ Created .capsuleignore");
-    println!("   ✓ Created package.json");
-    println!("   ✓ Created src/index.ts");
-    println!("   ✓ Created dist/server.js");
+    maybe_notify(&reporter, "   ✓ Created capsule.toml")?;
+    maybe_notify(&reporter, "   ✓ Created .capsuleignore")?;
+    maybe_notify(&reporter, "   ✓ Created package.json")?;
+    maybe_notify(&reporter, "   ✓ Created src/index.ts")?;
+    maybe_notify(&reporter, "   ✓ Created dist/server.js")?;
     Ok(())
 }
 
-fn create_rust_project(dir: &Path, name: &str) -> Result<()> {
+fn create_rust_project(
+    dir: &Path,
+    name: &str,
+    reporter: std::sync::Arc<crate::reporters::CliReporter>,
+) -> Result<()> {
     // Bundle selection is opt-in: this file controls what goes into the bundle.
     fs::write(dir.join(".capsuleignore"), "target/\n")?;
 
@@ -278,7 +332,7 @@ edition = "2021"
 
     fs::create_dir_all(dir.join("src"))?;
     let main_rs = r#"fn main() {
-    println!("Hello from capsule! 🎉");
+    println!("Hello from capsule!");
     println!("Edit src/main.rs to get started.");
 }
 "#;
@@ -297,14 +351,18 @@ edition = "2021"
     );
     fs::write(dir.join("capsule.toml"), manifest)?;
 
-    println!("   ✓ Created capsule.toml");
-    println!("   ✓ Created .capsuleignore");
-    println!("   ✓ Created Cargo.toml");
-    println!("   ✓ Created src/main.rs");
+    maybe_notify(&reporter, "   ✓ Created capsule.toml")?;
+    maybe_notify(&reporter, "   ✓ Created .capsuleignore")?;
+    maybe_notify(&reporter, "   ✓ Created Cargo.toml")?;
+    maybe_notify(&reporter, "   ✓ Created src/main.rs")?;
     Ok(())
 }
 
-fn create_go_project(dir: &Path, name: &str) -> Result<()> {
+fn create_go_project(
+    dir: &Path,
+    name: &str,
+    reporter: std::sync::Arc<crate::reporters::CliReporter>,
+) -> Result<()> {
     let go_mod = format!(
         r#"module example.com/{name}
 
@@ -337,13 +395,17 @@ func main() {
     );
     fs::write(dir.join("capsule.toml"), manifest)?;
 
-    println!("   ✓ Created capsule.toml");
-    println!("   ✓ Created go.mod");
-    println!("   ✓ Created main.go");
+    maybe_notify(&reporter, "   ✓ Created capsule.toml")?;
+    maybe_notify(&reporter, "   ✓ Created go.mod")?;
+    maybe_notify(&reporter, "   ✓ Created main.go")?;
     Ok(())
 }
 
-fn create_shell_project(dir: &Path, name: &str) -> Result<()> {
+fn create_shell_project(
+    dir: &Path,
+    name: &str,
+    reporter: std::sync::Arc<crate::reporters::CliReporter>,
+) -> Result<()> {
     let manifest = format!(
         r#"# Capsule Manifest - UARC V1.1.0
 schema_version = "1.0"
@@ -385,12 +447,15 @@ echo "Edit main.sh to get started."
         fs::set_permissions(dir.join("main.sh"), perms)?;
     }
 
-    println!("   ✓ Created capsule.toml");
-    println!("   ✓ Created main.sh");
+    maybe_notify(&reporter, "   ✓ Created capsule.toml")?;
+    maybe_notify(&reporter, "   ✓ Created main.sh")?;
     Ok(())
 }
 
-fn create_gitignore(dir: &Path) -> Result<()> {
+fn create_gitignore(
+    dir: &Path,
+    reporter: std::sync::Arc<crate::reporters::CliReporter>,
+) -> Result<()> {
     let content = r#"# Capsule
 .capsule/
 *.capsule
@@ -413,11 +478,16 @@ node_modules/
 target/
 "#;
     fs::write(dir.join(".gitignore"), content)?;
-    println!("   ✓ Created .gitignore");
+    maybe_notify(&reporter, "   ✓ Created .gitignore")?;
     Ok(())
 }
 
-fn create_readme(dir: &Path, name: &str, template: &str) -> Result<()> {
+fn create_readme(
+    dir: &Path,
+    name: &str,
+    template: &str,
+    reporter: std::sync::Arc<crate::reporters::CliReporter>,
+) -> Result<()> {
     let quickstart: String = match template {
         "node" | "nodejs" | "js" | "hono" => r#"```bash
 # Install deps (optional for this minimal template)
@@ -504,6 +574,6 @@ A capsule application built with UARC V1.1.0.
 "#
     );
     fs::write(dir.join("README.md"), content)?;
-    println!("   ✓ Created README.md");
+    maybe_notify(&reporter, "   ✓ Created README.md")?;
     Ok(())
 }

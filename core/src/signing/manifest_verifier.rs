@@ -6,8 +6,8 @@ use ed25519_dalek::Signature;
 use serde_json::Value;
 
 use crate::schema::manifest_to_capnp_bytes;
-use crate::capsule_types::capsule_v1::CapsuleManifestV1;
-use crate::capsule_types::signing::{parse_developer_key, verify_signature_file, SignatureFile};
+use crate::types::capsule_v1::CapsuleManifestV1;
+use crate::types::signing::{parse_developer_key, verify_signature_file, SignatureFile};
 
 const SIGNATURE_VERSION: u8 = 0x01;
 const KEY_TYPE_ED25519: u8 = 0x01;

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use tracing::warn;
 
-use crate::runtime_router::ManifestData;
+use crate::router::ManifestData;
 use crate::signing;
 
 #[derive(Debug, Clone)]
@@ -17,6 +17,7 @@ pub fn pack(
     plan: &ManifestData,
     output: Option<PathBuf>,
     key_path: Option<PathBuf>,
+    reporter: &dyn crate::reporter::CapsuleReporter,
 ) -> Result<WasmPackResult> {
     let component = resolve_component(plan)?;
     let source_path = plan.resolve_path(&component);
@@ -35,7 +36,12 @@ pub fn pack(
     if output_path == source_path {
         warn!("Output path equals source; skipping optimization");
         let signature = if let Some(key) = key_path.as_ref() {
-            Some(signing::sign_artifact(&source_path, key, "capsule-cli", None)?)
+            Some(signing::sign_artifact(
+                &source_path,
+                key,
+                "capsule-cli",
+                None,
+            )?)
         } else {
             None
         };
@@ -64,10 +70,17 @@ pub fn pack(
             .with_context(|| format!("Failed to copy wasm: {}", source_path.display()))?;
     }
 
-    println!("✅ Wasm artifact ready: {}", output_path.display());
+    futures::executor::block_on(
+        reporter.notify(format!("✅ Wasm artifact ready: {}", output_path.display())),
+    )?;
 
     let signature = if let Some(key) = key_path {
-        Some(signing::sign_artifact(&output_path, &key, "capsule-cli", None)?)
+        Some(signing::sign_artifact(
+            &output_path,
+            &key,
+            "capsule-cli",
+            None,
+        )?)
     } else {
         None
     };
