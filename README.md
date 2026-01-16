@@ -74,6 +74,14 @@ exclude_libs = ["**/.venv/**", "**/site-packages/torch/**"]
 # GPU向けのスキャフォールド/テンプレ選択用（挙動の自動変更はしない）
 gpu = true
 
+# OCI pack のためのビルド設定（任意）
+# dockerfile を指定すると docker build を実行します。
+dockerfile = "./Dockerfile"   # デフォルト: ./Dockerfile (gpu=true の場合は Dockerfile.cuda を優先)
+context = "."                 # デフォルト: manifest ディレクトリ
+image = "my-org/my-app"        # デフォルト: manifest.name
+tag = "v0.1.0"                 # デフォルト: manifest.version または latest
+target = "runtime"             # 任意: マルチステージビルドの --target
+
 [isolation]
 # ホスト環境変数の透過を allowlist 方式で許可（bundle 実行時）
 allow_env = ["HF_TOKEN", "LD_LIBRARY_PATH"]

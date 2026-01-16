@@ -4,14 +4,28 @@ use serde_json::json;
 use std::path::PathBuf;
 use std::process::Command;
 
+#[cfg(feature = "manifest-signing")]
+mod capsule_capnp;
+mod capsule_types; // UARC manifest types
+mod common;
 mod config;
+mod executors;
 mod engine;
+mod hardware;
 mod init;
 mod keygen;
+mod manifest;
 mod new;
+mod observability;
+mod packers;
 mod policy; // v3.0: L4 Egress Policy Resolution
 mod r3_config;
+mod resource; // v3.0: provisioning/CAS integration
+mod runtime_router;
 mod scaffold;
+#[cfg(feature = "manifest-signing")]
+mod schema; // canonical manifest encoding
+mod security;
 mod signing; // v3.0: L2 Signature Creation/Verification
 mod validation; // v3.0: L1 Source Policy Scanning // v3.0: R3 Configuration Generator
 
@@ -221,26 +235,28 @@ fn main() -> Result<()> {
         }
 
         Commands::Dev { manifest } => {
-            let nacelle = engine::discover_nacelle(engine::EngineRequest {
-                explicit_path: cli.nacelle,
-                manifest_path: Some(manifest.clone()),
-            })?;
-            let manifest_dir = manifest
-                .parent()
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| PathBuf::from("."));
+            let decision = runtime_router::route_manifest(
+                &manifest,
+                runtime_router::ExecutionProfile::Dev,
+            )?;
 
-            let payload = json!({
-                "spec_version": "0.1.0",
-                "interactive": true,
-                "workload": {
-                    "type": "source",
-                    "path": manifest_dir,
-                    "manifest": manifest
+            println!(
+                "🧭 RuntimeRouter: {:?} ({})",
+                decision.kind, decision.reason
+            );
+
+            let metrics = observability::RunMetrics::start(decision.kind);
+
+            let exit_code = match decision.kind {
+                runtime_router::RuntimeKind::Source => {
+                    executors::source::execute(&decision.plan, cli.nacelle)?
                 }
-            });
+                runtime_router::RuntimeKind::Oci => executors::oci::execute(&decision.plan)?,
+                runtime_router::RuntimeKind::Wasm => executors::wasm::execute(&decision.plan)?,
+            };
 
-            let exit_code = engine::run_internal_streaming(&nacelle, "exec", &payload)?;
+            metrics.finish(exit_code).print();
+
             if exit_code != 0 {
                 std::process::exit(exit_code);
             }
@@ -273,98 +289,75 @@ fn main() -> Result<()> {
             println!("📦 Capsule Pack - Pure Runtime Architecture v3.0");
             println!("   Performing build-time validations...\n");
 
+            let decision = runtime_router::route_manifest(
+                &manifest,
+                runtime_router::ExecutionProfile::Release,
+            )?;
+
+            println!(
+                "🧭 RuntimeRouter: {:?} ({})",
+                decision.kind, decision.reason
+            );
+
             let manifest_dir = manifest
                 .parent()
                 .map(|p| p.to_path_buf())
                 .unwrap_or_else(|| PathBuf::from("."));
 
-            // Phase 1: L1 Source Policy Scan
-            if !skip_validation && !skip_l1 {
-                println!("🔍 Phase 1: L1 Source Policy Scan");
-                let source_dir = manifest_dir.join("source");
-                if source_dir.exists() {
-                    let scan_extensions = &["py", "sh", "js", "ts", "go", "rs"];
-                    match validation::source_policy::scan_source_directory(
-                        &source_dir,
-                        scan_extensions,
-                    ) {
-                        Ok(()) => {
-                            println!("   ✅ No dangerous patterns detected\n");
+            match decision.kind {
+                runtime_router::RuntimeKind::Source => {
+                    let artifact_path = packers::source::pack(
+                        &decision.plan,
+                        packers::source::SourcePackOptions {
+                            manifest_path: manifest.clone(),
+                            manifest_dir: manifest_dir.clone(),
+                            output,
+                            runtime,
+                            skip_l1,
+                            skip_validation,
+                            enforcement,
+                            nacelle_override: cli.nacelle,
+                        },
+                    )?;
+
+                    // Phase 4: L2 Sign bundle (if key provided)
+                    if let Some(key_path) = key {
+                        if !skip_validation {
+                            println!("🔐 Phase 4: L2 Signature Generation");
+                            match signing::sign_bundle(&artifact_path, &key_path, "capsule-cli") {
+                                Ok(_) => println!("   ✅ Bundle signed successfully\n"),
+                                Err(e) => {
+                                    eprintln!("   ❌ Signing failed: {}", e);
+                                    anyhow::bail!("L2 Signature generation failed");
+                                }
+                            }
                         }
-                        Err(e) => {
-                            eprintln!("   ❌ L1 Policy violation: {}", e);
-                            eprintln!("\n💡 Tip: Fix the security issue or use --skip-l1 (not recommended)");
-                            anyhow::bail!("L1 Source Policy check failed");
-                        }
+                    } else {
+                        println!("ℹ️  Phase 4: L2 Signature skipped (no --key provided)\n");
                     }
-                } else {
-                    println!("   ⚠️  No source/ directory found, skipping scan\n");
+
+                    println!("✅ Pack complete: {}", artifact_path.display());
                 }
-            } else if skip_l1 {
-                println!("⚠️  Phase 1: L1 Source Policy Scan SKIPPED (--skip-l1)\n");
-            }
-
-            // Phase 2: Generate R3 config.json (services-first)
-            println!("🧭 Phase 2: Generating R3 config.json");
-            let config_path = r3_config::generate_and_write_config(&manifest, Some(enforcement))?;
-            println!("   ✅ config.json generated: {}\n", config_path.display());
-
-            // Phase 3: Call nacelle to create bundle
-            println!("📦 Phase 3: Building bundle with nacelle");
-            let nacelle = engine::discover_nacelle(engine::EngineRequest {
-                explicit_path: cli.nacelle,
-                manifest_path: Some(manifest.clone()),
-            })?;
-
-            let payload = json!({
-                "spec_version": "0.1.0",
-                "workload": {
-                    "type": "source",
-                    "path": manifest_dir,
-                    "manifest": manifest
-                },
-                "output": {
-                    "format": "bundle",
-                    "path": output
-                },
-                "runtime_path": runtime,
-                "options": {
-                    "sign": false
-                }
-            });
-
-            let resp = engine::run_internal(&nacelle, "pack", &payload)?;
-
-            let artifact_path = resp
-                .get("artifact")
-                .and_then(|a| a.get("path"))
-                .and_then(|p| p.as_str())
-                .map(PathBuf::from)
-                .ok_or_else(|| anyhow::anyhow!("No artifact path in response"))?;
-
-            println!("   ✅ Bundle created: {}\n", artifact_path.display());
-
-            let bundle_source_dir = artifact_path;
-
-            // Phase 4: L2 Sign bundle (if key provided)
-            if let Some(key_path) = key {
-                if !skip_validation {
-                    println!("🔐 Phase 4: L2 Signature Generation");
-                    match signing::sign_bundle(&bundle_source_dir, &key_path, "capsule-cli") {
-                        Ok(_) => {
-                            println!("   ✅ Bundle signed successfully\n");
-                        }
-                        Err(e) => {
-                            eprintln!("   ❌ Signing failed: {}", e);
-                            anyhow::bail!("L2 Signature generation failed");
-                        }
+                runtime_router::RuntimeKind::Oci => {
+                    if key.is_some() {
+                        println!("ℹ️  L2 Signature skipped (OCI pack does not sign bundles)");
+                    }
+                    let result = packers::oci::pack(&decision.plan, output)?;
+                    if let Some(path) = result.archive {
+                        println!("✅ Pack complete: {}", path.display());
+                    } else {
+                        println!("✅ Pack complete: {}", result.image);
                     }
                 }
-            } else {
-                println!("ℹ️  Phase 4: L2 Signature skipped (no --key provided)\n");
+                runtime_router::RuntimeKind::Wasm => {
+                    let result = packers::wasm::pack(&decision.plan, output, key)?;
+                    println!("✅ Pack complete: {}", result.artifact.display());
+                    if let Some(sig) = result.signature {
+                        println!("✅ Signature: {}", sig.display());
+                    }
+                }
             }
 
-            println!("✅ Pack complete: {}", bundle_source_dir.display());
             Ok(())
         }
 

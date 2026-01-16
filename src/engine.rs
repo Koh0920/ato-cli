@@ -196,6 +196,7 @@ pub fn run_internal(engine: &Path, subcommand: &str, payload: &Value) -> Result<
 /// - stdin: JSON payload
 /// - stdout/stderr: inherited (logs stream directly)
 /// - returns: exit code of the engine process
+#[allow(dead_code)]
 pub fn run_internal_streaming(engine: &Path, subcommand: &str, payload: &Value) -> Result<i32> {
     let mut child = Command::new(engine)
         .arg("internal")
