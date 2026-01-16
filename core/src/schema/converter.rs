@@ -4,11 +4,11 @@
 //! The Cap'n Proto bytes are the sole signing ground truth per UARC spec.
 
 use super::capnp as capsule_capnp;
-use crate::capsule_types::capsule_v1::{
+use crate::types::capsule_v1::{
     CapsuleManifestV1, CapsuleType, EgressIdType, Platform, Quantization, RouteWeight, RuntimeType,
     TransparencyLevel,
 };
-use crate::capsule_types::utils::parse_memory_string;
+use crate::types::utils::parse_memory_string;
 
 /// Error type for Cap'n Proto conversion
 #[derive(Debug, thiserror::Error)]

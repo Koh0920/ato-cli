@@ -68,7 +68,10 @@ impl ToolchainFetcher for PythonFetcher {
             return Ok(runtime_dir);
         }
 
-        toolchain_out!("⬇️  Downloading Python {} runtime...", version);
+        provider
+            .reporter
+            .notify(format!("⬇️  Downloading Python {} runtime...", version))
+            .await?;
 
         let (os, arch) = RuntimeFetcher::detect_platform()?;
         let download_url = RuntimeFetcher::get_python_download_url(version, &os, &arch)?;
@@ -97,7 +100,10 @@ impl ToolchainFetcher for PythonFetcher {
         }
         std::fs::create_dir_all(&temp_dir)?;
 
-        toolchain_out!("📦 Extracting Python {} runtime...", version);
+        provider
+            .reporter
+            .notify(format!("📦 Extracting Python {} runtime...", version))
+            .await?;
         RuntimeFetcher::extract_archive_from_file(&archive_path, &temp_dir)?;
 
         if runtime_dir.exists() {
@@ -108,7 +114,13 @@ impl ToolchainFetcher for PythonFetcher {
 
         let _ = std::fs::remove_file(&archive_path);
 
-        toolchain_out!("✓ Python {} installed at {:?}", version, runtime_dir);
+        provider
+            .reporter
+            .notify(format!(
+                "✓ Python {} installed at {:?}",
+                version, runtime_dir
+            ))
+            .await?;
         Ok(runtime_dir)
     }
 }
@@ -133,48 +145,53 @@ impl ToolchainFetcher for NodeFetcher {
             return Ok(runtime_dir);
         }
 
-        toolchain_out!("⬇️  Downloading Node {} runtime...", version);
+        provider
+            .reporter
+            .notify(format!("⬇️  Downloading Node {} runtime...", version))
+            .await?;
 
         let (os, arch) = RuntimeFetcher::detect_platform()?;
         let full_version = RuntimeFetcher::resolve_node_full_version(version).await?;
+
         let (filename, is_zip) = RuntimeFetcher::node_artifact_filename(&full_version, &os, &arch)?;
+        let download_url = format!("https://nodejs.org/dist/v{}/{}", full_version, filename);
 
-        let base_url = format!("https://nodejs.org/dist/v{}", full_version);
-        let download_url = format!("{}/{}", base_url, filename);
+        debug!("Fetching from: {}", download_url);
 
-        let shasums = ChecksumManifest::new(
-            format!("{}/SHASUMS256.txt", base_url),
-            Some(format!("{}/SHASUMS256.txt.asc", base_url)),
-        );
-
-        let expected_sha256 = provider
-            .fetch_expected_sha256(&shasums.unsigned_url, Some(&filename))
-            .await
-            .context("Failed to fetch Node SHASUMS256.txt")?;
-
-        let archive_path = if is_zip {
-            provider.cache_dir().join(format!("node-{}.zip", version))
-        } else {
-            provider
-                .cache_dir()
-                .join(format!("node-{}.tar.gz", version))
-        };
+        let archive_path = provider.cache_dir().join(format!(
+            "node-{}{}",
+            full_version,
+            if is_zip { ".zip" } else { ".tar.gz" }
+        ));
 
         provider
             .download_with_progress(&download_url, &archive_path, show_progress)
             .await?;
 
+        let expected_sha256 = provider
+            .fetch_expected_sha256(
+                &format!("https://nodejs.org/dist/v{}/SHASUMS256.txt", full_version),
+                Some(&filename),
+            )
+            .await
+            .context("Failed to fetch expected sha256")?;
+
         provider
             .verify_sha256_of_file(&archive_path, &expected_sha256)
             .context("Downloaded Node runtime failed sha256 verification")?;
 
-        let temp_dir = provider.cache_dir().join(format!("tmp-node-{}", version));
+        let temp_dir = provider
+            .cache_dir()
+            .join(format!("tmp-node-{}", full_version));
         if temp_dir.exists() {
             std::fs::remove_dir_all(&temp_dir)?;
         }
         std::fs::create_dir_all(&temp_dir)?;
 
-        toolchain_out!("📦 Extracting Node {} runtime...", version);
+        provider
+            .reporter
+            .notify(format!("📦 Extracting Node {} runtime...", full_version))
+            .await?;
         if is_zip {
             RuntimeFetcher::extract_zip_from_file(&archive_path, &temp_dir)?;
         } else {
@@ -184,10 +201,18 @@ impl ToolchainFetcher for NodeFetcher {
         if runtime_dir.exists() {
             std::fs::remove_dir_all(&runtime_dir)?;
         }
-        std::fs::rename(&temp_dir, &runtime_dir).context("Failed to move extracted Node runtime")?;
+        std::fs::rename(&temp_dir, &runtime_dir)
+            .context("Failed to move extracted runtime to cache")?;
 
         let _ = std::fs::remove_file(&archive_path);
-        toolchain_out!("✓ Node {} installed at {:?}", version, runtime_dir);
+
+        provider
+            .reporter
+            .notify(format!(
+                "✓ Node {} installed at {:?}",
+                full_version, runtime_dir
+            ))
+            .await?;
         Ok(runtime_dir)
     }
 }
@@ -212,36 +237,29 @@ impl ToolchainFetcher for DenoFetcher {
             return Ok(runtime_dir);
         }
 
-        toolchain_out!("⬇️  Downloading Deno {} runtime...", version);
+        provider
+            .reporter
+            .notify(format!("⬇️  Downloading Deno {} runtime...", version))
+            .await?;
 
         let (os, arch) = RuntimeFetcher::detect_platform()?;
-        let deno_version = RuntimeFetcher::normalize_semverish(version);
-
-        let target = match (os.as_str(), arch.as_str()) {
-            ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
-            ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
-            ("macos", "x86_64") => "x86_64-apple-darwin",
-            ("macos", "aarch64") => "aarch64-apple-darwin",
-            ("windows", "x86_64") => "x86_64-pc-windows-msvc",
-            _ => anyhow::bail!("Unsupported platform for Deno: {} {}", os, arch),
-        };
-
-        let filename = format!("deno-{}.zip", target);
         let download_url = format!(
-            "https://github.com/denoland/deno/releases/download/v{}/{}",
-            deno_version, filename
+            "https://github.com/denoland/deno/releases/download/v{}/deno-{}-{}.zip",
+            version, os, arch
         );
-        let sha_url = format!("{}.sha256sum", download_url);
 
-        let expected_sha256 = provider
-            .fetch_expected_sha256(&sha_url, Some(&filename))
-            .await
-            .context("Failed to fetch Deno sha256sum")?;
+        debug!("Fetching from: {}", download_url);
 
         let archive_path = provider.cache_dir().join(format!("deno-{}.zip", version));
+
         provider
             .download_with_progress(&download_url, &archive_path, show_progress)
             .await?;
+
+        let expected_sha256 = provider
+            .fetch_expected_sha256(&(download_url.clone() + ".sha256"), None)
+            .await
+            .context("Failed to fetch expected sha256")?;
 
         provider
             .verify_sha256_of_file(&archive_path, &expected_sha256)
@@ -253,17 +271,24 @@ impl ToolchainFetcher for DenoFetcher {
         }
         std::fs::create_dir_all(&temp_dir)?;
 
-        toolchain_out!("📦 Extracting Deno {} runtime...", version);
+        provider
+            .reporter
+            .notify(format!("📦 Extracting Deno {} runtime...", version))
+            .await?;
         RuntimeFetcher::extract_zip_from_file(&archive_path, &temp_dir)?;
 
         if runtime_dir.exists() {
             std::fs::remove_dir_all(&runtime_dir)?;
         }
         std::fs::rename(&temp_dir, &runtime_dir)
-            .context("Failed to move extracted Deno runtime")?;
+            .context("Failed to move extracted runtime to cache")?;
 
         let _ = std::fs::remove_file(&archive_path);
-        toolchain_out!("✓ Deno {} installed at {:?}", version, runtime_dir);
+
+        provider
+            .reporter
+            .notify(format!("✓ Deno {} installed at {:?}", version, runtime_dir))
+            .await?;
         Ok(runtime_dir)
     }
 }
@@ -288,61 +313,67 @@ impl ToolchainFetcher for BunFetcher {
             return Ok(runtime_dir);
         }
 
-        toolchain_out!("⬇️  Downloading Bun {} runtime...", version);
+        provider
+            .reporter
+            .notify(format!("⬇️  Downloading Bun {} runtime...", version))
+            .await?;
 
         let (os, arch) = RuntimeFetcher::detect_platform()?;
-        let bun_version = RuntimeFetcher::normalize_semverish(version);
+        let full_version = RuntimeFetcher::normalize_semverish(version);
 
-        let filename = match (os.as_str(), arch.as_str()) {
-            ("macos", "x86_64") => "bun-darwin-x64.zip".to_string(),
-            ("macos", "aarch64") => "bun-darwin-aarch64.zip".to_string(),
-            ("linux", "x86_64") => "bun-linux-x64.zip".to_string(),
-            ("linux", "aarch64") => "bun-linux-aarch64.zip".to_string(),
-            ("windows", "x86_64") => "bun-windows-x64.zip".to_string(),
-            _ => anyhow::bail!("Unsupported platform for Bun: {} {}", os, arch),
-        };
-
-        let base_url = format!(
-            "https://github.com/oven-sh/bun/releases/download/bun-v{}",
-            bun_version
-        );
-        let download_url = format!("{}/{}", base_url, filename);
-
-        let shasums = ChecksumManifest::new(
-            format!("{}/SHASUMS256.txt", base_url),
-            Some(format!("{}/SHASUMS256.txt.asc", base_url)),
+        let download_url = format!(
+            "https://github.com/oven-sh/bun/releases/download/bun-v{}/bun-{}-{}.zip",
+            full_version, os, arch
         );
 
-        let expected_sha256 = provider
-            .fetch_expected_sha256(&shasums.unsigned_url, Some(&filename))
-            .await
-            .context("Failed to fetch Bun SHASUMS256.txt")?;
+        debug!("Fetching from: {}", download_url);
 
-        let archive_path = provider.cache_dir().join(format!("bun-{}.zip", version));
+        let archive_path = provider
+            .cache_dir()
+            .join(format!("bun-{}.zip", full_version));
+
         provider
             .download_with_progress(&download_url, &archive_path, show_progress)
             .await?;
+
+        let expected_sha256 = provider
+            .fetch_expected_sha256(&(download_url.clone() + ".sha256"), None)
+            .await
+            .context("Failed to fetch expected sha256")?;
 
         provider
             .verify_sha256_of_file(&archive_path, &expected_sha256)
             .context("Downloaded Bun runtime failed sha256 verification")?;
 
-        let temp_dir = provider.cache_dir().join(format!("tmp-bun-{}", version));
+        let temp_dir = provider
+            .cache_dir()
+            .join(format!("tmp-bun-{}", full_version));
         if temp_dir.exists() {
             std::fs::remove_dir_all(&temp_dir)?;
         }
         std::fs::create_dir_all(&temp_dir)?;
 
-        toolchain_out!("📦 Extracting Bun {} runtime...", version);
+        provider
+            .reporter
+            .notify(format!("📦 Extracting Bun {} runtime...", full_version))
+            .await?;
         RuntimeFetcher::extract_zip_from_file(&archive_path, &temp_dir)?;
 
         if runtime_dir.exists() {
             std::fs::remove_dir_all(&runtime_dir)?;
         }
-        std::fs::rename(&temp_dir, &runtime_dir).context("Failed to move extracted Bun runtime")?;
+        std::fs::rename(&temp_dir, &runtime_dir)
+            .context("Failed to move extracted runtime to cache")?;
 
         let _ = std::fs::remove_file(&archive_path);
-        toolchain_out!("✓ Bun {} installed at {:?}", version, runtime_dir);
+
+        provider
+            .reporter
+            .notify(format!(
+                "✓ Bun {} installed at {:?}",
+                full_version, runtime_dir
+            ))
+            .await?;
         Ok(runtime_dir)
     }
 }

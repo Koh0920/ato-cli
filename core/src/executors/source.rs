@@ -3,21 +3,16 @@ use rand::Rng;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use capsule_core::runtime::native::NativeHandle;
-use capsule_core::{RuntimeMetadata, SessionRunner, SessionRunnerConfig};
+use crate::reporter::NoOpReporter;
+use crate::runtime::native::NativeHandle;
+use crate::{RuntimeMetadata, SessionRunner, SessionRunnerConfig};
 
-use crate::reporters::CliReporter;
+use crate::engine;
+use crate::packers::bundle::{build_bundle, PackBundleArgs};
+use crate::r3_config;
+use crate::router::ManifestData;
 
-use capsule_core::engine;
-use capsule_core::packers::bundle::{build_bundle, PackBundleArgs};
-use capsule_core::r3_config;
-use capsule_core::router::ManifestData;
-
-pub fn execute(
-    plan: &ManifestData,
-    nacelle_override: Option<PathBuf>,
-    reporter: std::sync::Arc<CliReporter>,
-) -> Result<i32> {
+pub fn execute(plan: &ManifestData, nacelle_override: Option<PathBuf>) -> Result<i32> {
     let nacelle = engine::discover_nacelle(engine::EngineRequest {
         explicit_path: nacelle_override.clone(),
         manifest_path: Some(plan.manifest_path.clone()),
@@ -32,7 +27,6 @@ pub fn execute(
         let suffix: u64 = rng.gen();
         let output = std::env::temp_dir().join(format!("capsule-dev-{}.bundle", suffix));
 
-        let reporter = reporter.clone();
         runtime.block_on(build_bundle(
             PackBundleArgs {
                 manifest_path: plan.manifest_path.clone(),
@@ -40,26 +34,18 @@ pub fn execute(
                 output: Some(output),
                 nacelle_path: Some(nacelle),
             },
-            reporter,
+            std::sync::Arc::new(NoOpReporter),
         ))?
     };
 
-    let exit_code = runtime.block_on(run_bundle_with_metrics(
-        &bundle_path,
-        &plan.manifest_dir,
-        reporter,
-    ))?;
+    let exit_code = runtime.block_on(run_bundle_with_metrics(&bundle_path, &plan.manifest_dir))?;
 
     let _ = std::fs::remove_file(&bundle_path);
 
     Ok(exit_code)
 }
 
-async fn run_bundle_with_metrics(
-    bundle_path: &Path,
-    manifest_dir: &Path,
-    reporter: std::sync::Arc<CliReporter>,
-) -> Result<i32> {
+async fn run_bundle_with_metrics(bundle_path: &Path, manifest_dir: &Path) -> Result<i32> {
     let child = Command::new(bundle_path)
         .current_dir(manifest_dir)
         .spawn()
@@ -70,9 +56,10 @@ async fn run_bundle_with_metrics(
 
     let session_id = format!("dev-{}", rand::thread_rng().gen::<u64>());
     let handle = NativeHandle::new(session_id, pid);
+    let reporter = NoOpReporter;
     let config = SessionRunnerConfig::default();
 
-    let metrics = SessionRunner::new(handle, reporter.as_ref().clone())
+    let metrics = SessionRunner::new(handle, reporter)
         .with_config(config)
         .run()
         .await?;
@@ -80,7 +67,7 @@ async fn run_bundle_with_metrics(
     Ok(extract_exit_code(&metrics))
 }
 
-fn extract_exit_code(metrics: &capsule_core::UnifiedMetrics) -> i32 {
+fn extract_exit_code(metrics: &crate::UnifiedMetrics) -> i32 {
     match &metrics.metadata {
         RuntimeMetadata::Nacelle { exit_code, .. } => (*exit_code).unwrap_or(1),
         _ => 1,

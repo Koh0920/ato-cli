@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use capsule_core::CapsuleReporter;
+
 pub struct ScaffoldDockerArgs {
     pub manifest_path: PathBuf,
     pub output_dir: Option<PathBuf>,
@@ -9,7 +11,10 @@ pub struct ScaffoldDockerArgs {
     pub force: bool,
 }
 
-pub fn execute_docker(args: ScaffoldDockerArgs) -> Result<()> {
+pub fn execute_docker(
+    args: ScaffoldDockerArgs,
+    reporter: std::sync::Arc<crate::reporters::CliReporter>,
+) -> Result<()> {
     let manifest_path = args.manifest_path.canonicalize().with_context(|| {
         format!(
             "Failed to resolve manifest path: {}",
@@ -65,13 +70,18 @@ pub fn execute_docker(args: ScaffoldDockerArgs) -> Result<()> {
     write_if_allowed(&dockerfile_path, &dockerfile, args.force)?;
     write_if_allowed(&dockerignore_path, &dockerignore_template(), args.force)?;
 
-    println!("✅ Scaffolded Docker files");
-    println!("- {}", dockerfile_path.display());
-    println!("- {}", dockerignore_path.display());
+    futures::executor::block_on(reporter.notify("✅ Scaffolded Docker files".to_string()))?;
+    futures::executor::block_on(reporter.notify(format!("- {}", dockerfile_path.display())))?;
+    futures::executor::block_on(reporter.notify(format!("- {}", dockerignore_path.display())))?;
 
     if gpu {
-        println!("\nGPU mode detected: build.gpu=true");
-        println!("Run with: docker run --rm --gpus all -p 8000:8000 <image>");
+        futures::executor::block_on(
+            reporter.notify("\nGPU mode detected: build.gpu=true".to_string()),
+        )?;
+        futures::executor::block_on(
+            reporter
+                .notify("Run with: docker run --rm --gpus all -p 8000:8000 <image>".to_string()),
+        )?;
     }
 
     Ok(())

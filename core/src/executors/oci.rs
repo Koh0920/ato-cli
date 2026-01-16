@@ -6,13 +6,12 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use tracing::warn;
 
-use capsule_core::runtime::oci::OciHandle;
-use capsule_core::{CapsuleReporter, SessionRunner, SessionRunnerConfig};
+use crate::reporter::NoOpReporter;
+use crate::runtime::oci::OciHandle;
+use crate::{SessionRunner, SessionRunnerConfig};
 
-use crate::reporters::CliReporter;
-
-use capsule_core::hardware;
-use capsule_core::router::ManifestData;
+use crate::hardware;
+use crate::router::ManifestData;
 
 #[derive(Debug, Clone)]
 enum OciEngine {
@@ -20,7 +19,7 @@ enum OciEngine {
     Podman,
 }
 
-pub fn execute(plan: &ManifestData, reporter: std::sync::Arc<CliReporter>) -> Result<i32> {
+pub fn execute(plan: &ManifestData) -> Result<i32> {
     let engine = detect_engine()?;
     let image = resolve_image(plan)?;
     let mut env = plan.execution_env();
@@ -83,40 +82,34 @@ pub fn execute(plan: &ManifestData, reporter: std::sync::Arc<CliReporter>) -> Re
         .with_context(|| format!("Failed to run OCI engine: {}", engine_binary(&engine)))?;
 
     let runtime = tokio::runtime::Runtime::new()?;
-    let metrics_result = runtime.block_on(run_oci_with_metrics(name, image_for_metrics, reporter.clone()));
+    let metrics_result = runtime.block_on(run_oci_with_metrics(name, image_for_metrics));
 
     let status = child
         .wait()
         .with_context(|| format!("Failed waiting for OCI engine: {}", engine_binary(&engine)))?;
 
     if let Err(err) = metrics_result {
-        let _ = futures::executor::block_on(reporter.warn(format!(
-            "⚠️  Metrics collection failed: {}",
-            err
-        )));
+        return Err(err);
     }
 
     Ok(status.code().unwrap_or(1))
 }
 
-async fn run_oci_with_metrics(
-    container_id: String,
-    image_hash: String,
-    reporter: std::sync::Arc<CliReporter>,
-) -> Result<()> {
+async fn run_oci_with_metrics(container_id: String, image_hash: String) -> Result<()> {
     let docker = connect_docker().context("Failed to connect to Docker daemon")?;
 
     wait_for_container(&docker, &container_id, Duration::from_secs(10)).await?;
 
     let session_id = format!("oci-{}", rand::thread_rng().gen::<u64>());
     let handle = OciHandle::new(session_id, container_id.clone(), image_hash, docker.clone());
+    let reporter = NoOpReporter;
     let config = SessionRunnerConfig {
         sample_interval: Duration::from_secs(5),
-        timeout: None,
+        timeout: Some(Duration::from_secs(10)),
         finalize_timeout: Duration::from_secs(5),
     };
 
-    let _metrics = SessionRunner::new(handle, reporter.as_ref().clone())
+    let _metrics = SessionRunner::new(handle, reporter)
         .with_config(config)
         .run()
         .await?;

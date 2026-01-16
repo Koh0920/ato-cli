@@ -24,8 +24,7 @@ pub fn requires_gpu(manifest: &toml::Value) -> bool {
         .and_then(|r| r.get("vram_min"))
         .and_then(|v| v.as_str());
 
-    vram
-        .and_then(parse_memory_to_bytes)
+    vram.and_then(parse_memory_to_bytes)
         .map(|bytes| bytes > 0)
         .unwrap_or(false)
 }
