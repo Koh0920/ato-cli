@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use crate::manifest;
+use crate::policy::egress_resolver::{resolve_egress_policy, EgressRule};
+
 const CONFIG_VERSION: &str = "1.0.0";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,8 +81,6 @@ pub struct FilesystemConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkConfig {
     pub enabled: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub allow_domains: Option<Vec<String>>,
     pub enforcement: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub egress: Option<EgressConfig>,
@@ -154,11 +155,9 @@ pub fn generate_and_write_config(
     manifest_path: &Path,
     enforcement_override: Option<String>,
 ) -> Result<PathBuf> {
-    let manifest_content = std::fs::read_to_string(manifest_path)
-        .with_context(|| format!("Failed to read manifest: {}", manifest_path.display()))?;
-
-    let manifest: toml::Value = toml::from_str(&manifest_content)
-        .with_context(|| format!("Failed to parse manifest TOML: {}", manifest_path.display()))?;
+    let loaded = manifest::load_manifest(manifest_path)?;
+    let manifest_content = loaded.raw_text;
+    let manifest = loaded.raw;
 
     let config = build_config_json(&manifest, &manifest_content, enforcement_override)?;
     validate_config_json(&config)?;
@@ -244,14 +243,13 @@ fn build_config_json(
 
     validate_services_dag(&services)?;
 
-    let (allow_domains, egress_rules) = build_egress(manifest)?;
+    let egress_rules = build_egress(manifest)?;
 
     let sandbox = SandboxConfig {
         enabled: true,
         filesystem: read_filesystem(manifest),
         network: NetworkConfig {
             enabled: true,
-            allow_domains,
             enforcement: enforcement_override.unwrap_or_else(|| "best_effort".to_string()),
             egress: egress_rules,
         },
@@ -387,7 +385,7 @@ fn read_filesystem(manifest: &toml::Value) -> Option<FilesystemConfig> {
     })
 }
 
-fn build_egress(manifest: &toml::Value) -> Result<(Option<Vec<String>>, Option<EgressConfig>)> {
+fn build_egress(manifest: &toml::Value) -> Result<Option<EgressConfig>> {
     let mut allow_domains: Vec<String> = manifest
         .get("network")
         .and_then(|n| n.get("egress_allow"))
@@ -401,21 +399,48 @@ fn build_egress(manifest: &toml::Value) -> Result<(Option<Vec<String>>, Option<E
         .unwrap_or_default();
     allow_domains.sort();
     allow_domains.dedup();
-    let allow_domains = if allow_domains.is_empty() {
+    let has_allow_domains = !allow_domains.is_empty();
+    let resolved = if allow_domains.is_empty() {
         None
     } else {
-        Some(allow_domains)
+        Some(resolve_egress_policy(&allow_domains)?)
     };
 
     let mut rules: Vec<EgressRuleEntry> = Vec::new();
     let mut seen_ips: HashSet<String> = HashSet::new();
     let mut seen_cidrs: HashSet<String> = HashSet::new();
 
+    if let Some(resolved) = resolved {
+        for ip in resolved.resolved_ips {
+            if seen_ips.insert(ip.clone()) {
+                rules.push(EgressRuleEntry {
+                    rule_type: "ip".to_string(),
+                    value: ip,
+                });
+            }
+        }
+
+        for rule in resolved.rules {
+            if let EgressRule::Cidr { value } = rule {
+                if seen_cidrs.insert(value.clone()) {
+                    rules.push(EgressRuleEntry {
+                        rule_type: "cidr".to_string(),
+                        value,
+                    });
+                }
+            }
+        }
+    }
+
+    let mut has_id_allow = false;
     if let Some(id_allow) = manifest
         .get("network")
         .and_then(|n| n.get("egress_id_allow"))
         .and_then(|v| v.as_array())
     {
+        if !id_allow.is_empty() {
+            has_id_allow = true;
+        }
         for rule in id_allow {
             let rule_type = rule.get("type").and_then(|v| v.as_str());
             let value = rule.get("value").and_then(|v| v.as_str());
@@ -441,8 +466,8 @@ fn build_egress(manifest: &toml::Value) -> Result<(Option<Vec<String>>, Option<E
         }
     }
 
-    if rules.is_empty() && allow_domains.is_none() {
-        return Ok((None, None));
+    if rules.is_empty() && !has_allow_domains && !has_id_allow {
+        return Ok(None);
     }
 
     let egress = EgressConfig {
@@ -450,7 +475,7 @@ fn build_egress(manifest: &toml::Value) -> Result<(Option<Vec<String>>, Option<E
         rules: if rules.is_empty() { None } else { Some(rules) },
     };
 
-    Ok((allow_domains, Some(egress)))
+    Ok(Some(egress))
 }
 
 fn resolve_command(entrypoint: &str, manifest: &toml::Value) -> CommandResolution {
@@ -727,12 +752,14 @@ mod tests {
         let manifest_path = tmp.path().join("capsule.toml");
 
         let manifest = r#"
-name = "demo"
-version = "0.1.0"
+    schema_version = "1.0"
+    name = "demo"
+    version = "0.1.0"
+    type = "app"
 
-[execution]
-runtime = "source"
-entrypoint = "main.py"
+    [execution]
+    runtime = "source"
+    entrypoint = "main.py"
 
 [execution.env]
 MODEL = "demo"
