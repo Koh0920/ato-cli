@@ -1,7 +1,7 @@
-use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+use crate::error::{CapsuleError, Result};
 use crate::router::ManifestData;
 
 #[derive(Debug, Clone)]
@@ -46,12 +46,20 @@ pub fn pack(
 
         let status = cmd
             .status()
-            .with_context(|| format!("Failed to run {} build", engine_binary(&engine)))?;
+            .map_err(|e| {
+                CapsuleError::Pack(format!(
+                    "Failed to run {} build: {}",
+                    engine_binary(&engine),
+                    e
+                ))
+            })?;
         if !status.success() {
-            anyhow::bail!("OCI build failed");
+            return Err(CapsuleError::Pack("OCI build failed".to_string()));
         }
     } else if !image_exists(&engine, &image)? {
-        anyhow::bail!("OCI image not found locally and no build context provided");
+        return Err(CapsuleError::NotFound(
+            "OCI image not found locally and no build context provided".to_string(),
+        ));
     }
 
     let archive = if let Some(path) = output {
@@ -77,7 +85,9 @@ fn detect_engine() -> Result<OciEngine> {
     if which::which("podman").is_ok() {
         return Ok(OciEngine::Podman);
     }
-    anyhow::bail!("No OCI engine found (docker/podman)");
+    Err(CapsuleError::ContainerEngine(
+        "No OCI engine found (docker/podman)".to_string(),
+    ))
 }
 
 fn engine_binary(engine: &OciEngine) -> &'static str {
@@ -158,7 +168,8 @@ fn image_exists(engine: &OciEngine, image: &str) -> Result<bool> {
         .arg(image)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()?;
+        .status()
+        .map_err(|e| CapsuleError::Pack(format!("OCI inspect failed: {}", e)))?;
 
     Ok(output.success())
 }
@@ -173,10 +184,16 @@ fn save_image(engine: &OciEngine, image: &str, output: &PathBuf) -> Result<()> {
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
-        .with_context(|| format!("Failed to run {} save", engine_binary(engine)))?;
+        .map_err(|e| {
+            CapsuleError::Pack(format!(
+                "Failed to run {} save: {}",
+                engine_binary(engine),
+                e
+            ))
+        })?;
 
     if !status.success() {
-        anyhow::bail!("OCI image save failed");
+        return Err(CapsuleError::Pack("OCI image save failed".to_string()));
     }
 
     Ok(())

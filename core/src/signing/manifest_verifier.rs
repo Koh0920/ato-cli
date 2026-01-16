@@ -1,10 +1,10 @@
 #![cfg(feature = "manifest-signing")]
 #![allow(dead_code)]
 
-use anyhow::{anyhow, bail, Context, Result};
 use ed25519_dalek::Signature;
 use serde_json::Value;
 
+use crate::error::{CapsuleError, Result};
 use crate::schema::manifest_to_capnp_bytes;
 use crate::types::capsule_v1::CapsuleManifestV1;
 use crate::types::signing::{parse_developer_key, verify_signature_file, SignatureFile};
@@ -30,7 +30,8 @@ impl ManifestVerifier {
     /// Verify a manifest signature using JSON input.
     pub fn verify(&self, manifest_bytes: &[u8], signature: &[u8], capsule_id: &str) -> Result<()> {
         let manifest: CapsuleManifestV1 =
-            serde_json::from_slice(manifest_bytes).context("failed to parse manifest JSON")?;
+            serde_json::from_slice(manifest_bytes)
+                .map_err(|e| CapsuleError::Crypto(format!("failed to parse manifest JSON: {}", e)))?;
         self.verify_manifest(&manifest, signature, capsule_id)
     }
 
@@ -42,14 +43,17 @@ impl ManifestVerifier {
         _capsule_id: &str,
     ) -> Result<()> {
         let canonical_bytes =
-            manifest_to_capnp_bytes(manifest).context("failed to build canonical bytes")?;
+            manifest_to_capnp_bytes(manifest)
+                .map_err(|e| CapsuleError::Crypto(format!("failed to build canonical bytes: {}", e)))?;
         self.verify_bytes(&canonical_bytes, signature)
     }
 
     fn verify_bytes(&self, message: &[u8], signature: &[u8]) -> Result<()> {
         if self.trusted_key.is_none() {
             if self.strict {
-                bail!("signature verification failed: no trusted key configured");
+                return Err(CapsuleError::AuthRequired(
+                    "signature verification failed: no trusted key configured".to_string(),
+                ));
             }
             return Ok(());
         }
@@ -59,12 +63,16 @@ impl ManifestVerifier {
         if let Some(trusted_key) = &self.trusted_key {
             let trusted = parse_developer_key(trusted_key)?;
             if sig.public_key != trusted {
-                bail!("signature public key is not the trusted signer");
+                return Err(CapsuleError::AuthRequired(
+                    "signature public key is not the trusted signer".to_string(),
+                ));
             }
         }
 
         if let Err(_err) = verify_signature_file(&sig, message) {
-            bail!("Cryptographic verification failed");
+            return Err(CapsuleError::Crypto(
+                "Cryptographic verification failed".to_string(),
+            ));
         }
 
         Ok(())
@@ -73,16 +81,22 @@ impl ManifestVerifier {
 
 fn parse_signature_bytes(data: &[u8]) -> Result<SignatureFile> {
     if data.len() < 1 + 1 + 32 + 64 + 2 {
-        bail!("Invalid signature format");
+        return Err(CapsuleError::Crypto("Invalid signature format".to_string()));
     }
 
     let version = data[0];
     let key_type = data[1];
     if version != SIGNATURE_VERSION {
-        bail!("unsupported signature version {}", version);
+        return Err(CapsuleError::Crypto(format!(
+            "unsupported signature version {}",
+            version
+        )));
     }
     if key_type != KEY_TYPE_ED25519 {
-        bail!("unsupported key_type {}", key_type);
+        return Err(CapsuleError::Crypto(format!(
+            "unsupported key_type {}",
+            key_type
+        )));
     }
 
     let mut offset = 2;
@@ -98,11 +112,11 @@ fn parse_signature_bytes(data: &[u8]) -> Result<SignatureFile> {
     let metadata_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
     offset += 2;
     if data.len() < offset + metadata_len {
-        return Err(anyhow!("Invalid signature format"));
+        return Err(CapsuleError::Crypto("Invalid signature format".to_string()));
     }
     let metadata_bytes = &data[offset..offset + metadata_len];
     let metadata: Value = serde_json::from_slice(metadata_bytes)
-        .context("failed to parse signature metadata JSON")?;
+        .map_err(|e| CapsuleError::Crypto(format!("failed to parse signature metadata JSON: {}", e)))?;
 
     Ok(SignatureFile {
         version,

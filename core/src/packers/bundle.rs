@@ -1,4 +1,3 @@
-use anyhow::{Context, Result};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use std::fs;
 use std::io::Write;
@@ -6,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tar::Builder;
 
+use crate::error::{CapsuleError, Result};
 use super::runtime_fetcher::RuntimeFetcher;
 
 /// Magic bytes to identify self-extracting v2 bundles.
@@ -38,7 +38,7 @@ pub async fn build_bundle(
     let manifest_path = args.manifest_path.canonicalize()?;
     let source_dir = manifest_path
         .parent()
-        .context("Failed to determine source directory")?;
+        .ok_or_else(|| CapsuleError::Pack("Failed to determine source directory".to_string()))?;
 
     let output_path = args
         .output
@@ -100,7 +100,12 @@ pub async fn build_bundle(
                     .await?;
                 fetcher.download_bun_runtime(&version).await?
             }
-            other => anyhow::bail!("Unsupported runtime language for bundling: {}", other),
+            other => {
+                return Err(CapsuleError::Pack(format!(
+                    "Unsupported runtime language for bundling: {}",
+                    other
+                )))
+            }
         }
     } else {
         let dir =
@@ -249,7 +254,7 @@ fn decide_runtime_to_bundle(
 
     let manifest_dir = manifest_path
         .parent()
-        .context("Failed to resolve manifest directory")?;
+        .ok_or_else(|| CapsuleError::Pack("Failed to resolve manifest directory".to_string()))?;
     let entry_path = resolve_entrypoint_path(entrypoint, manifest_dir, source_dir);
 
     let ext = entry_path
@@ -278,11 +283,17 @@ fn decide_runtime_to_bundle(
 }
 
 fn read_manifest_source_target_hint(manifest_path: &Path) -> Result<Option<SourceTargetHint>> {
-    let raw = fs::read_to_string(manifest_path)
-        .with_context(|| format!("Failed to read manifest: {}", manifest_path.display()))?;
+    let raw = fs::read_to_string(manifest_path).map_err(|e| {
+        CapsuleError::Pack(format!("Failed to read manifest {}: {}", manifest_path.display(), e))
+    })?;
 
-    let manifest: toml::Value = toml::from_str(&raw)
-        .with_context(|| format!("Failed to parse manifest TOML: {}", manifest_path.display()))?;
+    let manifest: toml::Value = toml::from_str(&raw).map_err(|e| {
+        CapsuleError::Pack(format!(
+            "Failed to parse manifest TOML {}: {}",
+            manifest_path.display(),
+            e
+        ))
+    })?;
 
     let target = manifest
         .get("targets")
@@ -330,11 +341,17 @@ fn read_manifest_entrypoint(
         }
     }
 
-    let raw = fs::read_to_string(manifest_path)
-        .with_context(|| format!("Failed to read manifest: {}", manifest_path.display()))?;
+    let raw = fs::read_to_string(manifest_path).map_err(|e| {
+        CapsuleError::Pack(format!("Failed to read manifest {}: {}", manifest_path.display(), e))
+    })?;
 
-    let manifest: toml::Value = toml::from_str(&raw)
-        .with_context(|| format!("Failed to parse manifest TOML: {}", manifest_path.display()))?;
+    let manifest: toml::Value = toml::from_str(&raw).map_err(|e| {
+        CapsuleError::Pack(format!(
+            "Failed to parse manifest TOML {}: {}",
+            manifest_path.display(),
+            e
+        ))
+    })?;
 
     let entrypoint = manifest
         .get("execution")
@@ -444,7 +461,7 @@ fn append_dir(
         .ignore(false)
         .build()
     {
-        let entry = entry?;
+        let entry = entry.map_err(|e| CapsuleError::Pack(format!("Walk error: {}", e)))?;
         let path = entry.path();
         let rel = path.strip_prefix(dir).unwrap_or(path);
         if rel.as_os_str().is_empty() {
@@ -485,11 +502,17 @@ fn append_file(builder: &mut Builder<&mut Vec<u8>>, file: &Path, target: &str) -
 }
 
 fn read_build_exclude_patterns(manifest_path: &Path) -> Result<Vec<String>> {
-    let raw = fs::read_to_string(manifest_path)
-        .with_context(|| format!("Failed to read manifest: {}", manifest_path.display()))?;
+    let raw = fs::read_to_string(manifest_path).map_err(|e| {
+        CapsuleError::Pack(format!("Failed to read manifest {}: {}", manifest_path.display(), e))
+    })?;
 
-    let manifest: toml::Value = toml::from_str(&raw)
-        .with_context(|| format!("Failed to parse manifest TOML: {}", manifest_path.display()))?;
+    let manifest: toml::Value = toml::from_str(&raw).map_err(|e| {
+        CapsuleError::Pack(format!(
+            "Failed to parse manifest TOML {}: {}",
+            manifest_path.display(),
+            e
+        ))
+    })?;
 
     let patterns = manifest
         .get("build")
@@ -513,15 +536,20 @@ fn load_capsuleignore(source_dir: &Path, build_excludes: &[String]) -> Result<Op
     }
 
     for pattern in build_excludes {
-        builder.add_line(None, pattern)?;
+        builder
+            .add_line(None, pattern)
+            .map_err(|e| CapsuleError::Pack(format!("Invalid ignore pattern: {}", e)))?;
     }
 
-    let gitignore = builder.build()?;
+    let gitignore = builder
+        .build()
+        .map_err(|e| CapsuleError::Pack(format!("Failed to build ignore rules: {}", e)))?;
     Ok(Some(gitignore))
 }
 
 fn compress_with_zstd(data: &[u8], level: i32) -> Result<Vec<u8>> {
-    zstd::encode_all(data, level).context("Failed to compress with Zstd")
+    zstd::encode_all(data, level)
+        .map_err(|e| CapsuleError::Pack(format!("Failed to compress with Zstd: {}", e)))
 }
 
 fn find_nacelle_binary(explicit_path: Option<&PathBuf>) -> Result<PathBuf> {
@@ -538,7 +566,8 @@ fn find_nacelle_binary(explicit_path: Option<&PathBuf>) -> Result<PathBuf> {
         }
     }
 
-    let exe = std::env::current_exe().context("Failed to resolve current exe path")?;
+    let exe = std::env::current_exe()
+        .map_err(|e| CapsuleError::Pack(format!("Failed to resolve current exe path: {}", e)))?;
     if let Some(dir) = exe.parent() {
         let candidate = dir.join("nacelle");
         if candidate.exists() {
@@ -567,12 +596,13 @@ fn find_nacelle_binary(explicit_path: Option<&PathBuf>) -> Result<PathBuf> {
         }
     }
 
-    anyhow::bail!(
+    Err(CapsuleError::Pack(
         "Could not find nacelle binary. Please either:\n\
          1. Set NACELLE_PATH environment variable\n\
          2. Run 'cargo build --release' in the nacelle directory\n\
          3. Install nacelle to your PATH"
-    )
+            .to_string(),
+    ))
 }
 
 #[cfg(test)]

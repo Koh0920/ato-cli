@@ -1,5 +1,6 @@
+use crate::error::{CapsuleError, Result};
 use crate::security;
-use anyhow::{Context, Result};
+use reqwest::StatusCode;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -20,28 +21,37 @@ use tracing::info;
 pub async fn download_file(url: &str, destination: &str, allowed_paths: &[String]) -> Result<u64> {
     // 1. Security Validation
     security::validate_path(destination, allowed_paths)
-        .map_err(|e| anyhow::anyhow!("Invalid destination path: {}", e))?;
+        .map_err(|e| CapsuleError::Config(format!("Invalid destination path: {}", e)))?;
 
     info!("Starting download from {} to {}", url, destination);
 
     // 2. Create destination directory if it doesn't exist
     let dest_path = Path::new(destination);
     if let Some(parent) = dest_path.parent() {
-        std::fs::create_dir_all(parent).context("Failed to create parent directory")?;
+        std::fs::create_dir_all(parent)?;
     }
 
     // 3. Perform Download
-    let response = reqwest::get(url).await.context("Failed to send request")?;
-    let content = response
-        .bytes()
-        .await
-        .context("Failed to read response body")?;
+    let response = reqwest::get(url).await.map_err(CapsuleError::Network)?;
+    let status = response.status();
+    if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        return Err(CapsuleError::AuthRequired(url.to_string()));
+    }
+    if status == StatusCode::NOT_FOUND {
+        return Err(CapsuleError::NotFound(url.to_string()));
+    }
+    if !status.is_success() {
+        return Err(CapsuleError::Network(
+            response.error_for_status().unwrap_err(),
+        ));
+    }
+
+    let content = response.bytes().await.map_err(CapsuleError::Network)?;
     let bytes_downloaded = content.len() as u64;
 
     // 4. Write to file
-    let mut file = File::create(dest_path).context("Failed to create file")?;
-    file.write_all(&content)
-        .context("Failed to write to file")?;
+    let mut file = File::create(dest_path)?;
+    file.write_all(&content)?;
 
     info!(
         "Download completed successfully: {} ({} bytes)",

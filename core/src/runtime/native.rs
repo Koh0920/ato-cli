@@ -1,5 +1,6 @@
+use crate::error::{CapsuleError, Result};
 use crate::metrics::{MetricsSession, ResourceStats, RuntimeMetadata, UnifiedMetrics};
-use crate::runtime::{Measurable, MetricsError, MetricsResult, RuntimeHandle};
+use crate::runtime::{Measurable, RuntimeHandle};
 use async_trait::async_trait;
 use std::io;
 use std::mem;
@@ -54,26 +55,28 @@ impl RuntimeHandle for NativeHandle {
         self.session.session_id()
     }
 
-    fn kill(&mut self) -> MetricsResult<()> {
+    fn kill(&mut self) -> Result<()> {
         #[cfg(unix)]
         {
             let res = unsafe { libc::kill(self.pid as i32, libc::SIGKILL) };
             if res == 0 {
                 return Ok(());
             }
-            return Err(MetricsError::from(io::Error::last_os_error()));
+            return Err(CapsuleError::Runtime(
+                io::Error::last_os_error().to_string(),
+            ));
         }
 
         #[cfg(not(unix))]
         {
-            Err(MetricsError::unsupported("kill"))
+            Err(CapsuleError::Runtime("kill is not implemented".to_string()))
         }
     }
 }
 
 #[async_trait]
 impl Measurable for NativeHandle {
-    async fn capture_metrics(&self) -> MetricsResult<UnifiedMetrics> {
+    async fn capture_metrics(&self) -> Result<UnifiedMetrics> {
         let resources = {
             #[cfg(target_os = "linux")]
             {
@@ -100,7 +103,7 @@ impl Measurable for NativeHandle {
         Ok(self.session.snapshot(resources, self.metadata(None)))
     }
 
-    async fn wait_and_finalize(&self) -> MetricsResult<UnifiedMetrics> {
+    async fn wait_and_finalize(&self) -> Result<UnifiedMetrics> {
         #[cfg(unix)]
         {
             let pid = self.pid as i32;
@@ -114,7 +117,8 @@ impl Measurable for NativeHandle {
                 Ok((status, usage))
             })
             .await
-            .map_err(|err| MetricsError::new(format!("wait4 task failed: {err}")))??;
+            .map_err(|err| CapsuleError::Runtime(format!("wait4 task failed: {err}")))
+            .and_then(|res| res.map_err(|err| CapsuleError::Runtime(err.to_string())))?;
 
             let exit_code = decode_exit_code(status);
 
@@ -130,7 +134,7 @@ impl Measurable for NativeHandle {
 
         #[cfg(not(unix))]
         {
-            Err(MetricsError::unsupported("wait4"))
+            Err(CapsuleError::Runtime("wait4 is not implemented".to_string()))
         }
     }
 }

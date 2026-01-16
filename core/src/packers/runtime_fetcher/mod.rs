@@ -6,11 +6,13 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
 use fs2::FileExt;
 use futures::StreamExt;
+use reqwest::StatusCode;
 
 use tracing::{debug, info};
+
+use crate::error::{CapsuleError, Result};
 
 struct RuntimeInstallLock {
     _file: File,
@@ -49,7 +51,9 @@ impl RuntimeFetcher {
         reporter: Arc<dyn crate::reporter::CapsuleReporter + 'static>,
     ) -> Result<Self> {
         let cache_dir = toolchain_cache_dir()?;
-        fs::create_dir_all(&cache_dir).context("Failed to create toolchain cache directory")?;
+        fs::create_dir_all(&cache_dir).map_err(|e| {
+            CapsuleError::Pack(format!("Failed to create toolchain cache directory: {}", e))
+        })?;
 
         Ok(Self {
             cache_dir,
@@ -75,8 +79,9 @@ impl RuntimeFetcher {
         version: &str,
         show_progress: bool,
     ) -> Result<PathBuf> {
-        let key = Self::canonical_fetcher_key(language)
-            .with_context(|| format!("Unsupported runtime language: {}", language))?;
+        let key = Self::canonical_fetcher_key(language).ok_or_else(|| {
+            CapsuleError::Pack(format!("Unsupported runtime language: {}", language))
+        })?;
 
         let runtime_dir = self.get_runtime_path(key, version);
         if runtime_dir.exists() {
@@ -86,7 +91,12 @@ impl RuntimeFetcher {
         let _lock = self
             .acquire_install_lock(key, version)
             .await
-            .with_context(|| format!("Failed to acquire install lock for {} {}", key, version))?;
+            .map_err(|e| {
+                CapsuleError::Pack(format!(
+                    "Failed to acquire install lock for {} {}: {}",
+                    key, version, e
+                ))
+            })?;
 
         if runtime_dir.exists() {
             return Ok(runtime_dir);
@@ -95,14 +105,21 @@ impl RuntimeFetcher {
         let fetcher = self
             .fetchers
             .get(key)
-            .with_context(|| format!("No runtime fetcher registered for: {}", key))?;
+            .ok_or_else(|| {
+                CapsuleError::Pack(format!("No runtime fetcher registered for: {}", key))
+            })?;
 
         debug!("Using runtime fetcher: {}", fetcher.language());
 
         fetcher
             .download_runtime(self, version, show_progress)
             .await
-            .with_context(|| format!("Failed to download runtime: {} {}", key, version))
+            .map_err(|e| {
+                CapsuleError::Pack(format!(
+                    "Failed to download runtime: {} {} ({})",
+                    key, version, e
+                ))
+            })
     }
 
     fn sanitize_lock_component(s: &str) -> String {
@@ -133,7 +150,9 @@ impl RuntimeFetcher {
 
         tokio::task::spawn_blocking(move || -> Result<RuntimeInstallLock> {
             if let Some(parent) = lock_path.parent() {
-                fs::create_dir_all(parent).context("Failed to create lock directory")?;
+                fs::create_dir_all(parent).map_err(|e| {
+                    CapsuleError::Pack(format!("Failed to create lock directory: {}", e))
+                })?;
             }
 
             let file = fs::OpenOptions::new()
@@ -142,20 +161,27 @@ impl RuntimeFetcher {
                 .create(true)
                 .truncate(true)
                 .open(&lock_path)
-                .with_context(|| format!("Failed to open lock file: {:?}", lock_path))?;
+                .map_err(|e| {
+                    CapsuleError::Pack(format!("Failed to open lock file {:?}: {}", lock_path, e))
+                })?;
 
             match file.try_lock_exclusive() {
                 Ok(()) => Ok(RuntimeInstallLock { _file: file }),
                 Err(e) if e.kind() == fs2::lock_contended_error().kind() => {
                     file.lock_exclusive()
-                        .with_context(|| format!("Failed to wait for lock: {:?}", lock_path))?;
+                        .map_err(|e| {
+                            CapsuleError::Pack(format!("Failed to wait for lock {:?}: {}", lock_path, e))
+                        })?;
                     Ok(RuntimeInstallLock { _file: file })
                 }
-                Err(e) => Err(e).context("Failed to lock runtime install (unexpected error)"),
+                Err(e) => Err(CapsuleError::Pack(format!(
+                    "Failed to lock runtime install: {}",
+                    e
+                ))),
             }
         })
         .await
-        .context("Failed to join lock acquisition task")?
+        .map_err(|e| CapsuleError::Pack(format!("Failed to join lock acquisition task: {}", e)))?
     }
 
     pub fn cache_dir(&self) -> &PathBuf {
@@ -275,20 +301,26 @@ impl RuntimeFetcher {
             .get(url)
             .send()
             .await
-            .with_context(|| format!("Failed to download sha256 file: {}", url))?;
+            .map_err(CapsuleError::Network)?;
+
+        let status = response.status();
+        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+            return Err(CapsuleError::AuthRequired(url.to_string()));
+        }
+        if status == StatusCode::NOT_FOUND {
+            return Err(CapsuleError::NotFound(url.to_string()));
+        }
 
         if !response.status().is_success() {
-            anyhow::bail!(
-                "Failed to download sha256 file: HTTP {} - {}",
-                response.status(),
-                url
-            );
+            return Err(CapsuleError::Network(
+                response.error_for_status().unwrap_err(),
+            ));
         }
 
         let text = response
             .text()
             .await
-            .context("Failed to read sha256 body")?;
+            .map_err(CapsuleError::Network)?;
         Self::parse_sha256_from_text(&text, filename_hint)
     }
 
@@ -320,15 +352,13 @@ impl RuntimeFetcher {
             }
         }
 
-        anyhow::bail!("Could not parse sha256 from text")
+        Err(CapsuleError::Pack(
+            "Could not parse sha256 from text".to_string(),
+        ))
     }
 
     fn verify_sha256_of_file(&self, path: &PathBuf, expected_hex: &str) -> Result<()> {
-        match self
-            .verifier
-            .verify_sha256(path.as_path(), expected_hex)
-            .with_context(|| format!("Failed to verify sha256 for {:?}", path))
-        {
+        match self.verifier.verify_sha256(path.as_path(), expected_hex) {
             Ok(()) => Ok(()),
             Err(e) => {
                 let _ = fs::remove_file(path);
@@ -351,10 +381,20 @@ impl RuntimeFetcher {
             .get(url)
             .send()
             .await
-            .context("Failed to connect to download server")?;
+            .map_err(CapsuleError::Network)?;
+
+        let status = response.status();
+        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+            return Err(CapsuleError::AuthRequired(url.to_string()));
+        }
+        if status == StatusCode::NOT_FOUND {
+            return Err(CapsuleError::NotFound(url.to_string()));
+        }
 
         if !response.status().is_success() {
-            anyhow::bail!("Download failed: HTTP {} - {}", response.status(), url);
+            return Err(CapsuleError::Network(
+                response.error_for_status().unwrap_err(),
+            ));
         }
 
         let total_size = response.content_length();
@@ -369,13 +409,15 @@ impl RuntimeFetcher {
             fs::create_dir_all(parent)?;
         }
 
-        let mut file = File::create(dest).context("Failed to create download file")?;
+        let mut file = File::create(dest)
+            .map_err(|e| CapsuleError::Pack(format!("Failed to create download file: {}", e)))?;
         let mut stream = response.bytes_stream();
         let mut _downloaded: u64 = 0;
 
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("Error reading download stream")?;
-            file.write_all(&chunk).context("Failed to write to file")?;
+            let chunk = chunk.map_err(CapsuleError::Network)?;
+            file.write_all(&chunk)
+                .map_err(|e| CapsuleError::Pack(format!("Failed to write to file: {}", e)))?;
             _downloaded += chunk.len() as u64;
 
             if show_progress {
@@ -408,22 +450,25 @@ impl RuntimeFetcher {
             }
         }
 
-        anyhow::bail!(
+        Err(CapsuleError::Pack(format!(
             "Python binary not found in runtime directory: {:?}",
             runtime_dir
-        )
+        )))
     }
 
     fn extract_archive_from_file(archive_path: &Path, dest: &Path) -> Result<()> {
         use flate2::read::GzDecoder;
         use tar::Archive;
 
-        let file = File::open(archive_path)
-            .with_context(|| format!("Failed to open archive: {:?}", archive_path))?;
+        let file = File::open(archive_path).map_err(|e| {
+            CapsuleError::Pack(format!("Failed to open archive {:?}: {}", archive_path, e))
+        })?;
         let decoder = GzDecoder::new(file);
         let mut archive = Archive::new(decoder);
 
-        archive.unpack(dest).context("Failed to extract archive")?;
+        archive
+            .unpack(dest)
+            .map_err(|e| CapsuleError::Pack(format!("Failed to extract archive: {}", e)))?;
 
         Ok(())
     }
@@ -432,12 +477,16 @@ impl RuntimeFetcher {
         use std::io::copy;
         use zip::ZipArchive;
 
-        let file = File::open(archive_path)
-            .with_context(|| format!("Failed to open zip: {:?}", archive_path))?;
-        let mut zip = ZipArchive::new(file).context("Failed to read zip archive")?;
+        let file = File::open(archive_path).map_err(|e| {
+            CapsuleError::Pack(format!("Failed to open zip {:?}: {}", archive_path, e))
+        })?;
+        let mut zip = ZipArchive::new(file)
+            .map_err(|e| CapsuleError::Pack(format!("Failed to read zip archive: {}", e)))?;
 
         for i in 0..zip.len() {
-            let mut entry = zip.by_index(i).context("Failed to read zip entry")?;
+            let mut entry = zip
+                .by_index(i)
+                .map_err(|e| CapsuleError::Pack(format!("Failed to read zip entry: {}", e)))?;
             let out_rel = match entry.enclosed_name() {
                 Some(p) => p.to_owned(),
                 None => continue,
@@ -453,10 +502,12 @@ impl RuntimeFetcher {
                 fs::create_dir_all(parent)?;
             }
 
-            let mut outfile = File::create(&out_path)
-                .with_context(|| format!("Failed to create extracted file: {:?}", out_path))?;
-            copy(&mut entry, &mut outfile)
-                .with_context(|| format!("Failed to extract zip entry to {:?}", out_path))?;
+            let mut outfile = File::create(&out_path).map_err(|e| {
+                CapsuleError::Pack(format!("Failed to create extracted file {:?}: {}", out_path, e))
+            })?;
+            copy(&mut entry, &mut outfile).map_err(|e| {
+                CapsuleError::Pack(format!("Failed to extract zip entry to {:?}: {}", out_path, e))
+            })?;
 
             #[cfg(unix)]
             {
@@ -501,13 +552,14 @@ impl RuntimeFetcher {
             Ok(None)
         }
 
-        match walk(runtime_dir, candidates).context("Failed to search runtime directory")? {
+        match walk(runtime_dir, candidates)
+            .map_err(|e| CapsuleError::Pack(format!("Failed to search runtime directory: {}", e)))?
+        {
             Some(p) => Ok(p),
-            None => anyhow::bail!(
+            None => Err(CapsuleError::Pack(format!(
                 "Binary not found in runtime directory: {:?} (candidates={:?})",
-                runtime_dir,
-                candidates
-            ),
+                runtime_dir, candidates
+            ))),
         }
     }
 
@@ -543,7 +595,7 @@ impl RuntimeFetcher {
         } else if cfg!(target_os = "windows") {
             "windows"
         } else {
-            anyhow::bail!("Unsupported OS");
+            return Err(CapsuleError::Pack("Unsupported OS".to_string()));
         };
 
         let arch = if cfg!(target_arch = "x86_64") {
@@ -551,7 +603,7 @@ impl RuntimeFetcher {
         } else if cfg!(target_arch = "aarch64") {
             "aarch64"
         } else {
-            anyhow::bail!("Unsupported architecture");
+            return Err(CapsuleError::Pack("Unsupported architecture".to_string()));
         };
 
         Ok((os.to_string(), arch.to_string()))
@@ -573,7 +625,12 @@ impl RuntimeFetcher {
             ("macos", "x86_64") => ("x86_64-apple-darwin", "install_only"),
             ("macos", "aarch64") => ("aarch64-apple-darwin", "install_only"),
             ("windows", "x86_64") => ("x86_64-pc-windows-msvc", "shared-install_only"),
-            _ => anyhow::bail!("Unsupported platform: {} {}", os, arch),
+            _ => {
+                return Err(CapsuleError::Pack(format!(
+                    "Unsupported platform: {} {}",
+                    os, arch
+                )))
+            }
         };
 
         let filename = format!(
@@ -599,7 +656,10 @@ impl RuntimeFetcher {
         } else if parts.len() == 1 {
             format!("{}.", parts[0])
         } else {
-            anyhow::bail!("Invalid Node version hint: {}", version_hint);
+            return Err(CapsuleError::Config(format!(
+                "Invalid Node version hint: {}",
+                version_hint
+            )));
         };
 
         let client = reqwest::Client::builder()
@@ -610,20 +670,33 @@ impl RuntimeFetcher {
             .get("https://nodejs.org/dist/index.json")
             .send()
             .await
-            .context("Failed to download Node index.json")?;
+            .map_err(CapsuleError::Network)?;
+
+        let status = response.status();
+        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+            return Err(CapsuleError::AuthRequired(
+                "https://nodejs.org/dist/index.json".to_string(),
+            ));
+        }
+        if status == StatusCode::NOT_FOUND {
+            return Err(CapsuleError::NotFound(
+                "https://nodejs.org/dist/index.json".to_string(),
+            ));
+        }
 
         if !response.status().is_success() {
-            anyhow::bail!(
-                "Failed to download Node index.json: HTTP {}",
-                response.status()
-            );
+            return Err(CapsuleError::Network(
+                response.error_for_status().unwrap_err(),
+            ));
         }
 
         let json: serde_json::Value = response
             .json()
             .await
-            .context("Failed to parse Node index.json")?;
-        let arr = json.as_array().context("Node index.json is not an array")?;
+            .map_err(CapsuleError::Network)?;
+        let arr = json.as_array().ok_or_else(|| {
+            CapsuleError::Pack("Node index.json is not an array".to_string())
+        })?;
 
         for item in arr {
             let v = match item.get("version").and_then(|v| v.as_str()) {
@@ -636,7 +709,10 @@ impl RuntimeFetcher {
             }
         }
 
-        anyhow::bail!("Could not resolve Node version for hint: {}", version_hint)
+        Err(CapsuleError::Pack(format!(
+            "Could not resolve Node version for hint: {}",
+            version_hint
+        )))
     }
 
     fn node_artifact_filename(full_version: &str, os: &str, arch: &str) -> Result<(String, bool)> {
@@ -644,7 +720,7 @@ impl RuntimeFetcher {
             "linux" => ("linux", false),
             "macos" => ("darwin", false),
             "windows" => ("win", true),
-            _ => anyhow::bail!("Unsupported OS for Node: {}", os),
+            _ => return Err(CapsuleError::Pack(format!("Unsupported OS for Node: {}", os))),
         };
 
         let arch = match (os, arch) {
@@ -652,7 +728,7 @@ impl RuntimeFetcher {
             ("windows", "aarch64") => "arm64",
             (_, "x86_64") => "x64",
             (_, "aarch64") => "arm64",
-            _ => anyhow::bail!("Unsupported arch for Node: {}", arch),
+            _ => return Err(CapsuleError::Pack(format!("Unsupported arch for Node: {}", arch))),
         };
 
         let filename = if is_zip {
@@ -666,7 +742,8 @@ impl RuntimeFetcher {
 }
 
 fn toolchain_cache_dir() -> Result<PathBuf> {
-    let home = dirs::home_dir().context("Failed to determine home directory")?;
+    let home = dirs::home_dir()
+        .ok_or_else(|| CapsuleError::Config("Failed to determine home directory".to_string()))?;
     Ok(home.join(".nacelle").join("toolchain"))
 }
 

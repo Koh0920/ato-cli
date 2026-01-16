@@ -1,5 +1,6 @@
+use crate::error::Result;
 use crate::metrics::{MetricsSession, ResourceStats, RuntimeMetadata, UnifiedMetrics};
-use crate::runtime::{Measurable, MetricsResult, RuntimeHandle};
+use crate::runtime::{Measurable, RuntimeHandle};
 use async_trait::async_trait;
 
 /// Wasm 実行のメトリクスハンドル（暫定スタブ）。
@@ -35,14 +36,14 @@ impl RuntimeHandle for WasmHandle {
         &self.module_hash
     }
 
-    fn kill(&mut self) -> MetricsResult<()> {
+    fn kill(&mut self) -> Result<()> {
         Ok(())
     }
 }
 
 #[async_trait]
 impl Measurable for WasmHandle {
-    async fn capture_metrics(&self) -> MetricsResult<UnifiedMetrics> {
+    async fn capture_metrics(&self) -> Result<UnifiedMetrics> {
         let resources = ResourceStats {
             duration_ms: self.session.elapsed_ms(),
             ..ResourceStats::default()
@@ -50,7 +51,7 @@ impl Measurable for WasmHandle {
         Ok(self.session.snapshot(resources, self.metadata()))
     }
 
-    async fn wait_and_finalize(&self) -> MetricsResult<UnifiedMetrics> {
+    async fn wait_and_finalize(&self) -> Result<UnifiedMetrics> {
         let resources = ResourceStats {
             duration_ms: self.session.elapsed_ms(),
             ..ResourceStats::default()

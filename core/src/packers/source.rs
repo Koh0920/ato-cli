@@ -1,6 +1,6 @@
-use anyhow::Result;
 use std::path::PathBuf;
 
+use crate::error::{CapsuleError, Result};
 use crate::engine;
 use crate::manifest;
 use crate::packers::bundle::{build_bundle, PackBundleArgs};
@@ -34,12 +34,13 @@ pub fn pack(
             futures::executor::block_on(
                 reporter.notify("🧩 Phase 0: Checking CAS for source_digest".to_string()),
             )?;
-            let cas = create_cas_client_from_env().map_err(|e| anyhow::anyhow!(e))?;
-            let exists = rt
-                .block_on(cas.exists(digest))
-                .map_err(|e| anyhow::anyhow!(e))?;
+            let cas = create_cas_client_from_env()?;
+            let exists = rt.block_on(cas.exists(digest))?;
             if !exists {
-                anyhow::bail!("CAS blob not found for source_digest: {}", digest);
+                return Err(CapsuleError::NotFound(format!(
+                    "CAS blob not found for source_digest: {}",
+                    digest
+                )));
             }
         }
     }
@@ -67,7 +68,7 @@ pub fn pack(
                                 .to_string(),
                         ),
                     )?;
-                    anyhow::bail!("L1 Source Policy check failed");
+                    return Err(CapsuleError::Pack("L1 Source Policy check failed".to_string()));
                 }
             }
         } else {
