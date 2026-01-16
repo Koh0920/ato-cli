@@ -168,7 +168,33 @@ enum EngineCommands {
     },
 }
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(err) = run() {
+        if let Some(capsule_error) = err.downcast_ref::<capsule_core::CapsuleError>() {
+            match capsule_error {
+                capsule_core::CapsuleError::AuthRequired(target) => {
+                    eprintln!("🛑 Authentication Required");
+                    eprintln!("Please login or provide credentials: {}", target);
+                }
+                capsule_core::CapsuleError::ContainerEngine(msg) => {
+                    eprintln!("🛑 Container engine unavailable");
+                    eprintln!("{}", msg);
+                }
+                capsule_core::CapsuleError::Pack(msg) => {
+                    eprintln!("❌ Build Failed: {}", msg);
+                }
+                _ => {
+                    eprintln!("Error: {}", err);
+                }
+            }
+        } else {
+            eprintln!("Unexpected Error: {:?}", err);
+        }
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
     let reporter = std::sync::Arc::new(reporters::CliReporter::new(cli.json));
 
