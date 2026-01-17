@@ -778,4 +778,188 @@ egress_allow = ["1.1.1.1"]
         assert!(config["services"].get("main").is_some());
         assert!(config["sandbox"]["network"]["egress"].is_object());
     }
+
+    #[test]
+    fn test_python_app_config_generation() {
+        let tmp = tempdir().unwrap();
+        let manifest_path = tmp.path().join("capsule.toml");
+
+        let manifest = r#"
+    schema_version = "1.0"
+    name = "python-demo"
+    version = "0.1.0"
+    type = "app"
+
+    [targets]
+    source_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+    [targets.source]
+    language = "python"
+    version = "3.11"
+    entrypoint = "main.py"
+
+    [execution]
+    runtime = "source"
+    entrypoint = "main.py"
+
+    [execution.env]
+    PORT = "8080"
+    "#;
+
+        std::fs::write(&manifest_path, manifest).unwrap();
+
+        let config_path = generate_and_write_config(&manifest_path, None).unwrap();
+        let config_raw = std::fs::read_to_string(config_path).unwrap();
+        let config: ConfigJson = serde_json::from_str(&config_raw).unwrap();
+
+        assert_eq!(config.services["main"].executable, "runtime/python/bin/python3");
+        assert_eq!(config.services["main"].args, vec!["source/main.py"]);
+        assert_eq!(config.services["main"].cwd, Some("source".to_string()));
+        assert_eq!(
+            config.services["main"].env.as_ref().unwrap()["PYTHONHOME"],
+            "runtime/python"
+        );
+        assert_eq!(
+            config.services["main"].env.as_ref().unwrap()["PYTHONPATH"],
+            "source"
+        );
+        assert_eq!(
+            config.services["main"].env.as_ref().unwrap()["PORT"],
+            "8080"
+        );
+    }
+
+    #[test]
+    fn test_node_app_config_generation() {
+        let tmp = tempdir().unwrap();
+        let manifest_path = tmp.path().join("capsule.toml");
+
+        let manifest = r#"
+    schema_version = "1.0"
+    name = "node-demo"
+    version = "0.1.0"
+    type = "app"
+
+    [targets]
+    source_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+    [targets.source]
+    language = "node"
+    version = "20"
+    entrypoint = "index.js"
+
+    [execution]
+    runtime = "source"
+    entrypoint = "index.js"
+    "#;
+
+        std::fs::write(&manifest_path, manifest).unwrap();
+
+        let config_path = generate_and_write_config(&manifest_path, None).unwrap();
+        let config_raw = std::fs::read_to_string(config_path).unwrap();
+        let config: ConfigJson = serde_json::from_str(&config_raw).unwrap();
+
+        assert_eq!(config.services["main"].executable, "runtime/node/bin/node");
+        assert_eq!(config.services["main"].args, vec!["source/index.js"]);
+        assert_eq!(config.services["main"].cwd, Some("source".to_string()));
+    }
+
+    #[test]
+    fn test_deno_app_config_generation() {
+        let tmp = tempdir().unwrap();
+        let manifest_path = tmp.path().join("capsule.toml");
+
+        let manifest = r#"
+    schema_version = "1.0"
+    name = "deno-demo"
+    version = "0.1.0"
+    type = "app"
+
+    [targets]
+    source_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+    [targets.source]
+    language = "deno"
+    version = "1.40"
+    entrypoint = "server.ts"
+
+    [execution]
+    runtime = "source"
+    entrypoint = "server.ts"
+    "#;
+
+        std::fs::write(&manifest_path, manifest).unwrap();
+
+        let config_path = generate_and_write_config(&manifest_path, None).unwrap();
+        let config_raw = std::fs::read_to_string(config_path).unwrap();
+        let config: ConfigJson = serde_json::from_str(&config_raw).unwrap();
+
+        assert_eq!(config.services["main"].executable, "runtime/deno/bin/deno");
+        assert_eq!(config.services["main"].args, vec!["source/server.ts"]);
+    }
+
+    #[test]
+    fn test_bun_app_config_generation() {
+        let tmp = tempdir().unwrap();
+        let manifest_path = tmp.path().join("capsule.toml");
+
+        let manifest = r#"
+    schema_version = "1.0"
+    name = "bun-demo"
+    version = "0.1.0"
+    type = "app"
+
+    [targets]
+    source_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+    [targets.source]
+    language = "bun"
+    version = "1.1"
+    entrypoint = "main.ts"
+
+    [execution]
+    runtime = "source"
+    entrypoint = "main.ts"
+    "#;
+
+        std::fs::write(&manifest_path, manifest).unwrap();
+
+        let config_path = generate_and_write_config(&manifest_path, None).unwrap();
+        let config_raw = std::fs::read_to_string(config_path).unwrap();
+        let config: ConfigJson = serde_json::from_str(&config_raw).unwrap();
+
+        assert_eq!(config.services["main"].executable, "runtime/bun/bin/bun");
+        assert_eq!(config.services["main"].args, vec!["source/main.ts"]);
+    }
+
+    #[test]
+    fn test_custom_binary_config_generation() {
+        let tmp = tempdir().unwrap();
+        let manifest_path = tmp.path().join("capsule.toml");
+
+        let manifest = r#"
+    schema_version = "1.0"
+    name = "custom-demo"
+    version = "0.1.0"
+    type = "app"
+
+    [targets]
+    source_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+    [targets.source]
+    entrypoint = "./my-app"
+
+    [execution]
+    runtime = "source"
+    entrypoint = "./my-app"
+    "#;
+
+        std::fs::write(&manifest_path, manifest).unwrap();
+
+        let config_path = generate_and_write_config(&manifest_path, None).unwrap();
+        let config_raw = std::fs::read_to_string(config_path).unwrap();
+        let config: ConfigJson = serde_json::from_str(&config_raw).unwrap();
+
+        assert_eq!(config.services["main"].executable, "source/my-app");
+    }
 }

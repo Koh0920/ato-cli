@@ -52,7 +52,7 @@ bun run build
 `capsule.toml` の `[execution]` に加えて、以下のプロファイルをサポートします。
 
 - `[execution.dev]`:
-	- `capsule dev` / `nacelle dev` が優先して使う
+	- `capsule dev` が優先して使う
 - `[execution.release]`:
 	- `nacelle-bundle` 実行（=配布物）が優先して使う
 
