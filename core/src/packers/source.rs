@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
-use crate::error::{CapsuleError, Result};
 use crate::engine;
+use crate::error::{CapsuleError, Result};
 use crate::manifest;
 use crate::packers::bundle::{build_bundle, PackBundleArgs};
 use crate::r3_config;
@@ -68,7 +68,9 @@ pub fn pack(
                                 .to_string(),
                         ),
                     )?;
-                    return Err(CapsuleError::Pack("L1 Source Policy check failed".to_string()));
+                    return Err(CapsuleError::Pack(
+                        "L1 Source Policy check failed".to_string(),
+                    ));
                 }
             }
         } else {

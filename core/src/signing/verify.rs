@@ -7,8 +7,8 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
-use crate::error::{CapsuleError, Result};
 use super::sign::CapsuleSignature;
+use crate::error::{CapsuleError, Result};
 
 /// Verify a signed bundle
 ///
@@ -29,8 +29,8 @@ pub fn verify_bundle(bundle_path: &Path, trusted_public_keys: &[String]) -> Resu
     }
 
     let sig_json = std::fs::read_to_string(&sig_path)?;
-    let sig_data: CapsuleSignature = serde_json::from_str(&sig_json)
-        .map_err(|e| CapsuleError::Crypto(e.to_string()))?;
+    let sig_data: CapsuleSignature =
+        serde_json::from_str(&sig_json).map_err(|e| CapsuleError::Crypto(e.to_string()))?;
 
     // Read manifest
     let manifest_path = bundle_path.join("capsule.toml");

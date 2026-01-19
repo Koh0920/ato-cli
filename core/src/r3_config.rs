@@ -182,7 +182,8 @@ fn build_config_json(
 ) -> Result<ConfigJson> {
     let mut services = HashMap::new();
     let entrypoint = read_entrypoint(manifest)?;
-    let (executable, args, env, signals) = resolve_command(&entrypoint, manifest);
+    let command = read_command(manifest);
+    let (executable, args, env, signals) = resolve_command(&entrypoint, command.as_deref(), manifest);
     let main_spec = ServiceSpec {
         executable,
         args,
@@ -217,7 +218,9 @@ fn build_config_json(
                 );
             }
 
-            let (executable, args, env, signals) = resolve_command(&svc.entrypoint, manifest);
+            let command = None;
+            let (executable, args, env, signals) =
+                resolve_command(&svc.entrypoint, command, manifest);
             let health_check = svc.readiness_probe.as_ref().map(|p| HealthCheck {
                 http_get: p.http_get.clone(),
                 tcp_connect: p.tcp_connect.clone(),
@@ -304,6 +307,15 @@ fn validate_config_json(config: &ConfigJson) -> Result<()> {
     Ok(())
 }
 
+fn read_command(manifest: &toml::Value) -> Option<String> {
+    manifest
+        .get("execution")
+        .and_then(|e| e.get("release").and_then(|r| r.get("command")).or_else(|| e.get("command")))
+        .and_then(|c| c.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 fn read_entrypoint(manifest: &toml::Value) -> Result<String> {
     let entrypoint = manifest
         .get("targets")
@@ -314,9 +326,7 @@ fn read_entrypoint(manifest: &toml::Value) -> Result<String> {
             manifest.get("execution").and_then(|e| {
                 e.get("release")
                     .and_then(|r| r.get("entrypoint"))
-                    .or_else(|| e.get("release").and_then(|r| r.get("command")))
                     .or_else(|| e.get("entrypoint"))
-                    .or_else(|| e.get("command"))
                     .and_then(|v| v.as_str())
             })
         })
@@ -478,8 +488,20 @@ fn build_egress(manifest: &toml::Value) -> Result<Option<EgressConfig>> {
     Ok(Some(egress))
 }
 
-fn resolve_command(entrypoint: &str, manifest: &toml::Value) -> CommandResolution {
-    let tokens = shell_words::split(entrypoint).unwrap_or_else(|_| vec![entrypoint.to_string()]);
+fn resolve_command(entrypoint: &str, command: Option<&str>, manifest: &toml::Value) -> CommandResolution {
+    // `execution.entrypoint` is the program (and optional args) to start.
+    // `execution.command` is an additional argument string, commonly used like:
+    // entrypoint = "bash"
+    // command = "-c 'echo Hello'"
+    // We treat it as extra tokens appended to the entrypoint tokens.
+    let mut tokens =
+        shell_words::split(entrypoint).unwrap_or_else(|_| vec![entrypoint.to_string()]);
+    if let Some(command) = command {
+        if !command.trim().is_empty() {
+            let extra = shell_words::split(command).unwrap_or_else(|_| vec![command.to_string()]);
+            tokens.extend(extra);
+        }
+    }
     let program = tokens
         .first()
         .cloned()
@@ -812,7 +834,10 @@ egress_allow = ["1.1.1.1"]
         let config_raw = std::fs::read_to_string(config_path).unwrap();
         let config: ConfigJson = serde_json::from_str(&config_raw).unwrap();
 
-        assert_eq!(config.services["main"].executable, "runtime/python/bin/python3");
+        assert_eq!(
+            config.services["main"].executable,
+            "runtime/python/bin/python3"
+        );
         assert_eq!(config.services["main"].args, vec!["source/main.py"]);
         assert_eq!(config.services["main"].cwd, Some("source".to_string()));
         assert_eq!(

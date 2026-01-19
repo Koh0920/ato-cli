@@ -6,6 +6,7 @@ use capsule_core::router::ManifestData;
 
 use capsule_core::CapsuleReporter;
 
+use crate::common::proxy;
 pub fn execute(
     plan: &ManifestData,
     reporter: std::sync::Arc<crate::reporters::CliReporter>,
@@ -41,6 +42,10 @@ pub fn execute(
 
     for (k, v) in plan.execution_env() {
         cmd.env(k, v);
+    }
+
+    if let Some(proxy_env) = proxy::proxy_env_from_env(&[])? {
+        proxy::apply_proxy_env(&mut cmd, &proxy_env);
     }
 
     let status = cmd

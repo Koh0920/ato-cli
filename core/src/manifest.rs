@@ -47,10 +47,7 @@ pub fn load_manifest(path: &Path) -> Result<LoadedManifest> {
 
     if let Some(targets) = model.targets.as_ref() {
         if let Err(err) = targets.validate_source_digest() {
-            return Err(CapsuleError::Manifest(
-                path.to_path_buf(),
-                err.to_string(),
-            ));
+            return Err(CapsuleError::Manifest(path.to_path_buf(), err.to_string()));
         }
     }
 

@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tar::Builder;
 
-use crate::error::{CapsuleError, Result};
 use super::runtime_fetcher::RuntimeFetcher;
+use crate::error::{CapsuleError, Result};
 
 /// Magic bytes to identify self-extracting v2 bundles.
 const BUNDLE_MAGIC: &[u8] = b"NACELLE_V2_BUNDLE";
@@ -284,7 +284,11 @@ fn decide_runtime_to_bundle(
 
 fn read_manifest_source_target_hint(manifest_path: &Path) -> Result<Option<SourceTargetHint>> {
     let raw = fs::read_to_string(manifest_path).map_err(|e| {
-        CapsuleError::Pack(format!("Failed to read manifest {}: {}", manifest_path.display(), e))
+        CapsuleError::Pack(format!(
+            "Failed to read manifest {}: {}",
+            manifest_path.display(),
+            e
+        ))
     })?;
 
     let manifest: toml::Value = toml::from_str(&raw).map_err(|e| {
@@ -342,7 +346,11 @@ fn read_manifest_entrypoint(
     }
 
     let raw = fs::read_to_string(manifest_path).map_err(|e| {
-        CapsuleError::Pack(format!("Failed to read manifest {}: {}", manifest_path.display(), e))
+        CapsuleError::Pack(format!(
+            "Failed to read manifest {}: {}",
+            manifest_path.display(),
+            e
+        ))
     })?;
 
     let manifest: toml::Value = toml::from_str(&raw).map_err(|e| {
@@ -503,7 +511,11 @@ fn append_file(builder: &mut Builder<&mut Vec<u8>>, file: &Path, target: &str) -
 
 fn read_build_exclude_patterns(manifest_path: &Path) -> Result<Vec<String>> {
     let raw = fs::read_to_string(manifest_path).map_err(|e| {
-        CapsuleError::Pack(format!("Failed to read manifest {}: {}", manifest_path.display(), e))
+        CapsuleError::Pack(format!(
+            "Failed to read manifest {}: {}",
+            manifest_path.display(),
+            e
+        ))
     })?;
 
     let manifest: toml::Value = toml::from_str(&raw).map_err(|e| {

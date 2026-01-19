@@ -88,26 +88,20 @@ impl RuntimeFetcher {
             return Ok(runtime_dir);
         }
 
-        let _lock = self
-            .acquire_install_lock(key, version)
-            .await
-            .map_err(|e| {
-                CapsuleError::Pack(format!(
-                    "Failed to acquire install lock for {} {}: {}",
-                    key, version, e
-                ))
-            })?;
+        let _lock = self.acquire_install_lock(key, version).await.map_err(|e| {
+            CapsuleError::Pack(format!(
+                "Failed to acquire install lock for {} {}: {}",
+                key, version, e
+            ))
+        })?;
 
         if runtime_dir.exists() {
             return Ok(runtime_dir);
         }
 
-        let fetcher = self
-            .fetchers
-            .get(key)
-            .ok_or_else(|| {
-                CapsuleError::Pack(format!("No runtime fetcher registered for: {}", key))
-            })?;
+        let fetcher = self.fetchers.get(key).ok_or_else(|| {
+            CapsuleError::Pack(format!("No runtime fetcher registered for: {}", key))
+        })?;
 
         debug!("Using runtime fetcher: {}", fetcher.language());
 
@@ -168,10 +162,12 @@ impl RuntimeFetcher {
             match file.try_lock_exclusive() {
                 Ok(()) => Ok(RuntimeInstallLock { _file: file }),
                 Err(e) if e.kind() == fs2::lock_contended_error().kind() => {
-                    file.lock_exclusive()
-                        .map_err(|e| {
-                            CapsuleError::Pack(format!("Failed to wait for lock {:?}: {}", lock_path, e))
-                        })?;
+                    file.lock_exclusive().map_err(|e| {
+                        CapsuleError::Pack(format!(
+                            "Failed to wait for lock {:?}: {}",
+                            lock_path, e
+                        ))
+                    })?;
                     Ok(RuntimeInstallLock { _file: file })
                 }
                 Err(e) => Err(CapsuleError::Pack(format!(
@@ -317,10 +313,7 @@ impl RuntimeFetcher {
             ));
         }
 
-        let text = response
-            .text()
-            .await
-            .map_err(CapsuleError::Network)?;
+        let text = response.text().await.map_err(CapsuleError::Network)?;
         Self::parse_sha256_from_text(&text, filename_hint)
     }
 
@@ -503,10 +496,16 @@ impl RuntimeFetcher {
             }
 
             let mut outfile = File::create(&out_path).map_err(|e| {
-                CapsuleError::Pack(format!("Failed to create extracted file {:?}: {}", out_path, e))
+                CapsuleError::Pack(format!(
+                    "Failed to create extracted file {:?}: {}",
+                    out_path, e
+                ))
             })?;
             copy(&mut entry, &mut outfile).map_err(|e| {
-                CapsuleError::Pack(format!("Failed to extract zip entry to {:?}: {}", out_path, e))
+                CapsuleError::Pack(format!(
+                    "Failed to extract zip entry to {:?}: {}",
+                    out_path, e
+                ))
             })?;
 
             #[cfg(unix)]
@@ -690,13 +689,10 @@ impl RuntimeFetcher {
             ));
         }
 
-        let json: serde_json::Value = response
-            .json()
-            .await
-            .map_err(CapsuleError::Network)?;
-        let arr = json.as_array().ok_or_else(|| {
-            CapsuleError::Pack("Node index.json is not an array".to_string())
-        })?;
+        let json: serde_json::Value = response.json().await.map_err(CapsuleError::Network)?;
+        let arr = json
+            .as_array()
+            .ok_or_else(|| CapsuleError::Pack("Node index.json is not an array".to_string()))?;
 
         for item in arr {
             let v = match item.get("version").and_then(|v| v.as_str()) {
@@ -720,7 +716,12 @@ impl RuntimeFetcher {
             "linux" => ("linux", false),
             "macos" => ("darwin", false),
             "windows" => ("win", true),
-            _ => return Err(CapsuleError::Pack(format!("Unsupported OS for Node: {}", os))),
+            _ => {
+                return Err(CapsuleError::Pack(format!(
+                    "Unsupported OS for Node: {}",
+                    os
+                )))
+            }
         };
 
         let arch = match (os, arch) {
@@ -728,7 +729,12 @@ impl RuntimeFetcher {
             ("windows", "aarch64") => "arm64",
             (_, "x86_64") => "x64",
             (_, "aarch64") => "arm64",
-            _ => return Err(CapsuleError::Pack(format!("Unsupported arch for Node: {}", arch))),
+            _ => {
+                return Err(CapsuleError::Pack(format!(
+                    "Unsupported arch for Node: {}",
+                    arch
+                )))
+            }
         };
 
         let filename = if is_zip {

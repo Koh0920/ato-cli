@@ -29,9 +29,8 @@ impl ManifestVerifier {
 
     /// Verify a manifest signature using JSON input.
     pub fn verify(&self, manifest_bytes: &[u8], signature: &[u8], capsule_id: &str) -> Result<()> {
-        let manifest: CapsuleManifestV1 =
-            serde_json::from_slice(manifest_bytes)
-                .map_err(|e| CapsuleError::Crypto(format!("failed to parse manifest JSON: {}", e)))?;
+        let manifest: CapsuleManifestV1 = serde_json::from_slice(manifest_bytes)
+            .map_err(|e| CapsuleError::Crypto(format!("failed to parse manifest JSON: {}", e)))?;
         self.verify_manifest(&manifest, signature, capsule_id)
     }
 
@@ -42,9 +41,8 @@ impl ManifestVerifier {
         signature: &[u8],
         _capsule_id: &str,
     ) -> Result<()> {
-        let canonical_bytes =
-            manifest_to_capnp_bytes(manifest)
-                .map_err(|e| CapsuleError::Crypto(format!("failed to build canonical bytes: {}", e)))?;
+        let canonical_bytes = manifest_to_capnp_bytes(manifest)
+            .map_err(|e| CapsuleError::Crypto(format!("failed to build canonical bytes: {}", e)))?;
         self.verify_bytes(&canonical_bytes, signature)
     }
 
@@ -115,8 +113,9 @@ fn parse_signature_bytes(data: &[u8]) -> Result<SignatureFile> {
         return Err(CapsuleError::Crypto("Invalid signature format".to_string()));
     }
     let metadata_bytes = &data[offset..offset + metadata_len];
-    let metadata: Value = serde_json::from_slice(metadata_bytes)
-        .map_err(|e| CapsuleError::Crypto(format!("failed to parse signature metadata JSON: {}", e)))?;
+    let metadata: Value = serde_json::from_slice(metadata_bytes).map_err(|e| {
+        CapsuleError::Crypto(format!("failed to parse signature metadata JSON: {}", e))
+    })?;
 
     Ok(SignatureFile {
         version,
