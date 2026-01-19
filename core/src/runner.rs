@@ -86,7 +86,10 @@ where
 
     async fn handle_timeout(&mut self) -> Result<UnifiedMetrics> {
         let _ = self.handle.kill();
-        match timeout(self.config.finalize_timeout, self.handle.wait_and_finalize())
+        match timeout(
+            self.config.finalize_timeout,
+            self.handle.wait_and_finalize(),
+        )
         .await
         {
             Ok(result) => {

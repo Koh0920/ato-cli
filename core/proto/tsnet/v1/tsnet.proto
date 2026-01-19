@@ -1,0 +1,49 @@
+syntax = "proto3";
+
+package tsnet.v1;
+
+service TsnetService {
+  rpc Start(StartRequest) returns (StartResponse);
+  rpc Stop(StopRequest) returns (StopResponse);
+  rpc Status(StatusRequest) returns (StatusResponse);
+}
+
+message StartRequest {
+  string control_url = 1;
+  string auth_key = 2;
+  string hostname = 3;
+  uint32 socks_port = 4;
+}
+
+message StartResponse {
+  TsnetState state = 1;
+  uint32 socks_port = 2;
+  string message = 3;
+}
+
+message StopRequest {
+  bool force = 1;
+}
+
+message StopResponse {
+  TsnetState state = 1;
+  string message = 2;
+}
+
+message StatusRequest {}
+
+message StatusResponse {
+  TsnetState state = 1;
+  uint32 socks_port = 2;
+  bool connected = 3;
+  string last_error = 4;
+}
+
+enum TsnetState {
+  TSNET_STATE_UNSPECIFIED = 0;
+  TSNET_STATE_STOPPED = 1;
+  TSNET_STATE_STARTING = 2;
+  TSNET_STATE_RUNNING = 3;
+  TSNET_STATE_STOPPING = 4;
+  TSNET_STATE_FAILED = 5;
+}

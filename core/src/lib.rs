@@ -2,8 +2,8 @@
 
 pub mod common;
 pub mod config;
-pub mod error;
 pub mod engine;
+pub mod error;
 pub mod executors;
 pub mod hardware;
 pub mod manifest;
@@ -19,14 +19,20 @@ pub mod runtime;
 pub mod schema;
 pub mod security;
 pub mod signing;
+pub mod tsnet;
 pub mod types;
 pub mod validation;
 
-pub use metrics::{MetricsSession, ResourceStats, RuntimeMetadata, UnifiedMetrics};
 pub use error::{CapsuleError, Result};
+pub use metrics::{MetricsSession, ResourceStats, RuntimeMetadata, UnifiedMetrics};
 pub use reporter::{CapsuleReporter, NoOpReporter, UsageReporter};
 pub use runner::{SessionRunner, SessionRunnerConfig};
 pub use runtime::native::NativeHandle;
 pub use runtime::oci::OciHandle;
 pub use runtime::wasm::WasmHandle;
 pub use runtime::{Measurable, RuntimeHandle};
+pub use tsnet::{
+    discover_sidecar, spawn_sidecar, wait_for_ready, SidecarBaseConfig, SidecarRequest,
+    SidecarSpawnConfig, TsnetClient, TsnetConfig, TsnetEndpoint, TsnetHandle, TsnetState,
+    TsnetStatus, TsnetWaitConfig,
+};

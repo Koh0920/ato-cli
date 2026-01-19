@@ -1,21 +1,73 @@
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::json;
+use std::io::IsTerminal;
 use std::path::PathBuf;
-use std::process::Command;
 
 use capsule_core::CapsuleReporter;
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum EnforcementMode {
+    Strict,
+    BestEffort,
+}
+
+impl EnforcementMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            EnforcementMode::Strict => "strict",
+            EnforcementMode::BestEffort => "best_effort",
+        }
+    }
+}
+
+struct SidecarCleanup {
+    sidecar: Option<common::sidecar::SidecarHandle>,
+    reporter: std::sync::Arc<reporters::CliReporter>,
+}
+
+impl SidecarCleanup {
+    fn new(
+        sidecar: Option<common::sidecar::SidecarHandle>,
+        reporter: std::sync::Arc<reporters::CliReporter>,
+    ) -> Self {
+        Self { sidecar, reporter }
+    }
+
+    fn stop_now(&mut self) {
+        if let Some(sidecar) = self.sidecar.take() {
+            if let Err(err) = sidecar.stop() {
+                let _ = futures::executor::block_on(
+                    self.reporter
+                        .warn(format!("⚠️  Failed to stop sidecar: {}", err)),
+                );
+            }
+        }
+    }
+}
+
+impl Drop for SidecarCleanup {
+    fn drop(&mut self) {
+        self.stop_now();
+    }
+}
+
 #[cfg(feature = "manifest-signing")]
 mod capsule_capnp;
+mod commands;
 mod common;
+mod engine_manager;
+mod env;
+mod error_codes;
 mod executors;
 mod init;
 mod keygen;
 mod new;
 mod observability;
+mod process_manager;
 mod reporters;
 mod scaffold;
+mod sign;
 
 #[derive(Parser)]
 #[command(name = "capsule")]
@@ -42,11 +94,42 @@ enum Commands {
         command: EngineCommands,
     },
 
-    /// Run a capsule in dev mode (dispatches to engine)
-    Dev {
-        /// Path to capsule.toml
-        #[arg(long, default_value = "capsule.toml")]
-        manifest: PathBuf,
+    /// Setup and download engines
+    Setup {
+        /// Engine name to install (default: nacelle)
+        #[arg(long, default_value = "nacelle")]
+        engine: String,
+
+        /// Engine version (default: latest)
+        #[arg(long)]
+        version: Option<String>,
+
+        /// Skip SHA256 verification
+        #[arg(long, default_value_t = false)]
+        skip_verify: bool,
+    },
+
+    /// Run a capsule (local or archive)
+    Open {
+        /// Path to a .capsule archive or directory containing capsule.toml
+        #[arg()]
+        path: PathBuf,
+
+        /// Run in development mode (foreground) with hot-reloading on file changes
+        #[arg(long)]
+        watch: bool,
+
+        /// Run in background mode (detached)
+        #[arg(long)]
+        background: bool,
+
+        /// Path to nacelle engine binary (overrides NACELLE_PATH)
+        #[arg(long)]
+        nacelle: Option<PathBuf>,
+
+        /// Network enforcement mode
+        #[arg(long, value_enum, default_value_t = EnforcementMode::BestEffort)]
+        enforcement: EnforcementMode,
     },
 
     /// Create a new capsule project from a template
@@ -59,69 +142,107 @@ enum Commands {
         template: String,
     },
 
-    /// Initialize an existing project as a capsule (creates capsule.toml)
-    Init {
-        /// Target directory (default: current directory)
-        #[arg(long)]
-        path: Option<PathBuf>,
-
-        /// Skip prompts and use detected defaults
-        #[arg(long)]
-        yes: bool,
-    },
-
     /// Generate a new Ed25519 signing keypair
     Keygen {
-        /// Name for the key (default: timestamp-based)
+        /// Output base path (default: ./private.key and ./public.key)
         #[arg(long)]
-        name: Option<String>,
+        out: Option<PathBuf>,
+
+        /// Overwrite existing keys
+        #[arg(long, default_value_t = false)]
+        force: bool,
+
+        /// Output keys in StoredKey JSON format
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 
-    /// Build artifacts (dispatches to engine)
+    /// Create a capsule artifact from a directory
     Pack {
-        /// Path to capsule.toml
-        #[arg(long, default_value = "capsule.toml")]
-        manifest: PathBuf,
+        /// Directory containing capsule.toml (default: ".")
+        #[arg(default_value = ".")]
+        dir: PathBuf,
 
-        /// Create a self-extracting bundle (default)
-        #[arg(long, default_value_t = true)]
-        bundle: bool,
+        /// Initialize capsule.toml interactively if not found
+        #[arg(long, default_value_t = false)]
+        init: bool,
 
-        /// Output path (bundle)
-        #[arg(long)]
-        output: Option<PathBuf>,
-
-        /// Use a specific runtime directory (optional)
-        #[arg(long)]
-        runtime: Option<PathBuf>,
-
-        /// Path to signing key for L2 verification (optional)
+        /// Path to the signing key (optional)
         #[arg(long)]
         key: Option<PathBuf>,
 
-        /// Skip L1 source policy scan (dangerous!)
-        #[arg(long)]
-        skip_l1: bool,
-
-        /// Skip all validations (use only for testing)
-        #[arg(long)]
-        skip_validation: bool,
-
-        /// Network enforcement mode for R3 config.json (best_effort or strict)
-        #[arg(long, default_value = "best_effort", value_parser = ["best_effort", "strict"])]
-        enforcement: String,
-    },
-
-    /// Run a built self-extracting bundle
-    Open {
-        /// Path to bundle executable
-        path: PathBuf,
+        /// Network enforcement mode
+        #[arg(long, value_enum, default_value_t = EnforcementMode::BestEffort)]
+        enforcement: EnforcementMode,
     },
 
     /// Scaffold supporting files (e.g. Dockerfile)
     Scaffold {
         #[command(subcommand)]
         command: ScaffoldCommands,
+    },
+
+    /// Sign an existing artifact
+    Sign {
+        /// File to sign
+        target: PathBuf,
+
+        /// Path to the secret key
+        #[arg(long)]
+        key: PathBuf,
+
+        /// Output signature path (default: <target>.sig)
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+
+    /// List running capsules
+    Ps {
+        /// Show all capsules including stopped ones
+        #[arg(long, default_value_t = false)]
+        all: bool,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Stop a running capsule
+    Close {
+        /// Capsule ID (from ps output)
+        #[arg(long)]
+        id: Option<String>,
+
+        /// Capsule name (partial match)
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Stop all capsules matching the name
+        #[arg(long, default_value_t = false)]
+        all: bool,
+
+        /// Force kill (SIGKILL) instead of graceful shutdown (SIGTERM)
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
+
+    /// Show logs of a running capsule
+    Logs {
+        /// Capsule ID (from ps output)
+        #[arg(long)]
+        id: Option<String>,
+
+        /// Capsule name (partial match)
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Follow log output in real-time
+        #[arg(long, default_value_t = false)]
+        follow: bool,
+
+        /// Show last N lines
+        #[arg(long)]
+        tail: Option<usize>,
     },
 }
 
@@ -262,49 +383,109 @@ fn run() -> Result<()> {
             Ok(())
         }
 
-        Commands::Dev { manifest } => {
-            let decision = capsule_core::router::route_manifest(
-                &manifest,
-                capsule_core::router::ExecutionProfile::Dev,
-            )?;
+        Commands::Setup {
+            engine,
+            version,
+            skip_verify: _,
+        } => {
+            let em = engine_manager::EngineManager::new()?;
+            let version = version.unwrap_or_else(|| "latest".to_string());
+
+            let (url, sha256) = match engine.as_str() {
+                "nacelle" => {
+                    let os = if cfg!(target_os = "macos") {
+                        "darwin"
+                    } else if cfg!(target_os = "linux") {
+                        "linux"
+                    } else {
+                        anyhow::bail!("Unsupported OS");
+                    };
+                    let arch = if cfg!(target_arch = "x86_64") {
+                        "x64"
+                    } else if cfg!(target_arch = "aarch64") {
+                        "arm64"
+                    } else {
+                        anyhow::bail!("Unsupported architecture");
+                    };
+
+                    let ver = if version == "latest" {
+                        let resp = reqwest::blocking::get(
+                            "https://releases.capsule.dev/nacelle/latest.txt",
+                        )
+                        .context("Failed to fetch latest version")?
+                        .text()?;
+                        resp.trim().to_string()
+                    } else {
+                        version.clone()
+                    };
+
+                    let url = format!(
+                        "https://releases.capsule.dev/nacelle/{}/nacelle-{}-{}-{}",
+                        ver, ver, os, arch
+                    );
+                    (url, "".to_string())
+                }
+                _ => {
+                    anyhow::bail!(
+                        "Unknown engine: {}. Currently only 'nacelle' is supported.",
+                        engine
+                    );
+                }
+            };
+
+            let path = em.download_engine(&engine, &version, &url, &sha256, &*reporter)?;
 
             futures::executor::block_on(reporter.notify(format!(
-                "🧭 RuntimeRouter: {:?} ({})",
-                decision.kind, decision.reason
+                "✅ Engine {} v{} installed at {}",
+                engine,
+                version,
+                path.display()
             )))?;
 
-            let metrics = if matches!(
-                decision.kind,
-                capsule_core::router::RuntimeKind::Source | capsule_core::router::RuntimeKind::Oci
-            ) {
-                None
-            } else {
-                Some(observability::RunMetrics::start(
-                    decision.kind,
-                    reporter.clone(),
-                ))
-            };
-
-            let exit_code = match decision.kind {
-                capsule_core::router::RuntimeKind::Source => {
-                    executors::source::execute(&decision.plan, cli.nacelle, reporter.clone())?
-                }
-                capsule_core::router::RuntimeKind::Oci => {
-                    executors::oci::execute(&decision.plan, reporter.clone())?
-                }
-                capsule_core::router::RuntimeKind::Wasm => {
-                    executors::wasm::execute(&decision.plan, reporter.clone())?
-                }
-            };
-
-            if let Some(metrics) = metrics {
-                metrics.finish(exit_code).print()?;
+            let mut cfg = capsule_core::config::load_config()?;
+            cfg.engines.insert(
+                engine.clone(),
+                capsule_core::config::EngineRegistration {
+                    path: path.display().to_string(),
+                },
+            );
+            if cfg.default_engine.is_none() {
+                cfg.default_engine = Some(engine.clone());
             }
+            capsule_core::config::save_config(&cfg)?;
 
-            if exit_code != 0 {
-                std::process::exit(exit_code);
-            }
+            futures::executor::block_on(
+                reporter.notify("✅ Registered as default engine".to_string()),
+            )?;
+
             Ok(())
+        }
+
+        Commands::Open {
+            path,
+            watch,
+            background,
+            nacelle,
+            enforcement,
+        } => {
+            let target = if path.is_file() || path.extension().map_or(false, |ext| ext == "capsule")
+            {
+                path.clone()
+            } else {
+                path.join("capsule.toml")
+            };
+
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()?;
+                rt.block_on(commands::open::execute(commands::open::OpenArgs {
+                    target,
+                    watch,
+                    background,
+                    nacelle,
+                    enforcement: enforcement.as_str().to_string(),
+                    reporter: reporter.clone(),
+                }))
         }
 
         Commands::New { name, template } => new::execute(
@@ -315,24 +496,49 @@ fn run() -> Result<()> {
             reporter.clone(),
         ),
 
-        Commands::Init { path, yes } => {
-            init::execute(init::InitArgs { path, yes }, reporter.clone())
+        Commands::Keygen { out, force, json } => {
+            keygen::execute(keygen::KeygenArgs { out, force, json }, reporter.clone())
         }
 
-        Commands::Keygen { name } => keygen::execute(keygen::KeygenArgs { name }, reporter.clone()),
-
         Commands::Pack {
-            manifest,
-            bundle,
-            output,
-            runtime,
+            dir,
+            init,
             key,
-            skip_l1,
-            skip_validation,
             enforcement,
         } => {
-            if !bundle {
-                anyhow::bail!("Only bundle output is supported (use --bundle)");
+            let dir = dir
+                .canonicalize()
+                .with_context(|| format!("Failed to resolve directory: {}", dir.display()))?;
+            if !dir.is_dir() {
+                anyhow::bail!("Target is not a directory: {}", dir.display());
+            }
+
+            let manifest = dir.join("capsule.toml");
+            if !manifest.exists() {
+                let stdin_is_tty = std::io::stdin().is_terminal();
+                if init {
+                    if !stdin_is_tty {
+                        anyhow::bail!("--init requires an interactive TTY");
+                    }
+                    if cli.json {
+                        anyhow::bail!("--init cannot be used with --json output");
+                    }
+                    init::execute(
+                        init::InitArgs {
+                            path: Some(dir.clone()),
+                            yes: false,
+                        },
+                        reporter.clone(),
+                    )?;
+                } else {
+                    anyhow::bail!(
+                        "capsule.toml not found. Use --init to create one, or specify a directory with capsule.toml."
+                    );
+                }
+            }
+
+            if !manifest.exists() {
+                anyhow::bail!("capsule.toml not found after initialization");
             }
 
             futures::executor::block_on(
@@ -364,66 +570,34 @@ fn run() -> Result<()> {
                         capsule_core::packers::source::SourcePackOptions {
                             manifest_path: manifest.clone(),
                             manifest_dir: manifest_dir.clone(),
-                            output,
-                            runtime,
-                            skip_l1,
-                            skip_validation,
-                            enforcement,
+                            output: None,
+                            runtime: None,
+                            skip_l1: false,
+                            skip_validation: false,
+                            enforcement: enforcement.as_str().to_string(),
                             nacelle_override: cli.nacelle,
                         },
                         reporter.clone(),
                     )?;
 
-                    if let Some(key_path) = key {
-                        if !skip_validation {
-                            futures::executor::block_on(
-                                reporter.notify("🔐 Phase 4: L2 Signature Generation".to_string()),
-                            )?;
-                            match capsule_core::signing::sign::sign_bundle(
-                                &artifact_path,
-                                &key_path,
-                                "capsule-cli",
-                            ) {
-                                Ok(_) => {
-                                    futures::executor::block_on(
-                                        reporter.notify(
-                                            "   ✅ Bundle signed successfully\n".to_string(),
-                                        ),
-                                    )?;
-                                }
-                                Err(e) => {
-                                    futures::executor::block_on(
-                                        reporter.warn(format!("   ❌ Signing failed: {}", e)),
-                                    )?;
-                                    anyhow::bail!("L2 Signature generation failed");
-                                }
-                            }
-                        }
-                    } else {
-                        futures::executor::block_on(reporter.notify(
-                            "ℹ️  Phase 4: L2 Signature skipped (no --key provided)\n".to_string(),
-                        ))?;
-                    }
+                    let _ = sign_if_requested(&artifact_path, key.as_ref(), reporter.clone())?;
 
                     futures::executor::block_on(
                         reporter.notify(format!("✅ Pack complete: {}", artifact_path.display())),
                     )?;
                 }
                 capsule_core::router::RuntimeKind::Oci => {
-                    if key.is_some() {
-                        futures::executor::block_on(reporter.notify(
-                            "ℹ️  L2 Signature skipped (OCI pack does not sign bundles)".to_string(),
-                        ))?;
-                    }
-                    let result = capsule_core::packers::oci::pack(
-                        &decision.plan,
-                        output,
-                        reporter.as_ref(),
-                    )?;
+                    let result =
+                        capsule_core::packers::oci::pack(&decision.plan, None, reporter.as_ref())?;
                     if let Some(path) = result.archive {
+                        let _ = sign_if_requested(&path, key.as_ref(), reporter.clone())?;
                         futures::executor::block_on(
                             reporter.notify(format!("✅ Pack complete: {}", path.display())),
                         )?;
+                    } else if key.is_some() {
+                        futures::executor::block_on(reporter.warn(
+                            "ℹ️  Signature skipped: OCI pack produced no archive file".to_string(),
+                        ))?;
                     } else {
                         futures::executor::block_on(
                             reporter.notify(format!("✅ Pack complete: {}", result.image)),
@@ -433,32 +607,17 @@ fn run() -> Result<()> {
                 capsule_core::router::RuntimeKind::Wasm => {
                     let result = capsule_core::packers::wasm::pack(
                         &decision.plan,
-                        output,
-                        key,
+                        None,
+                        None,
                         reporter.as_ref(),
                     )?;
                     futures::executor::block_on(
                         reporter.notify(format!("✅ Pack complete: {}", result.artifact.display())),
                     )?;
-                    if let Some(sig) = result.signature {
-                        futures::executor::block_on(
-                            reporter.notify(format!("✅ Signature: {}", sig.display())),
-                        )?;
-                    }
+                    let _ = sign_if_requested(&result.artifact, key.as_ref(), reporter.clone())?;
                 }
             }
 
-            Ok(())
-        }
-
-        Commands::Open { path } => {
-            let status = Command::new(&path)
-                .status()
-                .with_context(|| format!("Failed to execute bundle: {}", path.display()))?;
-
-            if !status.success() {
-                std::process::exit(status.code().unwrap_or(1));
-            }
             Ok(())
         }
 
@@ -479,5 +638,61 @@ fn run() -> Result<()> {
             },
             reporter.clone(),
         ),
+
+        Commands::Sign { target, key, out } => {
+            sign::execute(sign::SignArgs { target, key, out }, reporter.clone())
+        }
+
+        Commands::Ps { all, json } => {
+            commands::ps::execute(commands::ps::PsArgs { all, json }, reporter.clone())
+        }
+
+        Commands::Close {
+            id,
+            name,
+            all,
+            force,
+        } => commands::close::execute(
+            commands::close::CloseArgs {
+                id,
+                name,
+                all,
+                force,
+            },
+            reporter.clone(),
+        ),
+
+        Commands::Logs {
+            id,
+            name,
+            follow,
+            tail,
+        } => commands::logs::execute(
+            commands::logs::LogsArgs {
+                id,
+                name,
+                follow,
+                tail,
+            },
+            reporter.clone(),
+        ),
     }
+}
+
+fn sign_if_requested(
+    target: &std::path::Path,
+    key: Option<&PathBuf>,
+    reporter: std::sync::Arc<reporters::CliReporter>,
+) -> Result<Option<PathBuf>> {
+    if let Some(key_path) = key {
+        futures::executor::block_on(
+            reporter.notify("🔐 Generating detached signature...".to_string()),
+        )?;
+        let sig_path = capsule_core::signing::sign_artifact(target, key_path, "capsule-cli", None)?;
+        futures::executor::block_on(
+            reporter.notify(format!("✅ Signature: {}", sig_path.display())),
+        )?;
+        return Ok(Some(sig_path));
+    }
+    Ok(None)
 }

@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use tracing::{debug, info};
 
-use crate::error::{CapsuleError, Result};
 use super::RuntimeFetcher;
+use crate::error::{CapsuleError, Result};
 
 /// A checksum manifest URL and (optional) detached signature URL.
 ///
@@ -89,9 +89,7 @@ impl ToolchainFetcher for PythonFetcher {
             .download_with_progress(&download_url, &archive_path, show_progress)
             .await?;
 
-        provider
-            .verify_sha256_of_file(&archive_path, &expected_sha256)
-            ?;
+        provider.verify_sha256_of_file(&archive_path, &expected_sha256)?;
 
         let temp_dir = provider.cache_dir().join(format!("tmp-python-{}", version));
         if temp_dir.exists() {
@@ -108,10 +106,9 @@ impl ToolchainFetcher for PythonFetcher {
         if runtime_dir.exists() {
             std::fs::remove_dir_all(&runtime_dir)?;
         }
-        std::fs::rename(&temp_dir, &runtime_dir)
-            .map_err(|e| {
-                CapsuleError::Pack(format!("Failed to move extracted runtime to cache: {}", e))
-            })?;
+        std::fs::rename(&temp_dir, &runtime_dir).map_err(|e| {
+            CapsuleError::Pack(format!("Failed to move extracted runtime to cache: {}", e))
+        })?;
 
         let _ = std::fs::remove_file(&archive_path);
 
@@ -176,9 +173,7 @@ impl ToolchainFetcher for NodeFetcher {
             )
             .await?;
 
-        provider
-            .verify_sha256_of_file(&archive_path, &expected_sha256)
-            ?;
+        provider.verify_sha256_of_file(&archive_path, &expected_sha256)?;
 
         let temp_dir = provider
             .cache_dir()
@@ -201,10 +196,9 @@ impl ToolchainFetcher for NodeFetcher {
         if runtime_dir.exists() {
             std::fs::remove_dir_all(&runtime_dir)?;
         }
-        std::fs::rename(&temp_dir, &runtime_dir)
-            .map_err(|e| {
-                CapsuleError::Pack(format!("Failed to move extracted runtime to cache: {}", e))
-            })?;
+        std::fs::rename(&temp_dir, &runtime_dir).map_err(|e| {
+            CapsuleError::Pack(format!("Failed to move extracted runtime to cache: {}", e))
+        })?;
 
         let _ = std::fs::remove_file(&archive_path);
 
@@ -262,9 +256,7 @@ impl ToolchainFetcher for DenoFetcher {
             .fetch_expected_sha256(&(download_url.clone() + ".sha256"), None)
             .await?;
 
-        provider
-            .verify_sha256_of_file(&archive_path, &expected_sha256)
-            ?;
+        provider.verify_sha256_of_file(&archive_path, &expected_sha256)?;
 
         let temp_dir = provider.cache_dir().join(format!("tmp-deno-{}", version));
         if temp_dir.exists() {
@@ -281,10 +273,9 @@ impl ToolchainFetcher for DenoFetcher {
         if runtime_dir.exists() {
             std::fs::remove_dir_all(&runtime_dir)?;
         }
-        std::fs::rename(&temp_dir, &runtime_dir)
-            .map_err(|e| {
-                CapsuleError::Pack(format!("Failed to move extracted runtime to cache: {}", e))
-            })?;
+        std::fs::rename(&temp_dir, &runtime_dir).map_err(|e| {
+            CapsuleError::Pack(format!("Failed to move extracted runtime to cache: {}", e))
+        })?;
 
         let _ = std::fs::remove_file(&archive_path);
 
@@ -343,9 +334,7 @@ impl ToolchainFetcher for BunFetcher {
             .fetch_expected_sha256(&(download_url.clone() + ".sha256"), None)
             .await?;
 
-        provider
-            .verify_sha256_of_file(&archive_path, &expected_sha256)
-            ?;
+        provider.verify_sha256_of_file(&archive_path, &expected_sha256)?;
 
         let temp_dir = provider
             .cache_dir()
@@ -364,10 +353,9 @@ impl ToolchainFetcher for BunFetcher {
         if runtime_dir.exists() {
             std::fs::remove_dir_all(&runtime_dir)?;
         }
-        std::fs::rename(&temp_dir, &runtime_dir)
-            .map_err(|e| {
-                CapsuleError::Pack(format!("Failed to move extracted runtime to cache: {}", e))
-            })?;
+        std::fs::rename(&temp_dir, &runtime_dir).map_err(|e| {
+            CapsuleError::Pack(format!("Failed to move extracted runtime to cache: {}", e))
+        })?;
 
         let _ = std::fs::remove_file(&archive_path);
 

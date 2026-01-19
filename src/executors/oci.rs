@@ -14,6 +14,7 @@ use crate::reporters::CliReporter;
 use capsule_core::hardware;
 use capsule_core::router::ManifestData;
 
+use crate::common::proxy;
 #[derive(Debug, Clone)]
 enum OciEngine {
     Docker,
@@ -25,6 +26,9 @@ pub fn execute(plan: &ManifestData, reporter: std::sync::Arc<CliReporter>) -> Re
     let image = resolve_image(plan)?;
     let mut env = plan.execution_env();
     env.extend(plan.targets_oci_env());
+    if let Some(proxy_env) = proxy::proxy_env_from_env(&[])? {
+        proxy::extend_env_map(&mut env, &proxy_env);
+    }
 
     let mut cmd = Command::new(engine_binary(&engine));
     cmd.arg("run").arg("--rm");
@@ -83,17 +87,20 @@ pub fn execute(plan: &ManifestData, reporter: std::sync::Arc<CliReporter>) -> Re
         .with_context(|| format!("Failed to run OCI engine: {}", engine_binary(&engine)))?;
 
     let runtime = tokio::runtime::Runtime::new()?;
-    let metrics_result = runtime.block_on(run_oci_with_metrics(name, image_for_metrics, reporter.clone()));
+    let metrics_result = runtime.block_on(run_oci_with_metrics(
+        name,
+        image_for_metrics,
+        reporter.clone(),
+    ));
 
     let status = child
         .wait()
         .with_context(|| format!("Failed waiting for OCI engine: {}", engine_binary(&engine)))?;
 
     if let Err(err) = metrics_result {
-        let _ = futures::executor::block_on(reporter.warn(format!(
-            "⚠️  Metrics collection failed: {}",
-            err
-        )));
+        let _ = futures::executor::block_on(
+            reporter.warn(format!("⚠️  Metrics collection failed: {}", err)),
+        );
     }
 
     Ok(status.code().unwrap_or(1))

@@ -229,18 +229,12 @@ impl CasClient for HttpCasClient {
             ));
         }
 
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(CapsuleError::Network)?;
+        let bytes = response.bytes().await.map_err(CapsuleError::Network)?;
 
         // Verify hash
         let actual_hash = hex::encode(Sha256::digest(&bytes));
         if actual_hash != hash {
-            return Err(CapsuleError::HashMismatch(
-                hash.to_string(),
-                actual_hash,
-            ));
+            return Err(CapsuleError::HashMismatch(hash.to_string(), actual_hash));
         }
 
         // Write to cache

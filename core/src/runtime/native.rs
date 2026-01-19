@@ -134,7 +134,9 @@ impl Measurable for NativeHandle {
 
         #[cfg(not(unix))]
         {
-            Err(CapsuleError::Runtime("wait4 is not implemented".to_string()))
+            Err(CapsuleError::Runtime(
+                "wait4 is not implemented".to_string(),
+            ))
         }
     }
 }

@@ -10,6 +10,7 @@ path = "src/lib.rs"
 
 [dependencies]
 libc = "0.2"
+prost = "0.13"
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 anyhow = "1.0"
@@ -28,6 +29,10 @@ hex = "0.4"
 capnp = { version = "0.18", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 tar = "0.4"
+http = "0.2"
+hyper-util = { version = "0.1", features = ["tokio"] }
+tonic = { version = "0.12", default-features = false, features = ["transport", "codegen", "prost"] }
+tower = "0.4"
 flate2 = "1.0"
 zip = "2.1"
 sha2 = "0.10"
@@ -46,6 +51,9 @@ zstd = "0.13"
 
 [dev-dependencies]
 tempfile = "3"
+
+[build-dependencies]
+tonic-build = "0.12"
 
 [features]
 default = []

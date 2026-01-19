@@ -25,6 +25,15 @@ pub enum CapsuleError {
     #[error("Runtime error: {0}")]
     Runtime(String),
 
+    #[error("Sidecar IPC error: {0}")]
+    SidecarIpc(String),
+
+    #[error("Sidecar request failed ({0}): {1}")]
+    SidecarRequest(String, String),
+
+    #[error("Sidecar response error: {0}")]
+    SidecarResponse(String),
+
     #[error("Container engine error: {0}")]
     ContainerEngine(String),
 

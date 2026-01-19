@@ -44,15 +44,13 @@ pub fn pack(
             cmd.arg("--target").arg(target);
         }
 
-        let status = cmd
-            .status()
-            .map_err(|e| {
-                CapsuleError::Pack(format!(
-                    "Failed to run {} build: {}",
-                    engine_binary(&engine),
-                    e
-                ))
-            })?;
+        let status = cmd.status().map_err(|e| {
+            CapsuleError::Pack(format!(
+                "Failed to run {} build: {}",
+                engine_binary(&engine),
+                e
+            ))
+        })?;
         if !status.success() {
             return Err(CapsuleError::Pack("OCI build failed".to_string()));
         }

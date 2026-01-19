@@ -66,14 +66,13 @@ pub fn pack(
             return Err(CapsuleError::Pack("wasm-opt failed".to_string()));
         }
     } else {
-        fs::copy(&source_path, &output_path)
-            .map_err(|e| {
-                CapsuleError::Pack(format!(
-                    "Failed to copy wasm: {} ({})",
-                    source_path.display(),
-                    e
-                ))
-            })?;
+        fs::copy(&source_path, &output_path).map_err(|e| {
+            CapsuleError::Pack(format!(
+                "Failed to copy wasm: {} ({})",
+                source_path.display(),
+                e
+            ))
+        })?;
     }
 
     futures::executor::block_on(
