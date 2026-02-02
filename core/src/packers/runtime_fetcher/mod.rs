@@ -284,7 +284,7 @@ impl RuntimeFetcher {
             .await
     }
 
-    async fn fetch_expected_sha256(
+    pub(crate) async fn fetch_expected_sha256(
         &self,
         url: &str,
         filename_hint: Option<&str>,
@@ -586,7 +586,7 @@ impl RuntimeFetcher {
         }
     }
 
-    fn detect_platform() -> Result<(String, String)> {
+    pub(crate) fn detect_platform() -> Result<(String, String)> {
         let os = if cfg!(target_os = "linux") {
             "linux"
         } else if cfg!(target_os = "macos") {
@@ -608,7 +608,7 @@ impl RuntimeFetcher {
         Ok((os.to_string(), arch.to_string()))
     }
 
-    fn get_python_download_url(version: &str, os: &str, arch: &str) -> Result<String> {
+    pub(crate) fn get_python_download_url(version: &str, os: &str, arch: &str) -> Result<String> {
         let full_version = match version {
             "3.11" => "3.11.10",
             "3.12" => "3.12.7",
@@ -643,7 +643,7 @@ impl RuntimeFetcher {
         Ok(format!("{}/{}/{}", base_url, release_tag, filename))
     }
 
-    async fn resolve_node_full_version(version_hint: &str) -> Result<String> {
+    pub(crate) async fn resolve_node_full_version(version_hint: &str) -> Result<String> {
         let hint = Self::normalize_semverish(version_hint);
         let parts: Vec<&str> = hint.split('.').filter(|s| !s.is_empty()).collect();
         if parts.len() >= 3 {
@@ -711,7 +711,11 @@ impl RuntimeFetcher {
         )))
     }
 
-    fn node_artifact_filename(full_version: &str, os: &str, arch: &str) -> Result<(String, bool)> {
+    pub(crate) fn node_artifact_filename(
+        full_version: &str,
+        os: &str,
+        arch: &str,
+    ) -> Result<(String, bool)> {
         let (platform, is_zip) = match os {
             "linux" => ("linux", false),
             "macos" => ("darwin", false),
@@ -750,7 +754,7 @@ impl RuntimeFetcher {
 fn toolchain_cache_dir() -> Result<PathBuf> {
     let home = dirs::home_dir()
         .ok_or_else(|| CapsuleError::Config("Failed to determine home directory".to_string()))?;
-    Ok(home.join(".nacelle").join("toolchain"))
+    Ok(home.join(".capsule").join("toolchains"))
 }
 
 #[cfg(test)]

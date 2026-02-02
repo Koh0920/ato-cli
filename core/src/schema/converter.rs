@@ -1,7 +1,7 @@
-//! Cap'n Proto ↔ CapsuleManifestV1 conversion.
+//! Cap'n Proto ↔ CapsuleManifestV1 conversion (legacy signing).
 //!
 //! This module provides canonical Cap'n Proto serialization for UARC V1.1.0.
-//! The Cap'n Proto bytes are the sole signing ground truth per UARC spec.
+//! Cap'n Proto bytes are deprecated as signing input; JCS is canonical per ADR-002.
 
 use super::capnp as capsule_capnp;
 use crate::types::capsule_v1::{
@@ -88,7 +88,7 @@ fn transparency_level_to_capnp(t: TransparencyLevel) -> capsule_capnp::Transpare
 ///
 /// This function produces deterministic output regardless of how the manifest
 /// was originally constructed (from JSON, TOML, or Cap'n Proto). The output
-/// is suitable for signature verification as per UARC V1.1.0 Normative Decision #2.
+/// is suitable for legacy Cap'n Proto signature verification (deprecated).
 pub fn manifest_to_capnp_bytes(
     manifest: &CapsuleManifestV1,
 ) -> Result<Vec<u8>, CapnpConversionError> {

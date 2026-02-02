@@ -320,7 +320,7 @@ impl CasClient for HttpCasClient {
 /// Reads from environment variables:
 /// - `ATO_CAS_TYPE`: "local" or "http" (default: "local")
 /// - `ATO_CAS_ENDPOINT`: HTTP endpoint for remote CAS
-/// - `ATO_CAS_ROOT`: Root directory for local CAS (default: ~/.nacelle/cas)
+/// - `ATO_CAS_ROOT`: Root directory for local CAS (default: ~/.capsule/cas)
 #[allow(dead_code)] // Will be used when CAS integration is enabled
 pub fn create_cas_client_from_env() -> Result<Box<dyn CasClient>> {
     let cas_type = std::env::var("ATO_CAS_TYPE").unwrap_or_else(|_| "local".to_string());
@@ -333,7 +333,7 @@ pub fn create_cas_client_from_env() -> Result<Box<dyn CasClient>> {
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| {
                     crate::common::paths::nacelle_home_dir()
-                        .unwrap_or_else(|_| PathBuf::from("/tmp").join(".nacelle"))
+                        .unwrap_or_else(|_| PathBuf::from("/tmp").join(".capsule"))
                         .join("cas-cache")
                 });
             Ok(Box::new(HttpCasClient::new(endpoint, cache_dir)?))
@@ -343,7 +343,7 @@ pub fn create_cas_client_from_env() -> Result<Box<dyn CasClient>> {
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| {
                     crate::common::paths::nacelle_home_dir()
-                        .unwrap_or_else(|_| PathBuf::from("/tmp").join(".nacelle"))
+                        .unwrap_or_else(|_| PathBuf::from("/tmp").join(".capsule"))
                         .join("cas")
                 });
             Ok(Box::new(LocalCasClient::new(root)?))
@@ -355,7 +355,7 @@ pub fn create_cas_client_from_env() -> Result<Box<dyn CasClient>> {
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| {
                     crate::common::paths::nacelle_home_dir()
-                        .unwrap_or_else(|_| PathBuf::from("/tmp").join(".nacelle"))
+                        .unwrap_or_else(|_| PathBuf::from("/tmp").join(".capsule"))
                         .join("cas")
                 });
             Ok(Box::new(LocalCasClient::new(root)?))

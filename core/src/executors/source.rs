@@ -18,7 +18,7 @@ pub fn execute(plan: &ManifestData, nacelle_override: Option<PathBuf>) -> Result
         manifest_path: Some(plan.manifest_path.clone()),
     })?;
 
-    r3_config::generate_and_write_config(&plan.manifest_path, Some("best_effort".to_string()))?;
+    r3_config::generate_and_write_config(&plan.manifest_path, Some("best_effort".to_string()), false)?;
 
     let runtime = tokio::runtime::Runtime::new()?;
 

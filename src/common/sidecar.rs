@@ -112,6 +112,7 @@ async fn start_and_wait(
         auth_key,
         hostname,
         socks_port,
+        allow_net: vec![],
         endpoint,
     };
 

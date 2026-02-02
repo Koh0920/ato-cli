@@ -9,6 +9,7 @@ use std::fs;
 use std::path::Path;
 
 use super::error::CapsuleError;
+use crate::schema_registry::SchemaRegistry;
 use super::utils::parse_memory_string;
 
 /// Capsule Type - defines the fundamental nature of the Capsule
@@ -299,6 +300,10 @@ pub struct CapsuleManifestV1 {
     #[serde(default)]
     pub isolation: Option<IsolationConfig>,
 
+    /// Polymorphism configuration (implements schema hashes)
+    #[serde(default)]
+    pub polymorphism: Option<PolymorphismConfig>,
+
     /// Multi-target execution configuration (UARC V1.1.0)
     ///
     /// Allows capsules to specify multiple runtime targets (wasm, source, oci).
@@ -311,6 +316,15 @@ pub struct CapsuleManifestV1 {
     /// Optional and dev-first: absence means single-process execution via `execution`.
     #[serde(default)]
     pub services: Option<HashMap<String, ServiceSpec>>,
+}
+
+/// Polymorphism configuration
+///
+/// Allows capsules to declare which schema hashes they implement.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PolymorphismConfig {
+    #[serde(default)]
+    pub implements: Vec<String>,
 }
 
 fn default_schema_version() -> String {
@@ -802,6 +816,34 @@ impl CapsuleManifestV1 {
     /// Serialize to TOML
     pub fn to_toml(&self) -> Result<String, CapsuleError> {
         toml::to_string_pretty(self).map_err(|e| CapsuleError::SerializeError(e.to_string()))
+    }
+
+    /// Check whether this capsule implements the given schema identifier.
+    ///
+    /// The schema identifier may be a sha256 hash or a registry alias.
+    pub fn implements_schema(
+        &self,
+        schema_id: &str,
+        registry: &SchemaRegistry,
+    ) -> Result<bool, CapsuleError> {
+        let Some(poly) = &self.polymorphism else {
+            return Ok(false);
+        };
+
+        let target = registry
+            .resolve_schema_hash(schema_id)
+            .map_err(|e| CapsuleError::ValidationError(e.to_string()))?;
+
+        for entry in &poly.implements {
+            let resolved = registry
+                .resolve_schema_hash(entry)
+                .map_err(|e| CapsuleError::ValidationError(e.to_string()))?;
+            if resolved == target {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 
     /// Load from file (auto-detects format by extension)

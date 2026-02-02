@@ -67,13 +67,36 @@ pub fn route_manifest(manifest_path: &Path, profile: ExecutionProfile) -> Result
         candidates.push(RuntimeKind::Source);
     }
 
+    let default_order = [RuntimeKind::Oci, RuntimeKind::Wasm, RuntimeKind::Source];
+    let explicit_runtime = if runtime_is_oci {
+        Some(RuntimeKind::Oci)
+    } else if runtime_is_wasm {
+        Some(RuntimeKind::Wasm)
+    } else if runtime_is_source {
+        Some(RuntimeKind::Source)
+    } else {
+        None
+    };
+
     let preference = plan.execution_preference();
-    let chosen = if let Some(pref) = preference {
+    let chosen = if let Some(explicit) = explicit_runtime {
+        explicit
+    } else if let Some(pref) = preference {
         pref.into_iter()
             .find(|k| candidates.contains(k))
+            .or_else(|| {
+                default_order
+                    .iter()
+                    .copied()
+                    .find(|k| candidates.contains(k))
+            })
             .unwrap_or_else(|| candidates[0])
     } else {
-        candidates[0]
+        default_order
+            .iter()
+            .copied()
+            .find(|k| candidates.contains(k))
+            .unwrap_or_else(|| candidates[0])
     };
 
     let reason = match chosen {
@@ -95,7 +118,15 @@ pub fn route_manifest(manifest_path: &Path, profile: ExecutionProfile) -> Result
                 "execution.runtime=wasm".to_string()
             }
         }
-        RuntimeKind::Source => "default to source runtime".to_string(),
+        RuntimeKind::Source => {
+            if runtime_is_source {
+                "execution.runtime=source".to_string()
+            } else if has_source_target {
+                "targets.source detected".to_string()
+            } else {
+                "default to source runtime".to_string()
+            }
+        }
     };
 
     debug!(

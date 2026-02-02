@@ -37,7 +37,7 @@ pub fn execute(
         manifest_path: Some(plan.manifest_path.clone()),
     })?;
 
-    r3_config::generate_and_write_config(&plan.manifest_path, Some(enforcement.to_string()))?;
+    r3_config::generate_and_write_config(&plan.manifest_path, Some(enforcement.to_string()), false)?;
 
     // Create a Tokio runtime for async pack/bundle operations.
     // Note: this function is sync, but it needs to run async code.
@@ -87,12 +87,14 @@ pub fn execute(
     };
 
     let child = match &rt {
-        Rt::Handle(h) => tokio::task::block_in_place(|| h.block_on(run_bundle(
-            &bundle_path,
-            &plan.manifest_dir,
-            reporter.clone(),
-            mode,
-        )))?,
+        Rt::Handle(h) => tokio::task::block_in_place(|| {
+            h.block_on(run_bundle(
+                &bundle_path,
+                &plan.manifest_dir,
+                reporter.clone(),
+                mode,
+            ))
+        })?,
         Rt::Owned(runtime) => runtime.block_on(run_bundle(
             &bundle_path,
             &plan.manifest_dir,

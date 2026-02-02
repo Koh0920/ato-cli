@@ -18,6 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 capsule-core = { path = "core" }
+capsule-sync = { path = "../capsule-sync" }
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive", "env"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -44,6 +45,10 @@ flate2 = "1.0"
 zip = "2.1"
 zstd = "0.13"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time"] }
+tempfile = "3.8"
+wasmtime = "16.0"
+wasmtime-wasi = "16.0"
+wasi-common = "16.0"
 capnp = { version = "0.18", optional = true }
 chrono = { version = "0.4", default-features = true }
 thiserror = "2.0"
@@ -55,6 +60,7 @@ libc = "0.2"
 tempfile = "3"
 assert_cmd = "2"
 predicates = "3"
+wat = "1.0"
 
 [features]
 default = []

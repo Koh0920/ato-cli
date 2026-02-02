@@ -200,7 +200,8 @@ impl ProcessManager {
                     if let Some(id) = filename.to_str() {
                         if let Ok(info) = self.read_pid(id) {
                             if info.status == ProcessStatus::Stopped
-                                || (info.status == ProcessStatus::Running && !is_process_alive(info.pid))
+                                || (info.status == ProcessStatus::Running
+                                    && !is_process_alive(info.pid))
                             {
                                 let _ = fs::remove_file(&path);
                                 cleaned += 1;

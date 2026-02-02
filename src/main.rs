@@ -164,16 +164,20 @@ enum Commands {
         dir: PathBuf,
 
         /// Initialize capsule.toml interactively if not found
-        #[arg(long, default_value_t = false)]
+        #[arg(long)]
         init: bool,
 
-        /// Path to the signing key (optional)
+        /// Path to signing key (optional)
         #[arg(long)]
         key: Option<PathBuf>,
 
         /// Network enforcement mode
         #[arg(long, value_enum, default_value_t = EnforcementMode::BestEffort)]
         enforcement: EnforcementMode,
+
+        /// Create self-extracting executable installer (includes nacelle runtime)
+        #[arg(long)]
+        standalone: bool,
     },
 
     /// Scaffold supporting files (e.g. Dockerfile)
@@ -243,6 +247,13 @@ enum Commands {
         /// Show last N lines
         #[arg(long)]
         tail: Option<usize>,
+    },
+
+    /// Handle guest mode requests (internal)
+    Guest {
+        /// Path to a .sync archive
+        #[arg()]
+        sync_path: PathBuf,
     },
 }
 
@@ -475,17 +486,17 @@ fn run() -> Result<()> {
                 path.join("capsule.toml")
             };
 
-                let rt = tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()?;
-                rt.block_on(commands::open::execute(commands::open::OpenArgs {
-                    target,
-                    watch,
-                    background,
-                    nacelle,
-                    enforcement: enforcement.as_str().to_string(),
-                    reporter: reporter.clone(),
-                }))
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(commands::open::execute(commands::open::OpenArgs {
+                target,
+                watch,
+                background,
+                nacelle,
+                enforcement: enforcement.as_str().to_string(),
+                reporter: reporter.clone(),
+            }))
         }
 
         Commands::New { name, template } => new::execute(
@@ -504,6 +515,7 @@ fn run() -> Result<()> {
             dir,
             init,
             key,
+            standalone,
             enforcement,
         } => {
             let dir = dir
@@ -511,6 +523,34 @@ fn run() -> Result<()> {
                 .with_context(|| format!("Failed to resolve directory: {}", dir.display()))?;
             if !dir.is_dir() {
                 anyhow::bail!("Target is not a directory: {}", dir.display());
+            }
+
+            let manifest = dir.join("capsule.toml");
+            if !manifest.exists() {
+                let stdin_is_tty = std::io::stdin().is_terminal();
+                if init {
+                    if !stdin_is_tty {
+                        anyhow::bail!("--init requires an interactive TTY");
+                    }
+                    if cli.json {
+                        anyhow::bail!("--init cannot be used with --json output");
+                    }
+                    init::execute(
+                        init::InitArgs {
+                            path: Some(dir.clone()),
+                            yes: false,
+                        },
+                        reporter.clone(),
+                    )?;
+                } else {
+                    anyhow::bail!(
+                        "capsule.toml not found. Use --init to create one, or specify a directory with capsule.toml."
+                    );
+                }
+            }
+
+            if !manifest.exists() {
+                anyhow::bail!("capsule.toml not found after initialization");
             }
 
             let manifest = dir.join("capsule.toml");
@@ -576,6 +616,7 @@ fn run() -> Result<()> {
                             skip_validation: false,
                             enforcement: enforcement.as_str().to_string(),
                             nacelle_override: cli.nacelle,
+                            standalone,
                         },
                         reporter.clone(),
                     )?;
@@ -676,6 +717,10 @@ fn run() -> Result<()> {
             },
             reporter.clone(),
         ),
+
+        Commands::Guest { sync_path } => {
+            commands::guest::execute(commands::guest::GuestArgs { sync_path })
+        }
     }
 }
 

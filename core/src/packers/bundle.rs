@@ -154,6 +154,7 @@ pub async fn build_bundle(
         .await?;
     let build_excludes = read_build_exclude_patterns(&manifest_path)?;
     let source_ignore = load_capsuleignore(source_dir, &build_excludes)?;
+    let _node_modules_guard = NodeModulesGuard::new(source_dir, source_ignore.as_ref())?;
     let config_path = source_dir.join("config.json");
     let config_ref = if config_path.exists() {
         Some(config_path.as_path())
@@ -403,14 +404,38 @@ fn build_runtime_alias(
         return Ok(None);
     };
 
-    let source_path = runtime_dir.to_path_buf();
-    let version = runtime_version_for(runtime.language.as_str(), runtime.version.as_deref());
-    let archive_path = format!("runtime/{}/{}", runtime.language, version);
+    let source_path = resolve_runtime_root(runtime_dir, runtime.language.as_str())?;
+    let archive_path = format!("runtime/{}", runtime.language);
 
     Ok(Some(RuntimeAlias {
         archive_path,
         source_path,
     }))
+}
+
+fn resolve_runtime_root(runtime_dir: &Path, language: &str) -> Result<PathBuf> {
+    let direct = runtime_dir.join(language);
+    if direct.exists() {
+        return Ok(direct);
+    }
+
+    if language == "node" {
+        let entries = fs::read_dir(runtime_dir).map_err(|e| {
+            CapsuleError::Pack(format!("Failed to read runtime dir: {}", e))
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|e| CapsuleError::Pack(format!("Walk error: {}", e)))?;
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if path.is_dir() && name.starts_with("node-") {
+                return Ok(path);
+            }
+        }
+    }
+
+    Ok(runtime_dir.to_path_buf())
 }
 
 fn runtime_version_for(language: &str, version: Option<&str>) -> String {
@@ -444,10 +469,37 @@ fn create_bundle_archive(
             append_dir(&mut builder, runtime_dir, "runtime", None)?;
         }
 
-        append_dir(&mut builder, source_dir, "source", source_ignore)?;
+        let source_subdir = source_dir.join("source");
+        let (actual_source_dir, source_prefix) = if source_subdir.is_dir() {
+            (source_subdir.as_path(), "")
+        } else {
+            (source_dir, "")
+        };
+
+        append_dir(&mut builder, actual_source_dir, source_prefix, source_ignore)?;
 
         if let Some(config_path) = config_path {
             append_file(&mut builder, config_path, "config.json")?;
+        }
+
+        let capsule_lock = source_dir.join("capsule.lock");
+        if capsule_lock.exists() {
+            append_file(&mut builder, &capsule_lock, "capsule.lock")?;
+        }
+
+        let uv_lock = source_dir.join("uv.lock");
+        if uv_lock.exists() {
+            append_file(&mut builder, &uv_lock, "uv.lock")?;
+        }
+
+        let locks_dir = source_dir.join("locks");
+        if locks_dir.exists() {
+            append_dir(&mut builder, &locks_dir, "locks", None)?;
+        }
+
+        let artifacts_dir = source_dir.join("artifacts");
+        if artifacts_dir.exists() {
+            append_dir(&mut builder, &artifacts_dir, "artifacts", None)?;
         }
 
         builder.finish()?;
@@ -557,6 +609,87 @@ fn load_capsuleignore(source_dir: &Path, build_excludes: &[String]) -> Result<Op
         .build()
         .map_err(|e| CapsuleError::Pack(format!("Failed to build ignore rules: {}", e)))?;
     Ok(Some(gitignore))
+}
+
+struct NodeModulesGuard {
+    moves: Vec<(PathBuf, PathBuf)>,
+}
+
+impl NodeModulesGuard {
+    fn new(source_dir: &Path, ignore: Option<&Gitignore>) -> Result<Self> {
+        let Some(ignore) = ignore else {
+            return Ok(Self { moves: Vec::new() });
+        };
+
+        let mut moves = Vec::new();
+        let mut it = walkdir::WalkDir::new(source_dir).into_iter();
+        while let Some(entry) = it.next() {
+            let entry = entry.map_err(|e| CapsuleError::Pack(format!("Walk error: {}", e)))?;
+            if !entry.file_type().is_dir() {
+                continue;
+            }
+            if entry.file_name() != "node_modules" {
+                continue;
+            }
+
+            let path = entry.path();
+            if ignore
+                .matched_path_or_any_parents(path, true)
+                .is_ignore()
+            {
+                let backup = unique_backup_path(path)?;
+                fs::rename(path, &backup).map_err(|e| {
+                    CapsuleError::Pack(format!(
+                        "Failed to move {}: {}",
+                        path.display(),
+                        e
+                    ))
+                })?;
+                moves.push((path.to_path_buf(), backup));
+                it.skip_current_dir();
+            }
+        }
+
+        Ok(Self { moves })
+    }
+}
+
+impl Drop for NodeModulesGuard {
+    fn drop(&mut self) {
+        for (original, backup) in self.moves.drain(..) {
+            if backup.exists() && !original.exists() {
+                let _ = fs::rename(&backup, &original);
+            }
+        }
+    }
+}
+
+fn unique_backup_path(original: &Path) -> Result<PathBuf> {
+    let parent = original.parent().ok_or_else(|| {
+        CapsuleError::Pack(format!("Failed to resolve parent for {}", original.display()))
+    })?;
+    let name = original
+        .file_name()
+        .ok_or_else(|| {
+            CapsuleError::Pack(format!("Failed to resolve name for {}", original.display()))
+        })?
+        .to_string_lossy();
+    for idx in 0..100 {
+        let suffix = if idx == 0 {
+            "capsule-bak".to_string()
+        } else {
+            format!("capsule-bak-{}", idx)
+        };
+        let candidate = parent.join(format!("{}.{}", name, suffix));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+
+    Err(CapsuleError::Pack(format!(
+        "Failed to allocate backup path for {}",
+        original.display()
+    )))
 }
 
 fn compress_with_zstd(data: &[u8], level: i32) -> Result<Vec<u8>> {
