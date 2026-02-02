@@ -16,8 +16,8 @@
 - `cargo build` builds the workspace.
 - `cargo build -p capsule-cli` builds the CLI only.
 - `cargo build -p capsule-core` builds the core library.
-- `cargo build --features manifest-signing` enables Cap'n Proto signing.
-- `cargo build -p capsule-core --features manifest-signing` builds core with signing.
+- `cargo build --features manifest-signing` enables legacy Cap'n Proto signing (deprecated; JCS is canonical for `.capsule` v2).
+- `cargo build -p capsule-core --features manifest-signing` builds core with legacy signing enabled.
 
 ## Run / Usage
 - `cargo run -- <args>` runs the CLI in debug.
@@ -42,7 +42,7 @@
 - `cargo test -p capsule-core --test <integration_test>` (if added)
 
 ## Feature Flags
-- `manifest-signing` enables Cap'n Proto signing support.
+- `manifest-signing` enables legacy Cap'n Proto signing support (deprecated; JCS is canonical for `.capsule` v2).
 - `provisioning-tests` enables networked artifact tests (see `core/src/resource/artifact/tests.rs`).
 
 ## Code Style (Rust)

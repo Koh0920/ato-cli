@@ -7,6 +7,7 @@ use capsule_core::{
 };
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 const ENV_CONTROL_URL: &str = "ATO_TSNET_CONTROL_URL";
 const ENV_AUTH_KEY: &str = "ATO_TSNET_AUTH_KEY";
@@ -70,6 +71,14 @@ fn endpoint_from_tempdir(temp_dir: &TempDir) -> TsnetEndpoint {
     }
 }
 
+async fn start_sidecar_for_test(temp_dir: &TempDir) -> (Child, TsnetClient, TsnetEndpoint) {
+    let mut child = spawn_sidecar(temp_dir).expect("failed to spawn ato-tsnetd");
+    let endpoint = endpoint_from_tempdir(temp_dir);
+    let client =
+        TsnetClient::from_endpoint(endpoint.clone()).expect("failed to create tsnet client");
+    (child, client, endpoint)
+}
+
 #[tokio::test]
 async fn sidecar_starts_and_responds_to_socks5() {
     let Some((control_url, auth_key, hostname)) = required_envs() else {
@@ -83,11 +92,7 @@ async fn sidecar_starts_and_responds_to_socks5() {
     };
 
     let temp_dir = TempDir::new().expect("failed to create temp dir");
-    let mut child = spawn_sidecar(&temp_dir).expect("failed to spawn ato-tsnetd");
-
-    let endpoint = endpoint_from_tempdir(&temp_dir);
-    let client =
-        TsnetClient::from_endpoint(endpoint.clone()).expect("failed to create tsnet client");
+    let (mut child, client, endpoint) = start_sidecar_for_test(&temp_dir).await;
 
     let socks_port = read_env(ENV_SOCKS_PORT)
         .and_then(|value| value.parse::<u16>().ok())
@@ -98,6 +103,7 @@ async fn sidecar_starts_and_responds_to_socks5() {
         auth_key,
         hostname,
         socks_port,
+        allow_net: vec![],
         endpoint,
     };
 
@@ -124,6 +130,116 @@ async fn sidecar_starts_and_responds_to_socks5() {
     let mut buf = [0u8; 2];
     stream.read_exact(&mut buf).await.expect("read failed");
     assert_eq!(buf, [0x05, 0x00]);
+
+    let _ = client.stop().await;
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[tokio::test]
+async fn sidecar_serve_lifecycle() {
+    let Some((control_url, auth_key, hostname)) = required_envs() else {
+        eprintln!("[skip] sidecar e2e requires ATO_TSNET_CONTROL_URL/ATO_TSNET_AUTH_KEY/ATO_TSNET_HOSTNAME");
+        return;
+    };
+
+    let Some(_) = sidecar_path() else {
+        eprintln!("[skip] sidecar e2e requires ATO_TSNETD_PATH");
+        return;
+    };
+
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let (mut child, client, endpoint) = start_sidecar_for_test(&temp_dir).await;
+
+    let config = TsnetConfig {
+        control_url,
+        auth_key,
+        hostname,
+        socks_port: 0,
+        allow_net: vec![],
+        endpoint,
+    };
+
+    let status = client.start(config).await.expect("start failed");
+    if status.state != TsnetState::Ready {
+        let wait_config = TsnetWaitConfig::new(Duration::from_millis(200), Duration::from_secs(5));
+        wait_for_ready(&client, wait_config)
+            .await
+            .expect("wait_for_ready failed");
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind target listener");
+    let target_port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = listener.accept().await;
+    });
+
+    let serve = client
+        .start_serve(format!("127.0.0.1:{target_port}"), 0)
+        .await
+        .expect("start_serve failed");
+    assert!(serve.running);
+    assert!(serve.listen_port.is_some());
+
+    let status = client.serve_status().await.expect("serve_status failed");
+    assert!(status.running);
+
+    let stopped = client.stop_serve().await.expect("stop_serve failed");
+    assert!(!stopped.running);
+
+    let _ = client.stop().await;
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+
+#[tokio::test]
+async fn sidecar_serve_rejects_non_loopback_target() {
+    let Some((control_url, auth_key, hostname)) = required_envs() else {
+        eprintln!("[skip] sidecar e2e requires ATO_TSNET_CONTROL_URL/ATO_TSNET_AUTH_KEY/ATO_TSNET_HOSTNAME");
+        return;
+    };
+
+    let Some(_) = sidecar_path() else {
+        eprintln!("[skip] sidecar e2e requires ATO_TSNETD_PATH");
+        return;
+    };
+
+    let temp_dir = TempDir::new().expect("failed to create temp dir");
+    let mut child = spawn_sidecar(&temp_dir).expect("failed to spawn ato-tsnetd");
+
+    let endpoint = endpoint_from_tempdir(&temp_dir);
+    let client =
+        TsnetClient::from_endpoint(endpoint.clone()).expect("failed to create tsnet client");
+
+    let socks_port = read_env(ENV_SOCKS_PORT)
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(0);
+
+    let config = TsnetConfig {
+        control_url,
+        auth_key,
+        hostname,
+        socks_port,
+        allow_net: vec![],
+        endpoint,
+    };
+
+    let status = client.start(config).await.expect("start failed");
+    if status.state != TsnetState::Ready {
+        let wait_config = TsnetWaitConfig::new(Duration::from_millis(200), Duration::from_secs(5));
+        wait_for_ready(&client, wait_config)
+            .await
+            .expect("wait_for_ready failed");
+    }
+
+    let err = client
+        .start_serve("10.0.0.1:80".to_string(), 0)
+        .await
+        .expect_err("non-loopback target should be rejected");
+    assert!(err.to_string().contains("target_addr"));
 
     let _ = client.stop().await;
     let _ = child.kill();

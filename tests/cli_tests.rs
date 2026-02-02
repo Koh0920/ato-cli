@@ -99,7 +99,7 @@ fn test_pack_command_with_key_flag() {
         .arg("--help")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Path to the signing key"));
+        .stdout(predicate::str::contains("Path to signing key"));
 }
 
 #[test]

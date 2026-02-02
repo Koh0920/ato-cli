@@ -19,6 +19,8 @@ pub struct ConfigJson {
     pub metadata: Option<MetadataConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sidecar: Option<SidecarConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,6 +126,21 @@ pub struct UserConfig {
     pub umask: Option<u16>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SidecarConfig {
+    pub tsnet: TsnetSidecarConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TsnetSidecarConfig {
+    pub enabled: bool,
+    pub control_url: String,
+    pub auth_key: String,
+    pub hostname: String,
+    pub socks_port: u16,
+    pub allow_net: Vec<String>,
+}
+
 type CommandResolution = (
     String,
     Vec<String>,
@@ -154,12 +171,18 @@ struct ManifestReadinessProbe {
 pub fn generate_and_write_config(
     manifest_path: &Path,
     enforcement_override: Option<String>,
+    standalone: bool,
 ) -> Result<PathBuf> {
     let loaded = manifest::load_manifest(manifest_path)?;
     let manifest_content = loaded.raw_text;
     let manifest = loaded.raw;
 
-    let config = build_config_json(&manifest, &manifest_content, enforcement_override)?;
+    let config = build_config_json(
+        &manifest,
+        &manifest_content,
+        enforcement_override,
+        standalone,
+    )?;
     validate_config_json(&config)?;
 
     let manifest_dir = manifest_path
@@ -179,11 +202,13 @@ fn build_config_json(
     manifest: &toml::Value,
     manifest_raw: &str,
     enforcement_override: Option<String>,
+    standalone: bool,
 ) -> Result<ConfigJson> {
     let mut services = HashMap::new();
     let entrypoint = read_entrypoint(manifest)?;
     let command = read_command(manifest);
-    let (executable, args, env, signals) = resolve_command(&entrypoint, command.as_deref(), manifest);
+    let (executable, args, env, signals) =
+        resolve_command(&entrypoint, command.as_deref(), manifest, standalone);
     let main_spec = ServiceSpec {
         executable,
         args,
@@ -220,7 +245,7 @@ fn build_config_json(
 
             let command = None;
             let (executable, args, env, signals) =
-                resolve_command(&svc.entrypoint, command, manifest);
+                resolve_command(&svc.entrypoint, command, manifest, standalone);
             let health_check = svc.readiness_probe.as_ref().map(|p| HealthCheck {
                 http_get: p.http_get.clone(),
                 tcp_connect: p.tcp_connect.clone(),
@@ -246,7 +271,7 @@ fn build_config_json(
 
     validate_services_dag(&services)?;
 
-    let egress_rules = build_egress(manifest)?;
+    let (egress_rules, allow_domains) = build_egress(manifest)?;
 
     let sandbox = SandboxConfig {
         enabled: true,
@@ -273,12 +298,15 @@ fn build_config_json(
         source_manifest: Some(format!("sha256:{}", sha256_hex(manifest_raw.as_bytes()))),
     };
 
+    let sidecar = build_sidecar_config(manifest, &allow_domains)?;
+
     Ok(ConfigJson {
         version: CONFIG_VERSION.to_string(),
         services,
         sandbox,
         metadata: Some(metadata),
         annotations: None,
+        sidecar,
     })
 }
 
@@ -310,7 +338,11 @@ fn validate_config_json(config: &ConfigJson) -> Result<()> {
 fn read_command(manifest: &toml::Value) -> Option<String> {
     manifest
         .get("execution")
-        .and_then(|e| e.get("release").and_then(|r| r.get("command")).or_else(|| e.get("command")))
+        .and_then(|e| {
+            e.get("release")
+                .and_then(|r| r.get("command"))
+                .or_else(|| e.get("command"))
+        })
         .and_then(|c| c.as_str())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -395,7 +427,7 @@ fn read_filesystem(manifest: &toml::Value) -> Option<FilesystemConfig> {
     })
 }
 
-fn build_egress(manifest: &toml::Value) -> Result<Option<EgressConfig>> {
+fn build_egress(manifest: &toml::Value) -> Result<(Option<EgressConfig>, Vec<String>)> {
     let mut allow_domains: Vec<String> = manifest
         .get("network")
         .and_then(|n| n.get("egress_allow"))
@@ -477,7 +509,7 @@ fn build_egress(manifest: &toml::Value) -> Result<Option<EgressConfig>> {
     }
 
     if rules.is_empty() && !has_allow_domains && !has_id_allow {
-        return Ok(None);
+        return Ok((None, allow_domains));
     }
 
     let egress = EgressConfig {
@@ -485,10 +517,104 @@ fn build_egress(manifest: &toml::Value) -> Result<Option<EgressConfig>> {
         rules: if rules.is_empty() { None } else { Some(rules) },
     };
 
-    Ok(Some(egress))
+    Ok((Some(egress), allow_domains))
 }
 
-fn resolve_command(entrypoint: &str, command: Option<&str>, manifest: &toml::Value) -> CommandResolution {
+fn build_sidecar_config(
+    manifest: &toml::Value,
+    allow_domains: &[String],
+) -> Result<Option<SidecarConfig>> {
+    let network = match manifest.get("network") {
+        Some(n) => n.clone(),
+        None => return Ok(None),
+    };
+
+    let tsnet_enabled = network
+        .get("tsnet")
+        .and_then(|t| t.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    if !tsnet_enabled {
+        return Ok(None);
+    }
+
+    let control_url = network
+        .get("tsnet")
+        .and_then(|t| t.get("control_url"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+
+    let auth_key = network
+        .get("tsnet")
+        .and_then(|t| t.get("auth_key"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+
+    let hostname = network
+        .get("tsnet")
+        .and_then(|t| t.get("hostname"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            manifest
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| format!("{}-tsnet", s))
+                .unwrap_or_else(|| "capsule-tsnet".to_string())
+        });
+
+    let socks_port = network
+        .get("tsnet")
+        .and_then(|t| t.get("socks_port"))
+        .and_then(|v| v.as_integer())
+        .map(|p| p as u16)
+        .unwrap_or(0);
+
+    let mut allow_net: Vec<String> = allow_domains.to_vec();
+
+    if let Some(id_allow) = manifest
+        .get("network")
+        .and_then(|n| n.get("egress_id_allow"))
+        .and_then(|v| v.as_array())
+    {
+        for rule in id_allow {
+            let rule_type = rule.get("type").and_then(|v| v.as_str());
+            let value = rule.get("value").and_then(|v| v.as_str());
+            match (rule_type, value) {
+                (Some("cidr"), Some(val)) => {
+                    allow_net.push(val.to_string());
+                }
+                (Some("ip"), Some(val)) => {
+                    allow_net.push(val.to_string());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let tsnet_config = TsnetSidecarConfig {
+        enabled: true,
+        control_url,
+        auth_key,
+        hostname,
+        socks_port,
+        allow_net,
+    };
+
+    Ok(Some(SidecarConfig {
+        tsnet: tsnet_config,
+    }))
+}
+
+fn resolve_command(
+    entrypoint: &str,
+    command: Option<&str>,
+    manifest: &toml::Value,
+    standalone: bool,
+) -> CommandResolution {
     // `execution.entrypoint` is the program (and optional args) to start.
     // `execution.command` is an additional argument string, commonly used like:
     // entrypoint = "bash"
@@ -528,49 +654,68 @@ fn resolve_command(entrypoint: &str, command: Option<&str>, manifest: &toml::Val
     let (executable, mut args) = if let Some(lang) = language.as_deref() {
         match lang {
             "python" => {
-                env.insert("PYTHONHOME".to_string(), "runtime/python".to_string());
-                env.insert("PYTHONPATH".to_string(), "source".to_string());
                 let mut args = tokens.get(1..).unwrap_or(&[]).to_vec();
                 if tokens.len() <= 1 {
-                    args = vec![program];
+                    args = vec![program.clone()];
                 }
-                ("runtime/python/bin/python3".to_string(), args)
+                if standalone {
+                    env.insert("PYTHONHOME".to_string(), "runtime/python".to_string());
+                    env.insert("PYTHONPATH".to_string(), "source".to_string());
+                    ("runtime/python/bin/python3".to_string(), args)
+                } else {
+                    ("python3".to_string(), args)
+                }
             }
             "node" => {
                 let mut args = tokens.get(1..).unwrap_or(&[]).to_vec();
                 if tokens.len() <= 1 {
-                    args = vec![program];
+                    args = vec![program.clone()];
                 }
-                ("runtime/node/bin/node".to_string(), args)
+                if standalone {
+                    ("runtime/node/bin/node".to_string(), args)
+                } else {
+                    ("node".to_string(), args)
+                }
             }
             "deno" => {
                 let mut args = tokens.get(1..).unwrap_or(&[]).to_vec();
                 if tokens.len() <= 1 {
-                    args = vec![program];
+                    args = vec![program.clone()];
                 }
-                ("runtime/deno/bin/deno".to_string(), args)
+                if standalone {
+                    ("runtime/deno/bin/deno".to_string(), args)
+                } else {
+                    ("deno".to_string(), args)
+                }
             }
             "bun" => {
                 let mut args = tokens.get(1..).unwrap_or(&[]).to_vec();
                 if tokens.len() <= 1 {
-                    args = vec![program];
+                    args = vec![program.clone()];
                 }
-                ("runtime/bun/bin/bun".to_string(), args)
+                if standalone {
+                    ("runtime/bun/bin/bun".to_string(), args)
+                } else {
+                    ("bun".to_string(), args)
+                }
             }
             _ => (
-                normalize_program(&program),
+                normalize_program(&program, standalone),
                 tokens.get(1..).unwrap_or(&[]).to_vec(),
             ),
         }
     } else {
         (
-            normalize_program(&program),
+            normalize_program(&program, standalone),
             tokens.get(1..).unwrap_or(&[]).to_vec(),
         )
     };
 
     if !args.is_empty() {
-        args = args.into_iter().map(|a| normalize_arg(&a)).collect();
+        args = args
+            .into_iter()
+            .map(|a| normalize_arg(&a, standalone))
+            .collect();
     }
 
     let signals = manifest
@@ -639,28 +784,32 @@ fn normalize_language(lang: &str) -> String {
     }
 }
 
-fn normalize_program(program: &str) -> String {
+fn normalize_program(program: &str, _standalone: bool) -> String {
     let p = program.trim();
     if p.is_empty() {
         return program.to_string();
     }
 
-    if p.starts_with('/') || p.starts_with("runtime/") || p.starts_with("source/") {
+    if p.starts_with('/') || p.starts_with("runtime/") {
         return p.to_string();
     }
 
     if p.starts_with("./") {
-        return format!("source/{}", p.trim_start_matches("./"));
+        return p.trim_start_matches("./").to_string();
+    }
+
+    if p.starts_with("source/") {
+        return p.to_string();
     }
 
     if p.contains('/') || p.contains('.') {
-        return format!("source/{p}");
+        return p.to_string();
     }
 
     p.to_string()
 }
 
-fn normalize_arg(arg: &str) -> String {
+fn normalize_arg(arg: &str, standalone: bool) -> String {
     let a = arg.trim();
     if a.is_empty() || a.starts_with('-') {
         return arg.to_string();
@@ -671,7 +820,11 @@ fn normalize_arg(arg: &str) -> String {
     }
 
     if a.starts_with("./") {
-        return format!("source/{}", a.trim_start_matches("./"));
+        let normalized = a.trim_start_matches("./");
+        if standalone {
+            return format!("source/{}", normalized);
+        }
+        return normalized.to_string();
     }
 
     if a.contains('/')
@@ -683,7 +836,10 @@ fn normalize_arg(arg: &str) -> String {
         || a.ends_with(".tsx")
         || a.ends_with(".wasm")
     {
-        return format!("source/{a}");
+        if standalone {
+            return format!("source/{a}");
+        }
+        return a.to_string();
     }
 
     a.to_string()
@@ -792,7 +948,7 @@ egress_allow = ["1.1.1.1"]
 
         std::fs::write(&manifest_path, manifest).unwrap();
 
-        let config_path = generate_and_write_config(&manifest_path, None).unwrap();
+        let config_path = generate_and_write_config(&manifest_path, None, false).unwrap();
         let config_raw = std::fs::read_to_string(config_path).unwrap();
         let config: serde_json::Value = serde_json::from_str(&config_raw).unwrap();
 
@@ -830,7 +986,7 @@ egress_allow = ["1.1.1.1"]
 
         std::fs::write(&manifest_path, manifest).unwrap();
 
-        let config_path = generate_and_write_config(&manifest_path, None).unwrap();
+        let config_path = generate_and_write_config(&manifest_path, None, true).unwrap();
         let config_raw = std::fs::read_to_string(config_path).unwrap();
         let config: ConfigJson = serde_json::from_str(&config_raw).unwrap();
 
@@ -848,6 +1004,48 @@ egress_allow = ["1.1.1.1"]
             config.services["main"].env.as_ref().unwrap()["PYTHONPATH"],
             "source"
         );
+        assert_eq!(
+            config.services["main"].env.as_ref().unwrap()["PORT"],
+            "8080"
+        );
+    }
+
+    #[test]
+    fn test_python_app_config_generation_thin() {
+        let tmp = tempdir().unwrap();
+        let manifest_path = tmp.path().join("capsule.toml");
+
+        let manifest = r#"
+    schema_version = "1.0"
+    name = "python-demo"
+    version = "0.1.0"
+    type = "app"
+
+    [targets]
+    source_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+    [targets.source]
+    language = "python"
+    version = "3.11"
+    entrypoint = "main.py"
+
+    [execution]
+    runtime = "source"
+    entrypoint = "main.py"
+
+    [execution.env]
+    PORT = "8080"
+    "#;
+
+        std::fs::write(&manifest_path, manifest).unwrap();
+
+        let config_path = generate_and_write_config(&manifest_path, None, false).unwrap();
+        let config_raw = std::fs::read_to_string(config_path).unwrap();
+        let config: ConfigJson = serde_json::from_str(&config_raw).unwrap();
+
+        assert_eq!(config.services["main"].executable, "python3");
+        assert_eq!(config.services["main"].args, vec!["main.py"]);
+        assert_eq!(config.services["main"].cwd, Some("source".to_string()));
         assert_eq!(
             config.services["main"].env.as_ref().unwrap()["PORT"],
             "8080"
@@ -880,12 +1078,47 @@ egress_allow = ["1.1.1.1"]
 
         std::fs::write(&manifest_path, manifest).unwrap();
 
-        let config_path = generate_and_write_config(&manifest_path, None).unwrap();
+        let config_path = generate_and_write_config(&manifest_path, None, true).unwrap();
         let config_raw = std::fs::read_to_string(config_path).unwrap();
         let config: ConfigJson = serde_json::from_str(&config_raw).unwrap();
 
         assert_eq!(config.services["main"].executable, "runtime/node/bin/node");
         assert_eq!(config.services["main"].args, vec!["source/index.js"]);
+        assert_eq!(config.services["main"].cwd, Some("source".to_string()));
+    }
+
+    #[test]
+    fn test_node_app_config_generation_thin() {
+        let tmp = tempdir().unwrap();
+        let manifest_path = tmp.path().join("capsule.toml");
+
+        let manifest = r#"
+    schema_version = "1.0"
+    name = "node-demo"
+    version = "0.1.0"
+    type = "app"
+
+    [targets]
+    source_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+    [targets.source]
+    language = "node"
+    version = "20"
+    entrypoint = "index.js"
+
+    [execution]
+    runtime = "source"
+    entrypoint = "index.js"
+    "#;
+
+        std::fs::write(&manifest_path, manifest).unwrap();
+
+        let config_path = generate_and_write_config(&manifest_path, None, false).unwrap();
+        let config_raw = std::fs::read_to_string(config_path).unwrap();
+        let config: ConfigJson = serde_json::from_str(&config_raw).unwrap();
+
+        assert_eq!(config.services["main"].executable, "node");
+        assert_eq!(config.services["main"].args, vec!["index.js"]);
         assert_eq!(config.services["main"].cwd, Some("source".to_string()));
     }
 
@@ -915,12 +1148,46 @@ egress_allow = ["1.1.1.1"]
 
         std::fs::write(&manifest_path, manifest).unwrap();
 
-        let config_path = generate_and_write_config(&manifest_path, None).unwrap();
+        let config_path = generate_and_write_config(&manifest_path, None, true).unwrap();
         let config_raw = std::fs::read_to_string(config_path).unwrap();
         let config: ConfigJson = serde_json::from_str(&config_raw).unwrap();
 
         assert_eq!(config.services["main"].executable, "runtime/deno/bin/deno");
         assert_eq!(config.services["main"].args, vec!["source/server.ts"]);
+    }
+
+    #[test]
+    fn test_deno_app_config_generation_thin() {
+        let tmp = tempdir().unwrap();
+        let manifest_path = tmp.path().join("capsule.toml");
+
+        let manifest = r#"
+    schema_version = "1.0"
+    name = "deno-demo"
+    version = "0.1.0"
+    type = "app"
+
+    [targets]
+    source_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+    [targets.source]
+    language = "deno"
+    version = "1.40"
+    entrypoint = "server.ts"
+
+    [execution]
+    runtime = "source"
+    entrypoint = "server.ts"
+    "#;
+
+        std::fs::write(&manifest_path, manifest).unwrap();
+
+        let config_path = generate_and_write_config(&manifest_path, None, false).unwrap();
+        let config_raw = std::fs::read_to_string(config_path).unwrap();
+        let config: ConfigJson = serde_json::from_str(&config_raw).unwrap();
+
+        assert_eq!(config.services["main"].executable, "deno");
+        assert_eq!(config.services["main"].args, vec!["server.ts"]);
     }
 
     #[test]
@@ -949,12 +1216,46 @@ egress_allow = ["1.1.1.1"]
 
         std::fs::write(&manifest_path, manifest).unwrap();
 
-        let config_path = generate_and_write_config(&manifest_path, None).unwrap();
+        let config_path = generate_and_write_config(&manifest_path, None, true).unwrap();
         let config_raw = std::fs::read_to_string(config_path).unwrap();
         let config: ConfigJson = serde_json::from_str(&config_raw).unwrap();
 
         assert_eq!(config.services["main"].executable, "runtime/bun/bin/bun");
         assert_eq!(config.services["main"].args, vec!["source/main.ts"]);
+    }
+
+    #[test]
+    fn test_bun_app_config_generation_thin() {
+        let tmp = tempdir().unwrap();
+        let manifest_path = tmp.path().join("capsule.toml");
+
+        let manifest = r#"
+    schema_version = "1.0"
+    name = "bun-demo"
+    version = "0.1.0"
+    type = "app"
+
+    [targets]
+    source_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+    [targets.source]
+    language = "bun"
+    version = "1.1"
+    entrypoint = "main.ts"
+
+    [execution]
+    runtime = "source"
+    entrypoint = "main.ts"
+    "#;
+
+        std::fs::write(&manifest_path, manifest).unwrap();
+
+        let config_path = generate_and_write_config(&manifest_path, None, false).unwrap();
+        let config_raw = std::fs::read_to_string(config_path).unwrap();
+        let config: ConfigJson = serde_json::from_str(&config_raw).unwrap();
+
+        assert_eq!(config.services["main"].executable, "bun");
+        assert_eq!(config.services["main"].args, vec!["main.ts"]);
     }
 
     #[test]
@@ -972,6 +1273,7 @@ egress_allow = ["1.1.1.1"]
     source_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
 
     [targets.source]
+    language = "binary"
     entrypoint = "./my-app"
 
     [execution]
@@ -981,10 +1283,10 @@ egress_allow = ["1.1.1.1"]
 
         std::fs::write(&manifest_path, manifest).unwrap();
 
-        let config_path = generate_and_write_config(&manifest_path, None).unwrap();
+        let config_path = generate_and_write_config(&manifest_path, None, true).unwrap();
         let config_raw = std::fs::read_to_string(config_path).unwrap();
         let config: ConfigJson = serde_json::from_str(&config_raw).unwrap();
 
-        assert_eq!(config.services["main"].executable, "source/my-app");
+        assert_eq!(config.services["main"].executable, "my-app");
     }
 }

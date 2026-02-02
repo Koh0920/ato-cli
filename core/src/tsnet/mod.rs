@@ -11,6 +11,7 @@ pub struct TsnetConfig {
     pub auth_key: String,
     pub hostname: String,
     pub socks_port: u16,
+    pub allow_net: Vec<String>,
     pub endpoint: TsnetEndpoint,
 }
 
@@ -39,6 +40,14 @@ pub use sidecar::{
 pub struct TsnetStatus {
     pub state: TsnetState,
     pub socks_port: Option<u16>,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TsnetServeStatus {
+    pub running: bool,
+    pub listen_port: Option<u16>,
+    pub listen_addr: Option<String>,
     pub message: Option<String>,
 }
 
@@ -93,6 +102,8 @@ where
 pub mod client;
 pub mod ipc;
 pub mod sidecar;
+#[cfg(test)]
+pub mod integration_test;
 
 #[allow(clippy::all)]
 pub mod proto {

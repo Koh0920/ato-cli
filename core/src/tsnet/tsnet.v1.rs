@@ -9,6 +9,9 @@ pub struct StartRequest {
     pub hostname: ::prost::alloc::string::String,
     #[prost(uint32, tag = "4")]
     pub socks_port: u32,
+    /// Allowed egress destinations (domains/CIDR)
+    #[prost(string, repeated, tag = "5")]
+    pub allow_net: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StartResponse {
@@ -41,6 +44,51 @@ pub struct StatusResponse {
     pub socks_port: u32,
     #[prost(bool, tag = "3")]
     pub connected: bool,
+    #[prost(string, tag = "4")]
+    pub last_error: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ServeRequest {
+    /// local address to forward, e.g. 127.0.0.1:3000
+    #[prost(string, tag = "1")]
+    pub target_addr: ::prost::alloc::string::String,
+    /// tailnet port to listen (0 = auto)
+    #[prost(uint32, tag = "2")]
+    pub listen_port: u32,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ServeResponse {
+    #[prost(bool, tag = "1")]
+    pub running: bool,
+    #[prost(uint32, tag = "2")]
+    pub listen_port: u32,
+    #[prost(string, tag = "3")]
+    pub listen_addr: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub message: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ServeStopRequest {
+    #[prost(bool, tag = "1")]
+    pub force: bool,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ServeStopResponse {
+    #[prost(bool, tag = "1")]
+    pub running: bool,
+    #[prost(string, tag = "2")]
+    pub message: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct ServeStatusRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ServeStatusResponse {
+    #[prost(bool, tag = "1")]
+    pub running: bool,
+    #[prost(uint32, tag = "2")]
+    pub listen_port: u32,
+    #[prost(string, tag = "3")]
+    pub listen_addr: ::prost::alloc::string::String,
     #[prost(string, tag = "4")]
     pub last_error: ::prost::alloc::string::String,
 }
@@ -234,6 +282,75 @@ pub mod tsnet_service_client {
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("tsnet.v1.TsnetService", "Status"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn start_serve(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ServeRequest>,
+        ) -> std::result::Result<tonic::Response<super::ServeResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/tsnet.v1.TsnetService/StartServe",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("tsnet.v1.TsnetService", "StartServe"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn stop_serve(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ServeStopRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ServeStopResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/tsnet.v1.TsnetService/StopServe",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("tsnet.v1.TsnetService", "StopServe"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn serve_status(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ServeStatusRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ServeStatusResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/tsnet.v1.TsnetService/ServeStatus",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("tsnet.v1.TsnetService", "ServeStatus"));
             self.inner.unary(req, path, codec).await
         }
     }
