@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use serde_json::json;
-use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use capsule_core::CapsuleReporter;
@@ -67,6 +66,7 @@ mod auth;
 mod capsule_capnp;
 mod commands;
 mod common;
+mod diagnostics;
 mod engine_manager;
 mod env;
 mod error_codes;
@@ -96,10 +96,10 @@ mod verify;
 Usage: {usage}
 
 Primary Commands:
-  run      Run a capsule app or local project
+  run      Run a capsule app or local project (strict sandbox by default)
   install  Install a package from the store
   init     Initialize a new project
-  build    Build project into a capsule archive
+  build    Build project into a capsule archive (includes smoke test)
   search   Search the store for packages
 
 Management:
@@ -163,8 +163,12 @@ enum Commands {
         nacelle: Option<PathBuf>,
 
         /// Network enforcement mode
-        #[arg(long, value_enum, default_value_t = EnforcementMode::BestEffort)]
+        #[arg(long, value_enum, default_value_t = EnforcementMode::Strict)]
         enforcement: EnforcementMode,
+
+        /// Explicitly allow non-strict sandbox execution (unsafe)
+        #[arg(long, default_value_t = false)]
+        unsafe_bypass_sandbox: bool,
     },
 
     #[command(
@@ -187,9 +191,9 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         default: bool,
 
-        /// Skip signature verification (not recommended)
-        #[arg(long, default_value_t = false)]
-        skip_verify: bool,
+        /// Deprecated legacy flag (always rejected)
+        #[arg(long = "skip-verify", hide = true, default_value_t = false)]
+        skip_verify_legacy: bool,
 
         /// Output directory (default: ~/.capsule/store/)
         #[arg(long)]
@@ -231,12 +235,16 @@ enum Commands {
         key: Option<PathBuf>,
 
         /// Network enforcement mode
-        #[arg(long, value_enum, default_value_t = EnforcementMode::BestEffort)]
+        #[arg(long, value_enum, default_value_t = EnforcementMode::Strict)]
         enforcement: EnforcementMode,
 
         /// Create self-extracting executable installer (includes nacelle runtime)
         #[arg(long)]
         standalone: bool,
+
+        /// Keep failed build artifacts when smoke test fails
+        #[arg(long, default_value_t = false)]
+        keep_failed_artifacts: bool,
     },
 
     #[command(
@@ -430,8 +438,12 @@ enum Commands {
         nacelle: Option<PathBuf>,
 
         /// Network enforcement mode
-        #[arg(long, value_enum, default_value_t = EnforcementMode::BestEffort)]
+        #[arg(long, value_enum, default_value_t = EnforcementMode::Strict)]
         enforcement: EnforcementMode,
+
+        /// Explicitly allow non-strict sandbox execution (unsafe)
+        #[arg(long, default_value_t = false)]
+        unsafe_bypass_sandbox: bool,
     },
 
     #[command(hide = true)]
@@ -474,12 +486,16 @@ enum Commands {
         key: Option<PathBuf>,
 
         /// Network enforcement mode
-        #[arg(long, value_enum, default_value_t = EnforcementMode::BestEffort)]
+        #[arg(long, value_enum, default_value_t = EnforcementMode::Strict)]
         enforcement: EnforcementMode,
 
         /// Create self-extracting executable installer (includes nacelle runtime)
         #[arg(long)]
         standalone: bool,
+
+        /// Keep failed build artifacts when smoke test fails
+        #[arg(long, hide = true, default_value_t = false)]
+        keep_failed_artifacts: bool,
     },
 
     #[command(hide = true)]
@@ -939,28 +955,27 @@ enum PackageCommands {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let json_mode = args.iter().any(|arg| arg == "--json");
+    let command_context = diagnostics::detect_command_context(&args);
+
     if let Err(err) = run() {
-        if let Some(capsule_error) = err.downcast_ref::<capsule_core::CapsuleError>() {
-            match capsule_error {
-                capsule_core::CapsuleError::AuthRequired(target) => {
-                    eprintln!("🛑 Authentication Required");
-                    eprintln!("Please login or provide credentials: {}", target);
-                }
-                capsule_core::CapsuleError::ContainerEngine(msg) => {
-                    eprintln!("🛑 Container engine unavailable");
-                    eprintln!("{}", msg);
-                }
-                capsule_core::CapsuleError::Pack(msg) => {
-                    eprintln!("❌ Build Failed: {}", msg);
-                }
-                _ => {
-                    eprintln!("Error: {}", err);
-                }
+        let diagnostic = diagnostics::from_anyhow(&err, command_context);
+        let exit_code = diagnostics::map_exit_code(&diagnostic, &err);
+
+        if json_mode {
+            if let Ok(payload) = serde_json::to_string(&diagnostic.to_json_envelope()) {
+                println!("{}", payload);
+            } else {
+                println!(
+                    r#"{{"schema_version":"1","type":"error","code":"E999","message":"failed to serialize error payload","causes":[]}}"#
+                );
             }
         } else {
-            eprintln!("Unexpected Error: {:?}", err);
+            eprintln!("{:?}", miette::Report::new(diagnostic));
         }
-        std::process::exit(1);
+
+        std::process::exit(exit_code);
     }
 }
 
@@ -984,15 +999,26 @@ fn run() -> Result<()> {
             background,
             nacelle,
             enforcement,
-        } => execute_open_command(
-            path,
-            target,
-            watch,
-            background,
-            nacelle,
-            enforcement,
-            reporter.clone(),
-        ),
+            unsafe_bypass_sandbox,
+        } => {
+            if matches!(enforcement, EnforcementMode::BestEffort) && !unsafe_bypass_sandbox {
+                anyhow::bail!("--enforcement best-effort requires --unsafe-bypass-sandbox");
+            }
+            if matches!(enforcement, EnforcementMode::BestEffort) && unsafe_bypass_sandbox {
+                futures::executor::block_on(reporter.warn(
+                    "⚠️  Unsafe mode enabled: running with best_effort sandbox".to_string(),
+                ))?;
+            }
+            execute_open_command(
+                path,
+                target,
+                watch,
+                background,
+                nacelle,
+                enforcement,
+                reporter.clone(),
+            )
+        }
 
         Commands::Engine { command } => {
             execute_engine_command(command, cli.nacelle, reporter.clone())
@@ -1013,15 +1039,29 @@ fn run() -> Result<()> {
             background,
             nacelle,
             enforcement,
-        } => execute_open_command(
-            path,
-            target,
-            watch,
-            background,
-            nacelle,
-            enforcement,
-            reporter.clone(),
-        ),
+            unsafe_bypass_sandbox,
+        } => {
+            futures::executor::block_on(
+                reporter.warn("⚠️  'ato open' is deprecated. Use 'ato run' instead.".to_string()),
+            )?;
+            if matches!(enforcement, EnforcementMode::BestEffort) && !unsafe_bypass_sandbox {
+                anyhow::bail!("--enforcement best-effort requires --unsafe-bypass-sandbox");
+            }
+            if matches!(enforcement, EnforcementMode::BestEffort) && unsafe_bypass_sandbox {
+                futures::executor::block_on(reporter.warn(
+                    "⚠️  Unsafe mode enabled: running with best_effort sandbox".to_string(),
+                ))?;
+            }
+            execute_open_command(
+                path,
+                target,
+                watch,
+                background,
+                nacelle,
+                enforcement,
+                reporter.clone(),
+            )
+        }
 
         Commands::Init { name, template } => new::execute(
             new::NewArgs {
@@ -1045,12 +1085,14 @@ fn run() -> Result<()> {
             key,
             standalone,
             enforcement,
-        } => execute_pack_command(
+            keep_failed_artifacts,
+        } => commands::build::execute_pack_command(
             dir,
             init,
             key,
             standalone,
-            enforcement,
+            keep_failed_artifacts,
+            enforcement.as_str().to_string(),
             reporter.clone(),
             cli.json,
             cli.nacelle,
@@ -1089,16 +1131,23 @@ fn run() -> Result<()> {
             key,
             standalone,
             enforcement,
-        } => execute_pack_command(
-            dir,
-            init,
-            key,
-            standalone,
-            enforcement,
-            reporter.clone(),
-            cli.json,
-            cli.nacelle,
-        ),
+            keep_failed_artifacts,
+        } => {
+            futures::executor::block_on(
+                reporter.warn("⚠️  'ato pack' is deprecated. Use 'ato build' instead.".to_string()),
+            )?;
+            commands::build::execute_pack_command(
+                dir,
+                init,
+                key,
+                standalone,
+                keep_failed_artifacts,
+                enforcement.as_str().to_string(),
+                reporter.clone(),
+                cli.json,
+                cli.nacelle,
+            )
+        }
 
         Commands::Scaffold {
             command:
@@ -1170,10 +1219,15 @@ fn run() -> Result<()> {
             registry,
             version,
             default,
-            skip_verify,
+            skip_verify_legacy,
             output,
             json,
         } => {
+            if skip_verify_legacy {
+                anyhow::bail!(
+                    "--skip-verify is no longer supported. Signature/hash verification is always required."
+                );
+            }
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async {
                 let result = install::install_app(
@@ -1181,7 +1235,6 @@ fn run() -> Result<()> {
                     registry.as_deref(),
                     version.as_deref(),
                     output,
-                    skip_verify,
                     default,
                     json,
                 )
@@ -1607,132 +1660,6 @@ fn execute_open_command(
     }))
 }
 
-fn execute_pack_command(
-    dir: PathBuf,
-    init: bool,
-    key: Option<PathBuf>,
-    standalone: bool,
-    enforcement: EnforcementMode,
-    reporter: std::sync::Arc<reporters::CliReporter>,
-    cli_json: bool,
-    nacelle_override: Option<PathBuf>,
-) -> Result<()> {
-    let dir = dir
-        .canonicalize()
-        .with_context(|| format!("Failed to resolve directory: {}", dir.display()))?;
-    if !dir.is_dir() {
-        anyhow::bail!("Target is not a directory: {}", dir.display());
-    }
-
-    let manifest = dir.join("capsule.toml");
-    if !manifest.exists() {
-        let stdin_is_tty = std::io::stdin().is_terminal();
-        if init {
-            if !stdin_is_tty {
-                anyhow::bail!("--init requires an interactive TTY");
-            }
-            if cli_json {
-                anyhow::bail!("--init cannot be used with --json output");
-            }
-            init::execute(
-                init::InitArgs {
-                    path: Some(dir.clone()),
-                    yes: false,
-                },
-                reporter.clone(),
-            )?;
-        } else {
-            anyhow::bail!(
-                "capsule.toml not found. Use --init to create one, or specify a directory with capsule.toml."
-            );
-        }
-    }
-
-    if !manifest.exists() {
-        anyhow::bail!("capsule.toml not found after initialization");
-    }
-
-    futures::executor::block_on(
-        reporter.notify("📦 Capsule Pack - Pure Runtime Architecture v3.0".to_string()),
-    )?;
-    futures::executor::block_on(
-        reporter.notify("   Performing build-time validations...\n".to_string()),
-    )?;
-
-    let decision = capsule_core::router::route_manifest(
-        &manifest,
-        capsule_core::router::ExecutionProfile::Release,
-        None,
-    )?;
-
-    futures::executor::block_on(reporter.notify(format!(
-        "🧭 RuntimeRouter: {:?} ({})",
-        decision.kind, decision.reason
-    )))?;
-
-    let manifest_dir = manifest
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
-
-    match decision.kind {
-        capsule_core::router::RuntimeKind::Source => {
-            let artifact_path = capsule_core::packers::source::pack(
-                &decision.plan,
-                capsule_core::packers::source::SourcePackOptions {
-                    manifest_path: manifest.clone(),
-                    manifest_dir: manifest_dir.clone(),
-                    output: None,
-                    runtime: None,
-                    skip_l1: false,
-                    skip_validation: false,
-                    enforcement: enforcement.as_str().to_string(),
-                    nacelle_override,
-                    standalone,
-                },
-                reporter.clone(),
-            )?;
-
-            let _ = sign_if_requested(&artifact_path, key.as_ref(), reporter.clone())?;
-            futures::executor::block_on(
-                reporter.notify(format!("✅ Pack complete: {}", artifact_path.display())),
-            )?;
-        }
-        capsule_core::router::RuntimeKind::Oci => {
-            let result = capsule_core::packers::oci::pack(&decision.plan, None, reporter.as_ref())?;
-            if let Some(path) = result.archive {
-                let _ = sign_if_requested(&path, key.as_ref(), reporter.clone())?;
-                futures::executor::block_on(
-                    reporter.notify(format!("✅ Pack complete: {}", path.display())),
-                )?;
-            } else if key.is_some() {
-                futures::executor::block_on(
-                    reporter.warn(
-                        "ℹ️  Signature skipped: OCI pack produced no archive file".to_string(),
-                    ),
-                )?;
-            } else {
-                futures::executor::block_on(
-                    reporter.notify(format!("✅ Pack complete: {}", result.image)),
-                )?;
-            }
-        }
-        capsule_core::router::RuntimeKind::Wasm => {
-            let result =
-                capsule_core::packers::wasm::pack(&decision.plan, None, None, reporter.as_ref())?;
-            futures::executor::block_on(
-                reporter.notify(format!("✅ Pack complete: {}", result.artifact.display())),
-            )?;
-            let _ = sign_if_requested(&result.artifact, key.as_ref(), reporter.clone())?;
-        }
-        capsule_core::router::RuntimeKind::Web => {
-            anyhow::bail!("runtime=web targets are not packable as executable runtime artifacts");
-        }
-    }
-
-    Ok(())
-}
-
 fn execute_source_register_command(
     repo_url: String,
     registry: Option<String>,
@@ -1785,22 +1712,4 @@ fn execute_search_command(
         }
         Ok(())
     })
-}
-
-fn sign_if_requested(
-    target: &std::path::Path,
-    key: Option<&PathBuf>,
-    reporter: std::sync::Arc<reporters::CliReporter>,
-) -> Result<Option<PathBuf>> {
-    if let Some(key_path) = key {
-        futures::executor::block_on(
-            reporter.notify("🔐 Generating detached signature...".to_string()),
-        )?;
-        let sig_path = capsule_core::signing::sign_artifact(target, key_path, "ato-cli", None)?;
-        futures::executor::block_on(
-            reporter.notify(format!("✅ Signature: {}", sig_path.display())),
-        )?;
-        return Ok(Some(sig_path));
-    }
-    Ok(None)
 }

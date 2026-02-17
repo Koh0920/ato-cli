@@ -1,5 +1,6 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
+use tempfile::tempdir;
 
 #[test]
 fn test_cli_help() {
@@ -190,4 +191,55 @@ fn test_legacy_setup_still_available() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Engine name to install"));
+}
+
+#[test]
+fn test_build_invalid_manifest_outputs_single_json_error() {
+    let tmp = tempdir().unwrap();
+    std::fs::write(tmp.path().join("capsule.toml"), "name =\n").unwrap();
+
+    let output = Command::cargo_bin("ato")
+        .unwrap()
+        .args(["--json", "build", tmp.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    assert_eq!(lines.len(), 1, "unexpected stdout: {}", stdout);
+
+    let value: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(value["schema_version"], "1");
+    assert_eq!(value["type"], "error");
+    assert_eq!(value["code"], "E001");
+}
+
+#[test]
+fn test_publish_json_error_uses_diagnostic_envelope() {
+    let output = Command::cargo_bin("ato")
+        .unwrap()
+        .args([
+            "--json",
+            "publish",
+            "https://github.com/example/repo",
+            "--registry",
+            "http://127.0.0.1:9",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let value: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+    assert_eq!(value["schema_version"], "1");
+    assert_eq!(value["type"], "error");
+    assert_eq!(value["code"], "E201");
 }
