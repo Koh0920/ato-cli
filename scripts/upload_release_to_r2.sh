@@ -5,19 +5,21 @@ set -euo pipefail
 #
 # Example:
 #   VERSION="0.2.0" \
-#   BUCKET="ato-store-artifacts-stg" \
+#   DEPLOY_ENV="staging" \
 #   TARGETS="x86_64-apple-darwin aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu" \
 #   ./scripts/upload_release_to_r2.sh
 #
 # Env:
 #   VERSION             required
-#   BUCKET              required
+#   BUCKET              optional (if omitted, inferred from DEPLOY_ENV)
+#   DEPLOY_ENV          optional: staging|stg|production|prod
 #   SOURCE_DIR          default: /tmp/ato-release/$VERSION
 #   TARGETS             default: infer from SOURCE_DIR/ato-*.tar.gz
 #   UPDATE_LATEST       default: 1
 #   PREFIX              default: ato
 #   WRANGLER_CONFIG     default: ../../ato-store/wrangler.toml (from this script dir)
 #   WRANGLER_ENV        optional
+#   REMOTE              default: 1 (set 0 to omit --remote)
 #   DRY_RUN             default: 0
 
 need_cmd() {
@@ -27,21 +29,35 @@ need_cmd() {
   }
 }
 
+resolve_bucket_from_env() {
+  case "${DEPLOY_ENV:-}" in
+    staging|stg) echo "ato-releases-stg" ;;
+    production|prod) echo "ato-releases-prod" ;;
+    *) echo "" ;;
+  esac
+}
+
 put_object() {
   local object_key="$1"
   local source_file="$2"
   local object_ref="${BUCKET}/${object_key}"
+  local -a cmd
+
+  cmd=(wrangler --config "$WRANGLER_CONFIG")
+  if [[ -n "$WRANGLER_ENV" ]]; then
+    cmd+=(--env "$WRANGLER_ENV")
+  fi
+  cmd+=(r2 object put "$object_ref" --file "$source_file")
+  if [[ "$REMOTE" == "1" ]]; then
+    cmd+=(--remote)
+  fi
 
   if [[ "$DRY_RUN" == "1" ]]; then
-    echo "[dry-run] wrangler r2 object put ${object_ref} --file ${source_file}"
+    echo "[dry-run] ${cmd[*]}"
     return
   fi
 
-  if [[ -n "$WRANGLER_ENV" ]]; then
-    wrangler --config "$WRANGLER_CONFIG" --env "$WRANGLER_ENV" r2 object put "$object_ref" --file "$source_file"
-  else
-    wrangler --config "$WRANGLER_CONFIG" r2 object put "$object_ref" --file "$source_file"
-  fi
+  "${cmd[@]}"
 }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -51,13 +67,14 @@ need_cmd wrangler
 need_cmd find
 
 VERSION="${VERSION:-}"
-BUCKET="${BUCKET:-}"
+DEPLOY_ENV="${DEPLOY_ENV:-}"
+BUCKET="${BUCKET:-$(resolve_bucket_from_env)}"
 if [[ -z "$VERSION" ]]; then
   echo "error: VERSION is required" >&2
   exit 1
 fi
 if [[ -z "$BUCKET" ]]; then
-  echo "error: BUCKET is required" >&2
+  echo "error: BUCKET is required (or set DEPLOY_ENV=staging|production)" >&2
   exit 1
 fi
 
@@ -67,6 +84,7 @@ UPDATE_LATEST="${UPDATE_LATEST:-1}"
 PREFIX="${PREFIX:-ato}"
 WRANGLER_CONFIG="${WRANGLER_CONFIG:-$WORKSPACE_ROOT/apps/ato-store/wrangler.toml}"
 WRANGLER_ENV="${WRANGLER_ENV:-}"
+REMOTE="${REMOTE:-1}"
 DRY_RUN="${DRY_RUN:-0}"
 
 if [[ ! -f "$WRANGLER_CONFIG" ]]; then
@@ -123,7 +141,9 @@ fi
 
 echo "==> upload completed"
 echo "    bucket : $BUCKET"
+echo "    env    : ${DEPLOY_ENV:-<manual>}"
 echo "    version: $VERSION"
 echo "    prefix : $PREFIX"
 echo "    targets: ${target_list[*]}"
 echo "    latest : $UPDATE_LATEST"
+echo "    remote : $REMOTE"

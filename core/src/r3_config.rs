@@ -311,11 +311,28 @@ fn build_config_json(
 }
 
 fn validate_config_json(config: &ConfigJson) -> Result<()> {
-    let schema_json: serde_json::Value = serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../schema/config-schema.json"
-    )))
-    .context("Failed to parse config schema")?;
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let candidate_paths = [
+        manifest_dir.join("../schema/config-schema.json"),
+        manifest_dir.join("../../schema/config-schema.json"),
+        manifest_dir.join("schema/config-schema.json"),
+        manifest_dir.join("src/schema/config-schema.json"),
+    ];
+
+    let schema_raw = candidate_paths
+        .iter()
+        .find_map(|path| std::fs::read_to_string(path).ok())
+        .with_context(|| {
+            let tried = candidate_paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("Failed to find config schema. Tried: {tried}")
+        })?;
+
+    let schema_json: serde_json::Value =
+        serde_json::from_str(&schema_raw).context("Failed to parse config schema")?;
     let schema_json = Box::leak(Box::new(schema_json));
 
     let compiled = JSONSchema::options()
