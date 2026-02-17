@@ -7,9 +7,13 @@ use capsule_core::router::ManifestData;
 use capsule_core::CapsuleReporter;
 
 use crate::common::proxy;
+
+use super::source::IpcEnvVars;
+
 pub fn execute(
     plan: &ManifestData,
     reporter: std::sync::Arc<crate::reporters::CliReporter>,
+    ipc_env: Option<&IpcEnvVars>,
 ) -> Result<i32> {
     let component = resolve_component(plan)?;
     let component_path = plan.resolve_path(&component);
@@ -42,6 +46,13 @@ pub fn execute(
 
     for (k, v) in plan.execution_env() {
         cmd.env(k, v);
+    }
+
+    // Inject IPC environment variables (CAPSULE_IPC_*)
+    if let Some(ipc) = ipc_env {
+        for (k, v) in ipc {
+            cmd.env(k, v);
+        }
     }
 
     if let Some(proxy_env) = proxy::proxy_env_from_env(&[])? {

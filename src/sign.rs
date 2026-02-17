@@ -23,7 +23,7 @@ pub fn execute(
         .with_context(|| format!("Failed to resolve key: {}", args.key.display()))?;
 
     let sig_path =
-        capsule_core::signing::sign_artifact(&target, &key, "capsule-cli", args.out.clone())?;
+        capsule_core::signing::sign_artifact(&target, &key, "ato-cli", args.out.clone())?;
 
     futures::executor::block_on(
         reporter.notify(format!("✅ Signature written: {}", sig_path.display())),

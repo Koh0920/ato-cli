@@ -1,4 +1,4 @@
-//! `capsule init` - initialize an existing project as a capsule.
+//! `ato init` - initialize an existing project as a capsule.
 
 use anyhow::{Context, Result};
 use std::fs;
@@ -34,7 +34,7 @@ pub fn execute(
     if manifest_path.exists() {
         anyhow::bail!(
             "capsule.toml already exists!\n\
-            Use 'capsule dev --manifest capsule.toml' to run, or delete the file to re-initialize."
+            Use 'ato dev --manifest capsule.toml' to run, or delete the file to re-initialize."
         );
     }
 
@@ -76,7 +76,7 @@ pub fn execute(
     let manifest_content = recipe::generate_manifest(
         &info,
         recipe::ManifestMeta {
-            generated_by: "capsule init",
+            generated_by: "ato init",
             description: &description,
         },
     );
@@ -93,10 +93,10 @@ pub fn execute(
     futures::executor::block_on(reporter.notify("\n✨ Created capsule.toml!".to_string()))?;
     futures::executor::block_on(reporter.notify("\nNext steps:".to_string()))?;
     futures::executor::block_on(
-        reporter.notify("   capsule dev           # Run locally (no bundling)".to_string()),
+        reporter.notify("   ato dev           # Run locally (no bundling)".to_string()),
     )?;
     futures::executor::block_on(
-        reporter.notify("   capsule pack --bundle # Create self-extracting bundle".to_string()),
+        reporter.notify("   ato pack --bundle # Create self-extracting bundle".to_string()),
     )?;
 
     if matches!(info.project_type, detect::ProjectType::Rust) {
