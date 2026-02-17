@@ -223,7 +223,7 @@ fn is_process_alive(pid: i32) -> bool {
 }
 
 fn errno() -> i32 {
-    unsafe { *libc::__error() }
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
 
 fn wait_for_process_exit(pid: i32, timeout_secs: u64) -> Result<()> {
