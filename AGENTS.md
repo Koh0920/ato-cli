@@ -6,7 +6,7 @@
 - Follow existing patterns unless instructed otherwise.
 
 ## Repository Layout
-- `src/` contains the CLI binary (`capsule`).
+- `src/` contains the CLI binary (`ato`).
 - `core/` is the `capsule-core` library crate.
 - `core/src/` holds packers, router, runtime, and resource logic.
 - `core/src/resource/` contains artifact/cas/storage logic.
@@ -14,31 +14,31 @@
 
 ## Build Commands
 - `cargo build` builds the workspace.
-- `cargo build -p capsule-cli` builds the CLI only.
+- `cargo build -p ato-cli` builds the CLI only.
 - `cargo build -p capsule-core` builds the core library.
 - `cargo build --features manifest-signing` enables legacy Cap'n Proto signing (deprecated; JCS is canonical for `.capsule` v2).
 - `cargo build -p capsule-core --features manifest-signing` builds core with legacy signing enabled.
 
 ## Run / Usage
 - `cargo run -- <args>` runs the CLI in debug.
-- `./target/debug/capsule <args>` runs the built binary directly.
+- `./target/debug/ato <args>` runs the built binary directly.
 
 ## Lint / Format
 - `cargo fmt` formats all Rust code.
 - `cargo fmt --all -- --check` checks formatting in CI mode.
 - `cargo clippy --workspace --all-targets --all-features` runs full lint.
-- `cargo clippy -p capsule-cli --all-targets` lints the CLI only.
+- `cargo clippy -p ato-cli --all-targets` lints the CLI only.
 
 ## Tests (Workspace)
 - `cargo test` runs default tests in the workspace.
-- `cargo test -p capsule-cli` runs CLI tests only.
+- `cargo test -p ato-cli` runs CLI tests only.
 - `cargo test -p capsule-core` runs core tests only.
 - `cargo test --workspace --all-features` runs all tests with features.
 
 ## Single Test Examples
 - `cargo test -p capsule-core test_registry_parsing`
 - `cargo test -p capsule-core --features provisioning-tests test_registry_parsing`
-- `cargo test -p capsule-cli <test_name>`
+- `cargo test -p ato-cli <test_name>`
 - `cargo test -p capsule-core --test <integration_test>` (if added)
 
 ## Feature Flags
@@ -135,8 +135,8 @@
 - Run format and targeted tests when possible.
 
 ## Gotchas
-- `capsule` delegates to the external `nacelle` binary.
-- `capsule pack` routes to Source/OCI/WASM via `router` logic.
+- `ato` delegates to the external `nacelle` binary.
+- `ato pack` routes to Source/OCI/WASM via `router` logic.
 - `--skip-l1` and `--skip-validation` are dangerous; use sparingly.
 
 ## Useful Paths

@@ -2,7 +2,7 @@
 
 ## 概要
 
-`capsule open` または `capsule pack` で作成したバンドルを実行すると、Tokio ランタイム関連のパニックが発生し、アプリケーションが起動できない。
+`ato open` または `ato pack` で作成したバンドルを実行すると、Tokio ランタイム関連のパニックが発生し、アプリケーションが起動できない。
 
 ## エラーメッセージ
 
@@ -32,9 +32,9 @@ EOF
 ### 手順2: カプセルをパック
 
 ```bash
-cd /path/to/capsule-cli
+cd /path/to/ato-cli
 cargo build
-./target/debug/capsule pack /tmp/test-capsule
+./target/debug/ato pack /tmp/test-capsule
 ```
 
 **結果:** ✅ 成功 (バンドル作成)
@@ -50,7 +50,7 @@ cargo build
 ### 手順3: カプセルを実行
 
 ```bash
-./target/debug/capsule open /tmp/test-capsule
+./target/debug/ato open /tmp/test-capsule
 ```
 
 **結果:** ❌ パニック発生
@@ -70,10 +70,10 @@ there is no reactor running, must be called from the context of a Tokio 1.x runt
 
 ## 影響範囲
 
-- ** capsule-cli (動作確認)**
-  - `capsule pack` ✅ 正常動作
-  - `capsule open --background` ✅ PIDファイル作成まで正常
-  - `capsule open` (フォアグラウンド) ❌ パニック発生
+- ** ato-cli (動作確認)**
+  - `ato pack` ✅ 正常動作
+  - `ato open --background` ✅ PIDファイル作成まで正常
+  - `ato open` (フォアグラウンド) ❌ パニック発生
 
 - ** バンドル直接実行 **
   ```bash
@@ -88,7 +88,7 @@ there is no reactor running, must be called from the context of a Tokio 1.x runt
 | OS | macOS Sequoia 15.2 |
 | Arch | arm64 (Apple Silicon) |
 | Rust | 1.83.0 |
-| capsule-cli | 0.2.0 |
+| ato-cli | 0.2.0 |
 | nacelle | 0.2.0 |
 | tokio | 1.49.0 |
 
@@ -182,7 +182,7 @@ async fn main() -> anyhow::Result<()> {
 
 **高 (High)**
 
-- バンドル実行が完全に動作capsule openしない
+- バンドル実行が完全に動作ato openしない
 - `` コマンドの実用性が失われる
 
 ## 担当者
@@ -250,7 +250,7 @@ RUST_BACKTRACE=1 で実行時の追加情報:
 
 2. **デバッグモードで実行**
    ```bash
-   RUST_BACKTRACE=1 ./target/debug/capsule open /path/to/capsule
+   RUST_BACKTRACE=1 ./target/debug/ato open /path/to/capsule
    ```
 
 3. **既存の nacelle バイナリを使用**
@@ -260,10 +260,10 @@ RUST_BACKTRACE=1 で実行時の追加情報:
 
 | 機能 | 状態 | 備考 |
 |------|------|------|
-| `capsule pack` | ✅ 正常 | バンドル作成は問題なし |
-| `capsule open --background` | ⚠️ 部分的 | PIDファイル作成まで正常、実行でpanic |
-| `capsule open` | ❌ 失敗 | パニック発生 |
+| `ato pack` | ✅ 正常 | バンドル作成は問題なし |
+| `ato open --background` | ⚠️ 部分的 | PIDファイル作成まで正常、実行でpanic |
+| `ato open` | ❌ 失敗 | パニック発生 |
 | `nacelle-bundle` 直接実行 | ❌ 失敗 | パニック発生 |
-| `capsule ps` | ✅ 正常 | PIDファイルから情報表示 |
-| `capsule close` | ⚠️ 部分的 | PIDファイルは削除されるが、実プロセス終了しない |
+| `ato ps` | ✅ 正常 | PIDファイルから情報表示 |
+| `ato close` | ⚠️ 部分的 | PIDファイルは削除されるが、実プロセス終了しない |
 

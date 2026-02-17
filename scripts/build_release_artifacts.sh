@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Build and package ato release archives for one or more Rust targets.
+#
+# Example:
+#   TARGETS="aarch64-apple-darwin" ./scripts/build_release_artifacts.sh
+#   TARGETS="x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu" ./scripts/build_release_artifacts.sh
+#
+# Env:
+#   VERSION      default: parsed from Cargo.toml ([package].version)
+#   TARGETS      default: host target only
+#   OUT_ROOT     default: /tmp/ato-release
+#   SKIP_BUILD   default: 0 (set 1 to only package already-built binaries)
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "error: required command not found: $1" >&2
+    exit 1
+  }
+}
+
+detect_host_target() {
+  local os arch
+  os="$(uname -s)"
+  arch="$(uname -m)"
+
+  case "$arch" in
+    x86_64|amd64) arch="x86_64" ;;
+    arm64|aarch64) arch="aarch64" ;;
+    *)
+      echo "error: unsupported host architecture: $arch" >&2
+      exit 1
+      ;;
+  esac
+
+  case "$os" in
+    Darwin) echo "${arch}-apple-darwin" ;;
+    Linux) echo "${arch}-unknown-linux-gnu" ;;
+    *)
+      echo "error: unsupported host OS: $os" >&2
+      exit 1
+      ;;
+  esac
+}
+
+extract_version() {
+  local cargo_toml="$1"
+  awk '
+    /^\[package\]/ { in_package=1; next }
+    in_package && /^\[/ { in_package=0 }
+    in_package && $1 == "version" {
+      gsub(/"/, "", $3)
+      print $3
+      exit
+    }
+  ' "$cargo_toml"
+}
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ATO_CLI_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+need_cmd cargo
+need_cmd rustup
+need_cmd tar
+need_cmd shasum
+need_cmd mktemp
+
+VERSION="${VERSION:-$(extract_version "$ATO_CLI_DIR/Cargo.toml")}"
+if [[ -z "$VERSION" ]]; then
+  echo "error: failed to detect VERSION from Cargo.toml" >&2
+  exit 1
+fi
+
+TARGETS="${TARGETS:-$(detect_host_target)}"
+OUT_ROOT="${OUT_ROOT:-/tmp/ato-release}"
+SKIP_BUILD="${SKIP_BUILD:-0}"
+OUT_DIR="${OUT_ROOT%/}/${VERSION}"
+
+read -r -a target_list <<<"$TARGETS"
+if [[ "${#target_list[@]}" -eq 0 ]]; then
+  echo "error: TARGETS is empty" >&2
+  exit 1
+fi
+
+mkdir -p "$OUT_DIR"
+
+for target in "${target_list[@]}"; do
+  echo "==> target: $target"
+
+  if [[ "$SKIP_BUILD" != "1" ]]; then
+    rustup target add "$target"
+    cargo build --release --locked --target "$target" --manifest-path "$ATO_CLI_DIR/Cargo.toml"
+  fi
+
+  binary_path="$ATO_CLI_DIR/target/$target/release/ato"
+  if [[ ! -x "$binary_path" ]]; then
+    echo "error: built binary not found: $binary_path" >&2
+    exit 1
+  fi
+
+  "$binary_path" --version >/dev/null
+
+  staging_dir="$(mktemp -d)"
+  cp "$binary_path" "$staging_dir/ato"
+  chmod 0755 "$staging_dir/ato"
+
+  archive_path="$OUT_DIR/ato-$target.tar.gz"
+  tar -C "$staging_dir" -czf "$archive_path" ato
+  rm -rf "$staging_dir"
+
+  entries="$(tar -tzf "$archive_path")"
+  if [[ "$entries" != "ato" ]]; then
+    echo "error: archive must contain only root 'ato': $archive_path" >&2
+    echo "$entries" >&2
+    exit 1
+  fi
+
+  echo "    packaged: $archive_path"
+done
+
+(
+  cd "$OUT_DIR"
+  shasum -a 256 ato-*.tar.gz > SHA256SUMS
+)
+
+echo "==> done"
+echo "    version : $VERSION"
+echo "    out dir : $OUT_DIR"
+echo "    targets : ${target_list[*]}"
+echo "    checksum: $OUT_DIR/SHA256SUMS"

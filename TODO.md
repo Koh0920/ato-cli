@@ -1,4 +1,4 @@
-# capsule-cli TODO
+# ato-cli TODO
 
 ## Phase 1: 基盤整備 ✅
 
@@ -80,12 +80,12 @@ resolver = "2"
 
 ### 2. watch モードでの sidecar リーク修正 ✅
 **課題:**
-- watch モードでカプセルを再起動する際、子プロセスの `capsule open` を kill しても、ato-tsnetd (sidecar) がリークする可能性がある
+- watch モードでカプセルを再起動する際、子プロセスの `ato open` を kill しても、ato-tsnetd (sidecar) がリークする可能性がある
 
 **解決策:**
 - `CAPSULE_WATCH_MODE=1` 環境変数を子プロセスに渡す
 - `sidecar.rs` で `CAPSULE_WATCH_MODE` が設定されている場合は sidecar を起動しない
-- 親プロセスの `capsule open --watch` が sidecar を管理
+- 親プロセスの `ato open --watch` が sidecar を管理
 
 ### 3. NO_PROXY 環境変数の上書き問題修正 ✅
 **課題:**
@@ -131,7 +131,7 @@ resolver = "2"
 ### 4. core の futures 依存
 **課題:**
 - core/Cargo.toml で futures 0.3.11 を使用
-- capsule-cli で futures 0.3.35 を使用
+- ato-cli で futures 0.3.35 を使用
 
 **解決策:**
 - futures 0.3.35 にバージョンアップグレード
@@ -149,7 +149,7 @@ resolver = "2"
    - コンパイル成功
 
 2. **bollard クレートの依存追加** ✅
-   - `capsule-cli/Cargo.toml` に `bollard = "0.15"` を追加
+   - `ato-cli/Cargo.toml` に `bollard = "0.15"` を追加
    - OCI executor の依存を解決
 
 3. **Arc<CliReporter> と Arc<dyn CapsuleReporter> の型不一致** ✅
@@ -243,7 +243,7 @@ resolver = "2"
   - `--id` / `--name` で対象指定
 
 ### プロセス管理の既知の制限
-- 現在は `capsule open` がPIDファイルを書き出さない（将来実装）
+- 現在は `ato open` がPIDファイルを書き出さない（将来実装）
 - `ps` コマンドは既存のPIDファイルを表示（実プロセスとの照会は実装済み）
 
 ---
@@ -276,9 +276,9 @@ resolver = "2"
 
 ### 追加したテスト
 - [x] watch モードの単体テスト (phase 2 で実装済み)
-- [x] `capsule open --watch` のE2Eテスト (phase 2 で実装済み)
+- [x] `ato open --watch` のE2Eテスト (phase 2 で実装済み)
 - [x] CLI 引数の検証テスト (`tests/cli_tests.rs`)
-- [x] `capsule open <file>` のE2Eテスト (phase 2 で実装済み)
+- [x] `ato open <file>` のE2Eテスト (phase 2 で実装済み)
 - [x] エラーコードの検証テスト (phase 1 で実装済み)
 
 ### テスト結果
@@ -335,7 +335,7 @@ reqwest = { version = "0.11", default-features = false, features = ["blocking", 
 ### 2. プロセスの「完全な」バックグラウンド化 (Phase 2)
 **課題:**
 - Rust の `Command::spawn()` は親プロセス（CLI）が終了すると、子プロセスも道連れに終了する場合がある
-- `capsule open`（バックグラウンドモード）は、CLI が終了してもランタイムが生き続ける必要がある
+- `ato open`（バックグラウンドモード）は、CLI が終了してもランタイムが生き続ける必要がある
 
 **対策:**
 - まず macOS/Linux のみサポート
@@ -345,7 +345,7 @@ reqwest = { version = "0.11", default-features = false, features = ["blocking", 
 ### 3. Stale PID (ゾンビPIDファイル) 問題 (Phase 4)
 **課題:**
 - マシンが強制終了したり、カプセルがクラッシュした場合、PIDファイルが残る
-- 次に `capsule ps` したとき、その PID が偶然別のプロセス（OSの無関係なプロセス）に割り当たると、誤判定を起こす
+- 次に `ato ps` したとき、その PID が偶然別のプロセス（OSの無関係なプロセス）に割り当たると、誤判定を起こす
 
 **対策:**
 - PIDファイルの存在確認だけでなく、「プロセス名が期待通りか（nacelle / ato-tsnetd か）」も検証するロジックを `process_manager.rs` に追加
@@ -366,11 +366,11 @@ reqwest = { version = "0.11", default-features = false, features = ["blocking", 
 
 1. ✅ 依存関係の解消 (完了)
    - futures バージョンを "0.3" に統一
-   - bollard クレートを capsule-cli に追加
+   - bollard クレートを ato-cli に追加
    - コンパイル成功
 
 2. ✅ Phase 2 の完了 (基本機能のみ)
-   - `capsule open` コマンドの実装
+   - `ato open` コマンドの実装
    - `--watch` フラグの実装 (ファイル監視、デバンス、無視パターン)
    - 型不一致を解決 (Arc<CliReporter> 統一)
    - watch モードの基本実装完了
@@ -401,7 +401,7 @@ reqwest = { version = "0.11", default-features = false, features = ["blocking", 
 
 7. 次のタスク
     - [x] テストの追加実装 (完了)
-    - [x] PIDファイル書き出し機能の実装（capsule open 時）- Source executor対応
+    - [x] PIDファイル書き出し機能の実装（ato open 時）- Source executor対応
     - [x] バックグラウンドモードの実装 (`--background` フラグ追加)
 
 ---

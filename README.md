@@ -1,6 +1,6 @@
-# capsule-cli
+# ato-cli
 
-`capsule` は **メタレイヤー / CLI** として、`capsule.toml` を読み、適切な下位エンジン（例: `nacelle`）へディスパッチします。
+`ato` は **メタレイヤー / CLI** として、`capsule.toml` を読み、適切な下位エンジン（例: `nacelle`）へディスパッチします。
 
 このワークスペースでは、プロセス境界（JSON over stdio）の最小契約に従って `nacelle internal ...` を呼び出します。
 
@@ -14,19 +14,19 @@ cd ../nacelle/cli
 cargo build
 
 # capsule をビルド（メタCLI）
-cd ../../capsule-cli
+cd ../../ato-cli
 cargo build
 
 # 一度だけ engine を登録（PATH探索は無効化されているため）
-./target/debug/capsule engine register --name default --path ../nacelle/target/debug/nacelle --default
+./target/debug/ato config engine register --name default --path ../nacelle/target/debug/nacelle --default
 
 # 1) Create
-./target/debug/capsule new my-app --template node
+./target/debug/ato init my-app --template node
 cd my-app
 
 # 2) Run (dev)
 # `execution.dev.entrypoint` があればそれを優先
-../target/debug/capsule dev
+../target/debug/ato run .
 
 # (Node/Bun) 3) Build (recommended)
 # `execution.release.entrypoint` を実行できるように、配布前にビルド成果物を生成
@@ -41,7 +41,7 @@ bun run build
 #   - bun --watch run src/index.ts
 
 # 3) Ship (bundle)
-../target/debug/capsule pack --bundle
+../target/debug/ato build .
 
 # 4) Execute (deploy artifact)
 ./nacelle-bundle
@@ -52,9 +52,43 @@ bun run build
 `capsule.toml` の `[execution]` に加えて、以下のプロファイルをサポートします。
 
 - `[execution.dev]`:
-	- `capsule dev` が優先して使う
+	- `ato run` が優先して使う
 - `[execution.release]`:
 	- `nacelle-bundle` 実行（=配布物）が優先して使う
+
+## Package Search
+
+公開されているパッケージは次のコマンドで検索できます。
+
+```bash
+ato search ai
+ato search --category productivity --limit 10
+```
+
+互換のため、旧 `ato package search ...` も引き続き利用できます。
+
+既定の検索先は `https://api.ato.run` です。`ATO_STORE_API_URL` または `--registry` で上書きできます。
+
+## Login (Device Flow)
+
+`ato login` はブラウザを開いて `store.ato.run` の認証を行い、完了後に CLI へセッションを自動引き継ぎします。
+
+```bash
+ato login
+```
+
+互換のため、従来の PAT フローも利用可能です。
+
+```bash
+ato login --token <github-personal-access-token>
+```
+
+## Environment Variables
+
+- `ATO_STORE_API_URL` (default: `https://api.ato.run`)
+- `ATO_STORE_SITE_URL` (default: `https://store.ato.run`)
+- `ATO_SESSION_TOKEN` (優先)
+- `CAPSULE_SESSION_TOKEN` (legacy fallback)
 
 ## .capsuleignore
 
@@ -96,10 +130,10 @@ self-extracting bundle（`nacelle-bundle`）をコンテナで実行するため
 
 ```bash
 # capsule.toml の build.gpu を見て Dockerfile を選択
-capsule scaffold docker --manifest capsule.toml
+ato scaffold docker --manifest capsule.toml
 
 # 既存ファイルを上書き
-capsule scaffold docker --force
+ato scaffold docker --force
 ```
 
 ## License
