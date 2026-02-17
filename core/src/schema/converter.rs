@@ -173,9 +173,9 @@ pub fn manifest_to_capnp_bytes(
                     "targets.<default_target>.entrypoint",
                 ));
             }
-            let selected_runtime = manifest
-                .resolve_default_runtime()
-                .map_err(|_| CapnpConversionError::MissingField("targets.<default_target>.runtime"))?;
+            let selected_runtime = manifest.resolve_default_runtime().map_err(|_| {
+                CapnpConversionError::MissingField("targets.<default_target>.runtime")
+            })?;
             let mut merged_env = manifest
                 .targets
                 .as_ref()

@@ -2,6 +2,7 @@
 
 pub mod common;
 pub mod config;
+pub mod diagnostics;
 pub mod discovery;
 pub mod engine;
 pub mod error;
@@ -23,6 +24,7 @@ pub mod schema;
 pub mod schema_registry;
 pub mod security;
 pub mod signing;
+pub mod smoke;
 pub mod trust_store;
 pub mod tsnet;
 pub mod types;

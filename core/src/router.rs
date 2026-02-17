@@ -287,10 +287,7 @@ fn resolve_target_label(manifest: &toml::Value, target_label: Option<&str>) -> R
         .unwrap_or(default_target);
 
     if !targets.contains_key(selected) {
-        return Err(anyhow!(
-            "Target '{}' not found under [targets]",
-            selected
-        ));
+        return Err(anyhow!("Target '{}' not found under [targets]", selected));
     }
 
     Ok(selected.to_string())
