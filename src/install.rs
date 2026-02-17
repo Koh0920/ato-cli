@@ -61,7 +61,6 @@ pub async fn install_app(
     registry_url: Option<&str>,
     version: Option<&str>,
     output_dir: Option<PathBuf>,
-    skip_verify: bool,
     _set_default: bool,
     json_output: bool,
 ) -> Result<InstallResult> {
@@ -161,34 +160,32 @@ pub async fn install_app(
         .with_context(|| "Failed to read downloaded artifact")?;
 
     let computed_blake3 = compute_blake3(&bytes);
-    if !skip_verify {
-        ensure_signature_verified(&signature_status)?;
+    ensure_signature_verified(&signature_status)?;
 
-        match (sha256.as_ref(), blake3.as_ref()) {
-            (None, None) => {
-                bail!("No hash metadata available for verification");
-            }
-            (Some(expected_sha), _) => {
-                let got_sha = compute_sha256(&bytes);
-                if !equals_hash(expected_sha, &got_sha) {
-                    bail!(
-                        "SHA256 mismatch!\n  Expected: {}\n  Got: {}",
-                        expected_sha,
-                        got_sha
-                    );
-                }
-            }
-            (None, Some(_)) => {}
+    match (sha256.as_ref(), blake3.as_ref()) {
+        (None, None) => {
+            bail!("No hash metadata available for verification");
         }
-
-        if let Some(expected_blake3) = blake3.as_ref() {
-            if !equals_hash(expected_blake3, &computed_blake3) {
+        (Some(expected_sha), _) => {
+            let got_sha = compute_sha256(&bytes);
+            if !equals_hash(expected_sha, &got_sha) {
                 bail!(
-                    "BLAKE3 mismatch!\n  Expected: {}\n  Got: {}",
-                    expected_blake3,
-                    computed_blake3
+                    "SHA256 mismatch!\n  Expected: {}\n  Got: {}",
+                    expected_sha,
+                    got_sha
                 );
             }
+        }
+        (None, Some(_)) => {}
+    }
+
+    if let Some(expected_blake3) = blake3.as_ref() {
+        if !equals_hash(expected_blake3, &computed_blake3) {
+            bail!(
+                "BLAKE3 mismatch!\n  Expected: {}\n  Got: {}",
+                expected_blake3,
+                computed_blake3
+            );
         }
     }
 

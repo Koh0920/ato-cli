@@ -875,10 +875,7 @@ pub struct OciTarget {
 impl TargetsConfig {
     /// Check if any target is defined
     pub fn has_any_target(&self) -> bool {
-        self.wasm.is_some()
-            || self.source.is_some()
-            || self.oci.is_some()
-            || !self.named.is_empty()
+        self.wasm.is_some() || self.source.is_some() || self.oci.is_some() || !self.named.is_empty()
     }
 
     /// Get the preference order, using defaults if not specified
@@ -997,7 +994,12 @@ impl CapsuleManifestV1 {
         let target = self.resolve_default_target()?;
         RuntimeType::from_target_runtime(&target.runtime)
             .map(|runtime| runtime.normalize())
-            .ok_or_else(|| CapsuleError::ValidationError(format!("Invalid target '{}': runtime and entrypoint are required", self.default_target)))
+            .ok_or_else(|| {
+                CapsuleError::ValidationError(format!(
+                    "Invalid target '{}': runtime and entrypoint are required",
+                    self.default_target
+                ))
+            })
     }
 
     /// Check whether this capsule implements the given schema identifier.
@@ -1299,7 +1301,11 @@ impl std::fmt::Display for ValidationError {
                 write!(f, "At least one [targets.<label>] entry is required")
             }
             ValidationError::DefaultTargetNotFound(target) => {
-                write!(f, "default_target '{}' does not exist under [targets]", target)
+                write!(
+                    f,
+                    "default_target '{}' does not exist under [targets]",
+                    target
+                )
             }
             ValidationError::InvalidTarget(label) => {
                 write!(
@@ -1408,7 +1414,10 @@ quantization = "4bit"
         assert_eq!(manifest.version, "1.0.0");
         assert_eq!(manifest.capsule_type, CapsuleType::Inference);
         assert_eq!(manifest.targets.as_ref().and_then(|t| t.port), Some(8081));
-        assert_eq!(manifest.resolve_default_runtime().unwrap(), RuntimeType::Source);
+        assert_eq!(
+            manifest.resolve_default_runtime().unwrap(),
+            RuntimeType::Source
+        );
         assert!(manifest.capabilities.as_ref().unwrap().chat);
         assert_eq!(manifest.routing.weight, RouteWeight::Light);
     }
@@ -1472,10 +1481,7 @@ quantization = "4bit"
         assert!(build.gpu);
         assert_eq!(build.exclude_libs, vec!["**/site-packages/torch/**"]);
         assert_eq!(
-            build
-                .lifecycle
-                .as_ref()
-                .and_then(|v| v.prepare.as_deref()),
+            build.lifecycle.as_ref().and_then(|v| v.prepare.as_deref()),
             Some("npm ci")
         );
         assert_eq!(
@@ -1483,17 +1489,11 @@ quantization = "4bit"
             Some("node:20")
         );
         assert_eq!(
-            build
-                .outputs
-                .as_ref()
-                .and_then(|v| v.capsule.as_deref()),
+            build.outputs.as_ref().and_then(|v| v.capsule.as_deref()),
             Some("dist/*.capsule")
         );
         assert_eq!(
-            build
-                .policy
-                .as_ref()
-                .and_then(|v| v.require_attestation),
+            build.policy.as_ref().and_then(|v| v.require_attestation),
             Some(true)
         );
 

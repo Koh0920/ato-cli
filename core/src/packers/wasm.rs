@@ -36,12 +36,7 @@ pub fn pack(
     if output_path == source_path {
         warn!("Output path equals source; skipping optimization");
         let signature = if let Some(key) = key_path.as_ref() {
-            Some(signing::sign_artifact(
-                &source_path,
-                key,
-                "ato-cli",
-                None,
-            )?)
+            Some(signing::sign_artifact(&source_path, key, "ato-cli", None)?)
         } else {
             None
         };
@@ -80,12 +75,7 @@ pub fn pack(
     )?;
 
     let signature = if let Some(key) = key_path {
-        Some(signing::sign_artifact(
-            &output_path,
-            &key,
-            "ato-cli",
-            None,
-        )?)
+        Some(signing::sign_artifact(&output_path, &key, "ato-cli", None)?)
     } else {
         None
     };
