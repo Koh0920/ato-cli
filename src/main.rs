@@ -1041,9 +1041,7 @@ fn run() -> Result<()> {
             enforcement,
             unsafe_bypass_sandbox,
         } => {
-            futures::executor::block_on(
-                reporter.warn("⚠️  'ato open' is deprecated. Use 'ato run' instead.".to_string()),
-            )?;
+            eprintln!("⚠️  'ato open' is deprecated. Use 'ato run' instead.");
             if matches!(enforcement, EnforcementMode::BestEffort) && !unsafe_bypass_sandbox {
                 anyhow::bail!("--enforcement best-effort requires --unsafe-bypass-sandbox");
             }
@@ -1133,9 +1131,7 @@ fn run() -> Result<()> {
             enforcement,
             keep_failed_artifacts,
         } => {
-            futures::executor::block_on(
-                reporter.warn("⚠️  'ato pack' is deprecated. Use 'ato build' instead.".to_string()),
-            )?;
+            eprintln!("⚠️  'ato pack' is deprecated. Use 'ato build' instead.");
             commands::build::execute_pack_command(
                 dir,
                 init,

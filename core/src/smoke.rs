@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 use crate::error::CapsuleError;
 
 const DEFAULT_STARTUP_TIMEOUT_MS: u64 = 2000;
+const PORT_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
+const PORT_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SmokeOptions {
@@ -50,19 +52,12 @@ pub fn run_capsule_smoke(
     let mut child = spawn_main_service(extract_dir.path(), &service)?;
     let startup_timeout = Duration::from_millis(options.startup_timeout_ms);
     let deadline = Instant::now() + startup_timeout;
-    let mut port_ready = required_port.is_none();
 
     loop {
         if let Some(status) = child.try_wait().map_err(CapsuleError::Io)? {
             return Err(CapsuleError::Pack(format!(
                 "Smoke failed: process exited before startup timeout (status: {status})"
             )));
-        }
-
-        if let Some(port) = required_port {
-            if !port_ready && can_connect_localhost(port) {
-                port_ready = true;
-            }
         }
 
         if Instant::now() >= deadline {
@@ -72,13 +67,8 @@ pub fn run_capsule_smoke(
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    if !port_ready {
-        let port = required_port.unwrap_or_default();
-        let _ = kill_child(&mut child);
-        return Err(CapsuleError::Pack(format!(
-            "Smoke failed: required port {port} was not reachable within {}ms",
-            options.startup_timeout_ms
-        )));
+    if let Some(port) = required_port {
+        wait_for_required_port_with_retry(&mut child, port, PORT_RETRY_TIMEOUT)?;
     }
 
     run_check_commands(extract_dir.path(), &service, &options)?;
@@ -374,6 +364,34 @@ fn kill_child(child: &mut Child) -> Result<(), CapsuleError> {
 fn can_connect_localhost(port: u16) -> bool {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok()
+}
+
+fn wait_for_required_port_with_retry(
+    child: &mut Child,
+    port: u16,
+    timeout: Duration,
+) -> Result<(), CapsuleError> {
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().map_err(CapsuleError::Io)? {
+            return Err(CapsuleError::Pack(format!(
+                "Smoke failed: process exited while waiting for port {port} (status: {status})"
+            )));
+        }
+
+        if can_connect_localhost(port) {
+            return Ok(());
+        }
+
+        if start.elapsed() > timeout {
+            return Err(CapsuleError::Pack(format!(
+                "Port {port} did not open within {} seconds. Check logs.",
+                timeout.as_secs()
+            )));
+        }
+
+        std::thread::sleep(PORT_RETRY_INTERVAL);
+    }
 }
 
 fn resolve_path(root: &Path, raw: &str) -> PathBuf {
