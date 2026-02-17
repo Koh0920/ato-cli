@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use futures::executor;
 use tar::Builder;
 use zstd::stream::encode_all;
 
@@ -38,17 +37,15 @@ pub async fn pack(
     opts: CapsulePackOptions,
     reporter: Arc<dyn crate::reporter::CapsuleReporter + 'static>,
 ) -> CapsuleResult<PathBuf> {
-    futures::executor::block_on(reporter.notify(
-        "📦 Creating Capsule Archive (.capsule format)".to_string(),
-    ))?;
+    futures::executor::block_on(
+        reporter.notify("📦 Creating Capsule Archive (.capsule format)".to_string()),
+    )?;
 
     let loaded = crate::manifest::load_manifest(&opts.manifest_path)?;
     let manifest_content = loaded.raw_text;
 
     // Step 1: Generate config.json
-    futures::executor::block_on(
-        reporter.notify("🧭 Phase 1: Generating config.json".to_string()),
-    )?;
+    futures::executor::block_on(reporter.notify("🧭 Phase 1: Generating config.json".to_string()))?;
 
     let config_path = r3_config::generate_and_write_config(
         &opts.manifest_path,
@@ -69,11 +66,9 @@ pub async fn pack(
     // Step 3: Prepare source/ directory
     let source_dir = opts.manifest_dir.join("source");
     if !source_dir.exists() {
-        futures::executor::block_on(
-            reporter.warn(
-                "⚠️  No source/ directory found. Creating empty source/ directory.".to_string(),
-            ),
-        )?;
+        futures::executor::block_on(reporter.warn(
+            "⚠️  No source/ directory found. Creating empty source/ directory.".to_string(),
+        ))?;
         fs::create_dir_all(&source_dir).with_context(|| {
             format!(
                 "Failed to create source/ directory: {}",

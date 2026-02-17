@@ -26,8 +26,9 @@ impl SchemaRegistry {
     pub fn save(&self) -> Result<()> {
         let path = registry_path()?;
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| CapsuleError::Config(format!("Failed to create registry dir: {}", e)))?;
+            fs::create_dir_all(parent).map_err(|e| {
+                CapsuleError::Config(format!("Failed to create registry dir: {}", e))
+            })?;
         }
         let raw = serde_json::to_string_pretty(self)
             .map_err(|e| CapsuleError::Config(format!("Failed to serialize registry: {}", e)))?;

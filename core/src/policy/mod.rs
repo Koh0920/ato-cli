@@ -1,4 +1,4 @@
-//! Policy Module for Capsule CLI
+//! Policy Module for Ato CLI
 //!
 //! Handles policy resolution (e.g., DNS → IP for egress rules)
 

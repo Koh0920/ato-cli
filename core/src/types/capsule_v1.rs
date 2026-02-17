@@ -1,4 +1,4 @@
-//! Capsule Manifest v1.0 Schema
+//! Capsule Manifest v0.2 Schema
 //!
 //! Implements the "Everything is a Capsule" paradigm for Gumball v0.3.0.
 //! Supports both TOML (human-authored) and JSON (machine-generated) formats.
@@ -9,8 +9,8 @@ use std::fs;
 use std::path::Path;
 
 use super::error::CapsuleError;
-use crate::schema_registry::SchemaRegistry;
 use super::utils::parse_memory_string;
+use crate::schema_registry::SchemaRegistry;
 
 /// Capsule Type - defines the fundamental nature of the Capsule
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -48,6 +48,9 @@ pub enum RuntimeType {
     /// OCI Container Image runtime (youki, runc, containerd)
     /// UARC V1.1.0: Fallback for legacy/GPU applications
     Oci,
+
+    /// Static web runtime for browser sandbox / playground.
+    Web,
 
     // === Legacy types (deprecated, for backward compatibility) ===
     // These will be removed in UARC v0.2.0
@@ -89,6 +92,21 @@ impl RuntimeType {
             self,
             RuntimeType::Docker | RuntimeType::Native | RuntimeType::Youki
         )
+    }
+
+    /// Parse a v0.2 named target runtime label.
+    #[allow(deprecated)]
+    pub fn from_target_runtime(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "source" => Some(RuntimeType::Source),
+            "wasm" => Some(RuntimeType::Wasm),
+            "oci" => Some(RuntimeType::Oci),
+            "web" => Some(RuntimeType::Web),
+            "docker" => Some(RuntimeType::Docker),
+            "native" => Some(RuntimeType::Native),
+            "youki" => Some(RuntimeType::Youki),
+            _ => None,
+        }
     }
 }
 
@@ -178,6 +196,72 @@ pub struct BuildConfig {
     /// and optional exclude patterns) but should remain opt-in.
     #[serde(default)]
     pub gpu: bool,
+
+    /// Build task lifecycle for CI/build pipelines.
+    #[serde(default)]
+    pub lifecycle: Option<BuildLifecycleConfig>,
+
+    /// Build inputs used for reproducibility and provenance.
+    #[serde(default)]
+    pub inputs: Option<BuildInputsConfig>,
+
+    /// Build outputs expected by registry/store verification.
+    #[serde(default)]
+    pub outputs: Option<BuildOutputsConfig>,
+
+    /// Publish-time verification policy.
+    #[serde(default)]
+    pub policy: Option<BuildPolicyConfig>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BuildLifecycleConfig {
+    #[serde(default)]
+    pub prepare: Option<String>,
+    #[serde(default)]
+    pub build: Option<String>,
+    #[serde(default)]
+    pub package: Option<String>,
+    #[serde(default)]
+    pub verify: Option<String>,
+    #[serde(default)]
+    pub publish: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BuildInputsConfig {
+    #[serde(default)]
+    pub lockfiles: Vec<String>,
+    #[serde(default)]
+    pub toolchain: Option<String>,
+    #[serde(default)]
+    pub artifacts: Vec<String>,
+    #[serde(default)]
+    pub allow_network: Option<bool>,
+    #[serde(default)]
+    pub reproducibility: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BuildOutputsConfig {
+    #[serde(default)]
+    pub capsule: Option<String>,
+    #[serde(default)]
+    pub sha256: Option<bool>,
+    #[serde(default)]
+    pub blake3: Option<bool>,
+    #[serde(default)]
+    pub attestation: Option<bool>,
+    #[serde(default)]
+    pub signature: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BuildPolicyConfig {
+    #[serde(default)]
+    pub require_attestation: Option<bool>,
+    #[serde(default)]
+    pub require_did_signature: Option<bool>,
 }
 
 /// Isolation configuration (runtime-time behavior)
@@ -234,12 +318,12 @@ pub struct ReadinessProbe {
     pub port: String,
 }
 
-/// Capsule Manifest v1.0
+/// Capsule Manifest v0.2
 ///
 /// The primary configuration format for all Capsules in Gumball v0.3.0+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapsuleManifestV1 {
-    /// Schema version (must be "1.0")
+    /// Schema version (must be "0.2")
     #[serde(default = "default_schema_version")]
     pub schema_version: String,
 
@@ -252,6 +336,10 @@ pub struct CapsuleManifestV1 {
     /// Capsule type
     #[serde(rename = "type")]
     pub capsule_type: CapsuleType,
+
+    /// Default target label used when no explicit target is selected.
+    #[serde(default)]
+    pub default_target: String,
 
     /// Human-readable metadata
     #[serde(default)]
@@ -266,6 +354,7 @@ pub struct CapsuleManifestV1 {
     pub requirements: CapsuleRequirements,
 
     /// Execution configuration
+    #[serde(default, skip_serializing)]
     pub execution: CapsuleExecution,
 
     /// Persistent storage volumes
@@ -328,7 +417,7 @@ pub struct PolymorphismConfig {
 }
 
 fn default_schema_version() -> String {
-    "1.0".to_string()
+    "0.2".to_string()
 }
 
 /// Pre-warmed container pool configuration
@@ -526,7 +615,7 @@ fn default_kill_signal() -> String {
 }
 
 /// Execution configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CapsuleExecution {
     /// Runtime type
     pub runtime: RuntimeType,
@@ -675,6 +764,38 @@ pub struct TargetsConfig {
     /// OCI container target
     #[serde(default)]
     pub oci: Option<OciTarget>,
+
+    /// Named target entries for v0.2 (e.g. [targets.cli], [targets.static]).
+    #[serde(flatten)]
+    pub named: HashMap<String, NamedTarget>,
+}
+
+/// v0.2 named target definition under [targets.<label>].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NamedTarget {
+    /// Runtime kind for this target (`source`, `web`, `wasm`, `oci`).
+    #[serde(default)]
+    pub runtime: String,
+
+    /// Entrypoint path for the target.
+    #[serde(default)]
+    pub entrypoint: String,
+
+    /// Optional command arguments.
+    #[serde(default)]
+    pub cmd: Vec<String>,
+
+    /// Optional environment variables.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+
+    /// Public asset allowlist for web runtime.
+    #[serde(default)]
+    pub public: Vec<String>,
+
+    /// Optional working directory.
+    #[serde(default)]
+    pub working_dir: Option<String>,
 }
 
 /// WebAssembly Component Model target configuration
@@ -754,7 +875,10 @@ pub struct OciTarget {
 impl TargetsConfig {
     /// Check if any target is defined
     pub fn has_any_target(&self) -> bool {
-        self.wasm.is_some() || self.source.is_some() || self.oci.is_some()
+        self.wasm.is_some()
+            || self.source.is_some()
+            || self.oci.is_some()
+            || !self.named.is_empty()
     }
 
     /// Get the preference order, using defaults if not specified
@@ -793,17 +917,44 @@ impl TargetsConfig {
         }
         Ok(())
     }
+
+    /// Returns a v0.2 named target by label.
+    pub fn named_target(&self, label: &str) -> Option<&NamedTarget> {
+        self.named.get(label)
+    }
+
+    /// Returns all named targets.
+    pub fn named_targets(&self) -> &HashMap<String, NamedTarget> {
+        &self.named
+    }
 }
 
 impl CapsuleManifestV1 {
     /// Parse from TOML string
     pub fn from_toml(content: &str) -> Result<Self, CapsuleError> {
+        let raw: toml::Value = toml::from_str(content)
+            .map_err(|e| CapsuleError::ParseError(format!("TOML parse error: {}", e)))?;
+
+        if raw.get("execution").is_some() {
+            return Err(CapsuleError::ParseError(
+                "legacy [execution] section is not supported in schema_version=0.2".to_string(),
+            ));
+        }
+
         toml::from_str(content)
             .map_err(|e| CapsuleError::ParseError(format!("TOML parse error: {}", e)))
     }
 
     /// Parse from JSON string
     pub fn from_json(content: &str) -> Result<Self, CapsuleError> {
+        let raw: serde_json::Value = serde_json::from_str(content)
+            .map_err(|e| CapsuleError::ParseError(format!("JSON parse error: {}", e)))?;
+        if raw.get("execution").is_some() {
+            return Err(CapsuleError::ParseError(
+                "legacy [execution] section is not supported in schema_version=0.2".to_string(),
+            ));
+        }
+
         serde_json::from_str(content)
             .map_err(|e| CapsuleError::ParseError(format!("JSON parse error: {}", e)))
     }
@@ -816,6 +967,37 @@ impl CapsuleManifestV1 {
     /// Serialize to TOML
     pub fn to_toml(&self) -> Result<String, CapsuleError> {
         toml::to_string_pretty(self).map_err(|e| CapsuleError::SerializeError(e.to_string()))
+    }
+
+    /// Resolve the effective v0.2 target from `default_target`.
+    pub fn resolve_default_target(&self) -> Result<&NamedTarget, CapsuleError> {
+        let targets = self.targets.as_ref().ok_or_else(|| {
+            CapsuleError::ValidationError(
+                "at least one [targets.<label>] section is required".to_string(),
+            )
+        })?;
+        if self.default_target.trim().is_empty() {
+            return Err(CapsuleError::ValidationError(
+                "default_target is required".to_string(),
+            ));
+        }
+        targets
+            .named_targets()
+            .get(self.default_target.trim())
+            .ok_or_else(|| {
+                CapsuleError::ValidationError(format!(
+                    "default_target '{}' does not exist under [targets]",
+                    self.default_target
+                ))
+            })
+    }
+
+    /// Resolve runtime from the effective v0.2 target.
+    pub fn resolve_default_runtime(&self) -> Result<RuntimeType, CapsuleError> {
+        let target = self.resolve_default_target()?;
+        RuntimeType::from_target_runtime(&target.runtime)
+            .map(|runtime| runtime.normalize())
+            .ok_or_else(|| CapsuleError::ValidationError(format!("Invalid target '{}': runtime and entrypoint are required", self.default_target)))
     }
 
     /// Check whether this capsule implements the given schema identifier.
@@ -866,8 +1048,8 @@ impl CapsuleManifestV1 {
     pub fn validate(&self) -> Result<(), Vec<ValidationError>> {
         let mut errors = Vec::new();
 
-        // Schema version must be "1.0"
-        if self.schema_version != "1.0" {
+        // Schema version must be "0.2"
+        if self.schema_version != "0.2" {
             errors.push(ValidationError::InvalidSchemaVersion(
                 self.schema_version.clone(),
             ));
@@ -924,22 +1106,62 @@ impl CapsuleManifestV1 {
             errors.push(ValidationError::MissingModelConfig);
         }
 
-        // Port must be valid if specified
-        if let Some(port) = self.execution.port {
-            if port == 0 {
-                errors.push(ValidationError::InvalidPort(port));
+        // default_target must point to an existing named target.
+        let named_targets = self
+            .targets
+            .as_ref()
+            .map(|t| t.named_targets())
+            .cloned()
+            .unwrap_or_default();
+        if self.default_target.trim().is_empty() {
+            errors.push(ValidationError::MissingDefaultTarget);
+        }
+        if named_targets.is_empty() {
+            errors.push(ValidationError::MissingTargets);
+        } else if !self.default_target.trim().is_empty()
+            && !named_targets.contains_key(self.default_target.trim())
+        {
+            errors.push(ValidationError::DefaultTargetNotFound(
+                self.default_target.clone(),
+            ));
+        }
+
+        for (label, target) in named_targets {
+            let runtime = target.runtime.trim().to_ascii_lowercase();
+            let entrypoint = target.entrypoint.trim();
+            if label.trim().is_empty()
+                || runtime.is_empty()
+                || entrypoint.is_empty()
+                || !matches!(runtime.as_str(), "source" | "wasm" | "oci" | "web")
+            {
+                errors.push(ValidationError::InvalidTarget(label));
+                continue;
+            }
+            if runtime == "web" {
+                if target.public.is_empty() {
+                    errors.push(ValidationError::InvalidWebTarget(
+                        label.clone(),
+                        "public is required for runtime=web".to_string(),
+                    ));
+                } else if !target.public.iter().any(|p| p == entrypoint) {
+                    errors.push(ValidationError::InvalidWebTarget(
+                        label.clone(),
+                        "entrypoint must be included in public allowlist".to_string(),
+                    ));
+                }
             }
         }
 
-        // Storage volumes (minimal): OCI-only, unique names, safe absolute mount paths.
-        // UARC V1.1.0: Support Docker/Youki as legacy aliases for Oci
-        #[allow(deprecated)]
-        let is_oci_compatible = matches!(
-            self.execution.runtime,
-            RuntimeType::Oci | RuntimeType::Docker | RuntimeType::Youki
-        );
+        // Storage volumes (minimal): require at least one OCI target.
+        let has_oci_target = self.targets.as_ref().is_some_and(|targets| {
+            targets
+                .named_targets()
+                .values()
+                .any(|t| t.runtime.eq_ignore_ascii_case("oci"))
+                || targets.oci.is_some()
+        });
         if !self.storage.volumes.is_empty() {
-            if !is_oci_compatible {
+            if !has_oci_target {
                 errors.push(ValidationError::StorageOnlyForDocker);
             }
 
@@ -1027,13 +1249,18 @@ pub enum ValidationError {
     InvalidPort(u16),
     StorageOnlyForDocker,
     InvalidStorageVolume,
+    MissingDefaultTarget,
+    MissingTargets,
+    DefaultTargetNotFound(String),
+    InvalidTarget(String),
+    InvalidWebTarget(String, String),
 }
 
 impl std::fmt::Display for ValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ValidationError::InvalidSchemaVersion(v) => {
-                write!(f, "Invalid schema_version '{}', expected '1.0'", v)
+                write!(f, "Invalid schema_version '{}', expected '0.2'", v)
             }
             ValidationError::InvalidName(n) => {
                 write!(f, "Invalid name '{}', must be kebab-case", n)
@@ -1064,6 +1291,25 @@ impl std::fmt::Display for ValidationError {
                     f,
                     "Invalid storage volume (requires unique name and absolute mount_path)"
                 )
+            }
+            ValidationError::MissingDefaultTarget => {
+                write!(f, "default_target is required")
+            }
+            ValidationError::MissingTargets => {
+                write!(f, "At least one [targets.<label>] entry is required")
+            }
+            ValidationError::DefaultTargetNotFound(target) => {
+                write!(f, "default_target '{}' does not exist under [targets]", target)
+            }
+            ValidationError::InvalidTarget(label) => {
+                write!(
+                    f,
+                    "Invalid target '{}': runtime and entrypoint are required",
+                    label
+                )
+            }
+            ValidationError::InvalidWebTarget(label, message) => {
+                write!(f, "Invalid web target '{}': {}", label, message)
             }
         }
     }
@@ -1108,10 +1354,11 @@ mod tests {
     use super::*;
 
     const VALID_TOML: &str = r#"
-schema_version = "1.0"
+schema_version = "0.2"
 name = "mlx-qwen3-8b"
 version = "1.0.0"
 type = "inference"
+default_target = "cli"
 
 [metadata]
 display_name = "Qwen3 8B (MLX)"
@@ -1131,14 +1378,16 @@ vram_min = "6GB"
 vram_recommended = "8GB"
 disk = "5GB"
 
-[execution]
-runtime = "source"
-entrypoint = "server.py"
+[targets]
 port = 8081
 health_check = "/health"
 startup_timeout = 120
 
-[execution.env]
+[targets.cli]
+runtime = "source"
+entrypoint = "server.py"
+
+[targets.cli.env]
 GUMBALL_MODEL = "qwen3-8b"
 
 [routing]
@@ -1158,8 +1407,8 @@ quantization = "4bit"
         assert_eq!(manifest.name, "mlx-qwen3-8b");
         assert_eq!(manifest.version, "1.0.0");
         assert_eq!(manifest.capsule_type, CapsuleType::Inference);
-        assert_eq!(manifest.execution.port, Some(8081));
-        assert_eq!(manifest.execution.runtime, RuntimeType::Source);
+        assert_eq!(manifest.targets.as_ref().and_then(|t| t.port), Some(8081));
+        assert_eq!(manifest.resolve_default_runtime().unwrap(), RuntimeType::Source);
         assert!(manifest.capabilities.as_ref().unwrap().chat);
         assert_eq!(manifest.routing.weight, RouteWeight::Light);
     }
@@ -1172,7 +1421,7 @@ quantization = "4bit"
 
     #[test]
     fn test_validate_invalid_schema_version() {
-        let toml = VALID_TOML.replace("schema_version = \"1.0\"", "schema_version = \"2.0\"");
+        let toml = VALID_TOML.replace("schema_version = \"0.2\"", "schema_version = \"2.0\"");
         let manifest = CapsuleManifestV1::from_toml(&toml).unwrap();
         let errors = manifest.validate().unwrap_err();
         assert!(errors
@@ -1213,7 +1462,7 @@ quantization = "4bit"
     #[test]
     fn test_parse_build_and_isolation_sections() {
         let toml = format!(
-            "{}\n\n[build]\nexclude_libs = [\"**/site-packages/torch/**\"]\ngpu = true\n\n[isolation]\nallow_env = [\"LD_LIBRARY_PATH\", \"HF_TOKEN\"]\n",
+            "{}\n\n[build]\nexclude_libs = [\"**/site-packages/torch/**\"]\ngpu = true\n\n[build.lifecycle]\nprepare = \"npm ci\"\nbuild = \"npm run build\"\npackage = \"ato pack\"\n\n[build.inputs]\nlockfiles = [\"package-lock.json\"]\ntoolchain = \"node:20\"\n\n[build.outputs]\ncapsule = \"dist/*.capsule\"\nsha256 = true\nblake3 = true\nattestation = true\nsignature = true\n\n[build.policy]\nrequire_attestation = true\nrequire_did_signature = true\n\n[isolation]\nallow_env = [\"LD_LIBRARY_PATH\", \"HF_TOKEN\"]\n",
             VALID_TOML
         );
 
@@ -1222,6 +1471,31 @@ quantization = "4bit"
         let build = manifest.build.as_ref().expect("build section should exist");
         assert!(build.gpu);
         assert_eq!(build.exclude_libs, vec!["**/site-packages/torch/**"]);
+        assert_eq!(
+            build
+                .lifecycle
+                .as_ref()
+                .and_then(|v| v.prepare.as_deref()),
+            Some("npm ci")
+        );
+        assert_eq!(
+            build.inputs.as_ref().and_then(|v| v.toolchain.as_deref()),
+            Some("node:20")
+        );
+        assert_eq!(
+            build
+                .outputs
+                .as_ref()
+                .and_then(|v| v.capsule.as_deref()),
+            Some("dist/*.capsule")
+        );
+        assert_eq!(
+            build
+                .policy
+                .as_ref()
+                .and_then(|v| v.require_attestation),
+            Some(true)
+        );
 
         let isolation = manifest
             .isolation
@@ -1247,6 +1521,56 @@ quantization = "4bit"
         let manifest = CapsuleManifestV1::from_toml(VALID_TOML).unwrap();
         let vram_min = manifest.requirements.vram_min_bytes().unwrap();
         assert_eq!(vram_min, Some(6 * 1024 * 1024 * 1024)); // 6GB
+    }
+
+    #[test]
+    fn test_rejects_legacy_execution_section_toml() {
+        let legacy_manifest = r#"
+schema_version = "0.2"
+name = "legacy-app"
+version = "0.1.0"
+type = "app"
+default_target = "cli"
+
+[execution]
+runtime = "source"
+entrypoint = "main.py"
+
+[targets.cli]
+runtime = "source"
+entrypoint = "main.py"
+"#;
+
+        let error = CapsuleManifestV1::from_toml(legacy_manifest).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("legacy [execution] section is not supported in schema_version=0.2"));
+    }
+
+    #[test]
+    fn test_rejects_legacy_execution_section_json() {
+        let legacy_manifest = r#"{
+  "schema_version": "0.2",
+  "name": "legacy-app",
+  "version": "0.1.0",
+  "type": "app",
+  "default_target": "cli",
+  "execution": {
+    "runtime": "source",
+    "entrypoint": "main.py"
+  },
+  "targets": {
+    "cli": {
+      "runtime": "source",
+      "entrypoint": "main.py"
+    }
+  }
+}"#;
+
+        let error = CapsuleManifestV1::from_json(legacy_manifest).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("legacy [execution] section is not supported in schema_version=0.2"));
     }
 
     #[test]

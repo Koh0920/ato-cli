@@ -79,7 +79,11 @@ impl TsnetHandle for TsnetClient {
 }
 
 impl TsnetClient {
-    pub async fn start_serve(&self, target_addr: String, listen_port: u16) -> Result<TsnetServeStatus> {
+    pub async fn start_serve(
+        &self,
+        target_addr: String,
+        listen_port: u16,
+    ) -> Result<TsnetServeStatus> {
         let mut client = self.transport.connect_client().await?;
         let request = ServeRequest {
             target_addr,
@@ -90,7 +94,12 @@ impl TsnetClient {
             .await
             .map_err(|err| map_status_error("start_serve", err))?
             .into_inner();
-        map_serve_status(response.running, response.listen_port, response.listen_addr, response.message)
+        map_serve_status(
+            response.running,
+            response.listen_port,
+            response.listen_addr,
+            response.message,
+        )
     }
 
     pub async fn stop_serve(&self) -> Result<TsnetServeStatus> {
@@ -167,7 +176,11 @@ fn map_serve_status(
     } else {
         Some(listen_addr)
     };
-    let message = if message.is_empty() { None } else { Some(message) };
+    let message = if message.is_empty() {
+        None
+    } else {
+        Some(message)
+    };
     Ok(TsnetServeStatus {
         running,
         listen_port,

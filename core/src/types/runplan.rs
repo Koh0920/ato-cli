@@ -111,11 +111,21 @@ pub struct Mount {
 impl CapsuleManifestV1 {
     /// Convert a validated capsule_v1 manifest into a normalized RunPlan.
     pub fn to_run_plan(&self) -> Result<RunPlan, CapsuleError> {
-        let ports = port_list(self.execution.port);
-        let env = ordered_env(&self.execution.env);
+        let target = self.resolve_default_target()?;
+        if target.entrypoint.trim().is_empty() {
+            return Err(CapsuleError::ValidationError(format!(
+                "targets.{}.entrypoint is required",
+                self.default_target
+            )));
+        }
+
+        let resolved_runtime = self.resolve_default_runtime()?;
+        let merged_env = merged_target_env(self, target);
+        let ports = port_list(self.targets.as_ref().and_then(|targets| targets.port));
+        let env = ordered_env(&merged_env);
 
         #[allow(deprecated)]
-        let runtime = match self.execution.runtime {
+        let runtime = match resolved_runtime {
             RuntimeType::Docker | RuntimeType::Youki | RuntimeType::Oci => {
                 // OCI container runtime (Docker, Youki, or new Oci type)
                 let mut mounts = Vec::new();
@@ -149,11 +159,11 @@ impl CapsuleManifestV1 {
                 }
 
                 RunPlanRuntime::Docker(DockerRuntime {
-                    image: self.execution.entrypoint.clone(),
+                    image: target.entrypoint.clone(),
                     digest: None,
-                    command: Vec::new(),
+                    command: target.cmd.clone(),
                     env: env.clone(),
-                    working_dir: None,
+                    working_dir: target.working_dir.clone(),
                     user: None,
                     ports: ports.clone(),
                     mounts,
@@ -162,30 +172,41 @@ impl CapsuleManifestV1 {
             // UARC V1.1.0: Native is deprecated, map to Source runtime
             RuntimeType::Native => RunPlanRuntime::Source(SourceRuntime {
                 language: None,
-                entrypoint: self.execution.entrypoint.clone(),
-                cmd: Vec::new(),
+                entrypoint: target.entrypoint.clone(),
+                cmd: target.cmd.clone(),
                 args: Vec::new(),
                 env: env.clone(),
-                working_dir: None,
+                working_dir: target.working_dir.clone(),
                 ports: ports.clone(),
                 dev_mode: false,
             }),
             RuntimeType::Source => RunPlanRuntime::Source(SourceRuntime {
                 language: None, // Will be set by caller if needed
-                entrypoint: self.execution.entrypoint.clone(),
-                cmd: Vec::new(),
+                entrypoint: target.entrypoint.clone(),
+                cmd: target.cmd.clone(),
                 args: Vec::new(),
                 env: env.clone(),
-                working_dir: None,
+                working_dir: target.working_dir.clone(),
                 ports: ports.clone(),
                 dev_mode: false,
             }),
             RuntimeType::Wasm => RunPlanRuntime::Native(NativeRuntime {
-                // Wasm components are routed by capsule-cli; nacelle does not execute them
-                binary_path: self.execution.entrypoint.clone(),
+                // Wasm components are routed by ato-cli; nacelle does not execute them
+                binary_path: target.entrypoint.clone(),
+                args: target.cmd.clone(),
+                env: env.clone(),
+                working_dir: target.working_dir.clone(),
+            }),
+            RuntimeType::Web => RunPlanRuntime::Source(SourceRuntime {
+                // Web targets are served by ato-cli open_web executor.
+                language: Some("web".to_string()),
+                entrypoint: target.entrypoint.clone(),
+                cmd: target.cmd.clone(),
                 args: Vec::new(),
                 env: env.clone(),
-                working_dir: None,
+                working_dir: target.working_dir.clone(),
+                ports: ports.clone(),
+                dev_mode: false,
             }),
         };
 
@@ -210,6 +231,21 @@ fn ordered_env(env: &HashMap<String, String>) -> BTreeMap<String, String> {
     env.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
 }
 
+fn merged_target_env(
+    manifest: &CapsuleManifestV1,
+    target: &super::capsule_v1::NamedTarget,
+) -> HashMap<String, String> {
+    let mut env = manifest
+        .targets
+        .as_ref()
+        .map(|targets| targets.env.clone())
+        .unwrap_or_default();
+    for (key, value) in &target.env {
+        env.insert(key.clone(), value.clone());
+    }
+    env
+}
+
 fn port_list(port: Option<u16>) -> Vec<Port> {
     port.map(|p| Port {
         container_port: p as u32,
@@ -225,17 +261,20 @@ mod tests {
     use super::*;
 
     const SAMPLE_PYTHON_TOML: &str = r#"
-schema_version = "1.0"
+schema_version = "0.2"
 name = "mlx-qwen3-8b"
 version = "1.0.0"
 type = "inference"
+default_target = "cli"
 
-[execution]
-runtime = "source"
-entrypoint = "server.py"
+[targets]
 port = 8081
 
-[execution.env]
+[targets.cli]
+runtime = "source"
+entrypoint = "server.py"
+
+[targets.cli.env]
 GUMBALL_MODEL = "qwen3-8b"
 
 [capabilities]
@@ -249,15 +288,18 @@ source = "hf:org/model"
 "#;
 
     const SAMPLE_DOCKER_TOML: &str = r#"
-schema_version = "1.0"
+schema_version = "0.2"
 name = "hello-docker"
 version = "0.1.0"
 type = "app"
+default_target = "container"
 
-[execution]
-runtime = "docker"
-entrypoint = "ghcr.io/example/hello:latest"
+[targets]
 port = 8080
+
+[targets.container]
+runtime = "oci"
+entrypoint = "ghcr.io/example/hello:latest"
 "#;
 
     #[test]

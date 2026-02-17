@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::debug;
@@ -10,6 +10,7 @@ pub enum RuntimeKind {
     Oci,
     Wasm,
     Source,
+    Web,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +25,7 @@ pub struct ManifestData {
     pub manifest_path: PathBuf,
     pub manifest_dir: PathBuf,
     pub profile: ExecutionProfile,
+    pub selected_target: String,
 }
 
 #[derive(Debug, Clone)]
@@ -33,105 +35,48 @@ pub struct RuntimeDecision {
     pub plan: ManifestData,
 }
 
-pub fn route_manifest(manifest_path: &Path, profile: ExecutionProfile) -> Result<RuntimeDecision> {
+pub fn route_manifest(
+    manifest_path: &Path,
+    profile: ExecutionProfile,
+    target_label: Option<&str>,
+) -> Result<RuntimeDecision> {
     let loaded = manifest::load_manifest(manifest_path)?;
     let manifest = loaded.raw;
     let manifest_dir = loaded.dir.clone();
+    let selected_target = resolve_target_label(&manifest, target_label)?;
 
     let plan = ManifestData {
         manifest,
         manifest_path: loaded.path,
         manifest_dir,
         profile,
+        selected_target,
     };
 
-    let entrypoint = plan.execution_entrypoint();
-    let runtime = plan.execution_runtime();
-    let image = plan.targets_oci_image().or_else(|| plan.execution_image());
-    let has_wasm_target = plan.get_value(&["targets", "wasm"]).is_some();
-    let has_source_target = plan.get_value(&["targets", "source"]).is_some();
-    let entrypoint_wasm = entrypoint.as_deref().is_some_and(is_wasm_path);
+    let runtime = plan.execution_runtime().ok_or_else(|| {
+        anyhow!(
+            "Target '{}' is missing required field: runtime",
+            plan.selected_target
+        )
+    })?;
 
-    let runtime_is_oci = runtime.as_deref().is_some_and(is_oci_runtime);
-    let runtime_is_wasm = runtime.as_deref().is_some_and(is_wasm_runtime);
-    let runtime_is_source = runtime.as_deref().is_some_and(is_source_runtime);
+    let chosen = parse_runtime_kind(&runtime).ok_or_else(|| {
+        anyhow!(
+            "Unsupported runtime '{}' for target '{}'",
+            runtime,
+            plan.selected_target
+        )
+    })?;
 
-    let mut candidates = Vec::new();
-    if image.is_some() || runtime_is_oci {
-        candidates.push(RuntimeKind::Oci);
-    }
-    if has_wasm_target || runtime_is_wasm || entrypoint_wasm {
-        candidates.push(RuntimeKind::Wasm);
-    }
-    if has_source_target || candidates.is_empty() || runtime_is_source {
-        candidates.push(RuntimeKind::Source);
-    }
-
-    let default_order = [RuntimeKind::Oci, RuntimeKind::Wasm, RuntimeKind::Source];
-    let explicit_runtime = if runtime_is_oci {
-        Some(RuntimeKind::Oci)
-    } else if runtime_is_wasm {
-        Some(RuntimeKind::Wasm)
-    } else if runtime_is_source {
-        Some(RuntimeKind::Source)
-    } else {
-        None
-    };
-
-    let preference = plan.execution_preference();
-    let chosen = if let Some(explicit) = explicit_runtime {
-        explicit
-    } else if let Some(pref) = preference {
-        pref.into_iter()
-            .find(|k| candidates.contains(k))
-            .or_else(|| {
-                default_order
-                    .iter()
-                    .copied()
-                    .find(|k| candidates.contains(k))
-            })
-            .unwrap_or_else(|| candidates[0])
-    } else {
-        default_order
-            .iter()
-            .copied()
-            .find(|k| candidates.contains(k))
-            .unwrap_or_else(|| candidates[0])
-    };
-
-    let reason = match chosen {
-        RuntimeKind::Oci => {
-            if image.is_some() {
-                "targets.oci.image or execution.image detected".to_string()
-            } else if runtime_is_oci {
-                "execution.runtime=oci".to_string()
-            } else {
-                "OCI candidate selected".to_string()
-            }
-        }
-        RuntimeKind::Wasm => {
-            if has_wasm_target {
-                "targets.wasm detected".to_string()
-            } else if entrypoint_wasm {
-                "execution.entrypoint ends with .wasm/.component".to_string()
-            } else {
-                "execution.runtime=wasm".to_string()
-            }
-        }
-        RuntimeKind::Source => {
-            if runtime_is_source {
-                "execution.runtime=source".to_string()
-            } else if has_source_target {
-                "targets.source detected".to_string()
-            } else {
-                "default to source runtime".to_string()
-            }
-        }
-    };
+    let reason = format!(
+        "targets.{}.runtime={}",
+        plan.selected_target,
+        runtime.to_ascii_lowercase()
+    );
 
     debug!(
-        "RuntimeRouter: chosen={:?}, reason={}, runtime={:?}",
-        chosen, reason, runtime
+        "RuntimeRouter: chosen={:?}, reason={}, target={}",
+        chosen, reason, plan.selected_target
     );
 
     Ok(RuntimeDecision {
@@ -143,25 +88,19 @@ pub fn route_manifest(manifest_path: &Path, profile: ExecutionProfile) -> Result
 
 impl ManifestData {
     pub fn execution_entrypoint(&self) -> Option<String> {
-        let profile_key = match self.profile {
-            ExecutionProfile::Dev => "dev",
-            ExecutionProfile::Release => "release",
-        };
-
-        self.get_str(&["execution", profile_key, "entrypoint"])
-            .or_else(|| self.get_str(&["execution", "entrypoint"]))
+        self.get_str(&["targets", &self.selected_target, "entrypoint"])
     }
 
     pub fn execution_runtime(&self) -> Option<String> {
-        self.get_str(&["execution", "runtime"])
+        self.get_str(&["targets", &self.selected_target, "runtime"])
     }
 
     pub fn execution_image(&self) -> Option<String> {
-        self.get_str(&["execution", "image"])
+        self.get_str(&["targets", &self.selected_target, "image"])
     }
 
     pub fn execution_env(&self) -> HashMap<String, String> {
-        self.get_table(&["execution", "env"])
+        self.get_table(&["targets", &self.selected_target, "env"])
             .map(table_to_map)
             .unwrap_or_default()
     }
@@ -175,19 +114,18 @@ impl ManifestData {
     }
 
     pub fn execution_port(&self) -> Option<u16> {
-        self.get_value(&["execution", "port"])
+        self.get_value(&["targets", &self.selected_target, "port"])
+            .or_else(|| self.get_value(&["port"]))
             .and_then(|v| v.as_integer())
             .and_then(|v| u16::try_from(v).ok())
     }
 
     pub fn execution_working_dir(&self) -> Option<String> {
-        self.get_str(&["execution", "working_dir"])
+        self.get_str(&["targets", &self.selected_target, "working_dir"])
     }
 
     pub fn execution_preference(&self) -> Option<Vec<RuntimeKind>> {
-        let pref = self
-            .get_array(&["execution", "preference"])
-            .or_else(|| self.get_array(&["targets", "preference"]))?;
+        let pref = self.get_array(&["targets", "preference"])?;
 
         let mut out = Vec::new();
         for value in pref {
@@ -205,34 +143,55 @@ impl ManifestData {
     }
 
     pub fn targets_oci_image(&self) -> Option<String> {
-        self.get_str(&["targets", "oci", "image"])
+        let runtime = self.execution_runtime()?;
+        if !runtime.eq_ignore_ascii_case("oci") {
+            return None;
+        }
+        self.get_str(&["targets", &self.selected_target, "image"])
+            .or_else(|| self.execution_entrypoint())
     }
 
     pub fn targets_oci_cmd(&self) -> Vec<String> {
-        self.get_array(&["targets", "oci", "cmd"])
+        self.get_array(&["targets", &self.selected_target, "cmd"])
             .map(|a| array_to_vec(a))
             .unwrap_or_default()
     }
 
     pub fn targets_oci_env(&self) -> HashMap<String, String> {
-        self.get_table(&["targets", "oci", "env"])
+        self.get_table(&["targets", &self.selected_target, "env"])
             .map(table_to_map)
             .unwrap_or_default()
     }
 
     pub fn targets_oci_working_dir(&self) -> Option<String> {
-        self.get_str(&["targets", "oci", "working_dir"])
+        self.get_str(&["targets", &self.selected_target, "working_dir"])
     }
 
     pub fn targets_wasm_component(&self) -> Option<String> {
-        self.get_str(&["targets", "wasm", "component"])
-            .or_else(|| self.get_str(&["targets", "wasm", "path"]))
+        let runtime = self.execution_runtime()?;
+        if !runtime.eq_ignore_ascii_case("wasm") {
+            return None;
+        }
+        self.get_str(&["targets", &self.selected_target, "component"])
+            .or_else(|| self.get_str(&["targets", &self.selected_target, "path"]))
+            .or_else(|| self.execution_entrypoint())
     }
 
     pub fn targets_wasm_args(&self) -> Vec<String> {
-        self.get_array(&["targets", "wasm", "args"])
+        self.get_array(&["targets", &self.selected_target, "args"])
+            .or_else(|| self.get_array(&["targets", &self.selected_target, "cmd"]))
             .map(|a| array_to_vec(a))
             .unwrap_or_default()
+    }
+
+    pub fn targets_web_public(&self) -> Vec<String> {
+        self.get_array(&["targets", &self.selected_target, "public"])
+            .map(|a| array_to_vec(a))
+            .unwrap_or_default()
+    }
+
+    pub fn selected_target_label(&self) -> &str {
+        &self.selected_target
     }
 
     pub fn build_gpu(&self) -> bool {
@@ -304,27 +263,37 @@ fn parse_runtime_kind(value: &str) -> Option<RuntimeKind> {
         "oci" | "docker" | "youki" | "runc" => Some(RuntimeKind::Oci),
         "wasm" => Some(RuntimeKind::Wasm),
         "source" | "native" => Some(RuntimeKind::Source),
+        "web" => Some(RuntimeKind::Web),
         _ => None,
     }
 }
 
-fn is_oci_runtime(value: &str) -> bool {
-    matches!(
-        value.to_ascii_lowercase().as_str(),
-        "oci" | "docker" | "youki" | "runc"
-    )
-}
+fn resolve_target_label(manifest: &toml::Value, target_label: Option<&str>) -> Result<String> {
+    let targets = manifest
+        .get("targets")
+        .and_then(|v| v.as_table())
+        .ok_or_else(|| anyhow!("Missing required [targets] table"))?;
 
-fn is_wasm_runtime(value: &str) -> bool {
-    value.eq_ignore_ascii_case("wasm")
-}
+    let default_target = manifest
+        .get("default_target")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("Missing required field: default_target"))?;
 
-fn is_source_runtime(value: &str) -> bool {
-    value.eq_ignore_ascii_case("source") || value.eq_ignore_ascii_case("native")
-}
+    let selected = target_label
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(default_target);
 
-fn is_wasm_path(value: &str) -> bool {
-    value.ends_with(".wasm") || value.ends_with(".component")
+    if !targets.contains_key(selected) {
+        return Err(anyhow!(
+            "Target '{}' not found under [targets]",
+            selected
+        ));
+    }
+
+    Ok(selected.to_string())
 }
 
 fn table_to_map(table: &toml::value::Table) -> HashMap<String, String> {

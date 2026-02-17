@@ -26,6 +26,13 @@ pub fn load_manifest(path: &Path) -> Result<LoadedManifest> {
         )
     })?;
 
+    if raw.get("execution").is_some() {
+        return Err(CapsuleError::Manifest(
+            path.to_path_buf(),
+            "legacy [execution] section is not supported in schema_version=0.2".to_string(),
+        ));
+    }
+
     let mut model = CapsuleManifestV1::from_toml(&raw_text).map_err(|e| {
         CapsuleError::Manifest(
             path.to_path_buf(),
@@ -53,7 +60,7 @@ pub fn load_manifest(path: &Path) -> Result<LoadedManifest> {
 
     // Ensure schema_version is set for downstream consumers.
     if model.schema_version.trim().is_empty() {
-        model.schema_version = "1.0".to_string();
+        model.schema_version = "0.2".to_string();
     }
 
     let dir = path

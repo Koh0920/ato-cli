@@ -198,13 +198,39 @@ pub fn generate_keypair(output_path: &Path) -> Result<String> {
 }
 
 fn read_key_bytes(path: &Path) -> Result<Vec<u8>> {
-    match std::fs::read(path) {
-        Ok(bytes) => Ok(bytes),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(CapsuleError::AuthRequired(
-            format!("Signing key not found: {}", path.display()),
-        )),
-        Err(err) => Err(CapsuleError::Io(err)),
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(CapsuleError::AuthRequired(format!(
+                "Signing key not found: {}",
+                path.display()
+            )));
+        }
+        Err(err) => return Err(CapsuleError::Io(err)),
+    };
+
+    // Try to parse as JSON (StoredKey format)
+    if let Ok(text) = std::str::from_utf8(&bytes) {
+        if let Ok(stored) = serde_json::from_str::<StoredKeyRef>(text) {
+            if stored.key_type == "ed25519" {
+                if let Ok(secret_bytes) = BASE64.decode(&stored.secret_key) {
+                    return Ok(secret_bytes);
+                }
+            }
+        }
     }
+
+    // Otherwise, return raw bytes
+    Ok(bytes)
+}
+
+/// Reference to StoredKey for parsing JSON key files
+#[derive(Deserialize)]
+struct StoredKeyRef {
+    key_type: String,
+    #[allow(dead_code)]
+    public_key: String,
+    secret_key: String,
 }
 
 #[cfg(test)]

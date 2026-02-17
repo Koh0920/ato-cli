@@ -39,7 +39,7 @@ pub fn pack(
             Some(signing::sign_artifact(
                 &source_path,
                 key,
-                "capsule-cli",
+                "ato-cli",
                 None,
             )?)
         } else {
@@ -83,7 +83,7 @@ pub fn pack(
         Some(signing::sign_artifact(
             &output_path,
             &key,
-            "capsule-cli",
+            "ato-cli",
             None,
         )?)
     } else {

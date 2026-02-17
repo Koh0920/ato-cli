@@ -185,19 +185,19 @@ fn validate_entrypoint(manifest_path: &PathBuf, manifest_dir: &PathBuf) -> Resul
         .parse()
         .map_err(|e| CapsuleError::Pack(format!("Failed to parse capsule.toml: {}", e)))?;
 
+    let default_target = manifest
+        .get("default_target")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| CapsuleError::Pack("default_target is required".to_string()))?;
+
     let entrypoint = manifest
         .get("targets")
-        .and_then(|t| t.get("source"))
+        .and_then(|t| t.as_table())
+        .and_then(|t| t.get(default_target))
         .and_then(|s| s.get("entrypoint"))
         .and_then(|e| e.as_str())
-        .or_else(|| {
-            manifest.get("execution").and_then(|e| {
-                e.get("release")
-                    .and_then(|r| r.get("entrypoint"))
-                    .or_else(|| e.get("entrypoint"))
-                    .and_then(|v| v.as_str())
-            })
-        })
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| CapsuleError::Pack("No entrypoint defined in capsule.toml".to_string()))?;
