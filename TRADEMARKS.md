@@ -4,7 +4,7 @@ The names **Capsule** and associated logos are project marks used to identify th
 
 ## Allowed
 
-- Descriptive use (e.g., “built with capsule-cli”).
+- Descriptive use (e.g., “built with ato-cli”).
 - Use in documentation and integrations that accurately refer to the project.
 - Redistribution of unmodified official releases without implying endorsement.
 
