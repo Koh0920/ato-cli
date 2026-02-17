@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use tar::Builder;
 use zstd::stream::encode_all;
 
-use crate::error::{CapsuleError, Result as CapsuleResult};
+use crate::error::Result as CapsuleResult;
 use crate::r3_config;
 
 /// Capsule Format v2 PAX TAR Archive Structure:

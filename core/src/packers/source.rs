@@ -7,7 +7,6 @@ use crate::manifest;
 use crate::packers::bundle::{build_bundle, PackBundleArgs};
 use crate::packers::capsule as capsule_packer;
 use crate::r3_config;
-use crate::reporter::CapsuleReporter;
 use crate::resource::cas::create_cas_client_from_env;
 use crate::router::ManifestData;
 use crate::validation;
@@ -111,7 +110,7 @@ pub fn pack(
     futures::executor::block_on(config_reporter.notify(format!(
         "   ✅ config.json generated: {}",
         config_path.display()
-    )));
+    )))?;
 
     let lockfile_path = rt.block_on(lockfile::generate_and_write_lockfile(
         &opts.manifest_path,
@@ -124,7 +123,7 @@ pub fn pack(
     futures::executor::block_on(lockfile_reporter.notify(format!(
         "   ✅ capsule.lock generated: {}",
         lockfile_path.display()
-    )));
+    )))?;
 
     if opts.standalone {
         futures::executor::block_on(
