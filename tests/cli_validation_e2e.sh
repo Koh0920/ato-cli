@@ -1,7 +1,7 @@
 #!/bin/bash
 # E2E Test: CLI Validation & Signature Verification
 #
-# This test suite verifies that capsule-cli commands match ADR requirements:
+# This test suite verifies that ato-cli commands match ADR requirements:
 # - CLI option validation (--enforcement accepts strict/best_effort)
 # - Signature verification workflow
 # - Pack creates bundles that can be executed
@@ -10,7 +10,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEST_DIR="${SCRIPT_DIR}/test-workspace"
-CAPSULE_CLI="${SCRIPT_DIR}/../target/debug/capsule"
+ATO_CLI="${SCRIPT_DIR}/../target/debug/ato"
 
 # Colors
 GREEN='\033[0;32m'
@@ -31,9 +31,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-check_capsule_cli() {
-    if [ ! -f "${CAPSULE_CLI}" ]; then
-        log_error "capsule-cli not found at ${CAPSULE_CLI}"
+check_ato_cli() {
+    if [ ! -f "${ATO_CLI}" ]; then
+        log_error "ato-cli not found at ${ATO_CLI}"
         log_info "Build with: cd .. && cargo build"
         exit 1
     fi
@@ -44,11 +44,11 @@ echo "E2E Test: CLI & Signature Verification"
 echo "=========================================="
 echo ""
 
-# Build capsule-cli first
-echo "Building capsule-cli..."
+# Build ato-cli first
+echo "Building ato-cli..."
 cd "${SCRIPT_DIR}/.."
 cargo build 2>&1 > /dev/null
-check_capsule_cli
+check_ato_cli
 
 # Test 1: CLI --enforcement validation
  echo "Test 1: CLI --enforcement validation"
@@ -56,7 +56,7 @@ check_capsule_cli
  
  # Test 1.1: Help shows enforcement option
  echo "  Testing: Help shows enforcement option..."
- if "${CAPSULE_CLI}" open --help 2>&1 | grep -q "enforcement"; then
+ if "${ATO_CLI}" run --help 2>&1 | grep -q "enforcement"; then
      log_info "  --enforcement option documented in help"
  else
      log_error "  --enforcement option not in help"

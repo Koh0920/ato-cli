@@ -1,12 +1,17 @@
+//! Guest E2E tests
+//!
+//! These tests verify the Guest protocol implementation for `.sync` file operations.
+//! They test permission enforcement, payload read/write, context operations, and WASM execution.
+
 use assert_cmd::Command;
-use capsule_sync::{
-    encode_payload_base64, GuestAction, GuestContext, GuestContextRole, GuestMode, GuestPermission,
-    GuestRequest, GuestResponse, GUEST_PROTOCOL_VERSION,
-};
 use serde_json::Value;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use sync_runtime::{
+    encode_payload_base64, GuestAction, GuestContext, GuestContextRole, GuestMode, GuestPermission,
+    GuestRequest, GuestResponse, GUEST_PROTOCOL_VERSION,
+};
 use tempfile::TempDir;
 use wat::parse_str as wat_parse;
 use zip::{write::FileOptions, ZipArchive, ZipWriter};
@@ -72,7 +77,7 @@ write_allowed = {}
 
 fn run_guest(sync_path: &PathBuf, request: &GuestRequest) -> GuestResponse {
     let request_json = serde_json::to_string(request).unwrap();
-    let mut cmd = Command::cargo_bin("capsule").unwrap();
+    let mut cmd = Command::cargo_bin("ato").unwrap();
     let output = cmd
         .arg("guest")
         .arg(sync_path)
