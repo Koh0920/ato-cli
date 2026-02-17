@@ -3,25 +3,30 @@ use predicates::prelude::*;
 
 #[test]
 fn test_cli_help() {
-    let mut cmd = Command::cargo_bin("capsule").unwrap();
+    let mut cmd = Command::cargo_bin("ato").unwrap();
     cmd.arg("--help")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Usage:"));
+        .stdout(predicate::str::contains("Primary Commands:"))
+        .stdout(predicate::str::contains("run"))
+        .stdout(predicate::str::contains("install"))
+        .stdout(predicate::str::contains("init"))
+        .stdout(predicate::str::contains("build"))
+        .stdout(predicate::str::contains("search"));
 }
 
 #[test]
 fn test_cli_version() {
-    let mut cmd = Command::cargo_bin("capsule").unwrap();
+    let mut cmd = Command::cargo_bin("ato").unwrap();
     cmd.arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::contains("capsule"));
+        .stdout(predicate::str::contains("ato"));
 }
 
 #[test]
 fn test_cli_invalid_command() {
-    let mut cmd = Command::cargo_bin("capsule").unwrap();
+    let mut cmd = Command::cargo_bin("ato").unwrap();
     cmd.arg("invalid-command")
         .assert()
         .failure()
@@ -29,18 +34,21 @@ fn test_cli_invalid_command() {
 }
 
 #[test]
-fn test_setup_command_exists() {
-    let mut cmd = Command::cargo_bin("capsule").unwrap();
-    cmd.arg("setup")
-        .arg("--help")
+fn test_help_hides_legacy_commands() {
+    let mut cmd = Command::cargo_bin("ato").unwrap();
+    cmd.arg("--help")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Setup and download engines"));
+        .stdout(predicate::str::contains(" open ").not())
+        .stdout(predicate::str::contains(" pack ").not())
+        .stdout(predicate::str::contains(" close ").not())
+        .stdout(predicate::str::contains(" auth ").not())
+        .stdout(predicate::str::contains(" setup ").not());
 }
 
 #[test]
 fn test_ps_command_exists() {
-    let mut cmd = Command::cargo_bin("capsule").unwrap();
+    let mut cmd = Command::cargo_bin("ato").unwrap();
     cmd.arg("ps")
         .arg("--help")
         .assert()
@@ -49,9 +57,9 @@ fn test_ps_command_exists() {
 }
 
 #[test]
-fn test_close_command_exists() {
-    let mut cmd = Command::cargo_bin("capsule").unwrap();
-    cmd.arg("close")
+fn test_stop_command_exists() {
+    let mut cmd = Command::cargo_bin("ato").unwrap();
+    cmd.arg("stop")
         .arg("--help")
         .assert()
         .success()
@@ -60,7 +68,7 @@ fn test_close_command_exists() {
 
 #[test]
 fn test_logs_command_exists() {
-    let mut cmd = Command::cargo_bin("capsule").unwrap();
+    let mut cmd = Command::cargo_bin("ato").unwrap();
     cmd.arg("logs")
         .arg("--help")
         .assert()
@@ -69,18 +77,40 @@ fn test_logs_command_exists() {
 }
 
 #[test]
-fn test_open_command_requires_path() {
-    let mut cmd = Command::cargo_bin("capsule").unwrap();
-    cmd.arg("open")
+fn test_login_help_shows_optional_token() {
+    let mut cmd = Command::cargo_bin("ato").unwrap();
+    cmd.args(["login", "--help"])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("required"));
+        .success()
+        .stdout(predicate::str::contains("--token <TOKEN>"))
+        .stdout(predicate::str::contains("[OPTIONS]").or(predicate::str::contains("Options:")));
 }
 
 #[test]
-fn test_pack_command_with_init_flag() {
-    let mut cmd = Command::cargo_bin("capsule").unwrap();
-    cmd.arg("pack")
+fn test_search_help_uses_store_api_default() {
+    let mut cmd = Command::cargo_bin("ato").unwrap();
+    cmd.args(["search", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--tag <TAGS>"))
+        .stdout(predicate::str::contains(
+            "Registry URL (default: https://api.ato.run)",
+        ));
+}
+
+#[test]
+fn test_run_command_accepts_default_path() {
+    let mut cmd = Command::cargo_bin("ato").unwrap();
+    cmd.arg("run")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("required").not());
+}
+
+#[test]
+fn test_build_command_with_init_flag() {
+    let mut cmd = Command::cargo_bin("ato").unwrap();
+    cmd.arg("build")
         .arg("--init")
         .arg("--help")
         .assert()
@@ -91,9 +121,9 @@ fn test_pack_command_with_init_flag() {
 }
 
 #[test]
-fn test_pack_command_with_key_flag() {
-    let mut cmd = Command::cargo_bin("capsule").unwrap();
-    cmd.arg("pack")
+fn test_build_command_with_key_flag() {
+    let mut cmd = Command::cargo_bin("ato").unwrap();
+    cmd.arg("build")
         .arg("--key")
         .arg("/path/to/key")
         .arg("--help")
@@ -104,7 +134,7 @@ fn test_pack_command_with_key_flag() {
 
 #[test]
 fn test_json_flag_exists() {
-    let mut cmd = Command::cargo_bin("capsule").unwrap();
+    let mut cmd = Command::cargo_bin("ato").unwrap();
     cmd.arg("--json")
         .arg("ps")
         .arg("--help")
@@ -113,4 +143,51 @@ fn test_json_flag_exists() {
         .stdout(predicate::str::contains(
             "Emit machine-readable JSON output",
         ));
+}
+
+#[test]
+fn test_publish_command_exists() {
+    let mut cmd = Command::cargo_bin("ato").unwrap();
+    cmd.args(["publish", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Register a GitHub repository to the registry",
+        ));
+}
+
+#[test]
+fn test_key_command_exists() {
+    let mut cmd = Command::cargo_bin("ato").unwrap();
+    cmd.args(["key", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Manage signing keys"));
+}
+
+#[test]
+fn test_config_engine_install_exists() {
+    let mut cmd = Command::cargo_bin("ato").unwrap();
+    cmd.args(["config", "engine", "install", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Download and install an engine"));
+}
+
+#[test]
+fn test_legacy_open_still_available() {
+    let mut cmd = Command::cargo_bin("ato").unwrap();
+    cmd.args(["open", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Usage: ato open"));
+}
+
+#[test]
+fn test_legacy_setup_still_available() {
+    let mut cmd = Command::cargo_bin("ato").unwrap();
+    cmd.args(["setup", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Engine name to install"));
 }

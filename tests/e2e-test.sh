@@ -5,7 +5,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEST_DIR="${SCRIPT_DIR}/test-workspace"
-CAPSULE_CLI="${SCRIPT_DIR}/../target/debug/capsule"
+ATO_CLI="${SCRIPT_DIR}/../target/debug/ato"
 
 # Colors
 GREEN='\033[0;32m'

@@ -2,15 +2,15 @@
 # E2E Test: Pack & Sign Verification
 #
 # This test verifies that:
-# - `capsule pack` creates valid bundles
-# - `capsule sign` creates detached signatures
+# - `ato build` creates valid bundles
+# - `ato key sign` creates detached signatures
 # - Signature can be verified
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEST_DIR="${SCRIPT_DIR}/test-workspace"
-CAPSULE_CLI="${SCRIPT_DIR}/../target/debug/capsule"
+ATO_CLI="${SCRIPT_DIR}/../target/debug/ato"
 
 # Colors
 GREEN='\033[0;32m'
@@ -28,9 +28,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-check_capsule_cli() {
-    if [ ! -f "${CAPSULE_CLI}" ]; then
-        log_error "capsule-cli not found at ${CAPSULE_CLI}"
+check_ato_cli() {
+    if [ ! -f "${ATO_CLI}" ]; then
+        log_error "ato-cli not found at ${ATO_CLI}"
         log_info "Build with: cd .. && cargo build"
         exit 1
     fi
@@ -41,26 +41,26 @@ echo "E2E Test: Pack & Sign Verification"
 echo "=========================================="
 echo ""
 
-# Build capsule-cli first
-echo "Building capsule-cli..."
+# Build ato-cli first
+echo "Building ato-cli..."
 cd "${SCRIPT_DIR}/.."
 cargo build 2>&1 > /dev/null
-check_capsule_cli
+check_ato_cli
 
 # Test 1: CLI commands exist
 echo "Test 1: CLI commands exist"
 echo "--------------------------------"
 
-if "${CAPSULE_CLI}" help 2>&1 | grep -q "Usage: capsule"; then
-    log_info "  capsule CLI available"
+if "${ATO_CLI}" help 2>&1 | grep -q "Usage: ato"; then
+    log_info "  ato CLI available"
 else
-    log_error "  capsule CLI not found"
+    log_error "  ato CLI not found"
     exit 1
 fi
 
 # Test that required subcommands exist
-for cmd in open pack new keygen sign; do
-    if "${CAPSULE_CLI}" help 2>&1 | grep -q "\s${cmd}\s"; then
+for cmd in run build init key config publish; do
+    if "${ATO_CLI}" help 2>&1 | grep -q "\s${cmd}\s"; then
         log_info "  Subcommand '${cmd}' exists"
     else
         log_error "  Subcommand '${cmd}' not found"
@@ -77,7 +77,7 @@ echo "Test 2: CLI option validation"
 echo "----------------------------"
 
 # Test --enforcement accepts valid values
-if "${CAPSULE_CLI}" open --help 2>&1 | grep -q "\-\-enforcement.*strict, best-effort"; then
+if "${ATO_CLI}" run --help 2>&1 | grep -q "\-\-enforcement.*strict, best-effort"; then
     log_info "  --enforcement option has correct enum values"
 else
     log_error "  --enforcement option missing or incorrect"
@@ -88,14 +88,14 @@ echo ""
 log_info "Test 2: PASSED"
 echo ""
 
-# Test 3: Keygen command
-echo "Test 3: Keygen command"
+# Test 3: Key command
+echo "Test 3: Key command"
 echo "----------------------"
 
 TEST_DIR="${SCRIPT_DIR}/test-workspace/keygen-test"
 mkdir -p "${TEST_DIR}"
 
-if "${CAPSULE_CLI}" keygen --out "${TEST_DIR}/test-key" 2>&1 | grep -q "Key generated successfully"; then
+if "${ATO_CLI}" key gen --out "${TEST_DIR}/test-key" 2>&1 | grep -q "Key generated successfully"; then
     log_info "  Key generation succeeded"
 else
     log_warn "  Key generation skipped (may require interactive terminal)"

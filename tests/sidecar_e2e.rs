@@ -194,7 +194,6 @@ async fn sidecar_serve_lifecycle() {
     let _ = child.wait();
 }
 
-
 #[tokio::test]
 async fn sidecar_serve_rejects_non_loopback_target() {
     let Some((control_url, auth_key, hostname)) = required_envs() else {
