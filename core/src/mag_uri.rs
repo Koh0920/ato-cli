@@ -46,7 +46,9 @@ pub fn parse_mag_uri(uri: &str) -> Result<MagUri> {
         let (did_part, hash_part) = head.split_at(idx);
         let did_part = did_part.trim_end_matches(':');
         if did_part.is_empty() || hash_part.is_empty() {
-            return Err(CapsuleError::Config("invalid mag:// schema hash".to_string()));
+            return Err(CapsuleError::Config(
+                "invalid mag:// schema hash".to_string(),
+            ));
         }
         did_or_domain = did_part.to_string();
         schema_hash = Some(hash_part.to_string());

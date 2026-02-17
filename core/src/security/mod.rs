@@ -1,5 +1,5 @@
 #![allow(unused_imports)]
-//! Security utilities for capsule-cli.
+//! Security utilities for ato-cli.
 
 pub mod path;
 

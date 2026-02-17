@@ -294,7 +294,7 @@ fn build_config_json(
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
         generated_at: None,
-        generated_by: Some(format!("capsule-cli v{}", env!("CARGO_PKG_VERSION"))),
+        generated_by: Some(format!("ato-cli v{}", env!("CARGO_PKG_VERSION"))),
         source_manifest: Some(format!("sha256:{}", sha256_hex(manifest_raw.as_bytes()))),
     };
 
@@ -313,7 +313,7 @@ fn build_config_json(
 fn validate_config_json(config: &ConfigJson) -> Result<()> {
     let schema_json: serde_json::Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../schema/config-schema.json"
+        "/../schema/config-schema.json"
     )))
     .context("Failed to parse config schema")?;
     let schema_json = Box::leak(Box::new(schema_json));
@@ -336,32 +336,30 @@ fn validate_config_json(config: &ConfigJson) -> Result<()> {
 }
 
 fn read_command(manifest: &toml::Value) -> Option<String> {
-    manifest
-        .get("execution")
-        .and_then(|e| {
-            e.get("release")
-                .and_then(|r| r.get("command"))
-                .or_else(|| e.get("command"))
-        })
-        .and_then(|c| c.as_str())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    let target = selected_target_table(manifest)?;
+    if let Some(cmd_str) = target.get("command").and_then(|c| c.as_str()) {
+        let v = cmd_str.trim().to_string();
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    if let Some(cmd_arr) = target.get("cmd").and_then(|v| v.as_array()) {
+        let parts: Vec<String> = cmd_arr
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !parts.is_empty() {
+            return Some(parts.join(" "));
+        }
+    }
+    None
 }
 
 fn read_entrypoint(manifest: &toml::Value) -> Result<String> {
-    let entrypoint = manifest
-        .get("targets")
-        .and_then(|t| t.get("source"))
-        .and_then(|s| s.get("entrypoint"))
+    let entrypoint = selected_target_table(manifest)
+        .and_then(|t| t.get("entrypoint"))
         .and_then(|e| e.as_str())
-        .or_else(|| {
-            manifest.get("execution").and_then(|e| {
-                e.get("release")
-                    .and_then(|r| r.get("entrypoint"))
-                    .or_else(|| e.get("entrypoint"))
-                    .and_then(|v| v.as_str())
-            })
-        })
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow::anyhow!("No entrypoint defined in capsule.toml"))?;
@@ -370,14 +368,15 @@ fn read_entrypoint(manifest: &toml::Value) -> Result<String> {
 }
 
 fn read_health_check(manifest: &toml::Value) -> Option<HealthCheck> {
-    let execution = manifest.get("execution")?;
-    let http_get = execution
+    let target = selected_target_table(manifest)?;
+    let http_get = target
         .get("health_check")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let port = execution
+    let port = target
         .get("port")
+        .or_else(|| manifest.get("port"))
         .and_then(|v| v.as_integer())
         .map(|p| p.to_string());
 
@@ -392,6 +391,19 @@ fn read_health_check(manifest: &toml::Value) -> Option<HealthCheck> {
         interval_secs: None,
         timeout_secs: None,
     })
+}
+
+fn selected_target_table<'a>(manifest: &'a toml::Value) -> Option<&'a toml::value::Table> {
+    let default_target = manifest
+        .get("default_target")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())?;
+    manifest
+        .get("targets")
+        .and_then(|v| v.as_table())
+        .and_then(|targets| targets.get(default_target))
+        .and_then(|v| v.as_table())
 }
 
 fn read_filesystem(manifest: &toml::Value) -> Option<FilesystemConfig> {

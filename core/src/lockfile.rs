@@ -139,16 +139,14 @@ pub async fn generate_and_write_lockfile(
     let output_path = manifest_dir.join("capsule.lock");
     let content = toml::to_string_pretty(&lockfile)
         .map_err(|e| CapsuleError::Pack(format!("Failed to serialize capsule.lock: {}", e)))?;
-    std::fs::write(&output_path, content).map_err(|e| {
-        CapsuleError::Pack(format!("Failed to write capsule.lock: {}", e))
-    })?;
+    std::fs::write(&output_path, content)
+        .map_err(|e| CapsuleError::Pack(format!("Failed to write capsule.lock: {}", e)))?;
     Ok(output_path)
 }
 
 pub fn verify_lockfile_manifest(manifest_path: &Path, lockfile_path: &Path) -> Result<()> {
-    let manifest_text = fs::read_to_string(manifest_path).map_err(|e| {
-        CapsuleError::Config(format!("Failed to read manifest: {}", e))
-    })?;
+    let manifest_text = fs::read_to_string(manifest_path)
+        .map_err(|e| CapsuleError::Config(format!("Failed to read manifest: {}", e)))?;
     let lockfile = read_lockfile(lockfile_path)?;
     let expected_hash = format!("sha256:{}", sha256_hex(manifest_text.as_bytes()));
 
@@ -180,7 +178,10 @@ async fn generate_lockfile(
     let target_triple = platform_triple()?;
 
     let mut targets: HashMap<String, TargetEntry> = HashMap::new();
-    let mut tools = ToolSection { uv: None, pnpm: None };
+    let mut tools = ToolSection {
+        uv: None,
+        pnpm: None,
+    };
     let mut runtimes = RuntimeSection {
         python: None,
         node: None,
@@ -192,9 +193,10 @@ async fn generate_lockfile(
     if let Some(lang) = language.as_deref() {
         if lang == "python" {
             let version = read_language_version(manifest_raw, "python", "3.11");
-            let python_lockfile = generate_uv_lock(manifest_dir, manifest_raw, reporter.clone())
-                .await?;
-            let runtime = resolve_python_runtime(&version, &target_triple, reporter.clone()).await?;
+            let python_lockfile =
+                generate_uv_lock(manifest_dir, manifest_raw, reporter.clone()).await?;
+            let runtime =
+                resolve_python_runtime(&version, &target_triple, reporter.clone()).await?;
             runtimes.python = Some(runtime);
             if python_lockfile.is_some() {
                 let python_artifacts = match prepare_python_artifacts(
@@ -210,10 +212,7 @@ async fn generate_lockfile(
                     Ok(_) => None,
                     Err(err) => {
                         reporter
-                            .warn(format!(
-                                "⚠️  Failed to prefetch Python artifacts: {}",
-                                err
-                            ))
+                            .warn(format!("⚠️  Failed to prefetch Python artifacts: {}", err))
                             .await?;
                         None
                     }
@@ -234,13 +233,8 @@ async fn generate_lockfile(
             }
         } else if lang == "node" {
             let version = read_language_version(manifest_raw, "node", "20");
-            let node_lockfile = generate_pnpm_lock(
-                manifest_dir,
-                manifest_raw,
-                &version,
-                reporter.clone(),
-            )
-            .await?;
+            let node_lockfile =
+                generate_pnpm_lock(manifest_dir, manifest_raw, &version, reporter.clone()).await?;
             let runtime = resolve_node_runtime(&version, &target_triple, reporter.clone()).await?;
             runtimes.node = Some(runtime);
             if node_lockfile.is_some() {
@@ -268,7 +262,10 @@ async fn generate_lockfile(
                     target_entry.artifacts.extend(artifacts);
                 }
                 tools.pnpm = Some(tool_targets_for(
-                    format!("https://registry.npmjs.org/pnpm/-/pnpm-{}.tgz", PNPM_VERSION),
+                    format!(
+                        "https://registry.npmjs.org/pnpm/-/pnpm-{}.tgz",
+                        PNPM_VERSION
+                    ),
                     PNPM_VERSION,
                     &target_triple,
                 ));
@@ -367,15 +364,14 @@ async fn generate_pnpm_lock(
     node_version: &str,
     reporter: Arc<dyn CapsuleReporter + 'static>,
 ) -> Result<Option<PathBuf>> {
-    let deps_path = read_dependencies_path(manifest, "node", manifest_dir)
-        .or_else(|| {
-            let candidate = manifest_dir.join("package.json");
-            if candidate.exists() {
-                Some(candidate)
-            } else {
-                None
-            }
-        });
+    let deps_path = read_dependencies_path(manifest, "node", manifest_dir).or_else(|| {
+        let candidate = manifest_dir.join("package.json");
+        if candidate.exists() {
+            Some(candidate)
+        } else {
+            None
+        }
+    });
     let Some(_) = deps_path else {
         return Ok(None);
     };
@@ -389,16 +385,13 @@ async fn generate_pnpm_lock(
 
     let mut cmd = std::process::Command::new(&pnpm_cmd.program);
     cmd.args(&pnpm_cmd.args_prefix)
-        .args([
-            "install",
-            "--lockfile-only",
-            "--ignore-scripts",
-            "--silent",
-        ])
+        .args(["install", "--lockfile-only", "--ignore-scripts", "--silent"])
         .current_dir(manifest_dir);
     let status = run_command_inner(cmd).await?;
     if !status.success() {
-        return Err(CapsuleError::Pack("pnpm lock generation failed".to_string()));
+        return Err(CapsuleError::Pack(
+            "pnpm lock generation failed".to_string(),
+        ));
     }
 
     let lock_path = manifest_dir.join("pnpm-lock.yaml");
@@ -406,13 +399,11 @@ async fn generate_pnpm_lock(
         return Ok(None);
     }
     let target_dir = manifest_dir.join("locks").join(platform_target_key()?);
-    std::fs::create_dir_all(&target_dir).map_err(|e| {
-        CapsuleError::Pack(format!("Failed to create locks directory: {}", e))
-    })?;
+    std::fs::create_dir_all(&target_dir)
+        .map_err(|e| CapsuleError::Pack(format!("Failed to create locks directory: {}", e)))?;
     let target_lock = target_dir.join("pnpm-lock.yaml");
-    std::fs::copy(&lock_path, &target_lock).map_err(|e| {
-        CapsuleError::Pack(format!("Failed to copy pnpm-lock.yaml: {}", e))
-    })?;
+    std::fs::copy(&lock_path, &target_lock)
+        .map_err(|e| CapsuleError::Pack(format!("Failed to copy pnpm-lock.yaml: {}", e)))?;
     Ok(Some(target_lock))
 }
 
@@ -479,15 +470,14 @@ async fn prepare_node_artifacts(
     node_version: &str,
     reporter: Arc<dyn CapsuleReporter + 'static>,
 ) -> Result<Vec<ArtifactEntry>> {
-    let deps_path = read_dependencies_path(manifest, "node", manifest_dir)
-        .or_else(|| {
-            let candidate = manifest_dir.join("package.json");
-            if candidate.exists() {
-                Some(candidate)
-            } else {
-                None
-            }
-        });
+    let deps_path = read_dependencies_path(manifest, "node", manifest_dir).or_else(|| {
+        let candidate = manifest_dir.join("package.json");
+        if candidate.exists() {
+            Some(candidate)
+        } else {
+            None
+        }
+    });
     let Some(_) = deps_path else {
         return Ok(Vec::new());
     };
@@ -505,21 +495,17 @@ async fn prepare_node_artifacts(
     let store_dir = artifact_root(manifest_dir, target_key).join("pnpm-store");
     reset_dir(&store_dir)?;
 
-    let temp_dir = TempDir::new().map_err(|e| {
-        CapsuleError::Pack(format!("Failed to create pnpm temp dir: {}", e))
-    })?;
+    let temp_dir = TempDir::new()
+        .map_err(|e| CapsuleError::Pack(format!("Failed to create pnpm temp dir: {}", e)))?;
     let temp_path = temp_dir.path();
     if let Some(path) = deps_path.as_ref() {
-        let dest = temp_path
-            .join(path.file_name().unwrap_or_else(|| path.as_os_str()));
-        std::fs::copy(path, &dest).map_err(|e| {
-            CapsuleError::Pack(format!("Failed to copy {}: {}", path.display(), e))
-        })?;
+        let dest = temp_path.join(path.file_name().unwrap_or_else(|| path.as_os_str()));
+        std::fs::copy(path, &dest)
+            .map_err(|e| CapsuleError::Pack(format!("Failed to copy {}: {}", path.display(), e)))?;
     }
     let temp_lock = temp_path.join("pnpm-lock.yaml");
-    std::fs::copy(&lock_path, &temp_lock).map_err(|e| {
-        CapsuleError::Pack(format!("Failed to copy pnpm-lock.yaml: {}", e))
-    })?;
+    std::fs::copy(&lock_path, &temp_lock)
+        .map_err(|e| CapsuleError::Pack(format!("Failed to copy pnpm-lock.yaml: {}", e)))?;
 
     let mut cmd = std::process::Command::new(&pnpm_cmd.program);
     cmd.args(&pnpm_cmd.args_prefix)
@@ -560,10 +546,12 @@ async fn ensure_uv(reporter: Arc<dyn CapsuleReporter + 'static>) -> Result<PathB
         .notify(format!("⬇️  Downloading uv {}", version))
         .await?;
     let target_triple = platform_triple()?;
-    let tools_dir = toolchain_cache_dir()?.join("tools").join("uv").join(version);
-    std::fs::create_dir_all(&tools_dir).map_err(|e| {
-        CapsuleError::Pack(format!("Failed to create uv tools directory: {}", e))
-    })?;
+    let tools_dir = toolchain_cache_dir()?
+        .join("tools")
+        .join("uv")
+        .join(version);
+    std::fs::create_dir_all(&tools_dir)
+        .map_err(|e| CapsuleError::Pack(format!("Failed to create uv tools directory: {}", e)))?;
     let archive_path = tools_dir.join(format!("uv-{}.tar.gz", target_triple));
     let url = format!(
         "https://github.com/astral-sh/uv/releases/download/{}/uv-{}.tar.gz",
@@ -571,9 +559,8 @@ async fn ensure_uv(reporter: Arc<dyn CapsuleReporter + 'static>) -> Result<PathB
     );
     download_file(&url, &archive_path).await?;
     extract_tgz(&archive_path, &tools_dir)?;
-    let uv_bin = find_binary_recursive(&tools_dir, &["uv", "uv.exe"]).ok_or_else(|| {
-        CapsuleError::Pack("uv binary not found after extraction".to_string())
-    })?;
+    let uv_bin = find_binary_recursive(&tools_dir, &["uv", "uv.exe"])
+        .ok_or_else(|| CapsuleError::Pack("uv binary not found after extraction".to_string()))?;
     Ok(uv_bin)
 }
 
@@ -603,10 +590,12 @@ async fn ensure_pnpm(
     reporter
         .notify(format!("⬇️  Downloading pnpm {}", version))
         .await?;
-    let tools_dir = toolchain_cache_dir()?.join("tools").join("pnpm").join(version);
-    std::fs::create_dir_all(&tools_dir).map_err(|e| {
-        CapsuleError::Pack(format!("Failed to create pnpm tools directory: {}", e))
-    })?;
+    let tools_dir = toolchain_cache_dir()?
+        .join("tools")
+        .join("pnpm")
+        .join(version);
+    std::fs::create_dir_all(&tools_dir)
+        .map_err(|e| CapsuleError::Pack(format!("Failed to create pnpm tools directory: {}", e)))?;
     let archive_path = tools_dir.join(format!("pnpm-{}.tgz", version));
     let url = format!("https://registry.npmjs.org/pnpm/-/pnpm-{}.tgz", version);
     download_file(&url, &archive_path).await?;
@@ -630,7 +619,11 @@ async fn download_file(url: &str, dest: &Path) -> Result<()> {
         .timeout(std::time::Duration::from_secs(60))
         .build()
         .map_err(CapsuleError::Network)?;
-    let response = client.get(url).send().await.map_err(CapsuleError::Network)?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(CapsuleError::Network)?;
     if !response.status().is_success() {
         return Err(CapsuleError::Network(
             response.error_for_status().unwrap_err(),
@@ -669,15 +662,17 @@ fn find_binary_recursive(root: &Path, candidates: &[&str]) -> Option<PathBuf> {
     None
 }
 
-async fn run_command(program: &Path, args: &[&str], cwd: &Path) -> Result<std::process::ExitStatus> {
+async fn run_command(
+    program: &Path,
+    args: &[&str],
+    cwd: &Path,
+) -> Result<std::process::ExitStatus> {
     let mut cmd = std::process::Command::new(program);
     cmd.args(args).current_dir(cwd);
     run_command_inner(cmd).await
 }
 
-async fn run_command_inner(
-    mut cmd: std::process::Command,
-) -> Result<std::process::ExitStatus> {
+async fn run_command_inner(mut cmd: std::process::Command) -> Result<std::process::ExitStatus> {
     tokio::task::spawn_blocking(move || cmd.status())
         .await
         .map_err(|e| CapsuleError::Pack(format!("Failed to run command: {}", e)))?
@@ -696,10 +691,7 @@ async fn resolve_python_runtime(
         .fetch_expected_sha256(&(url.clone() + ".sha256"), None)
         .await?;
     let mut targets = HashMap::new();
-    targets.insert(
-        target_triple.to_string(),
-        RuntimeArtifact { url, sha256 },
-    );
+    targets.insert(target_triple.to_string(), RuntimeArtifact { url, sha256 });
     Ok(RuntimeEntry {
         provider: "python-build-standalone".to_string(),
         version: version.to_string(),
@@ -716,10 +708,7 @@ async fn resolve_node_runtime(
     let (os, arch) = RuntimeFetcher::detect_platform()?;
     let full_version = RuntimeFetcher::resolve_node_full_version(version).await?;
     let (filename, _is_zip) = RuntimeFetcher::node_artifact_filename(&full_version, &os, &arch)?;
-    let url = format!(
-        "https://nodejs.org/dist/v{}/{}",
-        full_version, filename
-    );
+    let url = format!("https://nodejs.org/dist/v{}/{}", full_version, filename);
     let sha256 = fetcher
         .fetch_expected_sha256(
             &format!("https://nodejs.org/dist/v{}/SHASUMS256.txt", full_version),
@@ -727,10 +716,7 @@ async fn resolve_node_runtime(
         )
         .await?;
     let mut targets = HashMap::new();
-    targets.insert(
-        target_triple.to_string(),
-        RuntimeArtifact { url, sha256 },
-    );
+    targets.insert(target_triple.to_string(), RuntimeArtifact { url, sha256 });
     Ok(RuntimeEntry {
         provider: "official".to_string(),
         version: full_version,
@@ -759,10 +745,7 @@ fn detect_tools(target_triple: &str) -> Option<ToolSection> {
         targets: [(
             target_triple.to_string(),
             ToolArtifact {
-                url: format!(
-                    "https://registry.npmjs.org/pnpm/-/pnpm-{}.tgz",
-                    version
-                ),
+                url: format!("https://registry.npmjs.org/pnpm/-/pnpm-{}.tgz", version),
                 sha256: None,
                 version: Some(version),
             },
@@ -1008,7 +991,6 @@ fn reset_dir(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path)?;
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {

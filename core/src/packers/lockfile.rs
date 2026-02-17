@@ -16,11 +16,7 @@ const DEFAULT_PNPM_VERSION: &str = "9.9.0";
 const DEFAULT_NODE_VERSION: &str = "20.12.0";
 const DEFAULT_PYTHON_VERSION: &str = "3.11.9";
 
-const DEFAULT_ALLOWLIST: &[&str] = &[
-    "nodejs.org",
-    "registry.npmjs.org",
-    "github.com",
-];
+const DEFAULT_ALLOWLIST: &[&str] = &["nodejs.org", "registry.npmjs.org", "github.com"];
 
 #[derive(Debug, Serialize)]
 pub struct CapsuleLock {
@@ -238,18 +234,20 @@ pub fn write_lockfile(
         } else {
             None
         },
-        targets: if targets.is_empty() { None } else { Some(targets) },
+        targets: if targets.is_empty() {
+            None
+        } else {
+            Some(targets)
+        },
     };
 
     warn_on_allowlist(&lockfile, &allowlist, reporter.clone())?;
 
     let lock_path = manifest_dir.join("capsule.lock");
-    let content = toml::to_string_pretty(&lockfile).map_err(|e| {
-        CapsuleError::Pack(format!("Failed to serialize capsule.lock: {}", e))
-    })?;
-    std::fs::write(&lock_path, content).map_err(|e| {
-        CapsuleError::Pack(format!("Failed to write capsule.lock: {}", e))
-    })?;
+    let content = toml::to_string_pretty(&lockfile)
+        .map_err(|e| CapsuleError::Pack(format!("Failed to serialize capsule.lock: {}", e)))?;
+    std::fs::write(&lock_path, content)
+        .map_err(|e| CapsuleError::Pack(format!("Failed to write capsule.lock: {}", e)))?;
 
     Ok(lock_path)
 }
@@ -301,7 +299,11 @@ fn target_triple(os: &str, arch: &str) -> Result<String> {
     Ok(triple.to_string())
 }
 
-fn detect_languages(manifest: &toml::Value, manifest_path: &Path, manifest_dir: &Path) -> HashSet<String> {
+fn detect_languages(
+    manifest: &toml::Value,
+    manifest_path: &Path,
+    manifest_dir: &Path,
+) -> HashSet<String> {
     let mut langs = HashSet::new();
     if let Some(language) = manifest
         .get("targets")
@@ -363,10 +365,9 @@ fn warn_on_allowlist(
     let urls = collect_urls(lockfile);
     for url in urls {
         if !is_allowed(&url, allowlist) {
-            futures::executor::block_on(reporter.warn(format!(
-                "⚠️  Allowlist mismatch in capsule.lock: {}",
-                url
-            )))?;
+            futures::executor::block_on(
+                reporter.warn(format!("⚠️  Allowlist mismatch in capsule.lock: {}", url)),
+            )?;
         }
     }
     Ok(())
@@ -436,12 +437,13 @@ mod tests {
         let manifest_path = temp.path().join("capsule.toml");
         std::fs::write(
             &manifest_path,
-            r#"schema_version = "1.0"
+            r#"schema_version = "0.2"
 name = "lockfile-test"
 version = "0.1.0"
 type = "app"
+default_target = "cli"
 
-[execution]
+[targets.cli]
 runtime = "source"
 entrypoint = "python"
 

@@ -66,7 +66,7 @@ pub fn discover_nacelle(req: EngineRequest) -> Result<PathBuf> {
 Resolve options:\n\
   - pass --nacelle /absolute/path/to/nacelle\n\
   - set NACELLE_PATH=/absolute/path/to/nacelle\n\
-  - register a default engine: capsule engine register --name default --path /absolute/path/to/nacelle --default\n\
+  - register a default engine: ato engine register --name default --path /absolute/path/to/nacelle --default\n\
   - (portable) place nacelle next to the capsule binary"
     ))
 }
@@ -139,7 +139,7 @@ fn resolve_from_manifest(manifest_path: &Path) -> Result<Option<PathBuf>> {
             return Ok(Some(PathBuf::from(&entry.path)));
         }
         anyhow::bail!(
-            "Engine alias '{}' not registered. Run: capsule engine register --name {} --path /abs/path/to/nacelle",
+            "Engine alias '{}' not registered. Run: ato engine register --name {} --path /abs/path/to/nacelle",
             alias,
             alias
         );

@@ -45,6 +45,7 @@ fn runtime_type_to_capnp(r: RuntimeType) -> capsule_capnp::RuntimeType {
         RuntimeType::Source => capsule_capnp::RuntimeType::Source,
         RuntimeType::Wasm => capsule_capnp::RuntimeType::Wasm,
         RuntimeType::Oci => capsule_capnp::RuntimeType::Youki, // Map Oci to Youki in Cap'n Proto (closest match)
+        RuntimeType::Web => capsule_capnp::RuntimeType::Source, // Web is represented as source in legacy Cap'n Proto
         // Legacy types (deprecated)
         RuntimeType::Docker => capsule_capnp::RuntimeType::Docker,
         RuntimeType::Native => capsule_capnp::RuntimeType::Native,
@@ -164,17 +165,47 @@ pub fn manifest_to_capnp_bytes(
 
         // Execution
         {
+            let selected_target = manifest
+                .resolve_default_target()
+                .map_err(|_| CapnpConversionError::MissingField("targets.<default_target>"))?;
+            if selected_target.entrypoint.trim().is_empty() {
+                return Err(CapnpConversionError::MissingField(
+                    "targets.<default_target>.entrypoint",
+                ));
+            }
+            let selected_runtime = manifest
+                .resolve_default_runtime()
+                .map_err(|_| CapnpConversionError::MissingField("targets.<default_target>.runtime"))?;
+            let mut merged_env = manifest
+                .targets
+                .as_ref()
+                .map(|targets| targets.env.clone())
+                .unwrap_or_default();
+            for (k, v) in &selected_target.env {
+                merged_env.insert(k.clone(), v.clone());
+            }
+            let selected_port = manifest.targets.as_ref().and_then(|targets| targets.port);
+            let selected_health = manifest
+                .targets
+                .as_ref()
+                .and_then(|targets| targets.health_check.as_ref());
+            let selected_startup_timeout = manifest
+                .targets
+                .as_ref()
+                .map(|targets| targets.startup_timeout)
+                .unwrap_or(60);
+
             let mut exec = builder.reborrow().init_execution();
-            exec.set_runtime(runtime_type_to_capnp(manifest.execution.runtime.clone()));
-            exec.set_entrypoint(&manifest.execution.entrypoint);
-            if let Some(port) = manifest.execution.port {
+            exec.set_runtime(runtime_type_to_capnp(selected_runtime));
+            exec.set_entrypoint(&selected_target.entrypoint);
+            if let Some(port) = selected_port {
                 exec.set_port(port);
             }
-            if let Some(health) = &manifest.execution.health_check {
+            if let Some(health) = selected_health {
                 exec.set_health_check(health);
             }
-            exec.set_startup_timeout(manifest.execution.startup_timeout);
-            let env = &manifest.execution.env;
+            exec.set_startup_timeout(selected_startup_timeout);
+            let env = &merged_env;
             let mut env_builder = exec.reborrow().init_env(env.len() as u32);
             for (i, (k, v)) in env.iter().enumerate() {
                 let mut entry = env_builder.reborrow().get(i as u32);

@@ -1,5 +1,5 @@
 #![allow(unused_imports)]
-//! Signing Module for Capsule CLI
+//! Signing Module for Ato CLI
 //!
 //! Migrated from nacelle/src/verification/signing.rs
 //! Handles Ed25519 signature creation and verification.

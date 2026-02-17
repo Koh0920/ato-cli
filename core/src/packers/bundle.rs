@@ -420,9 +420,8 @@ fn resolve_runtime_root(runtime_dir: &Path, language: &str) -> Result<PathBuf> {
     }
 
     if language == "node" {
-        let entries = fs::read_dir(runtime_dir).map_err(|e| {
-            CapsuleError::Pack(format!("Failed to read runtime dir: {}", e))
-        })?;
+        let entries = fs::read_dir(runtime_dir)
+            .map_err(|e| CapsuleError::Pack(format!("Failed to read runtime dir: {}", e)))?;
         for entry in entries {
             let entry = entry.map_err(|e| CapsuleError::Pack(format!("Walk error: {}", e)))?;
             let path = entry.path();
@@ -476,7 +475,12 @@ fn create_bundle_archive(
             (source_dir, "")
         };
 
-        append_dir(&mut builder, actual_source_dir, source_prefix, source_ignore)?;
+        append_dir(
+            &mut builder,
+            actual_source_dir,
+            source_prefix,
+            source_ignore,
+        )?;
 
         if let Some(config_path) = config_path {
             append_file(&mut builder, config_path, "config.json")?;
@@ -633,17 +637,10 @@ impl NodeModulesGuard {
             }
 
             let path = entry.path();
-            if ignore
-                .matched_path_or_any_parents(path, true)
-                .is_ignore()
-            {
+            if ignore.matched_path_or_any_parents(path, true).is_ignore() {
                 let backup = unique_backup_path(path)?;
                 fs::rename(path, &backup).map_err(|e| {
-                    CapsuleError::Pack(format!(
-                        "Failed to move {}: {}",
-                        path.display(),
-                        e
-                    ))
+                    CapsuleError::Pack(format!("Failed to move {}: {}", path.display(), e))
                 })?;
                 moves.push((path.to_path_buf(), backup));
                 it.skip_current_dir();
@@ -666,7 +663,10 @@ impl Drop for NodeModulesGuard {
 
 fn unique_backup_path(original: &Path) -> Result<PathBuf> {
     let parent = original.parent().ok_or_else(|| {
-        CapsuleError::Pack(format!("Failed to resolve parent for {}", original.display()))
+        CapsuleError::Pack(format!(
+            "Failed to resolve parent for {}",
+            original.display()
+        ))
     })?;
     let name = original
         .file_name()
@@ -764,12 +764,13 @@ mod tests {
         std::fs::write(source_dir.join("hello.sh"), "#!/bin/sh\necho ok\n").unwrap();
 
         let manifest = r#"
-schema_version = "1.0"
+schema_version = "0.2"
 name = "bundle-test"
 version = "0.1.0"
 type = "app"
+default_target = "cli"
 
-[execution]
+[targets.cli]
 runtime = "source"
 entrypoint = "hello.sh"
 "#;

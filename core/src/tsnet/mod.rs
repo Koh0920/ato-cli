@@ -100,10 +100,10 @@ where
 }
 
 pub mod client;
-pub mod ipc;
-pub mod sidecar;
 #[cfg(test)]
 pub mod integration_test;
+pub mod ipc;
+pub mod sidecar;
 
 #[allow(clippy::all)]
 pub mod proto {

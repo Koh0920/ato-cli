@@ -11,14 +11,23 @@ use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use super::identity;
+
 const SIGNATURE_VERSION: u8 = 0x01;
 const KEY_TYPE_ED25519: u8 = 0x01;
 
-/// Parse a developer_key string (ed25519:base64) into raw bytes
+/// Parse a developer_key string (ed25519:base64 or did:key) into raw bytes
 pub fn parse_developer_key(value: &str) -> Result<[u8; 32]> {
+    // Support did:key format
+    if value.starts_with("did:key:") {
+        return identity::did_to_public_key(value)
+            .map_err(|e| anyhow!("failed to parse did:key: {}", e));
+    }
+
+    // Legacy ed25519:base64 format
     let value = value
         .strip_prefix("ed25519:")
-        .ok_or_else(|| anyhow!("developer_key must start with ed25519:"))?;
+        .ok_or_else(|| anyhow!("developer_key must start with ed25519: or did:key:"))?;
     let decoded = BASE64
         .decode(value)
         .map_err(|err| anyhow!("failed to decode developer_key: {err}"))?;
@@ -94,6 +103,19 @@ impl StoredKey {
     pub fn developer_key_fingerprint(&self) -> String {
         format!("ed25519:{}", self.public_key)
     }
+
+    /// Get the DID (did:key format) for this key
+    pub fn did(&self) -> Result<String> {
+        let public_bytes = BASE64
+            .decode(&self.public_key)
+            .map_err(|err| anyhow!("failed to decode public key: {err}"))?;
+        if public_bytes.len() != 32 {
+            bail!("public key must be 32 bytes, got {}", public_bytes.len());
+        }
+        let mut key_bytes = [0u8; 32];
+        key_bytes.copy_from_slice(&public_bytes);
+        Ok(identity::public_key_to_did(&key_bytes))
+    }
 }
 
 pub struct SignatureMetadata {
@@ -123,7 +145,7 @@ pub fn write_signature_file(
         "timestamp".to_string(),
         Value::String(metadata.timestamp.to_rfc3339()),
     );
-    meta_map.insert("tool".to_string(), Value::String("capsule-cli".to_string()));
+    meta_map.insert("tool".to_string(), Value::String("ato-cli".to_string()));
     meta_map.insert(
         "tool_version".to_string(),
         Value::String(env!("CARGO_PKG_VERSION").to_string()),
@@ -269,6 +291,64 @@ mod tests {
         write_signature_file(&path, &signing_key.verifying_key(), &signature, &metadata).unwrap();
         let sig = read_signature_file(&path).unwrap();
         ensure_signature_matches_manifest(&sig, &stored.developer_key_fingerprint()).unwrap();
+        verify_signature_file(&sig, message).unwrap();
+    }
+
+    #[test]
+    fn stored_key_did_conversion() {
+        let stored = StoredKey::generate();
+        let did = stored.did().expect("did");
+        assert!(
+            did.starts_with("did:key:z6Mk"),
+            "DID should start with did:key:z6Mk"
+        );
+
+        // Verify we can parse it back
+        let public_key = parse_developer_key(&did).expect("parse did");
+        let original_key =
+            parse_developer_key(&stored.developer_key_fingerprint()).expect("parse fingerprint");
+        assert_eq!(
+            public_key, original_key,
+            "DID and fingerprint should produce same public key"
+        );
+    }
+
+    #[test]
+    fn parse_developer_key_did_format() {
+        // Generate a test key
+        let stored = StoredKey::generate();
+        let did = stored.did().expect("did");
+
+        // Parse it
+        let public_key = parse_developer_key(&did).expect("parse did");
+
+        // Verify it matches
+        let signing_key = stored.to_signing_key().expect("signing key");
+        assert_eq!(public_key, *signing_key.verifying_key().as_bytes());
+    }
+
+    #[test]
+    fn signature_with_did_key() {
+        let stored = StoredKey::generate();
+        let did = stored.did().expect("did");
+        let signing_key = stored.to_signing_key().expect("signing key");
+        let message = b"test-did-signature";
+        let signature = signing_key.sign(message);
+        let metadata = SignatureMetadata {
+            package_sha256: "abc".to_string(),
+            manifest_sha256: "def".to_string(),
+            signer: Some(did.clone()),
+            timestamp: Utc::now(),
+            extra: BTreeMap::new(),
+        };
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("developer.sig");
+        write_signature_file(&path, &signing_key.verifying_key(), &signature, &metadata).unwrap();
+        let sig = read_signature_file(&path).unwrap();
+
+        // Verify using DID format
+        ensure_signature_matches_manifest(&sig, &did).unwrap();
         verify_signature_file(&sig, message).unwrap();
     }
 }
