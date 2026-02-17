@@ -15,19 +15,31 @@ use capsule_core::hardware;
 use capsule_core::router::ManifestData;
 
 use crate::common::proxy;
+
+use super::source::IpcEnvVars;
+
 #[derive(Debug, Clone)]
 enum OciEngine {
     Docker,
     Podman,
 }
 
-pub fn execute(plan: &ManifestData, reporter: std::sync::Arc<CliReporter>) -> Result<i32> {
+pub fn execute(
+    plan: &ManifestData,
+    reporter: std::sync::Arc<CliReporter>,
+    ipc_env: Option<&IpcEnvVars>,
+) -> Result<i32> {
     let engine = detect_engine()?;
     let image = resolve_image(plan)?;
     let mut env = plan.execution_env();
     env.extend(plan.targets_oci_env());
     if let Some(proxy_env) = proxy::proxy_env_from_env(&[])? {
         proxy::extend_env_map(&mut env, &proxy_env);
+    }
+
+    // Inject IPC environment variables (CAPSULE_IPC_*)
+    if let Some(ipc) = ipc_env {
+        env.extend(ipc.clone());
     }
 
     let mut cmd = Command::new(engine_binary(&engine));

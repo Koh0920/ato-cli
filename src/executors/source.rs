@@ -15,6 +15,9 @@ use capsule_core::router::ManifestData;
 
 use crate::common::proxy;
 
+/// Additional IPC environment variables to inject into the child process.
+pub type IpcEnvVars = std::collections::HashMap<String, String>;
+
 pub struct CapsuleProcess {
     pub child: Child,
     pub bundle_path: PathBuf,
@@ -31,13 +34,18 @@ pub fn execute(
     reporter: std::sync::Arc<CliReporter>,
     enforcement: &str,
     mode: ExecuteMode,
+    ipc_env: Option<&IpcEnvVars>,
 ) -> Result<CapsuleProcess> {
     let nacelle = engine::discover_nacelle(engine::EngineRequest {
         explicit_path: nacelle_override.clone(),
         manifest_path: Some(plan.manifest_path.clone()),
     })?;
 
-    r3_config::generate_and_write_config(&plan.manifest_path, Some(enforcement.to_string()), false)?;
+    r3_config::generate_and_write_config(
+        &plan.manifest_path,
+        Some(enforcement.to_string()),
+        false,
+    )?;
 
     // Create a Tokio runtime for async pack/bundle operations.
     // Note: this function is sync, but it needs to run async code.
@@ -93,6 +101,7 @@ pub fn execute(
                 &plan.manifest_dir,
                 reporter.clone(),
                 mode,
+                ipc_env,
             ))
         })?,
         Rt::Owned(runtime) => runtime.block_on(run_bundle(
@@ -100,6 +109,7 @@ pub fn execute(
             &plan.manifest_dir,
             reporter.clone(),
             mode,
+            ipc_env,
         ))?,
     };
 
@@ -111,11 +121,19 @@ async fn run_bundle(
     manifest_dir: &Path,
     reporter: std::sync::Arc<CliReporter>,
     mode: ExecuteMode,
+    ipc_env: Option<&IpcEnvVars>,
 ) -> Result<Child> {
     let mut cmd = Command::new(bundle_path);
     cmd.current_dir(manifest_dir);
     if let Some(proxy_env) = proxy::proxy_env_from_env(&[])? {
         proxy::apply_proxy_env(&mut cmd, &proxy_env);
+    }
+
+    // Inject IPC environment variables (CAPSULE_IPC_* )
+    if let Some(env) = ipc_env {
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
     }
 
     match mode {

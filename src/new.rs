@@ -1,4 +1,4 @@
-//! `capsule new` - create a new capsule project from scratch.
+//! `ato new` - create a new capsule project from scratch.
 
 use anyhow::{Context, Result};
 use std::fs;
@@ -75,7 +75,7 @@ pub fn execute(
     maybe_notify(&reporter, "\n✨ Project created successfully!")?;
     maybe_notify(&reporter, "\nNext steps:")?;
     maybe_notify(&reporter, format!("   cd {}", args.name))?;
-    maybe_notify(&reporter, "   capsule dev")?;
+    maybe_notify(&reporter, "   ato dev")?;
 
     Ok(())
 }
@@ -115,14 +115,14 @@ if __name__ == "__main__":
         "# Add your dependencies here\n",
     )?;
 
-    // Generate capsule.toml via the same detect+recipe path as `capsule init`.
+    // Generate capsule.toml via the same detect+recipe path as `ato init`.
     let detected = detect::detect_project(dir)?;
     let mut info = recipe::project_info_from_detection(&detected)?;
     info.name = name.to_string();
     let manifest = recipe::generate_manifest(
         &info,
         recipe::ManifestMeta {
-            generated_by: "capsule new",
+            generated_by: "ato new",
             description: "A new capsule application",
         },
     );
@@ -182,7 +182,7 @@ console.log(`Started server http://localhost:${process.env.PORT ?? 8000}`);
 "#;
     fs::write(dir.join("src/index.ts"), index_ts)?;
 
-    // Provide a ready-to-run release artifact so `capsule pack` works immediately.
+    // Provide a ready-to-run release artifact so `ato pack` works immediately.
     // Users are expected to overwrite this by running `bun run build`.
     let dist_js = r#"import { serve } from "bun";
 
@@ -199,14 +199,14 @@ console.log(`Started server http://localhost:${process.env.PORT ?? 8000}`);
 "#;
     fs::write(dir.join("dist/server.js"), dist_js)?;
 
-    // Generate capsule.toml via the same detect+recipe path as `capsule init`.
+    // Generate capsule.toml via the same detect+recipe path as `ato init`.
     let detected = detect::detect_project(dir)?;
     let mut info = recipe::project_info_from_detection(&detected)?;
     info.name = name.to_string();
     let manifest = recipe::generate_manifest(
         &info,
         recipe::ManifestMeta {
-            generated_by: "capsule new",
+            generated_by: "ato new",
             description: "A new Bun/Node.js capsule application",
         },
     );
@@ -272,7 +272,7 @@ console.log(`Started server http://localhost:${process.env.PORT ?? 8000}`);
 "#;
     fs::write(dir.join("src/index.ts"), index_ts)?;
 
-    // Provide a ready-to-run release artifact so `capsule pack` works immediately.
+    // Provide a ready-to-run release artifact so `ato pack` works immediately.
     // Users are expected to overwrite this by running `bun run build`.
     let dist_js = r#"import { Hono } from "hono";
 import { serve } from "bun";
@@ -290,14 +290,14 @@ console.log(`Started server http://localhost:${process.env.PORT ?? 8000}`);
 "#;
     fs::write(dir.join("dist/server.js"), dist_js)?;
 
-    // Generate capsule.toml via the same detect+recipe path as `capsule init`.
+    // Generate capsule.toml via the same detect+recipe path as `ato init`.
     let detected = detect::detect_project(dir)?;
     let mut info = recipe::project_info_from_detection(&detected)?;
     info.name = name.to_string();
     let manifest = recipe::generate_manifest(
         &info,
         recipe::ManifestMeta {
-            generated_by: "capsule new",
+            generated_by: "ato new",
             description: "A new Bun/Hono capsule application",
         },
     );
@@ -338,14 +338,14 @@ edition = "2021"
 "#;
     fs::write(dir.join("src/main.rs"), main_rs)?;
 
-    // Generate capsule.toml via the same detect+recipe path as `capsule init`.
+    // Generate capsule.toml via the same detect+recipe path as `ato init`.
     let detected = detect::detect_project(dir)?;
     let mut info = recipe::project_info_from_detection(&detected)?;
     info.name = name.to_string();
     let manifest = recipe::generate_manifest(
         &info,
         recipe::ManifestMeta {
-            generated_by: "capsule new",
+            generated_by: "ato new",
             description: "A new Rust capsule application",
         },
     );
@@ -382,14 +382,14 @@ func main() {
 "#;
     fs::write(dir.join("main.go"), main_go)?;
 
-    // Generate capsule.toml via the same detect+recipe path as `capsule init`.
+    // Generate capsule.toml via the same detect+recipe path as `ato init`.
     let detected = detect::detect_project(dir)?;
     let mut info = recipe::project_info_from_detection(&detected)?;
     info.name = name.to_string();
     let manifest = recipe::generate_manifest(
         &info,
         recipe::ManifestMeta {
-            generated_by: "capsule new",
+            generated_by: "ato new",
             description: "A new Go capsule application",
         },
     );
@@ -407,18 +407,19 @@ fn create_shell_project(
     reporter: std::sync::Arc<crate::reporters::CliReporter>,
 ) -> Result<()> {
     let manifest = format!(
-        r#"# Capsule Manifest - UARC V1.1.0
-schema_version = "1.0"
+        r#"# Capsule Manifest - Multi-Target Native v0.2
+schema_version = "0.2"
 name = "{name}"
 version = "0.1.0"
 type = "app"
+default_target = "cli"
 
 [metadata]
 description = "A new capsule application"
 
 [requirements]
 
-[execution]
+[targets.cli]
 runtime = "source"
 entrypoint = "bash main.sh"
 
@@ -494,13 +495,13 @@ fn create_readme(
 bun install
 
 # Run locally (dev profile)
-capsule dev
+ato dev
 
 # Build release artifact (recommended)
 bun run build
 
 # Create a self-extracting bundle (release profile)
-capsule pack --bundle
+ato pack --bundle
 
 # Run bundle
 ./nacelle-bundle
@@ -510,14 +511,14 @@ capsule pack --bundle
             format!(
                 r#"```bash
 # Run locally (dev profile)
-capsule dev
+ato dev
 
 # Build release binary for bundling
 cargo build --release
 cp target/release/{name} ./{name}
 
 # Create a self-extracting bundle (release profile)
-capsule pack --bundle
+ato pack --bundle
 
 # Run bundle
 ./nacelle-bundle
@@ -528,13 +529,13 @@ capsule pack --bundle
             format!(
                 r#"```bash
 # Run locally (dev profile)
-capsule dev
+ato dev
 
 # Build release binary for bundling
 go build -o {name} .
 
 # Create a self-extracting bundle (release profile)
-capsule pack --bundle
+ato pack --bundle
 
 # Run bundle
 ./nacelle-bundle
@@ -543,10 +544,10 @@ capsule pack --bundle
         }
         _ => r#"```bash
 # Run locally (no bundling)
-capsule dev
+ato dev
 
 # Create a self-extracting bundle
-capsule pack --bundle
+ato pack --bundle
 
 # Run bundle
 ./nacelle-bundle

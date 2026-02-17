@@ -115,7 +115,7 @@ fn dockerfile_distroless_template() -> String {
 # Thin Capsule runner (CPU) on Distroless
 #
 # Expected workflow:
-#   1) Build a Linux self-extracting bundle (nacelle-bundle) via: capsule pack
+#   1) Build a Linux self-extracting bundle (nacelle-bundle) via: ato pack
 #   2) docker build -t my-capsule .
 #   3) docker run --rm -p 8000:8000 my-capsule
 
@@ -123,7 +123,7 @@ FROM gcr.io/distroless/base-debian12:nonroot
 
 WORKDIR /app
 
-# Copy the self-extracting bundle produced by `capsule pack`.
+# Copy the self-extracting bundle produced by `ato pack`.
 # (Name is configurable; update as needed.)
 COPY --chown=nonroot:nonroot nacelle-bundle /app/nacelle-bundle
 
@@ -143,7 +143,7 @@ fn dockerfile_gpu_template() -> String {
 # Thin Capsule runner (GPU) on CUDA Runtime
 #
 # Expected workflow:
-#   1) Build a Linux self-extracting bundle (nacelle-bundle) via: capsule pack
+#   1) Build a Linux self-extracting bundle (nacelle-bundle) via: ato pack
 #   2) docker build -t my-capsule-gpu .
 #   3) docker run --rm --gpus all -p 8000:8000 my-capsule-gpu
 

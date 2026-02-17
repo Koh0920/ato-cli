@@ -1,13 +1,13 @@
 use anyhow::Result;
-use capsule_sync::{
-    decode_payload_base64, encode_payload_base64, GuestAction, GuestError, GuestErrorCode,
-    GuestPermission, GuestRequest, GuestResponse, GUEST_PROTOCOL_VERSION,
-};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use sync_runtime::{
+    decode_payload_base64, encode_payload_base64, GuestAction, GuestContextRole, GuestError,
+    GuestErrorCode, GuestPermission, GuestRequest, GuestResponse, GUEST_PROTOCOL_VERSION,
+};
 use tempfile::TempDir;
 use wasi_common::pipe::{ReadPipe, WritePipe};
 use wasmtime::{Config, Engine, Linker, Module, Store, StoreLimitsBuilder};
@@ -72,10 +72,7 @@ fn handle_request(sync_path: &PathBuf, request: &GuestRequest) -> GuestResponse 
         return error_response(
             &request_id,
             GuestErrorCode::ProtocolError,
-            format!(
-                "Unsupported protocol version: {}",
-                request.version
-            ),
+            format!("Unsupported protocol version: {}", request.version),
         );
     }
 
@@ -134,8 +131,14 @@ fn handle_request(sync_path: &PathBuf, request: &GuestRequest) -> GuestResponse 
     }
 }
 
-fn ensure_permissions(request: &GuestRequest, permissions: &GuestPermission) -> Result<(), GuestError> {
-    if matches!(request.context.role, capsule_sync::GuestContextRole::Consumer) {
+fn ensure_permissions(
+    request: &GuestRequest,
+    permissions: &GuestPermission,
+) -> Result<(), GuestError> {
+    if matches!(
+        request.context.role,
+        sync_runtime::GuestContextRole::Consumer
+    ) {
         match request.action {
             GuestAction::ReadPayload | GuestAction::ReadContext => {}
             _ => {
@@ -205,8 +208,8 @@ fn validate_env_context(request: &GuestRequest) -> Result<(), GuestError> {
 
     if let Ok(mode) = std::env::var("GUEST_MODE") {
         let expected = match request.context.mode {
-            capsule_sync::GuestMode::Widget => "widget",
-            capsule_sync::GuestMode::Headless => "headless",
+            sync_runtime::GuestMode::Widget => "widget",
+            sync_runtime::GuestMode::Headless => "headless",
         };
         if mode.to_ascii_lowercase() != expected {
             return Err(GuestError::new(
@@ -218,8 +221,8 @@ fn validate_env_context(request: &GuestRequest) -> Result<(), GuestError> {
 
     if let Ok(role) = std::env::var("GUEST_ROLE") {
         let expected = match request.context.role {
-            capsule_sync::GuestContextRole::Consumer => "consumer",
-            capsule_sync::GuestContextRole::Owner => "owner",
+            sync_runtime::GuestContextRole::Consumer => "consumer",
+            sync_runtime::GuestContextRole::Owner => "owner",
         };
         if role.to_ascii_lowercase() != expected {
             return Err(GuestError::new(
@@ -240,7 +243,7 @@ fn validate_env_context(request: &GuestRequest) -> Result<(), GuestError> {
 
     let widget_bounds = std::env::var("GUEST_WIDGET_BOUNDS").ok();
     match request.context.mode {
-        capsule_sync::GuestMode::Widget => {
+        sync_runtime::GuestMode::Widget => {
             let value = widget_bounds.ok_or_else(|| {
                 GuestError::new(
                     GuestErrorCode::InvalidRequest,
@@ -249,7 +252,7 @@ fn validate_env_context(request: &GuestRequest) -> Result<(), GuestError> {
             })?;
             parse_widget_bounds(&value)?;
         }
-        capsule_sync::GuestMode::Headless => {
+        sync_runtime::GuestMode::Headless => {
             if widget_bounds.is_some() {
                 return Err(GuestError::new(
                     GuestErrorCode::InvalidRequest,
@@ -271,18 +274,18 @@ fn parse_widget_bounds(value: &str) -> Result<(u32, u32, u32, u32), GuestError> 
         ));
     }
 
-    let x = parts[0].parse::<u32>().map_err(|err| {
-        GuestError::new(GuestErrorCode::InvalidRequest, err.to_string())
-    })?;
-    let y = parts[1].parse::<u32>().map_err(|err| {
-        GuestError::new(GuestErrorCode::InvalidRequest, err.to_string())
-    })?;
-    let width = parts[2].parse::<u32>().map_err(|err| {
-        GuestError::new(GuestErrorCode::InvalidRequest, err.to_string())
-    })?;
-    let height = parts[3].parse::<u32>().map_err(|err| {
-        GuestError::new(GuestErrorCode::InvalidRequest, err.to_string())
-    })?;
+    let x = parts[0]
+        .parse::<u32>()
+        .map_err(|err| GuestError::new(GuestErrorCode::InvalidRequest, err.to_string()))?;
+    let y = parts[1]
+        .parse::<u32>()
+        .map_err(|err| GuestError::new(GuestErrorCode::InvalidRequest, err.to_string()))?;
+    let width = parts[2]
+        .parse::<u32>()
+        .map_err(|err| GuestError::new(GuestErrorCode::InvalidRequest, err.to_string()))?;
+    let height = parts[3]
+        .parse::<u32>()
+        .map_err(|err| GuestError::new(GuestErrorCode::InvalidRequest, err.to_string()))?;
 
     if width == 0 || height == 0 {
         return Err(GuestError::new(
@@ -298,7 +301,7 @@ fn effective_permissions(
     sync_path: &PathBuf,
     requested: &GuestPermission,
 ) -> Result<GuestPermission, GuestError> {
-    let archive = capsule_sync::SyncArchive::open(sync_path).map_err(|err| {
+    let archive = sync_runtime::SyncArchive::open(sync_path).map_err(|err| {
         GuestError::new(
             GuestErrorCode::InvalidRequest,
             format!("Failed to open sync archive: {}", err),
@@ -307,14 +310,10 @@ fn effective_permissions(
     let manifest_permissions = archive.manifest().permissions.clone();
 
     let mut permissions = requested.clone();
-    permissions.allowed_env = intersect_allowlist(
-        &requested.allowed_env,
-        &manifest_permissions.allow_env,
-    );
-    permissions.allowed_hosts = intersect_allowlist(
-        &requested.allowed_hosts,
-        &manifest_permissions.allow_hosts,
-    );
+    permissions.allowed_env =
+        intersect_allowlist(&requested.allowed_env, &manifest_permissions.allow_env);
+    permissions.allowed_hosts =
+        intersect_allowlist(&requested.allowed_hosts, &manifest_permissions.allow_hosts);
 
     if let Ok(value) = std::env::var("ALLOW_ENV") {
         let allow_env = parse_allowlist_env(&value);
@@ -323,8 +322,7 @@ fn effective_permissions(
 
     if let Ok(value) = std::env::var("ALLOW_HOSTS") {
         let allow_hosts = parse_allowlist_env(&value);
-        permissions.allowed_hosts =
-            intersect_allowlist(&permissions.allowed_hosts, &allow_hosts);
+        permissions.allowed_hosts = intersect_allowlist(&permissions.allowed_hosts, &allow_hosts);
     }
 
     Ok(permissions)
@@ -397,15 +395,12 @@ fn read_context(sync_path: &PathBuf) -> Result<Value, GuestError> {
 
 fn write_payload(sync_path: &PathBuf, input: &Value) -> Result<(), GuestError> {
     let payload = input.as_str().ok_or_else(|| {
-        GuestError::new(
-            GuestErrorCode::InvalidRequest,
-            "payload must be a string",
-        )
+        GuestError::new(GuestErrorCode::InvalidRequest, "payload must be a string")
     })?;
 
     let decoded = decode_payload_base64(payload)?;
 
-    let mut archive = capsule_sync::SyncArchive::open(sync_path).map_err(|err| {
+    let mut archive = sync_runtime::SyncArchive::open(sync_path).map_err(|err| {
         GuestError::new(
             GuestErrorCode::InvalidRequest,
             format!("Failed to open sync archive: {}", err),
@@ -423,14 +418,11 @@ fn update_payload(
     permissions: &GuestPermission,
 ) -> Result<(), GuestError> {
     let payload = input.as_str().ok_or_else(|| {
-        GuestError::new(
-            GuestErrorCode::InvalidRequest,
-            "payload must be a string",
-        )
+        GuestError::new(GuestErrorCode::InvalidRequest, "payload must be a string")
     })?;
     let decoded = decode_payload_base64(payload)?;
 
-    let manifest = capsule_sync::SyncArchive::open(sync_path)
+    let manifest = sync_runtime::SyncArchive::open(sync_path)
         .map_err(|err| GuestError::new(GuestErrorCode::InvalidRequest, err.to_string()))?
         .manifest()
         .clone();
@@ -466,14 +458,13 @@ fn execute_wasm(
     permissions: &GuestPermission,
     stdin_payload: Option<Vec<u8>>,
 ) -> Result<Vec<u8>, GuestError> {
-    let wasm_bytes = read_zip_entry_bytes(sync_path, "sync.wasm").map_err(|err| {
-        GuestError::new(GuestErrorCode::InvalidRequest, err.message)
-    })?;
+    let wasm_bytes = read_zip_entry_bytes(sync_path, "sync.wasm")
+        .map_err(|err| GuestError::new(GuestErrorCode::InvalidRequest, err.message))?;
     let payload = read_payload_bytes(sync_path)?;
-    let context = read_optional_zip_entry_bytes(sync_path, "context.json")?
-        .unwrap_or_else(|| b"{}".to_vec());
+    let context =
+        read_optional_zip_entry_bytes(sync_path, "context.json")?.unwrap_or_else(|| b"{}".to_vec());
 
-    let manifest = capsule_sync::SyncArchive::open(sync_path)
+    let manifest = sync_runtime::SyncArchive::open(sync_path)
         .map_err(|err| GuestError::new(GuestErrorCode::InvalidRequest, err.to_string()))?
         .manifest()
         .clone();
@@ -489,8 +480,8 @@ fn execute_wasm(
     let module = Module::from_binary(&engine, &wasm_bytes)
         .map_err(|err| GuestError::new(GuestErrorCode::ExecutionFailed, err.to_string()))?;
 
-    let temp_dir = TempDir::new()
-        .map_err(|err| GuestError::new(GuestErrorCode::IoError, err.to_string()))?;
+    let temp_dir =
+        TempDir::new().map_err(|err| GuestError::new(GuestErrorCode::IoError, err.to_string()))?;
     let payload_path = temp_dir.path().join("payload");
     let context_path = temp_dir.path().join("context.json");
 
@@ -529,7 +520,11 @@ fn execute_wasm(
     wasi_builder
         .env("ALLOW_ENV", &permissions.allowed_env.join(","))
         .map_err(|err| GuestError::new(GuestErrorCode::ExecutionFailed, err.to_string()))?;
-    let sync_mode = if stdin_payload.is_some() { "push" } else { "pull" };
+    let sync_mode = if stdin_payload.is_some() {
+        "push"
+    } else {
+        "pull"
+    };
     let stdin_data = stdin_payload.unwrap_or_default();
     wasi_builder
         .env("SYNC_MODE", sync_mode)
@@ -563,13 +558,7 @@ fn execute_wasm(
         .memory_size(memory_limit_mb.saturating_mul(1024 * 1024))
         .build();
 
-    let mut store = Store::new(
-        &engine,
-        WasiState {
-            wasi,
-            limits,
-        },
-    );
+    let mut store = Store::new(&engine, WasiState { wasi, limits });
     store.limiter(|state| &mut state.limits);
 
     let timeout_secs = std::env::var("GUEST_CPU_LIMIT_MS")
@@ -596,9 +585,8 @@ fn execute_wasm(
         .get_typed_func::<(), ()>(&mut store, "_start")
         .map_err(|err| GuestError::new(GuestErrorCode::ExecutionFailed, err.to_string()))?;
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        start.call(&mut store, ())
-    }));
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| start.call(&mut store, ())));
 
     drop(store);
 
@@ -613,7 +601,10 @@ fn execute_wasm(
         let stderr = stderr_handle
             .try_into_inner()
             .map_err(|_| {
-                GuestError::new(GuestErrorCode::ExecutionFailed, "stderr handle still in use")
+                GuestError::new(
+                    GuestErrorCode::ExecutionFailed,
+                    "stderr handle still in use",
+                )
             })?
             .into_inner();
         let stderr_msg = String::from_utf8_lossy(&stderr);
@@ -627,7 +618,12 @@ fn execute_wasm(
 
     let output = stdout_handle
         .try_into_inner()
-        .map_err(|_| GuestError::new(GuestErrorCode::ExecutionFailed, "stdout handle still in use"))?
+        .map_err(|_| {
+            GuestError::new(
+                GuestErrorCode::ExecutionFailed,
+                "stdout handle still in use",
+            )
+        })?
         .into_inner();
 
     Ok(output)

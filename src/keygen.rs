@@ -1,4 +1,4 @@
-//! `capsule keygen` - generate signing keys for capsules.
+//! `ato keygen` - generate signing keys for capsules.
 
 use anyhow::{Context, Result};
 use ed25519_dalek::{SigningKey, VerifyingKey};
