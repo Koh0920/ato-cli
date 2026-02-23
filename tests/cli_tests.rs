@@ -109,6 +109,17 @@ fn test_run_command_accepts_default_path() {
 }
 
 #[test]
+fn test_run_help_shows_yes_flag() {
+    let mut cmd = Command::cargo_bin("ato").unwrap();
+    cmd.args(["run", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--yes"))
+        .stdout(predicate::str::contains("--registry"))
+        .stdout(predicate::str::contains("default: https://api.ato.run"));
+}
+
+#[test]
 fn test_build_command_with_init_flag() {
     let mut cmd = Command::cargo_bin("ato").unwrap();
     cmd.arg("build")
@@ -181,7 +192,9 @@ fn test_legacy_open_still_available() {
     cmd.args(["open", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Usage: ato open"));
+        .stdout(predicate::str::contains("Usage: ato open"))
+        .stdout(predicate::str::contains("--yes"))
+        .stdout(predicate::str::contains("--registry"));
 }
 
 #[test]
