@@ -17,6 +17,15 @@ pub struct SourceRegisterResult {
     pub capsule_slug: String,
     pub visibility: String,
     pub sync_status: String,
+    pub auto_submit_playground: bool,
+    pub auto_submit_result: Option<AutoSubmitResult>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AutoSubmitResult {
+    pub deployment_id: String,
+    pub review_status: String,
+    pub gate_status: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -25,6 +34,10 @@ struct RegisterResponse {
     capsule_slug: String,
     visibility: String,
     sync_status: String,
+    #[serde(default)]
+    auto_submit_playground: bool,
+    #[serde(default)]
+    auto_submit_result: Option<AutoSubmitResult>,
 }
 
 fn read_env_non_empty(key: &str) -> Option<String> {
@@ -38,6 +51,7 @@ pub async fn register_github_source(
     repo_url: &str,
     registry_url: Option<&str>,
     channel: Option<&str>,
+    apply_playground: bool,
     installation_id: Option<u64>,
     json_output: bool,
 ) -> Result<SourceRegisterResult> {
@@ -71,6 +85,7 @@ pub async fn register_github_source(
     let mut payload = serde_json::json!({
         "repo_url": repo_url,
         "channel": channel.unwrap_or("stable"),
+        "apply_playground": apply_playground,
     });
     if let Some(id) = installation_id {
         payload["installation_id"] = serde_json::json!(id);
@@ -114,6 +129,20 @@ pub async fn register_github_source(
         eprintln!("   Capsule:   {}", payload.capsule_slug);
         eprintln!("   Visibility: {}", payload.visibility);
         eprintln!("   Sync: {}", payload.sync_status);
+        eprintln!(
+            "   Auto submit playground: {}",
+            if payload.auto_submit_playground {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
+        if let Some(result) = payload.auto_submit_result.as_ref() {
+            eprintln!(
+                "   Auto submit result: review_status={}, gate_status={}",
+                result.review_status, result.gate_status
+            );
+        }
     }
 
     Ok(SourceRegisterResult {
@@ -121,5 +150,7 @@ pub async fn register_github_source(
         capsule_slug: payload.capsule_slug,
         visibility: payload.visibility,
         sync_status: payload.sync_status,
+        auto_submit_playground: payload.auto_submit_playground,
+        auto_submit_result: payload.auto_submit_result,
     })
 }

@@ -23,6 +23,59 @@ pub struct InstallResult {
     pub content_hash: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct CapsuleDetailSummary {
+    pub slug: String,
+    pub name: String,
+    pub description: String,
+    pub latest_version: String,
+    pub permissions: Option<CapsulePermissions>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct CapsulePermissions {
+    #[serde(default)]
+    pub network: Option<CapsuleNetworkPermissions>,
+    #[serde(default)]
+    pub isolation: Option<CapsuleIsolationPermissions>,
+    #[serde(default)]
+    pub filesystem: Option<CapsuleFilesystemPermissions>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct CapsuleNetworkPermissions {
+    #[serde(default)]
+    pub egress_allow: Vec<String>,
+    #[serde(default)]
+    pub connect_allowlist: Vec<String>,
+}
+
+impl CapsuleNetworkPermissions {
+    pub fn merged_endpoints(&self) -> Vec<String> {
+        let mut merged = self.egress_allow.clone();
+        for endpoint in &self.connect_allowlist {
+            if !merged.iter().any(|existing| existing == endpoint) {
+                merged.push(endpoint.clone());
+            }
+        }
+        merged
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct CapsuleIsolationPermissions {
+    #[serde(default)]
+    pub allow_env: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct CapsuleFilesystemPermissions {
+    #[serde(default, alias = "read")]
+    pub read_only: Vec<String>,
+    #[serde(default, alias = "write")]
+    pub read_write: Vec<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct CapsuleDetail {
     id: String,
@@ -33,6 +86,8 @@ struct CapsuleDetail {
     currency: String,
     latest_version: String,
     releases: Vec<ReleaseInfo>,
+    #[serde(default)]
+    permissions: Option<CapsulePermissions>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,20 +119,7 @@ pub async fn install_app(
     _set_default: bool,
     json_output: bool,
 ) -> Result<InstallResult> {
-    let registry = if let Some(url) = registry_url {
-        url.to_string()
-    } else {
-        let resolver = RegistryResolver::default();
-        let info = resolver.resolve("localhost").await?;
-        if !json_output {
-            eprintln!(
-                "📡 Using registry: {} ({})",
-                info.url,
-                format!("{:?}", info.source).to_lowercase()
-            );
-        }
-        info.url
-    };
+    let registry = resolve_registry_url(registry_url, !json_output).await?;
 
     let client = reqwest::Client::new();
     let capsule_url = format!("{}/v1/capsules/{}", registry, urlencoding::encode(slug));
@@ -215,7 +257,7 @@ pub async fn install_app(
 
     if !json_output {
         eprintln!("✅ Installed to: {}", output_path.display());
-        eprintln!("   To run: ato open {}", output_path.display());
+        eprintln!("   To run: ato run {}", output_path.display());
     }
 
     Ok(InstallResult {
@@ -225,6 +267,48 @@ pub async fn install_app(
         path: output_path,
         content_hash: computed_blake3,
     })
+}
+
+pub async fn fetch_capsule_detail(
+    slug: &str,
+    registry_url: Option<&str>,
+) -> Result<CapsuleDetailSummary> {
+    let registry = resolve_registry_url(registry_url, false).await?;
+    let client = reqwest::Client::new();
+    let capsule_url = format!("{}/v1/capsules/{}", registry, urlencoding::encode(slug));
+    let capsule: CapsuleDetail = client
+        .get(&capsule_url)
+        .send()
+        .await
+        .with_context(|| format!("Failed to connect to registry: {}", registry))?
+        .json()
+        .await
+        .with_context(|| format!("Capsule not found: {}", slug))?;
+
+    Ok(CapsuleDetailSummary {
+        slug: capsule.slug,
+        name: capsule.name,
+        description: capsule.description,
+        latest_version: capsule.latest_version,
+        permissions: capsule.permissions,
+    })
+}
+
+async fn resolve_registry_url(registry_url: Option<&str>, emit_log: bool) -> Result<String> {
+    if let Some(url) = registry_url {
+        return Ok(url.to_string());
+    }
+
+    let resolver = RegistryResolver::default();
+    let info = resolver.resolve("localhost").await?;
+    if emit_log {
+        eprintln!(
+            "📡 Using registry: {} ({})",
+            info.url,
+            format!("{:?}", info.source).to_lowercase()
+        );
+    }
+    Ok(info.url)
 }
 
 async fn resolve_distribution(
@@ -381,5 +465,42 @@ mod tests {
         assert!(ensure_signature_verified("verified").is_ok());
         assert!(ensure_signature_verified("unverified").is_err());
         assert!(ensure_signature_verified("unknown").is_err());
+    }
+
+    #[test]
+    fn test_permissions_deserialization_with_aliases() {
+        let payload = r#"{
+            "network": {
+                "egress_allow": ["api.example.com"],
+                "connect_allowlist": ["wss://ws.example.com"]
+            },
+            "isolation": {
+                "allow_env": ["OPENAI_API_KEY"]
+            },
+            "filesystem": {
+                "read": ["/opt/data"],
+                "write": ["/tmp"]
+            }
+        }"#;
+
+        let permissions: CapsulePermissions = serde_json::from_str(payload).unwrap();
+        let network = permissions.network.unwrap();
+        assert_eq!(network.merged_endpoints().len(), 2);
+        assert_eq!(
+            permissions.isolation.unwrap().allow_env,
+            vec!["OPENAI_API_KEY".to_string()]
+        );
+        let filesystem = permissions.filesystem.unwrap();
+        assert_eq!(filesystem.read_only, vec!["/opt/data".to_string()]);
+        assert_eq!(filesystem.read_write, vec!["/tmp".to_string()]);
+    }
+
+    #[test]
+    fn test_permissions_deserialization_missing_fields() {
+        let payload = r#"{}"#;
+        let permissions: CapsulePermissions = serde_json::from_str(payload).unwrap();
+        assert!(permissions.network.is_none());
+        assert!(permissions.isolation.is_none());
+        assert!(permissions.filesystem.is_none());
     }
 }
