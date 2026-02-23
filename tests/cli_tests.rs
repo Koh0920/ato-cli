@@ -256,3 +256,30 @@ fn test_publish_json_error_uses_diagnostic_envelope() {
     assert_eq!(value["type"], "error");
     assert_eq!(value["code"], "E201");
 }
+
+#[test]
+fn test_source_rebuild_help_uses_ref_flag() {
+    let mut cmd = Command::cargo_bin("ato").unwrap();
+    cmd.args(["source", "rebuild", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--ref <REFERENCE>"));
+}
+
+#[test]
+fn test_source_rebuild_accepts_reference_alias() {
+    let mut cmd = Command::cargo_bin("ato").unwrap();
+    cmd.args([
+        "source",
+        "rebuild",
+        "--source-id",
+        "src_123",
+        "--reference",
+        "main",
+        "--registry",
+        "http://127.0.0.1:9",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("Failed to preflight source operation"));
+}

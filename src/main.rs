@@ -180,6 +180,10 @@ enum Commands {
         /// Skip prompt and auto-install when app-id is not installed
         #[arg(short = 'y', long = "yes", default_value_t = false)]
         yes: bool,
+
+        /// Allow installing/running unverified signatures in non-production environments
+        #[arg(long, default_value_t = false)]
+        allow_unverified: bool,
     },
 
     #[command(
@@ -205,6 +209,10 @@ enum Commands {
         /// Deprecated legacy flag (always rejected)
         #[arg(long = "skip-verify", hide = true, default_value_t = false)]
         skip_verify_legacy: bool,
+
+        /// Allow installing unverified signatures in non-production environments
+        #[arg(long, default_value_t = false)]
+        allow_unverified: bool,
 
         /// Output directory (default: ~/.capsule/store/)
         #[arg(long)]
@@ -950,6 +958,46 @@ enum SourceCommands {
         #[arg(long)]
         json: bool,
     },
+    /// Show sync run status for a source
+    SyncStatus {
+        /// Source ID
+        #[arg(long = "source-id")]
+        source_id: String,
+
+        /// Sync run ID
+        #[arg(long = "sync-run-id")]
+        sync_run_id: String,
+
+        /// Registry URL
+        #[arg(long)]
+        registry: Option<String>,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Trigger rebuild/re-sign flow for a source
+    Rebuild {
+        /// Source ID
+        #[arg(long = "source-id")]
+        source_id: String,
+
+        /// Optional ref (branch/tag/SHA)
+        #[arg(long = "ref", alias = "reference")]
+        reference: Option<String>,
+
+        /// Wait and fetch status after trigger
+        #[arg(long, default_value_t = false)]
+        wait: bool,
+
+        /// Registry URL
+        #[arg(long)]
+        registry: Option<String>,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1033,6 +1081,7 @@ fn run() -> Result<()> {
             enforcement,
             unsafe_bypass_sandbox,
             yes,
+            allow_unverified,
         } => execute_run_like_command(
             path,
             target,
@@ -1043,6 +1092,7 @@ fn run() -> Result<()> {
             enforcement,
             unsafe_bypass_sandbox,
             yes,
+            allow_unverified,
             None,
             reporter.clone(),
         ),
@@ -1079,6 +1129,7 @@ fn run() -> Result<()> {
             enforcement,
             unsafe_bypass_sandbox,
             yes,
+            false,
             Some("⚠️  'ato open' is deprecated. Use 'ato run' instead."),
             reporter.clone(),
         ),
@@ -1238,6 +1289,7 @@ fn run() -> Result<()> {
             version,
             default,
             skip_verify_legacy,
+            allow_unverified,
             output,
             json,
         } => {
@@ -1254,6 +1306,7 @@ fn run() -> Result<()> {
                     version.as_deref(),
                     output,
                     default,
+                    allow_unverified,
                     json,
                 )
                 .await?;
@@ -1329,6 +1382,7 @@ fn run() -> Result<()> {
                     channel,
                     apply_playground,
                     installation_id,
+                    false,
                     json,
                 ),
             },
@@ -1354,6 +1408,7 @@ fn run() -> Result<()> {
                 channel,
                 apply_playground,
                 installation_id,
+                true,
                 json,
             )
         }
@@ -1371,24 +1426,37 @@ fn run() -> Result<()> {
                 },
         } => execute_search_command(query, category, tags, limit, cursor, registry, json),
 
-        Commands::Source {
-            command:
-                SourceCommands::Register {
-                    repo_url,
-                    registry,
-                    channel,
-                    apply_playground,
-                    installation_id,
-                    json,
-                },
-        } => execute_source_register_command(
-            repo_url,
-            registry,
-            channel,
-            apply_playground,
-            installation_id,
-            json,
-        ),
+        Commands::Source { command } => match command {
+            SourceCommands::Register {
+                repo_url,
+                registry,
+                channel,
+                apply_playground,
+                installation_id,
+                json,
+            } => execute_source_register_command(
+                repo_url,
+                registry,
+                channel,
+                apply_playground,
+                installation_id,
+                false,
+                json,
+            ),
+            SourceCommands::SyncStatus {
+                source_id,
+                sync_run_id,
+                registry,
+                json,
+            } => execute_source_sync_status_command(source_id, sync_run_id, registry, json),
+            SourceCommands::Rebuild {
+                source_id,
+                reference,
+                wait,
+                registry,
+                json,
+            } => execute_source_rebuild_command(source_id, reference, wait, registry, json),
+        },
 
         Commands::Ps { all, json } => {
             commands::ps::execute(commands::ps::PsArgs { all, json }, reporter.clone())
@@ -1677,6 +1745,7 @@ fn execute_run_like_command(
     enforcement: EnforcementMode,
     unsafe_bypass_sandbox: bool,
     yes: bool,
+    allow_unverified: bool,
     deprecation_warning: Option<&str>,
     reporter: std::sync::Arc<reporters::CliReporter>,
 ) -> Result<()> {
@@ -1688,6 +1757,7 @@ fn execute_run_like_command(
     let path = rt.block_on(resolve_run_target_or_install(
         path,
         yes,
+        allow_unverified,
         registry.as_deref(),
         reporter.clone(),
     ))?;
@@ -1707,6 +1777,7 @@ fn execute_run_like_command(
 async fn resolve_run_target_or_install(
     path: PathBuf,
     yes: bool,
+    allow_unverified: bool,
     registry: Option<&str>,
     reporter: std::sync::Arc<reporters::CliReporter>,
 ) -> Result<PathBuf> {
@@ -1769,6 +1840,7 @@ async fn resolve_run_target_or_install(
         None,
         None,
         false,
+        allow_unverified,
         json_mode,
     )
     .await?;
@@ -2073,6 +2145,7 @@ fn execute_source_register_command(
     channel: Option<String>,
     apply_playground: bool,
     installation_id: Option<u64>,
+    auto_sync_on_exists: bool,
     json: bool,
 ) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
@@ -2083,10 +2156,53 @@ fn execute_source_register_command(
             channel.as_deref(),
             apply_playground,
             installation_id,
+            auto_sync_on_exists,
             json,
         )
         .await?;
 
+        if json {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Ok(())
+    })
+}
+
+fn execute_source_sync_status_command(
+    source_id: String,
+    sync_run_id: String,
+    registry: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let result =
+            source::fetch_sync_run_status(&source_id, &sync_run_id, registry.as_deref(), json)
+                .await?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        Ok(())
+    })
+}
+
+fn execute_source_rebuild_command(
+    source_id: String,
+    reference: Option<String>,
+    wait: bool,
+    registry: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let result = source::rebuild_source(
+            &source_id,
+            reference.as_deref(),
+            wait,
+            registry.as_deref(),
+            json,
+        )
+        .await?;
         if json {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
