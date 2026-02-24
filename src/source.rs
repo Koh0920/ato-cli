@@ -475,14 +475,13 @@ pub async fn rebuild_source(
         .with_context(|| "Invalid source rebuild response")?;
 
     if wait {
-        let mut attempts = 0u8;
-        while attempts < 20
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(35 * 60);
+        while tokio::time::Instant::now() < deadline
             && (payload.status == "queued"
                 || payload.status == "running"
                 || payload.status == "awaiting_signature")
         {
-            attempts += 1;
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             let status =
                 fetch_sync_run_status(source_id, &payload.sync_run_id, Some(&registry), true)
                     .await?;
@@ -491,6 +490,19 @@ pub async fn rebuild_source(
             payload.signature_failure_reason = status.signature_failure_reason;
             payload.target_commit = status.target_commit;
             payload.attempt_count = status.attempt_count;
+        }
+        if payload.status == "queued"
+            || payload.status == "running"
+            || payload.status == "awaiting_signature"
+        {
+            anyhow::bail!(
+                "Rebuild wait timeout: source_id={} sync_run_id={} status={}. Check with `ato source sync-status --source-id {} --sync-run-id {}`.",
+                source_id,
+                payload.sync_run_id,
+                payload.status,
+                source_id,
+                payload.sync_run_id
+            );
         }
     }
 

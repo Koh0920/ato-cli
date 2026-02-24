@@ -10,6 +10,7 @@ use crate::r3_config;
 use crate::resource::cas::create_cas_client_from_env;
 use crate::router::ManifestData;
 use crate::validation;
+use tracing::debug;
 
 #[derive(Debug, Clone)]
 pub struct SourcePackOptions {
@@ -34,9 +35,7 @@ pub fn pack(
     let loaded = manifest::load_manifest(&opts.manifest_path)?;
     if let Some(targets) = loaded.model.targets.as_ref() {
         if let Some(digest) = targets.source_digest.as_ref() {
-            futures::executor::block_on(
-                reporter.notify("🧩 Phase 0: Checking CAS for source_digest".to_string()),
-            )?;
+            debug!("Phase 0: checking CAS for source_digest");
             let cas = create_cas_client_from_env()?;
             let exists = rt.block_on(cas.exists(digest))?;
             if !exists {
@@ -49,17 +48,13 @@ pub fn pack(
     }
 
     if !opts.skip_validation && !opts.skip_l1 {
-        futures::executor::block_on(
-            reporter.notify("🔍 Phase 1: L1 Source Policy Scan".to_string()),
-        )?;
+        debug!("Phase 1: L1 source policy scan");
         let source_dir = opts.manifest_dir.join("source");
         if source_dir.exists() {
             let scan_extensions = &["py", "sh", "js", "ts", "go", "rs"];
             match validation::source_policy::scan_source_directory(&source_dir, scan_extensions) {
                 Ok(()) => {
-                    futures::executor::block_on(
-                        reporter.notify("   ✅ No dangerous patterns detected\n".to_string()),
-                    )?;
+                    debug!("L1 source policy scan passed");
                 }
                 Err(e) => {
                     futures::executor::block_on(
@@ -77,27 +72,19 @@ pub fn pack(
                 }
             }
         } else {
-            futures::executor::block_on(
-                reporter.warn("   ⚠️  No source/ directory found, skipping scan\n".to_string()),
-            )?;
+            debug!("No source/ directory found; skipping L1 source scan");
         }
     } else if opts.skip_l1 {
-        futures::executor::block_on(
-            reporter.warn("⚠️  Phase 1: L1 Source Policy Scan SKIPPED (--skip-l1)\n".to_string()),
-        )?;
+        debug!("L1 source policy scan skipped (--skip-l1)");
     }
 
     if !opts.skip_validation {
-        futures::executor::block_on(
-            reporter.notify("🔍 Phase 1b: Entrypoint Validation".to_string()),
-        )?;
+        debug!("Phase 1b: entrypoint validation");
         validate_entrypoint(&opts.manifest_path, &opts.manifest_dir)?;
-        futures::executor::block_on(reporter.notify("   ✅ Entrypoint file exists\n".to_string()))?;
+        debug!("Entrypoint validation passed");
     }
 
-    futures::executor::block_on(
-        reporter.notify("🧭 Phase 2: Generating R3 config.json".to_string()),
-    )?;
+    debug!("Phase 2: generating R3 config.json");
     let enforcement = opts.enforcement.clone();
     let config_path = r3_config::generate_and_write_config(
         &opts.manifest_path,
@@ -107,10 +94,7 @@ pub fn pack(
 
     let config_reporter = reporter.clone();
 
-    futures::executor::block_on(config_reporter.notify(format!(
-        "   ✅ config.json generated: {}",
-        config_path.display()
-    )))?;
+    debug!("config.json generated: {}", config_path.display());
 
     let lockfile_path = rt.block_on(lockfile::generate_and_write_lockfile(
         &opts.manifest_path,
@@ -119,18 +103,10 @@ pub fn pack(
         config_reporter,
     ))?;
 
-    let lockfile_reporter = reporter.clone();
-    futures::executor::block_on(lockfile_reporter.notify(format!(
-        "   ✅ capsule.lock generated: {}",
-        lockfile_path.display()
-    )))?;
+    debug!("capsule.lock generated: {}", lockfile_path.display());
 
     if opts.standalone {
-        futures::executor::block_on(
-            reporter.notify(
-                "📦 Phase 3: Building self-extracting bundle (embedded runtime)".to_string(),
-            ),
-        )?;
+        debug!("Phase 3: building self-extracting bundle");
         let nacelle = engine::discover_nacelle(engine::EngineRequest {
             explicit_path: opts.nacelle_override,
             manifest_path: Some(opts.manifest_path.clone()),
@@ -146,15 +122,10 @@ pub fn pack(
             reporter.clone(),
         ))?;
 
-        futures::executor::block_on(reporter.notify(format!(
-            "   ✅ Self-extracting bundle created: {}\n",
-            bundle_path.display()
-        )))?;
+        debug!("Self-extracting bundle created: {}", bundle_path.display());
         Ok(bundle_path)
     } else {
-        futures::executor::block_on(
-            reporter.notify("📦 Phase 3: Creating Capsule Archive (.capsule format)".to_string()),
-        )?;
+        debug!("Phase 3: creating capsule archive");
 
         let artifact_path = rt.block_on(capsule_packer::pack(
             plan,
@@ -168,10 +139,7 @@ pub fn pack(
             reporter.clone(),
         ))?;
 
-        futures::executor::block_on(reporter.notify(format!(
-            "   ✅ Capsule created: {}\n",
-            artifact_path.display()
-        )))?;
+        debug!("Capsule archive created: {}", artifact_path.display());
         Ok(artifact_path)
     }
 }

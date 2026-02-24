@@ -777,6 +777,16 @@ pub struct NamedTarget {
     #[serde(default)]
     pub runtime: String,
 
+    /// Runtime driver (`browser_static`, `deno`, `node`, `python`, `wasmtime`, `native`).
+    ///
+    /// If omitted, the driver is inferred from runtime and language.
+    #[serde(default)]
+    pub driver: Option<String>,
+
+    /// Optional source language hint used for driver inference.
+    #[serde(default)]
+    pub language: Option<String>,
+
     /// Entrypoint path for the target.
     #[serde(default)]
     pub entrypoint: String,
@@ -1139,6 +1149,25 @@ impl CapsuleManifestV1 {
                 errors.push(ValidationError::InvalidTarget(label));
                 continue;
             }
+            if let Some(driver) = target.driver.as_ref() {
+                let normalized = driver.trim().to_ascii_lowercase();
+                if !matches!(
+                    normalized.as_str(),
+                    "browser_static"
+                        | "browser-static"
+                        | "deno"
+                        | "node"
+                        | "python"
+                        | "wasmtime"
+                        | "native"
+                ) {
+                    errors.push(ValidationError::InvalidTargetDriver(
+                        label.clone(),
+                        driver.clone(),
+                    ));
+                    continue;
+                }
+            }
             if runtime == "web" {
                 if target.public.is_empty() {
                     errors.push(ValidationError::InvalidWebTarget(
@@ -1255,6 +1284,7 @@ pub enum ValidationError {
     MissingTargets,
     DefaultTargetNotFound(String),
     InvalidTarget(String),
+    InvalidTargetDriver(String, String),
     InvalidWebTarget(String, String),
 }
 
@@ -1312,6 +1342,13 @@ impl std::fmt::Display for ValidationError {
                     f,
                     "Invalid target '{}': runtime and entrypoint are required",
                     label
+                )
+            }
+            ValidationError::InvalidTargetDriver(label, driver) => {
+                write!(
+                    f,
+                    "Invalid target '{}': unsupported driver '{}' (allowed: browser_static|deno|node|python|wasmtime|native)",
+                    label, driver
                 )
             }
             ValidationError::InvalidWebTarget(label, message) => {
@@ -1456,6 +1493,19 @@ quantization = "4bit"
         assert!(errors
             .iter()
             .any(|e| matches!(e, ValidationError::InvalidName(_))));
+    }
+
+    #[test]
+    fn test_validate_invalid_driver() {
+        let toml = VALID_TOML.replace(
+            "[targets.cli]\nruntime = \"source\"\nentrypoint = \"server.py\"",
+            "[targets.cli]\nruntime = \"source\"\ndriver = \"invalid-driver\"\nentrypoint = \"server.py\"",
+        );
+        let manifest = CapsuleManifestV1::from_toml(&toml).unwrap();
+        let errors = manifest.validate().unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::InvalidTargetDriver(_, _))));
     }
 
     #[test]

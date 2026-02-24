@@ -48,6 +48,7 @@ pub fn run_capsule_smoke(
     let options = parse_smoke_options(&manifest_raw, target_label)?;
     let service = load_main_service(extract_dir.path())?;
     let required_port = resolve_required_port(&manifest_raw, target_label, &service)?;
+    ensure_required_port_is_free_before_start(required_port)?;
 
     let mut child = spawn_main_service(extract_dir.path(), &service)?;
     let startup_timeout = Duration::from_millis(options.startup_timeout_ms);
@@ -55,6 +56,13 @@ pub fn run_capsule_smoke(
 
     loop {
         if let Some(status) = child.try_wait().map_err(CapsuleError::Io)? {
+            if status.success() && required_port.is_none() && options.check_commands.is_empty() {
+                return Ok(SmokeSummary {
+                    startup_timeout_ms: options.startup_timeout_ms,
+                    required_port,
+                    checked_commands: options.check_commands.len(),
+                });
+            }
             return Err(CapsuleError::Pack(format!(
                 "Smoke failed: process exited before startup timeout (status: {status})"
             )));
@@ -366,6 +374,20 @@ fn can_connect_localhost(port: u16) -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok()
 }
 
+fn ensure_required_port_is_free_before_start(
+    required_port: Option<u16>,
+) -> Result<(), CapsuleError> {
+    let Some(port) = required_port else {
+        return Ok(());
+    };
+    if can_connect_localhost(port) {
+        return Err(CapsuleError::Pack(format!(
+            "Smoke failed: required port {port} is already in use before launch; stop the existing process and retry"
+        )));
+    }
+    Ok(())
+}
+
 fn wait_for_required_port_with_retry(
     child: &mut Child,
     port: u16,
@@ -480,5 +502,16 @@ startup_timeout_ms = 0
         .unwrap();
         let err = parse_smoke_options(&manifest, "cli").unwrap_err();
         assert!(err.to_string().contains("startup_timeout_ms"));
+    }
+
+    #[test]
+    fn reject_required_port_already_in_use_before_start() {
+        let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", 0)) else {
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+
+        let err = ensure_required_port_is_free_before_start(Some(port)).unwrap_err();
+        assert!(err.to_string().contains("already in use"));
     }
 }

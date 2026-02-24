@@ -270,6 +270,8 @@ async fn generate_lockfile(
                     &target_triple,
                 ));
             }
+        } else if lang == "deno" {
+            let _ = generate_deno_lock(manifest_dir, manifest_raw, reporter.clone()).await?;
         }
     }
 
@@ -405,6 +407,57 @@ async fn generate_pnpm_lock(
     std::fs::copy(&lock_path, &target_lock)
         .map_err(|e| CapsuleError::Pack(format!("Failed to copy pnpm-lock.yaml: {}", e)))?;
     Ok(Some(target_lock))
+}
+
+async fn generate_deno_lock(
+    manifest_dir: &Path,
+    manifest: &toml::Value,
+    reporter: Arc<dyn CapsuleReporter + 'static>,
+) -> Result<Option<PathBuf>> {
+    let entrypoint = read_target_entrypoint(manifest).or_else(|| {
+        manifest
+            .get("execution")
+            .and_then(|e| e.get("entrypoint"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+    let Some(entrypoint) = entrypoint else {
+        return Ok(None);
+    };
+
+    let entrypoint_path = manifest_dir.join(&entrypoint);
+    if !entrypoint_path.exists() {
+        return Ok(None);
+    }
+
+    reporter
+        .notify("⚙️  Generating deno.lock".to_string())
+        .await?;
+
+    let mut cmd = std::process::Command::new("deno");
+    cmd.args([
+        "install",
+        "--entrypoint",
+        entrypoint.as_str(),
+        "--lock",
+        "deno.lock",
+        "--lockfile-only",
+    ])
+    .current_dir(manifest_dir);
+
+    let status = run_command_inner(cmd).await?;
+    if !status.success() {
+        return Err(CapsuleError::Pack(
+            "deno lock generation failed".to_string(),
+        ));
+    }
+
+    let lock_path = manifest_dir.join("deno.lock");
+    if lock_path.exists() {
+        Ok(Some(lock_path))
+    } else {
+        Ok(None)
+    }
 }
 
 async fn prepare_python_artifacts(
@@ -811,9 +864,7 @@ fn read_dependencies_path(
     language: &str,
     manifest_dir: &Path,
 ) -> Option<PathBuf> {
-    let from_targets = manifest
-        .get("targets")
-        .and_then(|t| t.get("source"))
+    let from_targets = selected_target_table(manifest)
         .and_then(|t| t.get("dependencies"))
         .and_then(|v| v.as_str())
         .map(|s| manifest_dir.join(s));
@@ -850,9 +901,7 @@ fn detect_language(manifest: &toml::Value) -> Option<String> {
         return Some("node".to_string());
     }
 
-    let target_lang = manifest
-        .get("targets")
-        .and_then(|t| t.get("source"))
+    let target_lang = selected_target_table(manifest)
         .and_then(|t| t.get("language"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
@@ -886,15 +935,32 @@ fn read_language_version(manifest: &toml::Value, language: &str, fallback: &str)
         .and_then(|v| v.get("version"))
         .and_then(|v| v.as_str())
         .or_else(|| {
-            manifest
-                .get("targets")
-                .and_then(|t| t.get("source"))
+            selected_target_table(manifest)
                 .and_then(|t| t.get("version"))
                 .and_then(|v| v.as_str())
         })
         .map(|s| s.to_string());
 
     version.unwrap_or_else(|| fallback.to_string())
+}
+
+fn selected_target_table<'a>(manifest: &'a toml::Value) -> Option<&'a toml::Value> {
+    let targets = manifest.get("targets")?;
+    let default_target = manifest
+        .get("default_target")
+        .and_then(|v| v.as_str())
+        .unwrap_or("source");
+
+    targets
+        .get(default_target)
+        .or_else(|| targets.get("source"))
+}
+
+fn read_target_entrypoint(manifest: &toml::Value) -> Option<String> {
+    selected_target_table(manifest)
+        .and_then(|t| t.get("entrypoint"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 fn platform_target_key() -> Result<String> {

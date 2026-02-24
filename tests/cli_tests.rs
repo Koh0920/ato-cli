@@ -114,9 +114,19 @@ fn test_run_help_shows_yes_flag() {
     cmd.args(["run", "--help"])
         .assert()
         .success()
+        .stdout(predicate::str::contains("--skill <SKILL>"))
         .stdout(predicate::str::contains("--yes"))
         .stdout(predicate::str::contains("--registry"))
         .stdout(predicate::str::contains("default: https://api.ato.run"));
+}
+
+#[test]
+fn test_run_skill_conflicts_with_from_skill() {
+    let mut cmd = Command::cargo_bin("ato").unwrap();
+    cmd.args(["run", "--skill", "demo", "--from-skill", "/tmp/SKILL.md"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
 }
 
 #[test]
@@ -164,8 +174,19 @@ fn test_publish_command_exists() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "Register a GitHub repository to the registry",
-        ));
+            "Upload a local .capsule or register a GitHub repository source",
+        ))
+        .stdout(predicate::str::contains("--artifact <ARTIFACT>"))
+        .stdout(predicate::str::contains("--scoped-id <SCOPED_ID>"));
+}
+
+#[test]
+fn test_registry_command_is_public() {
+    let mut cmd = Command::cargo_bin("ato").unwrap();
+    cmd.args(["registry", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("serve"));
 }
 
 #[test]
@@ -281,5 +302,7 @@ fn test_source_rebuild_accepts_reference_alias() {
     ])
     .assert()
     .failure()
-    .stderr(predicate::str::contains("Failed to preflight source operation"));
+    .stderr(predicate::str::contains(
+        "Failed to preflight source operation",
+    ));
 }

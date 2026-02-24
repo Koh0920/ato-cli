@@ -72,6 +72,22 @@ else
 fi
 
 echo ""
+
+# Test 4: Zero Config & Auto Submit E2E
+echo "Test 4: Zero Config & Auto Submit E2E"
+echo "---------------------------------------"
+if [ -f "./tests/e2e_zero_config.sh" ]; then
+    if bash ./tests/e2e_zero_config.sh; then
+        log_info "Zero Config & Auto Submit E2E passed"
+    else
+        log_error "Zero Config & Auto Submit E2E failed"
+        exit 1
+    fi
+else
+    log_warn "Zero Config E2E not found, skipping"
+fi
+
+echo ""
 log_info "Phase 1 & 2 Implementation: VERIFIED"
 echo ""
 

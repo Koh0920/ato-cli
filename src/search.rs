@@ -10,16 +10,20 @@ const ENV_STORE_API_URL: &str = "ATO_STORE_API_URL";
 
 /// Store API package summary (from GET /v1/capsules)
 #[derive(Debug, Deserialize)]
-struct CapsulesResponse {
-    capsules: Vec<CapsuleSummary>,
+struct RawCapsulesResponse {
+    capsules: Vec<RawCapsuleSummary>,
     #[serde(default, alias = "nextCursor")]
     next_cursor: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-pub struct CapsuleSummary {
+#[derive(Debug, Deserialize)]
+struct RawCapsuleSummary {
     id: String,
     slug: String,
+    #[serde(default)]
+    scoped_id: Option<String>,
+    #[serde(default, rename = "scopedId")]
+    scoped_id_camel: Option<String>,
     name: String,
     description: String,
     category: String,
@@ -28,8 +32,30 @@ pub struct CapsuleSummary {
     price: u64,
     currency: String,
     publisher: PublisherInfo,
-    #[serde(rename = "latestVersion", alias = "latest_version")]
-    latest_version: String,
+    #[serde(rename = "latestVersion", alias = "latest_version", default)]
+    latest_version: Option<String>,
+    downloads: u64,
+    #[serde(rename = "createdAt", alias = "created_at")]
+    created_at: String,
+    #[serde(rename = "updatedAt", alias = "updated_at")]
+    updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CapsuleSummary {
+    id: String,
+    slug: String,
+    scoped_id: Option<String>,
+    name: String,
+    description: String,
+    category: String,
+    #[serde(rename = "type")]
+    capsule_type: String,
+    price: u64,
+    currency: String,
+    publisher: PublisherInfo,
+    #[serde(rename = "latestVersion", alias = "latest_version", default)]
+    latest_version: Option<String>,
     downloads: u64,
     #[serde(rename = "createdAt", alias = "created_at")]
     created_at: String,
@@ -43,6 +69,28 @@ struct PublisherInfo {
     #[serde(rename = "authorDid", alias = "author_did")]
     author_did: String,
     verified: bool,
+}
+
+impl From<RawCapsuleSummary> for CapsuleSummary {
+    fn from(raw: RawCapsuleSummary) -> Self {
+        let scoped_id = raw.scoped_id.or(raw.scoped_id_camel);
+        Self {
+            id: raw.id,
+            slug: raw.slug,
+            scoped_id,
+            name: raw.name,
+            description: raw.description,
+            category: raw.category,
+            capsule_type: raw.capsule_type,
+            price: raw.price,
+            currency: raw.currency,
+            publisher: raw.publisher,
+            latest_version: raw.latest_version,
+            downloads: raw.downloads,
+            created_at: raw.created_at,
+            updated_at: raw.updated_at,
+        }
+    }
 }
 
 fn normalize_base_url(raw: &str) -> String {
@@ -118,7 +166,7 @@ pub async fn search_capsules(
         url.push_str(&params.join("&"));
     }
 
-    let response: CapsulesResponse = client
+    let response: RawCapsulesResponse = client
         .get(&url)
         .send()
         .await
@@ -127,7 +175,8 @@ pub async fn search_capsules(
         .await
         .with_context(|| "Invalid search response")?;
 
-    let total = response.capsules.len();
+    let capsules: Vec<CapsuleSummary> = response.capsules.into_iter().map(Into::into).collect();
+    let total = capsules.len();
 
     if !json_output {
         if total == 0 {
@@ -136,7 +185,7 @@ pub async fn search_capsules(
             println!("🔍 Found {} package(s):", total);
         }
 
-        for (index, capsule) in response.capsules.iter().enumerate() {
+        for (index, capsule) in capsules.iter().enumerate() {
             println!();
             println!("{}. {} ({})", index + 1, capsule.name, capsule.slug);
             if !capsule.description.is_empty() {
@@ -144,7 +193,9 @@ pub async fn search_capsules(
             }
             println!(
                 "   Category: {} | Type: {} | Version: {}",
-                capsule.category, capsule.capsule_type, capsule.latest_version
+                capsule.category,
+                capsule.capsule_type,
+                capsule.latest_version.as_deref().unwrap_or("unknown")
             );
             println!(
                 "   Publisher: {}{} | Downloads: {}",
@@ -161,7 +212,11 @@ pub async fn search_capsules(
             } else {
                 println!("   Price: {} {}", capsule.price, capsule.currency);
             }
-            println!("   Install: ato install {}", capsule.slug);
+            let scoped_id = capsule
+                .scoped_id
+                .clone()
+                .unwrap_or_else(|| format!("{}/{}", capsule.publisher.handle, capsule.slug));
+            println!("   Install: ato install {}", scoped_id);
         }
 
         if let Some(ref next) = response.next_cursor {
@@ -172,8 +227,74 @@ pub async fn search_capsules(
     }
 
     Ok(SearchResult {
-        capsules: response.capsules,
+        capsules,
         total,
         next_cursor: response.next_cursor,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RawCapsulesResponse;
+
+    #[test]
+    fn parses_capsules_response_when_latest_version_is_null() {
+        let raw = r#"{
+            "capsules": [{
+                "id": "01TEST",
+                "slug": "sample-capsule",
+                "name": "sample-capsule",
+                "description": "sample",
+                "category": "tools",
+                "type": "app",
+                "price": 0,
+                "currency": "usd",
+                "publisher": {
+                    "handle": "koh0920",
+                    "authorDid": "did:key:z6Mk...",
+                    "verified": true
+                },
+                "latestVersion": null,
+                "downloads": 2,
+                "createdAt": "2026-02-14 05:55:45",
+                "updatedAt": "2026-02-23T05:51:55.877Z"
+            }],
+            "next_cursor": null
+        }"#;
+
+        let parsed: RawCapsulesResponse = serde_json::from_str(raw).expect("should parse");
+        assert_eq!(parsed.capsules.len(), 1);
+        assert!(parsed.capsules[0].latest_version.is_none());
+    }
+
+    #[test]
+    fn parses_capsules_response_with_both_scoped_keys() {
+        let raw = r#"{
+            "capsules": [{
+                "id": "01TEST",
+                "slug": "sample-capsule",
+                "scoped_id": "koh0920/sample-capsule",
+                "scopedId": "koh0920/sample-capsule",
+                "name": "sample-capsule",
+                "description": "sample",
+                "category": "tools",
+                "type": "app",
+                "price": 0,
+                "currency": "usd",
+                "publisher": {
+                    "handle": "koh0920",
+                    "authorDid": "did:key:z6Mk...",
+                    "verified": true
+                },
+                "latestVersion": "1.0.0",
+                "downloads": 2,
+                "createdAt": "2026-02-14 05:55:45",
+                "updatedAt": "2026-02-23T05:51:55.877Z"
+            }],
+            "next_cursor": null
+        }"#;
+
+        let parsed: RawCapsulesResponse = serde_json::from_str(raw).expect("should parse");
+        assert_eq!(parsed.capsules.len(), 1);
+    }
 }

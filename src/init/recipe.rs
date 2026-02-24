@@ -18,22 +18,42 @@ pub struct ManifestMeta<'a> {
 }
 
 pub fn generate_manifest(info: &ProjectInfo, meta: ManifestMeta<'_>) -> String {
-    let entry_command = if info.entrypoint.is_empty() {
-        "echo 'Hello, capsule!'".to_string()
+    let mut entrypoint = if info.entrypoint.is_empty() {
+        "echo".to_string()
     } else {
-        info.entrypoint.join(" ")
+        info.entrypoint[0].clone()
+    };
+    let mut cmd = if info.entrypoint.len() > 1 {
+        info.entrypoint[1..].to_vec()
+    } else {
+        Vec::new()
     };
 
-    // Prefer direct script path for Python templates.
-    let execution_entrypoint = if matches!(info.project_type, ProjectType::Python)
+    if info.entrypoint.is_empty() {
+        cmd.push("Hello, capsule!".to_string());
+    }
+
+    // Prefer direct script path for common Python patterns (python main.py).
+    // Keep interpreter form when flags/modules are used (python -m app, python -c ...).
+    if matches!(info.project_type, ProjectType::Python)
         && info.entrypoint.len() >= 2
         && info.entrypoint[0]
             .to_ascii_lowercase()
             .starts_with("python")
+        && !info.entrypoint[1].starts_with('-')
     {
-        info.entrypoint[1].clone()
+        entrypoint = info.entrypoint[1].clone();
+        cmd = if info.entrypoint.len() > 2 {
+            info.entrypoint[2..].to_vec()
+        } else {
+            Vec::new()
+        };
+    }
+
+    let cmd_line = if cmd.is_empty() {
+        String::new()
     } else {
-        entry_command
+        format!("cmd = [{}]", render_toml_string_array(&cmd))
     };
 
     format!(
@@ -54,6 +74,7 @@ description = "{description}"
 [targets.cli]
 runtime = "source"
 entrypoint = "{entrypoint}"
+{cmd_line}
 
 [storage]
 
@@ -62,7 +83,8 @@ entrypoint = "{entrypoint}"
         generated_by = meta.generated_by,
         name = toml_escape_string(&info.name),
         description = toml_escape_string(meta.description),
-        entrypoint = toml_escape_string(&execution_entrypoint),
+        entrypoint = toml_escape_string(&entrypoint),
+        cmd_line = cmd_line,
     )
 }
 
@@ -333,4 +355,12 @@ fn toml_escape_string(input: &str) -> String {
         .replace('\n', "\\n")
         .replace('\r', "\\r")
         .replace('\t', "\\t")
+}
+
+fn render_toml_string_array(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|v| format!("\"{}\"", toml_escape_string(v)))
+        .collect::<Vec<_>>()
+        .join(", ")
 }

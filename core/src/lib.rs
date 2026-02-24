@@ -6,6 +6,7 @@ pub mod diagnostics;
 pub mod discovery;
 pub mod engine;
 pub mod error;
+pub mod execution_plan;
 pub mod executors;
 pub mod hardware;
 pub mod lockfile;

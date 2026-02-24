@@ -3,8 +3,9 @@ use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use tar::Builder;
+use tracing::debug;
 use zstd::stream::encode_all;
 
 use crate::error::Result as CapsuleResult;
@@ -35,17 +36,15 @@ const ZSTD_COMPRESSION_LEVEL: i32 = 19;
 pub async fn pack(
     _plan: &crate::router::ManifestData,
     opts: CapsulePackOptions,
-    reporter: Arc<dyn crate::reporter::CapsuleReporter + 'static>,
+    _reporter: Arc<dyn crate::reporter::CapsuleReporter + 'static>,
 ) -> CapsuleResult<PathBuf> {
-    futures::executor::block_on(
-        reporter.notify("📦 Creating Capsule Archive (.capsule format)".to_string()),
-    )?;
+    debug!("Creating capsule archive (.capsule format)");
 
     let loaded = crate::manifest::load_manifest(&opts.manifest_path)?;
     let manifest_content = loaded.raw_text;
 
     // Step 1: Generate config.json
-    futures::executor::block_on(reporter.notify("🧭 Phase 1: Generating config.json".to_string()))?;
+    debug!("Phase 1: generating config.json");
 
     let config_path = r3_config::generate_and_write_config(
         &opts.manifest_path,
@@ -54,33 +53,18 @@ pub async fn pack(
     )?;
 
     // Step 2: Generate capsule.lock (skip for now, placeholder)
-    futures::executor::block_on(
-        reporter.notify("🧾 Phase 2: Generating capsule.lock (placeholder)".to_string()),
-    )?;
+    debug!("Phase 2: generating capsule.lock (placeholder)");
 
     let lockfile_path = opts.manifest_dir.join("capsule.lock");
     if !lockfile_path.exists() {
         fs::write(&lockfile_path, "# Placeholder - generated during pack")?;
     }
 
-    // Step 3: Prepare source/ directory
+    // Step 3: Resolve source payload input
     let source_dir = opts.manifest_dir.join("source");
-    if !source_dir.exists() {
-        futures::executor::block_on(reporter.warn(
-            "⚠️  No source/ directory found. Creating empty source/ directory.".to_string(),
-        ))?;
-        fs::create_dir_all(&source_dir).with_context(|| {
-            format!(
-                "Failed to create source/ directory: {}",
-                source_dir.display()
-            )
-        })?;
-    }
 
     // Step 4: Create payload.tar.zst
-    futures::executor::block_on(
-        reporter.notify("📦 Phase 3: Creating payload.tar.zst".to_string()),
-    )?;
+    debug!("Phase 3: creating payload.tar.zst");
 
     let temp_dir = std::env::temp_dir().join(format!("capsule-payload-{}", std::process::id()));
     fs::create_dir_all(&temp_dir)?;
@@ -92,8 +76,14 @@ pub async fn pack(
     let mut payload_file = fs::File::create(&payload_tar_path)?;
     let mut ar = Builder::new(&mut payload_file);
 
-    // Add source/ directory contents
-    copy_dir_to_tar(&mut ar, &source_dir, "source")?;
+    // Add source/ directory contents.
+    // If source/ does not exist, fallback to project root contents (excluding generated/build files).
+    if source_dir.exists() {
+        copy_dir_to_tar(&mut ar, &source_dir, "source")?;
+    } else {
+        debug!("No source/ directory found; packaging project root as source/");
+        copy_project_root_to_tar(&mut ar, &opts.manifest_dir, "source")?;
+    }
 
     // Add config.json using append_path_with_name
     ar.append_path_with_name(&config_path, "config.json")?;
@@ -105,10 +95,10 @@ pub async fn pack(
     drop(ar);
 
     // Compress with zstd
-    futures::executor::block_on(reporter.notify(format!(
-        "✓ Compressing with Zstd Level {}...",
+    debug!(
+        "Compressing payload with zstd level {}",
         ZSTD_COMPRESSION_LEVEL
-    )))?;
+    );
 
     let payload_tar_size = fs::metadata(&payload_tar_path)?.len();
     let payload_tar_content = fs::read(&payload_tar_path)?;
@@ -119,16 +109,14 @@ pub async fn pack(
     zst_file.write_all(&compressed)?;
 
     let compression_ratio = (compressed.len() as f64 / payload_tar_size as f64) * 100.0;
-    futures::executor::block_on(reporter.notify(format!(
-        "✓ Compressed size: {} (ratio: {:.1}%)",
+    debug!(
+        "Compressed payload size: {} (ratio: {:.1}%)",
         format_bytes(compressed.len()),
         compression_ratio
-    )))?;
+    );
 
     // Step 5: Create final .capsule archive
-    futures::executor::block_on(
-        reporter.notify("📦 Phase 4: Creating .capsule archive".to_string()),
-    )?;
+    debug!("Phase 4: creating final .capsule archive");
 
     let output_path = opts.output.clone().unwrap_or_else(|| {
         let name_str = loaded.model.name.replace('\"', "-");
@@ -161,11 +149,11 @@ pub async fn pack(
     fs::remove_dir_all(&temp_dir)?;
 
     let final_size = fs::metadata(&output_path)?.len();
-    futures::executor::block_on(reporter.notify(format!(
-        "✅ Capsule created: {} ({})",
+    debug!(
+        "Capsule created: {} ({})",
         output_path.display(),
         format_bytes(final_size as usize)
-    )))?;
+    );
 
     Ok(output_path)
 }
@@ -185,6 +173,16 @@ fn copy_dir_to_tar(ar: &mut Builder<&mut fs::File>, src: &Path, prefix: &str) ->
 
     drop(entries);
 
+    copy_dir_to_tar_recursive(ar, src, prefix)?;
+
+    Ok(())
+}
+
+fn copy_dir_to_tar_recursive(
+    ar: &mut Builder<&mut fs::File>,
+    src: &Path,
+    prefix: &str,
+) -> Result<()> {
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         let path = entry.path();
@@ -193,12 +191,90 @@ fn copy_dir_to_tar(ar: &mut Builder<&mut fs::File>, src: &Path, prefix: &str) ->
 
         if entry.file_type()?.is_dir() {
             ar.append_dir(&target, &path)?;
+            copy_dir_to_tar_recursive(ar, &path, &target)?;
         } else {
             ar.append_path_with_name(&path, &target)?;
         }
     }
 
     Ok(())
+}
+
+fn copy_project_root_to_tar(
+    ar: &mut Builder<&mut fs::File>,
+    project_root: &Path,
+    prefix: &str,
+) -> Result<()> {
+    ar.append_dir(prefix, project_root)?;
+    copy_project_root_recursive(ar, project_root, project_root, prefix)
+}
+
+fn copy_project_root_recursive(
+    ar: &mut Builder<&mut fs::File>,
+    project_root: &Path,
+    current_dir: &Path,
+    prefix: &str,
+) -> Result<()> {
+    for entry in fs::read_dir(current_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let rel = match path.strip_prefix(project_root) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let file_type = entry.file_type()?;
+
+        if should_skip_project_entry(rel, file_type.is_dir()) {
+            continue;
+        }
+
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        let target = format!("{}/{}", prefix, rel_str);
+
+        if file_type.is_dir() {
+            ar.append_dir(&target, &path)?;
+            copy_project_root_recursive(ar, project_root, &path, prefix)?;
+        } else {
+            ar.append_path_with_name(&path, &target)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn should_skip_project_entry(rel: &Path, is_dir: bool) -> bool {
+    let first = rel
+        .components()
+        .next()
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    if matches!(first.as_str(), ".git" | ".capsule" | "target") {
+        return true;
+    }
+
+    if is_dir {
+        return false;
+    }
+
+    let file_name = rel
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    if matches!(
+        file_name.as_str(),
+        "capsule.toml"
+            | "config.json"
+            | "capsule.lock"
+            | "signature.json"
+            | "payload.tar"
+            | "payload.tar.zst"
+    ) {
+        return true;
+    }
+
+    file_name.ends_with(".capsule") || file_name.ends_with(".sig")
 }
 
 fn format_bytes(bytes: usize) -> String {
