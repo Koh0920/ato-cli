@@ -48,12 +48,7 @@ pub fn execute(
         cmd.env(k, v);
     }
 
-    // Inject IPC environment variables (CAPSULE_IPC_*)
-    if let Some(ipc) = ipc_env {
-        for (k, v) in ipc {
-            cmd.env(k, v);
-        }
-    }
+    super::source::apply_allowlisted_session_env(&mut cmd, ipc_env)?;
 
     if let Some(proxy_env) = proxy::proxy_env_from_env(&[])? {
         proxy::apply_proxy_env(&mut cmd, &proxy_env);

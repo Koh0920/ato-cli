@@ -1,21 +1,33 @@
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use colored::Colorize;
 use serde_json::json;
 use std::cmp::Ordering;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
+use std::thread;
+use std::time::Duration;
+use tracing::debug;
 
 use capsule_core::CapsuleReporter;
 
-const ATO_ASCII_ART: &str = r#"
-     _   _        
-    / \ | |_ ___  
-   / _ \| __/ _ \ 
-  / ___ \ || (_) |
- /_/   \_\__\___/ 
-
-        Ato
+fn print_animated_logo() {
+    let logo = r#"
+    ___    __       
+   /   |  / /_____  
+  / /| | / __/ __ \ 
+ / ___ |/ /_/ /_/ / 
+/_/  |_|\__/\____/  
 "#;
+
+    for line in logo.lines() {
+        println!("{}", line.cyan().bold());
+        io::stdout().flush().unwrap();
+        thread::sleep(Duration::from_millis(30));
+    }
+    println!();
+}
+
 const DEFAULT_RUN_REGISTRY_URL: &str = "https://api.ato.run";
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -64,11 +76,13 @@ impl Drop for SidecarCleanup {
     }
 }
 
+mod ato_error_jsonl;
 mod auth;
 #[cfg(feature = "manifest-signing")]
 mod capsule_capnp;
 mod commands;
 mod common;
+mod consent_store;
 mod diagnostics;
 mod engine_manager;
 mod env;
@@ -82,28 +96,41 @@ mod new;
 mod observability;
 mod process_manager;
 mod profile;
+mod publish_artifact;
 mod registry;
+mod registry_serve;
 mod reporters;
 mod scaffold;
 mod search;
 mod sign;
+mod skill;
+mod skill_resolver;
 mod source;
 mod verify;
+
+fn cli_styles() -> clap::builder::Styles {
+    use clap::builder::styling::{AnsiColor, Effects};
+    clap::builder::Styles::styled()
+        .header(AnsiColor::Cyan.on_default() | Effects::BOLD)
+        .usage(AnsiColor::Green.on_default() | Effects::BOLD)
+        .literal(AnsiColor::Blue.on_default() | Effects::BOLD)
+        .placeholder(AnsiColor::Yellow.on_default())
+}
 
 #[derive(Parser)]
 #[command(name = "ato")]
 #[command(version = env!("CARGO_PKG_VERSION"))]
-#[command(about = "ato CLI (meta-runtime) - dispatches to engines like nacelle")]
+#[command(styles = cli_styles())]
 #[command(help_template = "\
 {about-with-newline}
 Usage: {usage}
 
 Primary Commands:
-  run      Run a capsule app or local project (strict sandbox by default)
-  install  Install a package from the store
+  run      Execute a capsule or SKILL.md in a strict Zero-Trust sandbox
+  install  Install a verified package from the registry
   init     Initialize a new project
-  build    Build project into a capsule archive (includes smoke test)
-  search   Search the store for packages
+  build    Pack a project into an immutable .capsule archive
+  search   Search the registry for agent skills and packages
 
 Management:
   ps       List running capsules
@@ -118,7 +145,8 @@ Auth:
 Advanced Commands:
   key      Manage signing keys
   config   Manage configuration (registry, engine, source)
-  publish  Register a GitHub repository to the registry
+  publish  Upload a local .capsule or register a GitHub repository source
+  registry Manage registry commands (resolve/list/cache/serve)
 
 Options:
 {options}
@@ -145,9 +173,17 @@ enum Commands {
         about = "Run a capsule app or local project"
     )]
     Run {
-        /// Path to a .capsule archive or directory containing capsule.toml (default: current directory)
+        /// Local path (./, ../, ~/, /...) or store scoped ID (publisher/slug). Default: current directory
         #[arg(default_value = ".")]
         path: PathBuf,
+
+        /// Resolve SKILL.md by skill name from standard locations and run it safely
+        #[arg(long = "skill", conflicts_with = "from_skill")]
+        skill: Option<String>,
+
+        /// Run from SKILL.md by translating frontmatter into a fail-closed capsule execution plan
+        #[arg(long = "from-skill", conflicts_with = "skill")]
+        from_skill: Option<PathBuf>,
 
         /// Target label to execute (e.g. static, cli, widget)
         #[arg(short = 't', long = "target")]
@@ -173,8 +209,12 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = EnforcementMode::Strict)]
         enforcement: EnforcementMode,
 
-        /// Explicitly allow non-strict sandbox execution (unsafe)
-        #[arg(long, default_value_t = false)]
+        /// Explicitly allow Tier2 source/native execution (unsafe)
+        #[arg(long = "unsafe", default_value_t = false)]
+        unsafe_mode: bool,
+
+        /// Legacy alias for `--unsafe`
+        #[arg(long = "unsafe-bypass-sandbox", hide = true, default_value_t = false)]
         unsafe_bypass_sandbox: bool,
 
         /// Skip prompt and auto-install when app-id is not installed
@@ -191,7 +231,7 @@ enum Commands {
         about = "Install a package from the store"
     )]
     Install {
-        /// Capsule slug or ID
+        /// Capsule scoped ID (publisher/slug)
         slug: String,
 
         /// Registry URL (default: registry.capsule.app)
@@ -384,26 +424,40 @@ enum Commands {
 
     #[command(
         next_help_heading = "Advanced Commands",
-        about = "Register a GitHub repository to the registry"
+        about = "Upload a local .capsule or register a GitHub repository source"
     )]
     Publish {
-        /// GitHub repository URL (public)
-        repo_url: String,
+        /// GitHub repository URL (public). Required unless --artifact is supplied.
+        #[arg(required_unless_present = "artifact", conflicts_with = "artifact")]
+        repo_url: Option<String>,
+
+        /// Path to local .capsule artifact for direct upload to local registry
+        #[arg(long, conflicts_with = "repo_url")]
+        artifact: Option<PathBuf>,
+
+        /// Scoped capsule ID (publisher/slug). Required with --artifact.
+        #[arg(long, requires = "artifact")]
+        scoped_id: Option<String>,
 
         /// Registry URL (default: localhost:8787 for beta)
         #[arg(long)]
         registry: Option<String>,
 
         /// Distribution channel (stable|beta)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "artifact")]
         channel: Option<String>,
 
         /// Automatically submit to playground review queue after sync
-        #[arg(short = 'p', long = "apply-playground", default_value_t = false)]
+        #[arg(
+            short = 'p',
+            long = "apply-playground",
+            default_value_t = false,
+            conflicts_with = "artifact"
+        )]
         apply_playground: bool,
 
         /// GitHub App installation ID (required for session-token based flow)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "artifact")]
         installation_id: Option<u64>,
 
         /// Emit machine-readable JSON output
@@ -417,7 +471,10 @@ enum Commands {
         command: EngineCommands,
     },
 
-    #[command(hide = true)]
+    #[command(
+        next_help_heading = "Advanced Commands",
+        about = "Manage registry commands (resolve/list/cache/serve)"
+    )]
     Registry {
         #[command(subcommand)]
         command: RegistryCommands,
@@ -468,8 +525,12 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = EnforcementMode::Strict)]
         enforcement: EnforcementMode,
 
-        /// Explicitly allow non-strict sandbox execution (unsafe)
-        #[arg(long, default_value_t = false)]
+        /// Explicitly allow Tier2 source/native execution (unsafe)
+        #[arg(long = "unsafe", default_value_t = false)]
+        unsafe_mode: bool,
+
+        /// Legacy alias for `--unsafe`
+        #[arg(long = "unsafe-bypass-sandbox", hide = true, default_value_t = false)]
         unsafe_bypass_sandbox: bool,
 
         /// Skip prompt and auto-install when app-id is not installed
@@ -929,6 +990,21 @@ enum RegistryCommands {
 
     /// Clear registry cache
     ClearCache,
+
+    /// Start local HTTP registry server for offline development
+    Serve {
+        /// Listen port
+        #[arg(long, default_value_t = 8787)]
+        port: u16,
+
+        /// Data directory for local registry state
+        #[arg(long, default_value = "~/.capsule/local-registry")]
+        data_dir: String,
+
+        /// Listen host (loopback only)
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1039,6 +1115,10 @@ fn main() {
     let command_context = diagnostics::detect_command_context(&args);
 
     if let Err(err) = run() {
+        if ato_error_jsonl::try_emit_from_anyhow(&err) {
+            std::process::exit(error_codes::EXIT_USER_ERROR);
+        }
+
         let diagnostic = diagnostics::from_anyhow(&err, command_context);
         let exit_code = diagnostics::map_exit_code(&diagnostic, &err);
 
@@ -1059,8 +1139,10 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    if std::env::args_os().count() == 1 {
-        println!("{}", ATO_ASCII_ART);
+    let is_no_args = std::env::args_os().count() == 1;
+
+    if is_no_args {
+        print_animated_logo();
         let mut cmd = Cli::command();
         cmd.print_help().context("failed to print CLI help")?;
         println!();
@@ -1073,12 +1155,15 @@ fn run() -> Result<()> {
     match cli.command {
         Commands::Run {
             path,
+            skill,
+            from_skill,
             target,
             watch,
             background,
             nacelle,
             registry,
             enforcement,
+            unsafe_mode,
             unsafe_bypass_sandbox,
             yes,
             allow_unverified,
@@ -1090,9 +1175,12 @@ fn run() -> Result<()> {
             nacelle,
             registry,
             enforcement,
+            unsafe_mode,
             unsafe_bypass_sandbox,
             yes,
             allow_unverified,
+            skill,
+            from_skill,
             None,
             reporter.clone(),
         ),
@@ -1117,6 +1205,7 @@ fn run() -> Result<()> {
             nacelle,
             registry,
             enforcement,
+            unsafe_mode,
             unsafe_bypass_sandbox,
             yes,
         } => execute_run_like_command(
@@ -1127,9 +1216,12 @@ fn run() -> Result<()> {
             nacelle,
             registry,
             enforcement,
+            unsafe_mode,
             unsafe_bypass_sandbox,
             yes,
             false,
+            None,
+            None,
             Some("⚠️  'ato open' is deprecated. Use 'ato run' instead."),
             reporter.clone(),
         ),
@@ -1300,6 +1392,36 @@ fn run() -> Result<()> {
             }
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async {
+                if install::is_slug_only_ref(&slug) {
+                    let suggestions = install::suggest_scoped_capsules(
+                        &slug,
+                        registry.as_deref(),
+                        5,
+                    )
+                    .await?;
+                    if suggestions.is_empty() {
+                        anyhow::bail!(
+                            "scoped_id_required: '{}' is ambiguous. Use publisher/slug (for example: koh0920/{})",
+                            slug,
+                            slug
+                        );
+                    }
+                    let mut message = format!(
+                        "scoped_id_required: '{}' requires publisher scope.\n\nDid you mean one of these?",
+                        slug
+                    );
+                    for suggestion in suggestions {
+                        message.push_str(&format!(
+                            "\n  - {}  ({} downloads)",
+                            suggestion.scoped_id, suggestion.downloads
+                        ));
+                    }
+                    message.push_str("\n\nRun `ato search ");
+                    message.push_str(&slug);
+                    message.push_str("` to see more options.");
+                    anyhow::bail!(message);
+                }
+
                 let result = install::install_app(
                     &slug,
                     registry.as_deref(),
@@ -1390,27 +1512,49 @@ fn run() -> Result<()> {
 
         Commands::Publish {
             repo_url,
+            artifact,
+            scoped_id,
             registry,
             channel,
             apply_playground,
             installation_id,
             json,
         } => {
-            if !json {
-                println!("Registering GitHub repository as the source of truth...");
-                println!(
-                    "(Not uploading local artifacts. Ensure your changes are pushed to main.)"
-                );
+            if let Some(artifact_path) = artifact {
+                let scoped_id = scoped_id
+                    .ok_or_else(|| anyhow::anyhow!("--scoped-id is required with --artifact"))?;
+                let registry_url = registry.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--registry is required with --artifact and must use http://127.0.0.1:<port>"
+                    )
+                })?;
+                execute_publish_artifact_command(
+                    artifact_path,
+                    scoped_id,
+                    registry_url,
+                    json,
+                    reporter.clone(),
+                )
+            } else {
+                let repo_url = repo_url.ok_or_else(|| {
+                    anyhow::anyhow!("repo_url is required unless --artifact is supplied")
+                })?;
+                if !json {
+                    println!("Registering GitHub repository as the source of truth...");
+                    println!(
+                        "(Not uploading local artifacts. Ensure your changes are pushed to main.)"
+                    );
+                }
+                execute_source_register_command(
+                    repo_url,
+                    registry,
+                    channel,
+                    apply_playground,
+                    installation_id,
+                    true,
+                    json,
+                )
             }
-            execute_source_register_command(
-                repo_url,
-                registry,
-                channel,
-                apply_playground,
-                installation_id,
-                true,
-                json,
-            )
         }
 
         Commands::Package {
@@ -1656,7 +1800,59 @@ fn execute_registry_command(command: RegistryCommands) -> Result<()> {
                 println!("✅ Registry cache cleared");
                 Ok(())
             }
+            RegistryCommands::Serve {
+                port,
+                data_dir,
+                host,
+            } => {
+                if host != "127.0.0.1" {
+                    anyhow::bail!("--host must be exactly 127.0.0.1");
+                }
+                registry_serve::serve(registry_serve::RegistryServerConfig {
+                    host,
+                    port,
+                    data_dir,
+                })
+                .await
+            }
         }
+    })
+}
+
+fn execute_publish_artifact_command(
+    artifact: PathBuf,
+    scoped_id: String,
+    registry_url: String,
+    json_output: bool,
+    reporter: std::sync::Arc<reporters::CliReporter>,
+) -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        if !json_output {
+            futures::executor::block_on(reporter.notify(format!(
+                "🚀 Uploading local artifact '{}' to {}",
+                artifact.display(),
+                registry_url
+            )))?;
+        }
+
+        let result = publish_artifact::publish_artifact(publish_artifact::PublishArtifactArgs {
+            artifact_path: artifact,
+            scoped_id,
+            registry_url,
+        })
+        .await?;
+
+        if json_output {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        } else {
+            println!("✅ Published successfully!");
+            println!("   Scoped ID: {}", result.scoped_id);
+            println!("   Version:   {}", result.version);
+            println!("   Artifact:  {}", result.artifact_url);
+        }
+
+        Ok(())
     })
 }
 
@@ -1743,9 +1939,12 @@ fn execute_run_like_command(
     nacelle: Option<PathBuf>,
     registry: Option<String>,
     enforcement: EnforcementMode,
+    unsafe_mode: bool,
     unsafe_bypass_sandbox: bool,
     yes: bool,
     allow_unverified: bool,
+    skill: Option<String>,
+    from_skill: Option<PathBuf>,
     deprecation_warning: Option<&str>,
     reporter: std::sync::Arc<reporters::CliReporter>,
 ) -> Result<()> {
@@ -1754,6 +1953,46 @@ fn execute_run_like_command(
     }
 
     let rt = tokio::runtime::Runtime::new()?;
+
+    let resolved_skill_path = match (skill, from_skill) {
+        (Some(skill_name), None) => Some(skill_resolver::resolve_skill_path(&skill_name)?),
+        (None, Some(path)) => Some(path),
+        (None, None) => None,
+        (Some(_), Some(_)) => {
+            anyhow::bail!("--skill and --from-skill are mutually exclusive");
+        }
+    };
+
+    if let Some(skill_path) = resolved_skill_path {
+        if watch {
+            anyhow::bail!("--skill/--from-skill does not support --watch in MVP mode");
+        }
+        if background {
+            anyhow::bail!("--skill/--from-skill does not support --background in MVP mode");
+        }
+
+        let generated = skill::materialize_skill_capsule(&skill_path)?;
+        debug!(
+            manifest_path = %generated.manifest_path().display(),
+            "Translated SKILL.md to capsule"
+        );
+
+        let unsafe_requested = unsafe_mode || unsafe_bypass_sandbox;
+        let effective_enforcement =
+            enforce_sandbox_mode_flags(enforcement, unsafe_requested, reporter.clone())?;
+        return execute_open_command(
+            generated.manifest_path().to_path_buf(),
+            target,
+            watch,
+            background,
+            nacelle,
+            effective_enforcement,
+            unsafe_requested,
+            yes,
+            reporter,
+        );
+    }
+
     let path = rt.block_on(resolve_run_target_or_install(
         path,
         yes,
@@ -1762,14 +2001,18 @@ fn execute_run_like_command(
         reporter.clone(),
     ))?;
 
-    enforce_sandbox_mode_flags(enforcement, unsafe_bypass_sandbox, reporter.clone())?;
+    let unsafe_requested = unsafe_mode || unsafe_bypass_sandbox;
+    let effective_enforcement =
+        enforce_sandbox_mode_flags(enforcement, unsafe_requested, reporter.clone())?;
     execute_open_command(
         path,
         target,
         watch,
         background,
         nacelle,
-        enforcement,
+        effective_enforcement,
+        unsafe_requested,
+        yes,
         reporter,
     )
 }
@@ -1781,22 +2024,54 @@ async fn resolve_run_target_or_install(
     registry: Option<&str>,
     reporter: std::sync::Arc<reporters::CliReporter>,
 ) -> Result<PathBuf> {
-    if is_local_run_target(&path) {
-        return Ok(path);
+    let raw = path.to_string_lossy().to_string();
+    if is_explicit_local_path_input(&raw) {
+        return Ok(expand_explicit_local_path(&raw));
     }
 
-    if !is_store_slug_candidate(&path) {
-        return Ok(path);
-    }
+    let scoped_ref = match install::parse_capsule_ref(&raw) {
+        Ok(value) => value,
+        Err(error) => {
+            if install::is_slug_only_ref(&raw) {
+                let effective_registry = registry.unwrap_or(DEFAULT_RUN_REGISTRY_URL);
+                let suggestions =
+                    install::suggest_scoped_capsules(&raw, Some(effective_registry), 5).await?;
+                if suggestions.is_empty() {
+                    anyhow::bail!(
+                        "scoped_id_required: '{}' is not valid for `ato run`. Use publisher/slug (for example: koh0920/{}).",
+                        raw,
+                        raw.trim()
+                    );
+                }
 
-    let slug = path.to_string_lossy().to_string();
-    if let Some(installed_capsule) = resolve_installed_capsule_archive(&slug)? {
-        reporter
-            .notify(format!(
-                "📦 Using installed capsule: {}",
-                installed_capsule.display()
-            ))
-            .await?;
+                let mut message = format!(
+                    "scoped_id_required: '{}' is ambiguous. Specify publisher/slug.\n\nDid you mean one of these?",
+                    raw
+                );
+                for suggestion in suggestions {
+                    message.push_str(&format!(
+                        "\n  - {}  ({} downloads)",
+                        suggestion.scoped_id, suggestion.downloads
+                    ));
+                }
+                message.push_str("\n\nRun `ato search ");
+                message.push_str(raw.trim());
+                message.push_str("` to see more options.");
+                anyhow::bail!(message);
+            }
+            return Err(error).context(
+                "Invalid run target. Use ./, ../, ~/, / for local paths, or publisher/slug for store capsules.",
+            );
+        }
+    };
+
+    if let Some(installed_capsule) =
+        resolve_installed_capsule_archive(&scoped_ref, registry).await?
+    {
+        debug!(
+            capsule = %installed_capsule.display(),
+            "Using installed capsule"
+        );
         return Ok(installed_capsule);
     }
 
@@ -1819,25 +2094,37 @@ async fn resolve_run_target_or_install(
     }
 
     let effective_registry = registry.unwrap_or(DEFAULT_RUN_REGISTRY_URL);
-    let detail = install::fetch_capsule_detail(&slug, Some(effective_registry)).await?;
+    let detail =
+        install::fetch_capsule_detail(&scoped_ref.scoped_id, Some(effective_registry)).await?;
+    let installable_version = detail
+        .latest_version
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Cannot auto-install '{}': no installable version is published.",
+                detail.scoped_id
+            )
+        })?
+        .to_string();
+
     if !yes {
-        let approved = prompt_install_confirmation(&detail)?;
+        let approved = prompt_install_confirmation(&detail, &installable_version)?;
         if !approved {
             anyhow::bail!("Installation cancelled by user");
         }
     } else {
-        reporter
-            .notify(format!(
-                "📦 '{}' is not installed; continuing with -y auto-install",
-                detail.slug
-            ))
-            .await?;
+        debug!(
+            scoped_id = %detail.scoped_id,
+            "Capsule not installed; continuing with -y auto-install"
+        );
     }
 
     let install_result = install::install_app(
-        &slug,
+        &scoped_ref.scoped_id,
         Some(effective_registry),
-        None,
+        Some(installable_version.as_str()),
         None,
         false,
         allow_unverified,
@@ -1847,41 +2134,114 @@ async fn resolve_run_target_or_install(
     Ok(install_result.path)
 }
 
-fn is_local_run_target(path: &std::path::Path) -> bool {
-    if path.extension().is_some_and(|ext| ext == "capsule") {
+fn is_explicit_local_path_input(raw: &str) -> bool {
+    if raw.is_empty() {
+        return false;
+    }
+    if raw == "." || raw == ".." {
         return true;
     }
-    path.exists()
-}
-
-fn is_store_slug_candidate(path: &std::path::Path) -> bool {
-    if path.is_absolute() {
-        return false;
-    }
-
-    let Some(raw) = path.to_str() else {
-        return false;
-    };
-    if raw.is_empty()
-        || raw == "."
-        || raw == ".."
-        || raw.contains('/')
-        || raw.contains('\\')
-        || raw.contains('.')
+    if raw.starts_with("./")
+        || raw.starts_with("../")
+        || raw.starts_with(".\\")
+        || raw.starts_with("..\\")
+        || raw.starts_with("~/")
+        || raw.starts_with("~\\")
+        || raw.starts_with('/')
+        || raw.starts_with('\\')
     {
-        return false;
+        return true;
     }
-
-    raw.chars()
-        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+    raw.len() >= 3
+        && raw.as_bytes()[1] == b':'
+        && (raw.as_bytes()[2] == b'/' || raw.as_bytes()[2] == b'\\')
+        && raw.as_bytes()[0].is_ascii_alphabetic()
 }
 
-fn resolve_installed_capsule_archive(slug: &str) -> Result<Option<PathBuf>> {
+fn expand_explicit_local_path(raw: &str) -> PathBuf {
+    if raw == "~" {
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from(raw));
+    }
+    if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(raw)
+}
+
+async fn resolve_installed_capsule_archive(
+    scoped_ref: &install::ScopedCapsuleRef,
+    registry: Option<&str>,
+) -> Result<Option<PathBuf>> {
     let store_root = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".capsule")
         .join("store");
-    resolve_installed_capsule_archive_in_store(&store_root, slug)
+    if let Some(path) = resolve_installed_capsule_archive_in_store(
+        &store_root.join(&scoped_ref.publisher),
+        &scoped_ref.slug,
+    )? {
+        return Ok(Some(path));
+    }
+
+    let legacy_slug_dir = store_root.join(&scoped_ref.slug);
+    if !legacy_slug_dir.exists() || !legacy_slug_dir.is_dir() {
+        return Ok(None);
+    }
+
+    let scoped_slug_dir = store_root
+        .join(&scoped_ref.publisher)
+        .join(&scoped_ref.slug);
+    if scoped_slug_dir.exists() {
+        return resolve_installed_capsule_archive_in_store(
+            &store_root.join(&scoped_ref.publisher),
+            &scoped_ref.slug,
+        );
+    }
+
+    let effective_registry = registry.unwrap_or(DEFAULT_RUN_REGISTRY_URL);
+    let suggestions =
+        install::suggest_scoped_capsules(&scoped_ref.slug, Some(effective_registry), 10).await?;
+    let scoped_matches: Vec<_> = suggestions
+        .iter()
+        .filter(|candidate| {
+            candidate
+                .scoped_id
+                .ends_with(&format!("/{}", scoped_ref.slug))
+        })
+        .collect();
+    let unique_match =
+        scoped_matches.len() == 1 && scoped_matches[0].scoped_id == scoped_ref.scoped_id;
+
+    if !unique_match {
+        anyhow::bail!(
+            "Legacy installation found at {} but publisher could not be determined safely. Please reinstall using: ato install {}",
+            legacy_slug_dir.display(),
+            scoped_ref.scoped_id
+        );
+    }
+
+    if let Some(parent) = scoped_slug_dir.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "Failed to create scoped store directory: {}",
+                parent.display()
+            )
+        })?;
+    }
+    std::fs::rename(&legacy_slug_dir, &scoped_slug_dir).with_context(|| {
+        format!(
+            "Failed to migrate legacy store path {} -> {}",
+            legacy_slug_dir.display(),
+            scoped_slug_dir.display()
+        )
+    })?;
+
+    resolve_installed_capsule_archive_in_store(
+        &store_root.join(&scoped_ref.publisher),
+        &scoped_ref.slug,
+    )
 }
 
 fn resolve_installed_capsule_archive_in_store(
@@ -1944,21 +2304,19 @@ fn select_capsule_file_in_version(version_dir: &std::path::Path) -> Result<Optio
     Ok(capsules.into_iter().next())
 }
 
-fn prompt_install_confirmation(detail: &install::CapsuleDetailSummary) -> Result<bool> {
+fn prompt_install_confirmation(
+    detail: &install::CapsuleDetailSummary,
+    resolved_version: &str,
+) -> Result<bool> {
     println!();
-    println!("[!] Capsule '{}' is not installed.", detail.slug);
+    println!("[!] Capsule '{}' is not installed.", detail.scoped_id);
     println!();
-    let version = if detail.latest_version.trim().is_empty() {
-        "unknown"
-    } else {
-        detail.latest_version.trim()
-    };
     let name = if detail.name.trim().is_empty() {
         detail.slug.as_str()
     } else {
         detail.name.trim()
     };
-    println!("📦 {} (v{})", name, version);
+    println!("📦 {} (v{})", name, resolved_version);
     if !detail.description.trim().is_empty() {
         println!("{}", detail.description.trim());
     }
@@ -2095,19 +2453,20 @@ fn compare_semver(a: &ParsedSemver, b: &ParsedSemver) -> Ordering {
 
 fn enforce_sandbox_mode_flags(
     enforcement: EnforcementMode,
-    unsafe_bypass_sandbox: bool,
+    unsafe_requested: bool,
     reporter: std::sync::Arc<reporters::CliReporter>,
-) -> Result<()> {
-    if matches!(enforcement, EnforcementMode::BestEffort) && !unsafe_bypass_sandbox {
-        anyhow::bail!("--enforcement best-effort requires --unsafe-bypass-sandbox");
+) -> Result<EnforcementMode> {
+    if matches!(enforcement, EnforcementMode::BestEffort) {
+        anyhow::bail!("--enforcement best-effort is no longer supported; use --enforcement strict");
     }
-    if matches!(enforcement, EnforcementMode::BestEffort) && unsafe_bypass_sandbox {
+
+    if matches!(enforcement, EnforcementMode::Strict) && unsafe_requested {
         futures::executor::block_on(
-            reporter.warn("⚠️  Unsafe mode enabled: running with best_effort sandbox".to_string()),
+            reporter.warn("⚠️  Unsafe mode enabled: strict sandbox remains enabled".to_string()),
         )?;
     }
 
-    Ok(())
+    Ok(enforcement)
 }
 
 fn execute_open_command(
@@ -2117,6 +2476,8 @@ fn execute_open_command(
     background: bool,
     nacelle: Option<PathBuf>,
     enforcement: EnforcementMode,
+    unsafe_mode: bool,
+    assume_yes: bool,
     reporter: std::sync::Arc<reporters::CliReporter>,
 ) -> Result<()> {
     let target_path = if path.is_file() || path.extension().is_some_and(|ext| ext == "capsule") {
@@ -2135,6 +2496,8 @@ fn execute_open_command(
         background,
         nacelle,
         enforcement: enforcement.as_str().to_string(),
+        unsafe_mode,
+        assume_yes,
         reporter,
     }))
 }
@@ -2244,18 +2607,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn store_slug_candidate_rules() {
-        assert!(is_store_slug_candidate(std::path::Path::new(
-            "ato-explorer"
-        )));
-        assert!(is_store_slug_candidate(std::path::Path::new("abc-123")));
-        assert!(!is_store_slug_candidate(std::path::Path::new("foo/bar")));
-        assert!(!is_store_slug_candidate(std::path::Path::new("./foo")));
-        assert!(!is_store_slug_candidate(std::path::Path::new(
-            "capsule.toml"
-        )));
-        assert!(!is_store_slug_candidate(std::path::Path::new("Foo")));
-        assert!(!is_store_slug_candidate(std::path::Path::new(".")));
+    fn explicit_local_path_rules() {
+        assert!(is_explicit_local_path_input("./foo"));
+        assert!(is_explicit_local_path_input("../foo"));
+        assert!(is_explicit_local_path_input("~/foo"));
+        assert!(is_explicit_local_path_input("/tmp/foo"));
+        assert!(is_explicit_local_path_input("."));
+        assert!(is_explicit_local_path_input(".."));
+        assert!(!is_explicit_local_path_input("foo"));
+        assert!(!is_explicit_local_path_input("foo/bar"));
     }
 
     #[test]
@@ -2270,9 +2630,11 @@ mod tests {
     }
 
     #[test]
-    fn existing_directory_is_treated_as_local_target() {
+    fn bare_relative_scoped_like_input_is_not_local() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(is_local_run_target(tmp.path()));
+        let scoped_like = tmp.path().join("my-org").join("my-tool");
+        std::fs::create_dir_all(&scoped_like).unwrap();
+        assert!(!is_explicit_local_path_input("my-org/my-tool"));
     }
 
     #[test]

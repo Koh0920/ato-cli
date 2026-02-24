@@ -37,9 +37,20 @@ pub fn execute(
         proxy::extend_env_map(&mut env, &proxy_env);
     }
 
-    // Inject IPC environment variables (CAPSULE_IPC_*)
     if let Some(ipc) = ipc_env {
-        env.extend(ipc.clone());
+        for (k, v) in ipc {
+            if k.starts_with("CAPSULE_IPC_") || k == "ATO_BRIDGE_TOKEN" {
+                env.insert(k.clone(), v.clone());
+                continue;
+            }
+            return Err(
+                capsule_core::execution_plan::error::AtoExecutionError::policy_violation(format!(
+                    "session_token env '{}' is not allowlisted",
+                    k
+                ))
+                .into(),
+            );
+        }
     }
 
     let mut cmd = Command::new(engine_binary(&engine));

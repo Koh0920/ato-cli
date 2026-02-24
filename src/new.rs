@@ -421,7 +421,7 @@ description = "A new capsule application"
 
 [targets.cli]
 runtime = "source"
-entrypoint = "bash main.sh"
+entrypoint = "main.sh"
 
 [storage]
 

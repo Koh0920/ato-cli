@@ -95,6 +95,14 @@ impl ManifestData {
         self.get_str(&["targets", &self.selected_target, "runtime"])
     }
 
+    pub fn execution_driver(&self) -> Option<String> {
+        self.get_str(&["targets", &self.selected_target, "driver"])
+    }
+
+    pub fn execution_language(&self) -> Option<String> {
+        self.get_str(&["targets", &self.selected_target, "language"])
+    }
+
     pub fn execution_image(&self) -> Option<String> {
         self.get_str(&["targets", &self.selected_target, "image"])
     }

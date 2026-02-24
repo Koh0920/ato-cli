@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use capsule_core::CapsuleReporter;
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use tracing::debug;
 
 use crate::init;
 use crate::reporters;
@@ -25,6 +26,7 @@ pub fn execute_pack_command(
     }
 
     let manifest = dir.join("capsule.toml");
+    let mut temporary_manifest: Option<TemporaryManifestGuard> = None;
     if !manifest.exists() {
         let stdin_is_tty = std::io::stdin().is_terminal();
         if init_if_missing {
@@ -42,9 +44,14 @@ pub fn execute_pack_command(
                 reporter.clone(),
             )?;
         } else {
-            anyhow::bail!(
-                "capsule.toml not found. Use --init to create one, or specify a directory with capsule.toml."
-            );
+            futures::executor::block_on(reporter.warn(
+                "No capsule.toml found. Using defaults. Run 'ato init' to configure.".to_string(),
+            ))?;
+            let inferred = infer_zero_config_manifest(&dir)?;
+            std::fs::write(&manifest, inferred).with_context(|| {
+                format!("Failed to write temporary manifest: {}", manifest.display())
+            })?;
+            temporary_manifest = Some(TemporaryManifestGuard::new(manifest.clone()));
         }
     }
 
@@ -52,27 +59,30 @@ pub fn execute_pack_command(
         anyhow::bail!("capsule.toml not found after initialization");
     }
 
+    let _temporary_manifest_guard = temporary_manifest;
+
     let decision = capsule_core::router::route_manifest(
         &manifest,
         capsule_core::router::ExecutionProfile::Release,
         None,
     )?;
+    let loaded_manifest = capsule_core::manifest::load_manifest(&manifest)?;
+    let capsule_name = loaded_manifest.model.name.clone();
+    let capsule_version = loaded_manifest.model.version.clone();
     capsule_core::diagnostics::manifest::validate_manifest_for_build(
         &manifest,
         decision.plan.selected_target_label(),
     )?;
 
-    futures::executor::block_on(
-        reporter.notify("📦 Capsule Pack - Pure Runtime Architecture v3.0".to_string()),
-    )?;
-    futures::executor::block_on(
-        reporter.notify("   Performing build-time validations...\n".to_string()),
-    )?;
-
     futures::executor::block_on(reporter.notify(format!(
-        "🧭 RuntimeRouter: {:?} ({})",
-        decision.kind, decision.reason
+        "📦 Packing capsule \"{}\" (v{})...",
+        capsule_name, capsule_version
     )))?;
+    debug!(
+        runtime_kind = ?decision.kind,
+        reason = %decision.reason,
+        "Build runtime routed"
+    );
 
     let manifest_dir = manifest
         .parent()
@@ -105,20 +115,18 @@ pub fn execute_pack_command(
                     ),
                 )?;
             } else {
-                futures::executor::block_on(
-                    reporter.notify("🧪 Phase 4: Running smoke test".to_string()),
-                )?;
+                debug!("Running smoke test");
                 match capsule_core::smoke::run_capsule_smoke(
                     &artifact_path,
                     decision.plan.selected_target_label(),
                 ) {
                     Ok(summary) => {
-                        futures::executor::block_on(reporter.notify(format!(
-                            "   ✅ Smoke passed (timeout={}ms, port={:?}, checks={})",
+                        debug!(
+                            "Smoke passed (timeout={}ms, port={:?}, checks={})",
                             summary.startup_timeout_ms,
                             summary.required_port,
                             summary.checked_commands
-                        )))?;
+                        );
                     }
                     Err(err) => {
                         handle_failed_artifact(
@@ -132,17 +140,23 @@ pub fn execute_pack_command(
             }
 
             let _ = sign_if_requested(&artifact_path, key.as_ref(), reporter.clone())?;
-            futures::executor::block_on(
-                reporter.notify(format!("✅ Pack complete: {}", artifact_path.display())),
-            )?;
+            let size = std::fs::metadata(&artifact_path)?.len();
+            futures::executor::block_on(reporter.notify(format!(
+                "✅ Successfully built: {} ({:.1} KB)",
+                artifact_path.display(),
+                size as f64 / 1024.0
+            )))?;
         }
         capsule_core::router::RuntimeKind::Oci => {
             let result = capsule_core::packers::oci::pack(&decision.plan, None, reporter.as_ref())?;
             if let Some(path) = result.archive {
                 let _ = sign_if_requested(&path, key.as_ref(), reporter.clone())?;
-                futures::executor::block_on(
-                    reporter.notify(format!("✅ Pack complete: {}", path.display())),
-                )?;
+                let size = std::fs::metadata(&path)?.len();
+                futures::executor::block_on(reporter.notify(format!(
+                    "✅ Successfully built: {} ({:.1} KB)",
+                    path.display(),
+                    size as f64 / 1024.0
+                )))?;
             } else if key.is_some() {
                 futures::executor::block_on(
                     reporter.warn(
@@ -158,9 +172,12 @@ pub fn execute_pack_command(
         capsule_core::router::RuntimeKind::Wasm => {
             let result =
                 capsule_core::packers::wasm::pack(&decision.plan, None, None, reporter.as_ref())?;
-            futures::executor::block_on(
-                reporter.notify(format!("✅ Pack complete: {}", result.artifact.display())),
-            )?;
+            let size = std::fs::metadata(&result.artifact)?.len();
+            futures::executor::block_on(reporter.notify(format!(
+                "✅ Successfully built: {} ({:.1} KB)",
+                result.artifact.display(),
+                size as f64 / 1024.0
+            )))?;
             let _ = sign_if_requested(&result.artifact, key.as_ref(), reporter.clone())?;
         }
         capsule_core::router::RuntimeKind::Web => {
@@ -169,6 +186,89 @@ pub fn execute_pack_command(
     }
 
     Ok(())
+}
+
+struct TemporaryManifestGuard {
+    path: PathBuf,
+}
+
+impl TemporaryManifestGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for TemporaryManifestGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn infer_zero_config_manifest(dir: &Path) -> Result<String> {
+    let raw_name = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.trim())
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Failed to infer project name from directory"))?;
+    let name = sanitize_kebab_case(raw_name);
+    let name = if name.is_empty() {
+        "app".to_string()
+    } else {
+        name
+    };
+
+    let entrypoint = infer_entrypoint(dir).ok_or_else(|| {
+        anyhow::anyhow!(
+            "capsule.toml not found and entrypoint could not be inferred. Add capsule.toml or run `ato init`."
+        )
+    })?;
+
+    Ok(format!(
+        r#"schema_version = "0.2"
+name = "{name}"
+version = "0.1.0"
+type = "app"
+default_target = "cli"
+
+[metadata]
+description = "Generated by zero-config build fallback"
+
+[targets.cli]
+runtime = "source"
+entrypoint = "{entrypoint}"
+"#,
+        name = toml_escape(&name),
+        entrypoint = toml_escape(entrypoint),
+    ))
+}
+
+fn sanitize_kebab_case(input: &str) -> String {
+    input
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+fn infer_entrypoint(dir: &Path) -> Option<&'static str> {
+    let candidates = ["main.py", "app.py", "index.js", "main.rs", "main.sh"];
+    candidates
+        .into_iter()
+        .find(|candidate| dir.join(candidate).exists())
+}
+
+fn toml_escape(input: &str) -> String {
+    input
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
 }
 
 fn handle_failed_artifact(

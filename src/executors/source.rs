@@ -36,6 +36,11 @@ pub fn execute(
     mode: ExecuteMode,
     ipc_env: Option<&IpcEnvVars>,
 ) -> Result<CapsuleProcess> {
+    let force_python_no_bytecode = plan
+        .execution_entrypoint()
+        .map(|entry| entry.trim().to_ascii_lowercase().ends_with(".py"))
+        .unwrap_or(false);
+
     let nacelle = engine::discover_nacelle(engine::EngineRequest {
         explicit_path: nacelle_override.clone(),
         manifest_path: Some(plan.manifest_path.clone()),
@@ -102,6 +107,7 @@ pub fn execute(
                 reporter.clone(),
                 mode,
                 ipc_env,
+                force_python_no_bytecode,
             ))
         })?,
         Rt::Owned(runtime) => runtime.block_on(run_bundle(
@@ -110,6 +116,7 @@ pub fn execute(
             reporter.clone(),
             mode,
             ipc_env,
+            force_python_no_bytecode,
         ))?,
     };
 
@@ -122,6 +129,7 @@ async fn run_bundle(
     reporter: std::sync::Arc<CliReporter>,
     mode: ExecuteMode,
     ipc_env: Option<&IpcEnvVars>,
+    force_python_no_bytecode: bool,
 ) -> Result<Child> {
     let mut cmd = Command::new(bundle_path);
     cmd.current_dir(manifest_dir);
@@ -129,12 +137,8 @@ async fn run_bundle(
         proxy::apply_proxy_env(&mut cmd, &proxy_env);
     }
 
-    // Inject IPC environment variables (CAPSULE_IPC_* )
-    if let Some(env) = ipc_env {
-        for (key, value) in env {
-            cmd.env(key, value);
-        }
-    }
+    apply_allowlisted_session_env(&mut cmd, ipc_env)?;
+    apply_python_runtime_hardening(&mut cmd, force_python_no_bytecode);
 
     match mode {
         ExecuteMode::Foreground => {
@@ -154,6 +158,38 @@ async fn run_bundle(
         .with_context(|| format!("Failed to execute bundle: {}", bundle_path.display()))?;
 
     Ok(child)
+}
+
+fn apply_python_runtime_hardening(cmd: &mut Command, force_python_no_bytecode: bool) {
+    if force_python_no_bytecode {
+        cmd.env("PYTHONDONTWRITEBYTECODE", "1");
+    }
+}
+
+pub fn apply_allowlisted_session_env(
+    cmd: &mut Command,
+    ipc_env: Option<&IpcEnvVars>,
+) -> Result<()> {
+    let Some(env) = ipc_env else {
+        return Ok(());
+    };
+
+    for (key, value) in env {
+        if key.starts_with("CAPSULE_IPC_") || key == "ATO_BRIDGE_TOKEN" {
+            cmd.env(key, value);
+            continue;
+        }
+
+        return Err(
+            capsule_core::execution_plan::error::AtoExecutionError::policy_violation(format!(
+                "session_token env '{}' is not allowlisted",
+                key
+            ))
+            .into(),
+        );
+    }
+
+    Ok(())
 }
 
 pub async fn wait_for_exit(child: &mut Child) -> Result<i32> {
@@ -176,5 +212,41 @@ fn extract_exit_code(metrics: &capsule_core::UnifiedMetrics) -> i32 {
     match &metrics.metadata {
         RuntimeMetadata::Nacelle { exit_code, .. } => (*exit_code).unwrap_or(1),
         _ => 1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_apply_python_runtime_hardening_sets_env() {
+        let mut cmd = Command::new("echo");
+        apply_python_runtime_hardening(&mut cmd, true);
+
+        let value = cmd
+            .get_envs()
+            .find_map(|(key, value)| {
+                if key == "PYTHONDONTWRITEBYTECODE" {
+                    value.map(|v| v.to_string_lossy().to_string())
+                } else {
+                    None
+                }
+            })
+            .expect("PYTHONDONTWRITEBYTECODE must be set");
+
+        assert_eq!(value, "1");
+    }
+
+    #[test]
+    fn test_apply_python_runtime_hardening_noop_when_disabled() {
+        let mut cmd = Command::new("echo");
+        apply_python_runtime_hardening(&mut cmd, false);
+
+        let has_var = cmd
+            .get_envs()
+            .any(|(key, _)| key == "PYTHONDONTWRITEBYTECODE");
+
+        assert!(!has_var, "PYTHONDONTWRITEBYTECODE must not be set");
     }
 }

@@ -687,12 +687,19 @@ fn resolve_command(
                 if tokens.len() <= 1 {
                     args = vec![program.clone()];
                 }
+                env.insert("PYTHONDONTWRITEBYTECODE".to_string(), "1".to_string());
                 if standalone {
                     env.insert("PYTHONHOME".to_string(), "runtime/python".to_string());
                     env.insert("PYTHONPATH".to_string(), "source".to_string());
                     ("runtime/python/bin/python3".to_string(), args)
                 } else {
-                    ("python3".to_string(), args)
+                    let mut uv_args = vec![
+                        "run".to_string(),
+                        "--offline".to_string(),
+                        "python3".to_string(),
+                    ];
+                    uv_args.extend(args);
+                    ("uv".to_string(), uv_args)
                 }
             }
             "node" => {
@@ -709,7 +716,7 @@ fn resolve_command(
             "deno" => {
                 let mut args = tokens.get(1..).unwrap_or(&[]).to_vec();
                 if tokens.len() <= 1 {
-                    args = vec![program.clone()];
+                    args = vec!["run".to_string(), "-A".to_string(), program.clone()];
                 }
                 if standalone {
                     ("runtime/deno/bin/deno".to_string(), args)
@@ -773,10 +780,8 @@ fn resolve_command(
 }
 
 fn read_language(manifest: &toml::Value) -> Option<String> {
-    manifest
-        .get("targets")
-        .and_then(|t| t.get("source"))
-        .and_then(|s| s.get("language"))
+    selected_target_table(manifest)
+        .and_then(|t| t.get("language"))
         .and_then(|l| l.as_str())
         .map(normalize_language)
 }
@@ -1072,9 +1077,16 @@ egress_allow = ["1.1.1.1"]
         let config_raw = std::fs::read_to_string(config_path).unwrap();
         let config: ConfigJson = serde_json::from_str(&config_raw).unwrap();
 
-        assert_eq!(config.services["main"].executable, "python3");
-        assert_eq!(config.services["main"].args, vec!["main.py"]);
+        assert_eq!(config.services["main"].executable, "uv");
+        assert_eq!(
+            config.services["main"].args,
+            vec!["run", "--offline", "python3", "main.py"]
+        );
         assert_eq!(config.services["main"].cwd, Some("source".to_string()));
+        assert_eq!(
+            config.services["main"].env.as_ref().unwrap()["PYTHONDONTWRITEBYTECODE"],
+            "1"
+        );
         assert_eq!(
             config.services["main"].env.as_ref().unwrap()["PORT"],
             "8080"
