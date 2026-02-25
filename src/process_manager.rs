@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::process::Command;
 use std::time::SystemTime;
 
 const RUN_DIR: &str = ".capsule/run";
@@ -162,25 +164,13 @@ impl ProcessManager {
             return Ok(false);
         }
 
-        let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
-
-        let result = unsafe { libc::kill(info.pid as i32, signal) };
-
-        if result == 0 {
+        if terminate_process(info.pid, force)? {
             wait_for_process_exit(info.pid, 10)?;
             self.delete_pid(id)?;
             Ok(true)
         } else {
-            let err = errno();
-            if err == libc::ESRCH {
-                self.delete_pid(id)?;
-                Ok(false)
-            } else {
-                Err(anyhow::anyhow!(
-                    "Failed to send signal to process {}",
-                    info.pid
-                ))
-            }
+            self.delete_pid(id)?;
+            Ok(false)
         }
     }
 
@@ -216,12 +206,41 @@ impl ProcessManager {
 }
 
 fn is_process_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+
+    #[cfg(unix)]
     unsafe {
         let result = libc::kill(pid as i32, 0);
-        result == 0 || errno() != libc::ESRCH
+        return result == 0 || errno() != libc::ESRCH;
+    }
+
+    #[cfg(windows)]
+    {
+        let output = Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {}", pid), "/FO", "CSV", "/NH"])
+            .output();
+
+        let Ok(output) = output else {
+            return false;
+        };
+        if !output.status.success() {
+            return false;
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let pid_marker = format!(",\"{}\",", pid);
+        return stdout.contains(&pid_marker) || stdout.contains(&format!(",\"{}\"", pid));
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
     }
 }
 
+#[cfg(unix)]
 fn errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
@@ -239,6 +258,58 @@ fn wait_for_process_exit(pid: i32, timeout_secs: u64) -> Result<()> {
         pid,
         timeout_secs
     )
+}
+
+fn terminate_process(pid: i32, force: bool) -> Result<bool> {
+    if pid <= 0 {
+        return Ok(false);
+    }
+
+    #[cfg(unix)]
+    {
+        let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
+        let result = unsafe { libc::kill(pid, signal) };
+        if result == 0 {
+            return Ok(true);
+        }
+
+        let err = errno();
+        if err == libc::ESRCH {
+            Ok(false)
+        } else {
+            Err(anyhow::anyhow!("Failed to send signal to process {}", pid))
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let mut command = Command::new("taskkill");
+        command.arg("/PID").arg(pid.to_string());
+        if force {
+            command.arg("/F");
+        }
+        let status = command
+            .status()
+            .with_context(|| format!("Failed to execute taskkill for PID {}", pid))?;
+
+        if status.success() {
+            return Ok(true);
+        }
+
+        if !is_process_alive(pid) {
+            Ok(false)
+        } else {
+            Err(anyhow::anyhow!("Failed to terminate process {}", pid))
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = force;
+        Err(anyhow::anyhow!(
+            "Process termination is not supported on this platform"
+        ))
+    }
 }
 
 pub fn get_process_uptime(start_time: SystemTime) -> Result<std::time::Duration> {
