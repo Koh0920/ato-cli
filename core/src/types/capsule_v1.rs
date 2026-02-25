@@ -777,7 +777,7 @@ pub struct NamedTarget {
     #[serde(default)]
     pub runtime: String,
 
-    /// Runtime driver (`browser_static`, `deno`, `node`, `python`, `wasmtime`, `native`).
+    /// Runtime driver (`static`, `deno`, `node`, `python`, `wasmtime`, `native`).
     ///
     /// If omitted, the driver is inferred from runtime and language.
     #[serde(default)]
@@ -799,9 +799,13 @@ pub struct NamedTarget {
     #[serde(default)]
     pub env: HashMap<String, String>,
 
-    /// Public asset allowlist for web runtime.
+    /// Legacy public asset allowlist (deprecated for runtime=web; rejected by validation).
     #[serde(default)]
     pub public: Vec<String>,
+
+    /// Optional listening port.
+    #[serde(default)]
+    pub port: Option<u16>,
 
     /// Optional working directory.
     #[serde(default)]
@@ -1149,17 +1153,73 @@ impl CapsuleManifestV1 {
                 errors.push(ValidationError::InvalidTarget(label));
                 continue;
             }
+            if runtime == "web" {
+                if !target.public.is_empty() {
+                    errors.push(ValidationError::InvalidWebTarget(
+                        label.clone(),
+                        "public is no longer supported for runtime=web".to_string(),
+                    ));
+                }
+
+                if target.port.is_none() {
+                    errors.push(ValidationError::InvalidWebTarget(
+                        label.clone(),
+                        "port is required for runtime=web".to_string(),
+                    ));
+                } else if target.port == Some(0) {
+                    errors.push(ValidationError::InvalidWebTarget(
+                        label.clone(),
+                        "port must be between 1 and 65535".to_string(),
+                    ));
+                }
+
+                let mut normalized_driver: Option<String> = None;
+                match target.driver.as_ref() {
+                    None => errors.push(ValidationError::InvalidWebTarget(
+                        label.clone(),
+                        "driver is required for runtime=web (static|node|deno|python)".to_string(),
+                    )),
+                    Some(driver) => {
+                        let normalized = driver.trim().to_ascii_lowercase();
+                        if matches!(normalized.as_str(), "browser_static" | "browser-static") {
+                            errors.push(ValidationError::InvalidWebTarget(
+                                label.clone(),
+                                "driver 'browser_static' has been removed; use 'static'"
+                                    .to_string(),
+                            ));
+                        } else if !matches!(
+                            normalized.as_str(),
+                            "static" | "node" | "deno" | "python"
+                        ) {
+                            errors.push(ValidationError::InvalidTargetDriver(
+                                label.clone(),
+                                driver.clone(),
+                            ));
+                        } else {
+                            normalized_driver = Some(normalized);
+                        }
+                    }
+                }
+
+                if matches!(
+                    normalized_driver.as_deref(),
+                    Some("node") | Some("deno") | Some("python")
+                ) && entrypoint.split_whitespace().count() > 1
+                {
+                    errors.push(ValidationError::InvalidWebTarget(
+                        label.clone(),
+                        "entrypoint must be a script file path (shell command strings are not allowed)"
+                            .to_string(),
+                    ));
+                }
+                continue;
+            }
+
             if let Some(driver) = target.driver.as_ref() {
                 let normalized = driver.trim().to_ascii_lowercase();
                 if !matches!(
                     normalized.as_str(),
-                    "browser_static"
-                        | "browser-static"
-                        | "deno"
-                        | "node"
-                        | "python"
-                        | "wasmtime"
-                        | "native"
+                    "static" | "deno" | "node" | "python" | "wasmtime" | "native"
                 ) {
                     errors.push(ValidationError::InvalidTargetDriver(
                         label.clone(),
@@ -1167,18 +1227,12 @@ impl CapsuleManifestV1 {
                     ));
                     continue;
                 }
-            }
-            if runtime == "web" {
-                if target.public.is_empty() {
-                    errors.push(ValidationError::InvalidWebTarget(
+                if normalized == "static" {
+                    errors.push(ValidationError::InvalidTargetDriver(
                         label.clone(),
-                        "public is required for runtime=web".to_string(),
+                        driver.clone(),
                     ));
-                } else if !target.public.iter().any(|p| p == entrypoint) {
-                    errors.push(ValidationError::InvalidWebTarget(
-                        label.clone(),
-                        "entrypoint must be included in public allowlist".to_string(),
-                    ));
+                    continue;
                 }
             }
         }
@@ -1347,7 +1401,7 @@ impl std::fmt::Display for ValidationError {
             ValidationError::InvalidTargetDriver(label, driver) => {
                 write!(
                     f,
-                    "Invalid target '{}': unsupported driver '{}' (allowed: browser_static|deno|node|python|wasmtime|native)",
+                    "Invalid target '{}': unsupported driver '{}' (allowed: static|deno|node|python|wasmtime|native)",
                     label, driver
                 )
             }
@@ -1506,6 +1560,97 @@ quantization = "4bit"
         assert!(errors
             .iter()
             .any(|e| matches!(e, ValidationError::InvalidTargetDriver(_, _))));
+    }
+
+    #[test]
+    fn test_validate_web_requires_driver_and_port() {
+        let toml = r#"
+schema_version = "0.2"
+name = "web-app"
+version = "0.1.0"
+type = "app"
+default_target = "static"
+
+[targets.static]
+runtime = "web"
+entrypoint = "dist"
+"#;
+        let manifest = CapsuleManifestV1::from_toml(toml).unwrap();
+        let errors = manifest.validate().unwrap_err();
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            ValidationError::InvalidWebTarget(_, msg) if msg.contains("driver is required")
+        )));
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            ValidationError::InvalidWebTarget(_, msg) if msg.contains("port is required")
+        )));
+    }
+
+    #[test]
+    fn test_validate_web_rejects_public_and_browser_static() {
+        let toml = r#"
+schema_version = "0.2"
+name = "web-app"
+version = "0.1.0"
+type = "app"
+default_target = "static"
+
+[targets.static]
+runtime = "web"
+driver = "browser_static"
+entrypoint = "dist"
+public = ["dist/**"]
+port = 8080
+"#;
+        let manifest = CapsuleManifestV1::from_toml(toml).unwrap();
+        let errors = manifest.validate().unwrap_err();
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            ValidationError::InvalidWebTarget(_, msg) if msg.contains("driver 'browser_static' has been removed")
+        )));
+    }
+
+    #[test]
+    fn test_validate_web_static_accepts_port_and_driver() {
+        let toml = r#"
+schema_version = "0.2"
+name = "web-app"
+version = "0.1.0"
+type = "app"
+default_target = "static"
+
+[targets.static]
+runtime = "web"
+driver = "static"
+entrypoint = "dist"
+port = 8080
+"#;
+        let manifest = CapsuleManifestV1::from_toml(toml).unwrap();
+        assert!(manifest.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_web_dynamic_rejects_shell_style_entrypoint() {
+        let toml = r#"
+schema_version = "0.2"
+name = "web-app"
+version = "0.1.0"
+type = "app"
+default_target = "web"
+
+[targets.web]
+runtime = "web"
+driver = "node"
+entrypoint = "npm run start"
+port = 3000
+"#;
+        let manifest = CapsuleManifestV1::from_toml(toml).unwrap();
+        let errors = manifest.validate().unwrap_err();
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            ValidationError::InvalidWebTarget(_, msg) if msg.contains("shell command strings are not allowed")
+        )));
     }
 
     #[test]

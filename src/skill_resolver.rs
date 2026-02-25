@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use capsule_core::execution_plan::error::AtoExecutionError;
 use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -19,6 +20,15 @@ fn resolve_skill_path_with_roots(skill_name: &str, cwd: &Path, home: &Path) -> R
         return Ok(workspace);
     }
 
+    let mcp_workspace = cwd
+        .join(".mcp")
+        .join("skills")
+        .join(skill_name)
+        .join("SKILL.md");
+    if mcp_workspace.is_file() {
+        return Ok(mcp_workspace);
+    }
+
     let global = home
         .join(".config")
         .join("agents")
@@ -33,14 +43,19 @@ fn resolve_skill_path_with_roots(skill_name: &str, cwd: &Path, home: &Path) -> R
         return Ok(store);
     }
 
-    anyhow::bail!(
-        "Skill '{}' not found. Searched:\n  - {}\n  - {}\n  - {}/.capsule/store/*/{}/<version>/source/SKILL.md",
-        skill_name,
-        workspace.display(),
-        global.display(),
-        home.display(),
-        skill_name
-    );
+    return Err(AtoExecutionError::skill_not_found(
+        format!(
+            "Skill '{}' not found. Searched in:\n  - {}\n  - {}\n  - {}\n  - {}/.capsule/store/*/{}/<version>/source/SKILL.md",
+            skill_name,
+            workspace.display(),
+            mcp_workspace.display(),
+            global.display(),
+            home.display(),
+            skill_name
+        ),
+        Some(skill_name),
+    )
+    .into());
 }
 
 fn resolve_from_capsule_store(skill_name: &str, home: &Path) -> Result<Option<PathBuf>> {
@@ -161,6 +176,23 @@ mod tests {
     }
 
     #[test]
+    fn resolves_mcp_workspace_when_agents_missing() {
+        let dir = tempdir().unwrap();
+        let home = tempdir().unwrap();
+        let path = dir
+            .path()
+            .join(".mcp")
+            .join("skills")
+            .join("demo")
+            .join("SKILL.md");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "# demo mcp").unwrap();
+
+        let resolved = resolve_skill_path_with_roots("demo", dir.path(), home.path()).unwrap();
+        assert_eq!(resolved, path);
+    }
+
+    #[test]
     fn resolves_latest_store_version() {
         let dir = tempdir().unwrap();
         let home = tempdir().unwrap();
@@ -189,5 +221,20 @@ mod tests {
 
         let resolved = resolve_skill_path_with_roots("demo", dir.path(), home.path()).unwrap();
         assert_eq!(resolved, v2);
+    }
+
+    #[test]
+    fn returns_structured_skill_not_found_error() {
+        let dir = tempdir().unwrap();
+        let home = tempdir().unwrap();
+
+        let err = resolve_skill_path_with_roots("missing-skill", dir.path(), home.path())
+            .expect_err("must fail when skill is absent");
+        let ato_err = err
+            .downcast_ref::<AtoExecutionError>()
+            .expect("must be AtoExecutionError");
+        assert_eq!(ato_err.code, "ATO_ERR_SKILL_NOT_FOUND");
+        assert_eq!(ato_err.resource.as_deref(), Some("skill"));
+        assert_eq!(ato_err.target.as_deref(), Some("missing-skill"));
     }
 }

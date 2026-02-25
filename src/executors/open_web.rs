@@ -1,218 +1,113 @@
 use anyhow::{Context, Result};
-use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use capsule_core::router::ManifestData;
-use capsule_core::CapsuleReporter;
 
 use crate::reporters::CliReporter;
 
-pub fn execute(plan: &ManifestData, reporter: std::sync::Arc<CliReporter>) -> Result<()> {
-    let entrypoint = plan
-        .execution_entrypoint()
-        .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| anyhow::anyhow!("runtime=web target requires entrypoint"))?;
-    let public = plan.targets_web_public();
-    if public.is_empty() {
+pub fn execute(plan: &ManifestData, _reporter: std::sync::Arc<CliReporter>) -> Result<()> {
+    let driver = plan
+        .execution_driver()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .ok_or_else(|| anyhow::anyhow!("runtime=web target requires driver"))?;
+    if driver != "static" {
         anyhow::bail!(
-            "runtime=web target '{}' requires non-empty public allowlist",
-            plan.selected_target_label()
+            "open_web executor only supports runtime=web driver=static (got '{}')",
+            driver
         );
     }
-    if !is_public_allowed(&entrypoint, &public) {
+
+    if which::which("deno").is_err() {
+        anyhow::bail!("deno is required for runtime=web driver=static execution");
+    }
+
+    let entrypoint = plan
+        .execution_entrypoint()
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("runtime=web target requires entrypoint"))?;
+    let port = plan.execution_port().ok_or_else(|| {
+        anyhow::anyhow!(
+            "runtime=web target '{}' requires targets.<label>.port",
+            plan.selected_target_label()
+        )
+    })?;
+
+    let serve_dir = resolve_static_serve_dir(&plan.manifest_dir, &entrypoint)?;
+    let args = build_deno_file_server_args(&serve_dir, port);
+
+    let status = Command::new("deno")
+        .args(&args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .context("Failed to launch deno file server for runtime=web static target")?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "deno file server exited with status {}",
+            status
+        ))
+    }
+}
+
+fn resolve_static_serve_dir(manifest_dir: &Path, entrypoint: &str) -> Result<PathBuf> {
+    let path = manifest_dir.join(entrypoint.trim());
+    if !path.exists() || !path.is_dir() {
         anyhow::bail!(
-            "runtime=web target '{}' requires entrypoint '{}' to be included in public allowlist",
-            plan.selected_target_label(),
+            "runtime=web static entrypoint '{}' must be an existing directory",
             entrypoint
         );
     }
 
-    let listener = TcpListener::bind("127.0.0.1:0").context("Failed to bind local web server")?;
-    let addr = listener
-        .local_addr()
-        .context("Failed to resolve local web server address")?;
+    let root = manifest_dir
+        .canonicalize()
+        .unwrap_or_else(|_| manifest_dir.to_path_buf());
+    let canonical_path = path
+        .canonicalize()
+        .with_context(|| format!("Failed to resolve static entrypoint path '{}'", entrypoint))?;
 
-    let entry_uri = normalize_web_path(&entrypoint);
-    let url = format!("http://127.0.0.1:{}{}", addr.port(), entry_uri);
-    futures::executor::block_on(reporter.notify(format!(
-        "🌐 Opening web target '{}' at {}",
-        plan.selected_target_label(),
-        url
-    )))?;
-
-    let _ = try_open_browser(&url);
-
-    for stream in listener.incoming() {
-        let mut stream = match stream {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let _ = serve_request(
-            &mut stream,
-            &plan.manifest_dir,
-            &entrypoint,
-            &public,
-            plan.selected_target_label(),
+    if !canonical_path.starts_with(&root) {
+        anyhow::bail!(
+            "runtime=web static entrypoint '{}' resolves outside manifest directory",
+            entrypoint
         );
     }
 
-    Ok(())
+    Ok(canonical_path)
 }
 
-fn serve_request(
-    stream: &mut TcpStream,
-    root: &Path,
-    entrypoint: &str,
-    public: &[String],
-    target_label: &str,
-) -> Result<()> {
-    let mut first_line = String::new();
-    {
-        let mut reader = BufReader::new(stream.try_clone()?);
-        reader.read_line(&mut first_line)?;
-        // Drain headers.
-        loop {
-            let mut header = String::new();
-            let n = reader.read_line(&mut header)?;
-            if n == 0 || header == "\r\n" {
-                break;
-            }
-        }
-    }
-
-    let mut parts = first_line.split_whitespace();
-    let method = parts.next().unwrap_or("");
-    let raw_path = parts.next().unwrap_or("/");
-    if method != "GET" && method != "HEAD" {
-        write_response(stream, 405, "text/plain", b"Method Not Allowed")?;
-        return Ok(());
-    }
-
-    let path = if raw_path == "/" {
-        normalize_web_path(entrypoint)
-    } else {
-        raw_path.split('?').next().unwrap_or("/").to_string()
-    };
-
-    let cleaned = path.trim_start_matches('/');
-    if !is_safe_relative_path(cleaned) {
-        write_response(stream, 400, "text/plain", b"Bad Request")?;
-        return Ok(());
-    }
-
-    if !is_public_allowed(cleaned, public) {
-        let body = format!(
-            "Forbidden: '{}' is not public for target {}",
-            cleaned, target_label
-        );
-        write_response(stream, 403, "text/plain", body.as_bytes())?;
-        return Ok(());
-    }
-
-    let file_path = root.join(cleaned);
-    if !file_path.exists() || !file_path.is_file() {
-        write_response(stream, 404, "text/plain", b"Not Found")?;
-        return Ok(());
-    }
-
-    let mut body = Vec::new();
-    fs::File::open(&file_path)?.read_to_end(&mut body)?;
-    let content_type = mime_type_for(&file_path);
-    write_response(stream, 200, content_type, &body)?;
-    Ok(())
+fn build_deno_file_server_args(serve_dir: &Path, port: u16) -> Vec<String> {
+    vec![
+        "run".to_string(),
+        "--no-prompt".to_string(),
+        format!("--allow-read={}", serve_dir.to_string_lossy()),
+        format!("--allow-net=127.0.0.1:{port},localhost:{port}"),
+        "jsr:@std/http/file-server".to_string(),
+        serve_dir.to_string_lossy().to_string(),
+        "--host".to_string(),
+        "127.0.0.1".to_string(),
+        "--port".to_string(),
+        port.to_string(),
+        "--no-dir-listing".to_string(),
+    ]
 }
 
-fn write_response(
-    stream: &mut TcpStream,
-    status: u16,
-    content_type: &str,
-    body: &[u8],
-) -> Result<()> {
-    let status_text = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        403 => "Forbidden",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        _ => "Internal Server Error",
-    };
-    let headers = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-        status,
-        status_text,
-        content_type,
-        body.len()
-    );
-    stream.write_all(headers.as_bytes())?;
-    stream.write_all(body)?;
-    stream.flush()?;
-    Ok(())
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn is_safe_relative_path(path: &str) -> bool {
-    let p = Path::new(path);
-    !p.components().any(|c| {
-        matches!(
-            c,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        )
-    })
-}
-
-fn normalize_web_path(path: &str) -> String {
-    let trimmed = path.trim();
-    if trimmed.starts_with('/') {
-        trimmed.to_string()
-    } else {
-        format!("/{}", trimmed)
+    #[test]
+    fn deno_file_server_args_are_hardened_for_loopback_only() {
+        let args = build_deno_file_server_args(Path::new("/tmp/site"), 61357);
+        let rendered = args.join(" ");
+        assert!(rendered.contains("--allow-read=/tmp/site"));
+        assert!(rendered.contains("--allow-net=127.0.0.1:61357,localhost:61357"));
+        assert!(rendered.contains("--host 127.0.0.1"));
+        assert!(rendered.contains("--port 61357"));
+        assert!(rendered.contains("--no-dir-listing"));
     }
-}
-
-fn is_public_allowed(path: &str, public: &[String]) -> bool {
-    public.iter().any(|rule| {
-        let rule = rule.trim().trim_start_matches('/');
-        if rule.is_empty() {
-            return false;
-        }
-        if rule.ends_with("/**") {
-            let prefix = rule.trim_end_matches("/**").trim_end_matches('/');
-            path == prefix || path.starts_with(&format!("{}/", prefix))
-        } else {
-            path == rule
-        }
-    })
-}
-
-fn mime_type_for(path: &PathBuf) -> &'static str {
-    match path.extension().and_then(|s| s.to_str()).unwrap_or("") {
-        "html" => "text/html; charset=utf-8",
-        "js" | "mjs" => "application/javascript; charset=utf-8",
-        "css" => "text/css; charset=utf-8",
-        "json" => "application/json; charset=utf-8",
-        "svg" => "image/svg+xml",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "wasm" => "application/wasm",
-        _ => "application/octet-stream",
-    }
-}
-
-fn try_open_browser(url: &str) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("open").arg(url).spawn();
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let _ = std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .spawn();
-    }
-    Ok(())
 }

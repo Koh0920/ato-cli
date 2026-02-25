@@ -209,13 +209,25 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = EnforcementMode::Strict)]
         enforcement: EnforcementMode,
 
-        /// Explicitly allow Tier2 source/native execution (unsafe)
-        #[arg(long = "unsafe", default_value_t = false)]
-        unsafe_mode: bool,
+        /// Explicitly allow Tier2 (python/native) execution via native OS sandbox
+        #[arg(long = "sandbox", default_value_t = false)]
+        sandbox_mode: bool,
 
-        /// Legacy alias for `--unsafe`
+        /// Legacy alias for `--sandbox`
+        #[arg(long = "unsafe", hide = true, default_value_t = false)]
+        unsafe_mode_legacy: bool,
+
+        /// Legacy alias for `--sandbox`
         #[arg(long = "unsafe-bypass-sandbox", hide = true, default_value_t = false)]
-        unsafe_bypass_sandbox: bool,
+        unsafe_bypass_sandbox_legacy: bool,
+
+        /// Dangerously bypass all Ato runtime permission/sandbox barriers (host-native execution)
+        #[arg(
+            short = 'U',
+            long = "dangerously-skip-permissions",
+            default_value_t = false
+        )]
+        dangerously_skip_permissions: bool,
 
         /// Skip prompt and auto-install when app-id is not installed
         #[arg(short = 'y', long = "yes", default_value_t = false)]
@@ -525,13 +537,25 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = EnforcementMode::Strict)]
         enforcement: EnforcementMode,
 
-        /// Explicitly allow Tier2 source/native execution (unsafe)
-        #[arg(long = "unsafe", default_value_t = false)]
-        unsafe_mode: bool,
+        /// Explicitly allow Tier2 (python/native) execution via native OS sandbox
+        #[arg(long = "sandbox", default_value_t = false)]
+        sandbox_mode: bool,
 
-        /// Legacy alias for `--unsafe`
+        /// Legacy alias for `--sandbox`
+        #[arg(long = "unsafe", hide = true, default_value_t = false)]
+        unsafe_mode_legacy: bool,
+
+        /// Legacy alias for `--sandbox`
         #[arg(long = "unsafe-bypass-sandbox", hide = true, default_value_t = false)]
-        unsafe_bypass_sandbox: bool,
+        unsafe_bypass_sandbox_legacy: bool,
+
+        /// Dangerously bypass all Ato runtime permission/sandbox barriers (host-native execution)
+        #[arg(
+            short = 'U',
+            long = "dangerously-skip-permissions",
+            default_value_t = false
+        )]
+        dangerously_skip_permissions: bool,
 
         /// Skip prompt and auto-install when app-id is not installed
         #[arg(short = 'y', long = "yes", default_value_t = false)]
@@ -1163,8 +1187,10 @@ fn run() -> Result<()> {
             nacelle,
             registry,
             enforcement,
-            unsafe_mode,
-            unsafe_bypass_sandbox,
+            sandbox_mode,
+            unsafe_mode_legacy,
+            unsafe_bypass_sandbox_legacy,
+            dangerously_skip_permissions,
             yes,
             allow_unverified,
         } => execute_run_like_command(
@@ -1175,8 +1201,10 @@ fn run() -> Result<()> {
             nacelle,
             registry,
             enforcement,
-            unsafe_mode,
-            unsafe_bypass_sandbox,
+            sandbox_mode,
+            unsafe_mode_legacy,
+            unsafe_bypass_sandbox_legacy,
+            dangerously_skip_permissions,
             yes,
             allow_unverified,
             skill,
@@ -1205,8 +1233,10 @@ fn run() -> Result<()> {
             nacelle,
             registry,
             enforcement,
-            unsafe_mode,
-            unsafe_bypass_sandbox,
+            sandbox_mode,
+            unsafe_mode_legacy,
+            unsafe_bypass_sandbox_legacy,
+            dangerously_skip_permissions,
             yes,
         } => execute_run_like_command(
             path,
@@ -1216,8 +1246,10 @@ fn run() -> Result<()> {
             nacelle,
             registry,
             enforcement,
-            unsafe_mode,
-            unsafe_bypass_sandbox,
+            sandbox_mode,
+            unsafe_mode_legacy,
+            unsafe_bypass_sandbox_legacy,
+            dangerously_skip_permissions,
             yes,
             false,
             None,
@@ -1939,8 +1971,10 @@ fn execute_run_like_command(
     nacelle: Option<PathBuf>,
     registry: Option<String>,
     enforcement: EnforcementMode,
-    unsafe_mode: bool,
-    unsafe_bypass_sandbox: bool,
+    sandbox_mode: bool,
+    unsafe_mode_legacy: bool,
+    unsafe_bypass_sandbox_legacy: bool,
+    dangerously_skip_permissions: bool,
     yes: bool,
     allow_unverified: bool,
     skill: Option<String>,
@@ -1977,9 +2011,13 @@ fn execute_run_like_command(
             "Translated SKILL.md to capsule"
         );
 
-        let unsafe_requested = unsafe_mode || unsafe_bypass_sandbox;
-        let effective_enforcement =
-            enforce_sandbox_mode_flags(enforcement, unsafe_requested, reporter.clone())?;
+        let sandbox_requested = sandbox_mode || unsafe_mode_legacy || unsafe_bypass_sandbox_legacy;
+        let effective_enforcement = enforce_sandbox_mode_flags(
+            enforcement,
+            sandbox_requested,
+            dangerously_skip_permissions,
+            reporter.clone(),
+        )?;
         return execute_open_command(
             generated.manifest_path().to_path_buf(),
             target,
@@ -1987,7 +2025,8 @@ fn execute_run_like_command(
             background,
             nacelle,
             effective_enforcement,
-            unsafe_requested,
+            sandbox_requested,
+            dangerously_skip_permissions,
             yes,
             reporter,
         );
@@ -2001,9 +2040,13 @@ fn execute_run_like_command(
         reporter.clone(),
     ))?;
 
-    let unsafe_requested = unsafe_mode || unsafe_bypass_sandbox;
-    let effective_enforcement =
-        enforce_sandbox_mode_flags(enforcement, unsafe_requested, reporter.clone())?;
+    let sandbox_requested = sandbox_mode || unsafe_mode_legacy || unsafe_bypass_sandbox_legacy;
+    let effective_enforcement = enforce_sandbox_mode_flags(
+        enforcement,
+        sandbox_requested,
+        dangerously_skip_permissions,
+        reporter.clone(),
+    )?;
     execute_open_command(
         path,
         target,
@@ -2011,7 +2054,8 @@ fn execute_run_like_command(
         background,
         nacelle,
         effective_enforcement,
-        unsafe_requested,
+        sandbox_requested,
+        dangerously_skip_permissions,
         yes,
         reporter,
     )
@@ -2453,16 +2497,29 @@ fn compare_semver(a: &ParsedSemver, b: &ParsedSemver) -> Ordering {
 
 fn enforce_sandbox_mode_flags(
     enforcement: EnforcementMode,
-    unsafe_requested: bool,
+    sandbox_requested: bool,
+    dangerously_skip_permissions: bool,
     reporter: std::sync::Arc<reporters::CliReporter>,
 ) -> Result<EnforcementMode> {
     if matches!(enforcement, EnforcementMode::BestEffort) {
         anyhow::bail!("--enforcement best-effort is no longer supported; use --enforcement strict");
     }
 
-    if matches!(enforcement, EnforcementMode::Strict) && unsafe_requested {
+    if matches!(enforcement, EnforcementMode::Strict) && sandbox_requested {
         futures::executor::block_on(
-            reporter.warn("⚠️  Unsafe mode enabled: strict sandbox remains enabled".to_string()),
+            reporter.warn(
+                "⚠️  Sandbox mode enabled: Tier2 targets will run under strict native sandboxing"
+                    .to_string(),
+            ),
+        )?;
+    }
+
+    if dangerously_skip_permissions {
+        futures::executor::block_on(
+            reporter.warn(
+                "⚠️  Dangerous mode enabled: bypassing all Ato runtime permission and sandbox barriers"
+                    .to_string(),
+            ),
         )?;
     }
 
@@ -2476,7 +2533,8 @@ fn execute_open_command(
     background: bool,
     nacelle: Option<PathBuf>,
     enforcement: EnforcementMode,
-    unsafe_mode: bool,
+    sandbox_mode: bool,
+    dangerously_skip_permissions: bool,
     assume_yes: bool,
     reporter: std::sync::Arc<reporters::CliReporter>,
 ) -> Result<()> {
@@ -2496,7 +2554,8 @@ fn execute_open_command(
         background,
         nacelle,
         enforcement: enforcement.as_str().to_string(),
-        unsafe_mode,
+        sandbox_mode,
+        dangerously_skip_permissions,
         assume_yes,
         reporter,
     }))

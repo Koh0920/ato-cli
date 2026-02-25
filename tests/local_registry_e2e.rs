@@ -210,6 +210,70 @@ entrypoint = "main.ts"
 }
 
 #[test]
+fn e2e_local_registry_web_static_build_publish_install() -> Result<()> {
+    let ato = assert_cmd::cargo::cargo_bin("ato");
+    let tmp = TempDir::new().context("create temp dir")?;
+    let data_dir = tmp.path().join("registry-data");
+    let project_dir = tmp.path().join("web-static-project");
+    std::fs::create_dir_all(project_dir.join("dist"))?;
+
+    std::fs::write(
+        project_dir.join("capsule.toml"),
+        r#"schema_version = "0.2"
+name = "test-web-static"
+version = "1.0.0"
+type = "app"
+default_target = "static"
+
+[targets.static]
+runtime = "web"
+driver = "static"
+entrypoint = "dist"
+port = 8080
+"#,
+    )?;
+    std::fs::write(
+        project_dir.join("dist").join("index.html"),
+        r#"<!doctype html><title>web static</title>"#,
+    )?;
+
+    let (_guard, base_url) = start_local_registry(&ato, &data_dir)?;
+    build_publish_install(
+        &ato,
+        &project_dir,
+        &base_url,
+        "local/test-web-static",
+        "test-web-static",
+        tmp.path(),
+    )?;
+
+    let run = run_ato(
+        &ato,
+        &[
+            "run",
+            "local/test-web-static",
+            "--registry",
+            &base_url,
+            "--yes",
+        ],
+        tmp.path(),
+    )?;
+    assert!(
+        !run.status.success(),
+        "run should fail without consent in CI mode"
+    );
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        stderr.contains("ExecutionPlan consent missing")
+            || stderr.contains("ATO_ERR_POLICY_VIOLATION"),
+        "missing fail-closed consent error: {}",
+        stderr
+    );
+
+    Ok(())
+}
+
+#[test]
 fn e2e_local_registry_node_python_run_fail_closed() -> Result<()> {
     let ato = assert_cmd::cargo::cargo_bin("ato");
     let tmp = TempDir::new().context("create temp dir")?;
@@ -399,7 +463,7 @@ entrypoint = "main.py"
     )?;
     assert!(
         node_with_lock_run.status.success(),
-        "node with lock should run without --unsafe; stderr={}",
+        "node with lock should run without --sandbox; stderr={}",
         String::from_utf8_lossy(&node_with_lock_run.stderr)
     );
     let node_with_lock_stderr = String::from_utf8_lossy(&node_with_lock_run.stderr);
@@ -409,8 +473,8 @@ entrypoint = "main.py"
         node_with_lock_stderr
     );
     assert!(
-        !node_with_lock_stderr.contains("--unsafe"),
-        "node with lock should not require --unsafe; stderr={}",
+        !node_with_lock_stderr.contains("--sandbox"),
+        "node with lock should not require --sandbox; stderr={}",
         node_with_lock_stderr
     );
 
@@ -469,18 +533,18 @@ entrypoint = "main.py"
     )?;
     assert!(
         !python_with_lock_run.status.success(),
-        "python with lock without --unsafe must fail"
+        "python with lock without --sandbox must fail"
     );
     let python_with_lock_stderr = String::from_utf8_lossy(&python_with_lock_run.stderr);
     assert!(
         python_with_lock_stderr.contains("\"code\":\"ATO_ERR_POLICY_VIOLATION\""),
-        "expected policy violation JSONL for python without --unsafe; stderr={}",
+        "expected policy violation JSONL for python without --sandbox; stderr={}",
         python_with_lock_stderr
     );
     assert!(
         python_with_lock_stderr
-            .contains("source/native|python execution requires explicit --unsafe opt-in"),
-        "expected --unsafe requirement to be surfaced; stderr={}",
+            .contains("source/native|python execution requires explicit --sandbox opt-in"),
+        "expected --sandbox requirement to be surfaced; stderr={}",
         python_with_lock_stderr
     );
 
@@ -491,7 +555,7 @@ entrypoint = "main.py"
             "local/test-node-with-lock",
             "--registry",
             &base_url,
-            "--unsafe",
+            "--sandbox",
             "--yes",
         ],
         tmp.path(),
@@ -500,24 +564,24 @@ entrypoint = "main.py"
         String::from_utf8_lossy(&node_with_lock_unsafe_yes_run.stderr);
     assert!(
         node_with_lock_unsafe_yes_run.status.success(),
-        "node with lock should also run with --unsafe --yes; stderr={}",
+        "node with lock should also run with --sandbox --yes; stderr={}",
         node_with_lock_unsafe_yes_stderr
     );
     assert!(
         !node_with_lock_unsafe_yes_stderr.contains("\"code\":\"ATO_ERR_CONSENT_REQUIRED\""),
-        "unexpected consent-required in --unsafe --yes node run; stderr={}",
+        "unexpected consent-required in --sandbox --yes node run; stderr={}",
         node_with_lock_unsafe_yes_stderr
     );
     assert!(
         !node_with_lock_unsafe_yes_stderr
-            .contains("source/native|python execution requires explicit --unsafe opt-in"),
-        "unexpected unsafe requirement in --unsafe --yes node run; stderr={}",
+            .contains("source/native|python execution requires explicit --sandbox opt-in"),
+        "unexpected sandbox requirement in --sandbox --yes node run; stderr={}",
         node_with_lock_unsafe_yes_stderr
     );
     assert!(
         !node_with_lock_unsafe_yes_stderr
             .contains("package-lock.json is required for source/node Tier1 execution"),
-        "unexpected node lockfile error in --unsafe --yes node run; stderr={}",
+        "unexpected node lockfile error in --sandbox --yes node run; stderr={}",
         node_with_lock_unsafe_yes_stderr
     );
 
@@ -528,7 +592,7 @@ entrypoint = "main.py"
             "local/test-python-with-lock",
             "--registry",
             &base_url,
-            "--unsafe",
+            "--sandbox",
             "--yes",
         ],
         tmp.path(),
@@ -537,19 +601,19 @@ entrypoint = "main.py"
         String::from_utf8_lossy(&python_with_lock_unsafe_yes_run.stderr);
     assert!(
         !python_with_lock_unsafe_yes_stderr.contains("\"code\":\"ATO_ERR_CONSENT_REQUIRED\""),
-        "unexpected consent-required in --unsafe --yes python run; stderr={}",
+        "unexpected consent-required in --sandbox --yes python run; stderr={}",
         python_with_lock_unsafe_yes_stderr
     );
     assert!(
         !python_with_lock_unsafe_yes_stderr
-            .contains("source/native|python execution requires explicit --unsafe opt-in"),
-        "unexpected unsafe opt-in error in --unsafe --yes python run; stderr={}",
+            .contains("source/native|python execution requires explicit --sandbox opt-in"),
+        "unexpected sandbox opt-in error in --sandbox --yes python run; stderr={}",
         python_with_lock_unsafe_yes_stderr
     );
     assert!(
         !python_with_lock_unsafe_yes_stderr
             .contains("uv.lock is required for source/python execution"),
-        "unexpected uv.lock error in --unsafe --yes python run; stderr={}",
+        "unexpected uv.lock error in --sandbox --yes python run; stderr={}",
         python_with_lock_unsafe_yes_stderr
     );
 

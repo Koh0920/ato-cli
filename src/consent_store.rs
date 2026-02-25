@@ -20,13 +20,13 @@ struct ConsentRecord {
     approved_at: String,
 }
 
-pub fn require_consent(plan: &ExecutionPlan, _assume_yes: bool) -> Result<(), AtoExecutionError> {
+pub fn require_consent(plan: &ExecutionPlan, assume_yes: bool) -> Result<(), AtoExecutionError> {
     if is_zero_permission_plan(plan) {
         return Ok(());
     }
 
     let store = ConsentStore::new()?;
-    let key = ConsentRecord {
+    let record = ConsentRecord {
         scoped_id: plan.consent.key.scoped_id.clone(),
         version: plan.consent.key.version.clone(),
         target_label: plan.consent.key.target_label.clone(),
@@ -35,20 +35,23 @@ pub fn require_consent(plan: &ExecutionPlan, _assume_yes: bool) -> Result<(), At
         approved_at: String::new(),
     };
 
-    if store.is_consented(&key)? {
+    if store.is_consented(&record)? {
         return Ok(());
     }
 
-    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    if !interactive {
+    if assume_yes {
+        store.append_consent(record)?;
+        return Ok(());
+    }
+
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Err(AtoExecutionError::policy_violation(
-            "ExecutionPlan consent missing in non-interactive mode",
+            "ExecutionPlan consent missing in non-interactive mode. Re-run with -y/--yes to auto-approve.",
         ));
     }
 
     prompt_consent(plan)?;
-
-    store.append_consent(key)?;
+    store.append_consent(record)?;
     Ok(())
 }
 

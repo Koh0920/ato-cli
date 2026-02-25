@@ -20,6 +20,10 @@ need_cmd() {
   }
 }
 
+has_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
 detect_host_target() {
   local os arch
   os="$(uname -s)"
@@ -73,6 +77,7 @@ if [[ -z "$VERSION" ]]; then
 fi
 
 TARGETS="${TARGETS:-$(detect_host_target)}"
+HOST_TARGET="$(detect_host_target)"
 OUT_ROOT="${OUT_ROOT:-/tmp/ato-release}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 OUT_DIR="${OUT_ROOT%/}/${VERSION}"
@@ -90,7 +95,20 @@ for target in "${target_list[@]}"; do
 
   if [[ "$SKIP_BUILD" != "1" ]]; then
     rustup target add "$target"
-    cargo build --release --locked --target "$target" --manifest-path "$ATO_CLI_DIR/Cargo.toml"
+
+    # On macOS hosts, GNU/Linux cross builds often fail without a target GCC.
+    # If available, use cargo-zigbuild to provide a cross toolchain via Zig.
+    if [[ "$(uname -s)" == "Darwin" && "$target" == *"-unknown-linux-gnu" ]]; then
+      if has_cmd cargo-zigbuild && has_cmd zig; then
+        cargo zigbuild --release --locked --target "$target" --manifest-path "$ATO_CLI_DIR/Cargo.toml"
+      else
+        echo "error: missing cross toolchain for $target" >&2
+        echo "hint: install 'cargo-zigbuild' and 'zig', or install ${target%%-*}-linux-gnu-gcc" >&2
+        exit 1
+      fi
+    else
+      cargo build --release --locked --target "$target" --manifest-path "$ATO_CLI_DIR/Cargo.toml"
+    fi
   fi
 
   binary_path="$ATO_CLI_DIR/target/$target/release/ato"
@@ -99,7 +117,9 @@ for target in "${target_list[@]}"; do
     exit 1
   fi
 
-  "$binary_path" --version >/dev/null
+  if [[ "$target" == "$HOST_TARGET" ]]; then
+    "$binary_path" --version >/dev/null
+  fi
 
   staging_dir="$(mktemp -d)"
   cp "$binary_path" "$staging_dir/ato"

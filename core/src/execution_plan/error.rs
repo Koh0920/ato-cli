@@ -4,6 +4,8 @@ use thiserror::Error;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AtoErrorCode {
     AtoErrPolicyViolation,
+    AtoErrEngineMissing,
+    AtoErrSkillNotFound,
     AtoErrProvisioningLockIncomplete,
     AtoErrProvisioningTlsTrust,
     AtoErrStorageNoSpace,
@@ -16,6 +18,8 @@ impl AtoErrorCode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::AtoErrPolicyViolation => "ATO_ERR_POLICY_VIOLATION",
+            Self::AtoErrEngineMissing => "ATO_ERR_ENGINE_MISSING",
+            Self::AtoErrSkillNotFound => "ATO_ERR_SKILL_NOT_FOUND",
             Self::AtoErrProvisioningLockIncomplete => "ATO_ERR_PROVISIONING_LOCK_INCOMPLETE",
             Self::AtoErrProvisioningTlsTrust => "ATO_ERR_PROVISIONING_TLS_TRUST",
             Self::AtoErrStorageNoSpace => "ATO_ERR_STORAGE_NO_SPACE",
@@ -68,6 +72,26 @@ impl AtoExecutionError {
             AtoErrorCode::AtoErrProvisioningLockIncomplete,
             message,
             Some("lockfile"),
+            target,
+            None,
+        )
+    }
+
+    pub fn engine_missing(message: impl Into<String>, target: Option<&str>) -> Self {
+        Self::new(
+            AtoErrorCode::AtoErrEngineMissing,
+            message,
+            Some("engine"),
+            target,
+            None,
+        )
+    }
+
+    pub fn skill_not_found(message: impl Into<String>, target: Option<&str>) -> Self {
+        Self::new(
+            AtoErrorCode::AtoErrSkillNotFound,
+            message,
+            Some("skill"),
             target,
             None,
         )

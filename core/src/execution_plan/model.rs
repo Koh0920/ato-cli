@@ -37,7 +37,7 @@ impl ExecutionRuntime {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionDriver {
-    BrowserStatic,
+    Static,
     Deno,
     Node,
     Python,
@@ -48,7 +48,7 @@ pub enum ExecutionDriver {
 impl ExecutionDriver {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::BrowserStatic => "browser_static",
+            Self::Static => "static",
             Self::Deno => "deno",
             Self::Node => "node",
             Self::Python => "python",
@@ -59,7 +59,7 @@ impl ExecutionDriver {
 
     pub fn from_manifest(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "browser_static" | "browser-static" => Some(Self::BrowserStatic),
+            "static" => Some(Self::Static),
             "deno" => Some(Self::Deno),
             "node" | "nodejs" => Some(Self::Node),
             "python" | "python3" => Some(Self::Python),

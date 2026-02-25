@@ -6,5 +6,6 @@ default_target = "static"
 
 [targets.static]
 runtime = "web"
-public = ["index.html"]
-entrypoint = "../secret.html"
+driver = "static"
+entrypoint = "../secret"
+port = 8080

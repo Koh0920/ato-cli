@@ -30,7 +30,8 @@ pub struct OpenArgs {
     pub background: bool,
     pub nacelle: Option<PathBuf>,
     pub enforcement: String,
-    pub unsafe_mode: bool,
+    pub sandbox_mode: bool,
+    pub dangerously_skip_permissions: bool,
     pub assume_yes: bool,
     pub reporter: Arc<CliReporter>,
 }
@@ -163,7 +164,8 @@ async fn execute_capsule_file(args: &OpenArgs, capsule_path: &PathBuf) -> Result
         background: args.background,
         nacelle: args.nacelle.clone(),
         enforcement: args.enforcement.clone(),
-        unsafe_mode: args.unsafe_mode,
+        sandbox_mode: args.sandbox_mode,
+        dangerously_skip_permissions: args.dangerously_skip_permissions,
         assume_yes: args.assume_yes,
         reporter: args.reporter.clone(),
     };
@@ -369,7 +371,8 @@ async fn execute_normal_mode(args: OpenArgs) -> Result<()> {
         &execution_plan,
         &decision.plan.manifest_dir,
         &args.enforcement,
-        args.unsafe_mode,
+        args.sandbox_mode,
+        args.dangerously_skip_permissions,
     )?;
 
     crate::consent_store::require_consent(&execution_plan, args.assume_yes)?;
@@ -379,7 +382,8 @@ async fn execute_normal_mode(args: OpenArgs) -> Result<()> {
         driver = execution_plan.target.driver.as_str(),
         ?tier,
         executor = ?guard_result.executor_kind,
-        requires_unsafe_opt_in = guard_result.requires_unsafe_opt_in,
+        requires_sandbox_opt_in = guard_result.requires_sandbox_opt_in,
+        dangerously_skip_permissions = args.dangerously_skip_permissions,
         "ExecutionPlan resolved"
     );
 
@@ -432,18 +436,30 @@ async fn execute_normal_mode(args: OpenArgs) -> Result<()> {
         None
     };
 
+    if execution_plan.target.runtime == capsule_core::execution_plan::model::ExecutionRuntime::Web {
+        notify_web_endpoint(&decision.plan, &args.reporter).await?;
+    }
+
     match guard_result.executor_kind {
         ExecutorKind::Native => {
-            preflight_native_sandbox(args.nacelle.clone(), &decision.plan)?;
-
-            let mut process = crate::executors::source::execute(
-                &decision.plan,
-                args.nacelle,
-                args.reporter.clone(),
-                &args.enforcement,
-                mode,
-                ipc_env,
-            )?;
+            let mut process = if args.dangerously_skip_permissions {
+                crate::executors::source::execute_host(
+                    &decision.plan,
+                    args.reporter.clone(),
+                    mode,
+                    ipc_env,
+                )?
+            } else {
+                preflight_native_sandbox(args.nacelle.clone(), &decision.plan)?;
+                crate::executors::source::execute(
+                    &decision.plan,
+                    args.nacelle,
+                    args.reporter.clone(),
+                    &args.enforcement,
+                    mode,
+                    ipc_env,
+                )?
+            };
 
             if args.background {
                 let pid = process.child.id();
@@ -460,7 +476,11 @@ async fn execute_normal_mode(args: OpenArgs) -> Result<()> {
                         .to_string(),
                     pid: pid as i32,
                     status: crate::process_manager::ProcessStatus::Running,
-                    runtime: "nacelle".to_string(),
+                    runtime: if args.dangerously_skip_permissions {
+                        "host".to_string()
+                    } else {
+                        "nacelle".to_string()
+                    },
                     start_time: std::time::SystemTime::now(),
                     manifest_path: Some(decision.plan.manifest_path.clone()),
                 };
@@ -478,7 +498,9 @@ async fn execute_normal_mode(args: OpenArgs) -> Result<()> {
             }
 
             let exit_code = crate::executors::source::wait_for_exit(&mut process.child).await?;
-            let _ = std::fs::remove_file(&process.bundle_path);
+            if process.bundle_path.exists() {
+                let _ = std::fs::remove_file(&process.bundle_path);
+            }
 
             sidecar_cleanup.stop_now();
 
@@ -494,20 +516,29 @@ async fn execute_normal_mode(args: OpenArgs) -> Result<()> {
                 std::process::exit(exit);
             }
         }
-        ExecutorKind::BrowserStatic => {
+        ExecutorKind::WebStatic => {
             crate::executors::open_web::execute(&decision.plan, args.reporter.clone())?;
             sidecar_cleanup.stop_now();
         }
         ExecutorKind::Deno => {
-            let exit = crate::executors::deno::execute(&decision.plan, &execution_plan, ipc_env)?;
+            let exit = crate::executors::deno::execute(
+                &decision.plan,
+                &execution_plan,
+                ipc_env,
+                args.dangerously_skip_permissions,
+            )?;
             sidecar_cleanup.stop_now();
             if exit != 0 {
                 std::process::exit(exit);
             }
         }
         ExecutorKind::NodeCompat => {
-            let exit =
-                crate::executors::node_compat::execute(&decision.plan, &execution_plan, ipc_env)?;
+            let exit = crate::executors::node_compat::execute(
+                &decision.plan,
+                &execution_plan,
+                ipc_env,
+                args.dangerously_skip_permissions,
+            )?;
             sidecar_cleanup.stop_now();
             if exit != 0 {
                 std::process::exit(exit);
@@ -515,6 +546,26 @@ async fn execute_normal_mode(args: OpenArgs) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+async fn notify_web_endpoint(
+    plan: &capsule_core::router::ManifestData,
+    reporter: &Arc<CliReporter>,
+) -> Result<()> {
+    let port = plan.execution_port().ok_or_else(|| {
+        anyhow::anyhow!(
+            "runtime=web target '{}' requires targets.<label>.port",
+            plan.selected_target_label()
+        )
+    })?;
+    reporter
+        .notify(format!(
+            "🌐 Web target '{}' is available at http://127.0.0.1:{}/",
+            plan.selected_target_label(),
+            port
+        ))
+        .await?;
     Ok(())
 }
 
@@ -568,6 +619,12 @@ fn preflight_native_sandbox(
     let nacelle = capsule_core::engine::discover_nacelle(capsule_core::engine::EngineRequest {
         explicit_path: nacelle_override,
         manifest_path: Some(plan.manifest_path.clone()),
+    })
+    .map_err(|_| {
+        AtoExecutionError::engine_missing(
+            "Tier 2 execution requires 'nacelle' to be installed and registered (use --nacelle, NACELLE_PATH, or `ato engine register`).",
+            Some("nacelle"),
+        )
     })?;
     let response = capsule_core::engine::run_internal(
         &nacelle,
