@@ -1,7 +1,9 @@
+#[cfg(unix)]
 use std::path::PathBuf;
 
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(unix)]
 use tokio::net::UnixStream;
 use tonic::transport::{Channel, Endpoint};
 use tower::service_fn;
