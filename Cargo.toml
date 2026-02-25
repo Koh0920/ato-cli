@@ -55,7 +55,6 @@ wasi-common = "16.0"
 capnp = { version = "0.18", optional = true }
 chrono = { version = "0.4", default-features = true }
 thiserror = "2.0"
-bollard = "0.15"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 urlencoding = "2.1"
 hickory-resolver = "0.24"

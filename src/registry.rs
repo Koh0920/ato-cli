@@ -5,7 +5,7 @@
 //! - Well-known JSON endpoints
 //! - DHT/Git (future)
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -264,7 +264,7 @@ impl RegistryResolver {
     ///
     /// If the app_id contains a domain hint, use that.
     /// Otherwise, use the default registry.
-    pub async fn resolve_for_app(&self, app_id: &str) -> Result<RegistryInfo> {
+    pub async fn resolve_for_app(&self, _app_id: &str) -> Result<RegistryInfo> {
         // Check for domain hint in metadata (future)
         // For now, just return default
         self.fallbacks

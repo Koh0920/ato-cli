@@ -233,7 +233,7 @@ fn is_python_entrypoint(plan: &ManifestData, entrypoint: &str) -> bool {
 async fn run_bundle(
     bundle_path: &Path,
     manifest_dir: &Path,
-    reporter: std::sync::Arc<CliReporter>,
+    _reporter: std::sync::Arc<CliReporter>,
     mode: ExecuteMode,
     ipc_env: Option<&IpcEnvVars>,
     force_python_no_bytecode: bool,
