@@ -181,7 +181,60 @@ pub fn execute_pack_command(
             let _ = sign_if_requested(&result.artifact, key.as_ref(), reporter.clone())?;
         }
         capsule_core::router::RuntimeKind::Web => {
-            anyhow::bail!("runtime=web targets are not packable as executable runtime artifacts");
+            let driver = decision
+                .plan
+                .execution_driver()
+                .map(|v| v.trim().to_ascii_lowercase())
+                .ok_or_else(|| anyhow::anyhow!("runtime=web target requires driver"))?;
+
+            let artifact_path = if driver == "static" {
+                if standalone {
+                    anyhow::bail!("--standalone is not supported for runtime=web driver=static");
+                }
+                capsule_core::packers::web::pack(
+                    &decision.plan,
+                    capsule_core::packers::web::WebPackOptions {
+                        manifest_path: manifest.clone(),
+                        manifest_dir: manifest_dir.clone(),
+                        output: None,
+                    },
+                    reporter.clone(),
+                )?
+            } else {
+                let artifact = capsule_core::packers::source::pack(
+                    &decision.plan,
+                    capsule_core::packers::source::SourcePackOptions {
+                        manifest_path: manifest.clone(),
+                        manifest_dir: manifest_dir.clone(),
+                        output: None,
+                        runtime: None,
+                        skip_l1: false,
+                        skip_validation: false,
+                        enforcement: enforcement.clone(),
+                        nacelle_override,
+                        standalone,
+                    },
+                    reporter.clone(),
+                )?;
+
+                if standalone {
+                    futures::executor::block_on(
+                        reporter.warn(
+                            "⚠️  Phase 1: --standalone build is not smoke-tested yet (planned in next phase)"
+                                .to_string(),
+                        ),
+                    )?;
+                }
+                artifact
+            };
+
+            let _ = sign_if_requested(&artifact_path, key.as_ref(), reporter.clone())?;
+            let size = std::fs::metadata(&artifact_path)?.len();
+            futures::executor::block_on(reporter.notify(format!(
+                "✅ Successfully built: {} ({:.1} KB)",
+                artifact_path.display(),
+                size as f64 / 1024.0
+            )))?;
         }
     }
 

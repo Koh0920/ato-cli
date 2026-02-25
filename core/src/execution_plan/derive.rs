@@ -74,10 +74,24 @@ pub fn compile_execution_plan(
         .as_ref()
         .map(|network| network.egress_allow.clone())
         .unwrap_or_default();
+
+    if matches!(runtime, ExecutionRuntime::Web) {
+        let port = decision.plan.execution_port().ok_or_else(|| {
+            AtoExecutionError::policy_violation(format!(
+                "targets.{}.port is required for runtime=web",
+                selected_target_label
+            ))
+        })?;
+        allow_hosts.push(format!("127.0.0.1:{port}"));
+        allow_hosts.push(format!("localhost:{port}"));
+    }
     allow_hosts = normalize_unordered_set(&allow_hosts);
 
-    let read_only_raw = if matches!(runtime, ExecutionRuntime::Web) {
-        named_target.public.clone()
+    let read_only_raw = if matches!(
+        (runtime, driver),
+        (ExecutionRuntime::Web, ExecutionDriver::Static)
+    ) {
+        vec![named_target.entrypoint.clone()]
     } else {
         Vec::new()
     };
@@ -113,6 +127,9 @@ pub fn compile_execution_plan(
             (ExecutionRuntime::Source, ExecutionDriver::Deno)
                 | (ExecutionRuntime::Source, ExecutionDriver::Node)
                 | (ExecutionRuntime::Source, ExecutionDriver::Python)
+                | (ExecutionRuntime::Web, ExecutionDriver::Deno)
+                | (ExecutionRuntime::Web, ExecutionDriver::Node)
+                | (ExecutionRuntime::Web, ExecutionDriver::Python)
         ),
         integrity_required: matches!(tier, ExecutionTier::Tier1),
         allowed_registries: allow_hosts,
@@ -174,7 +191,7 @@ fn resolve_driver(
     let parsed = explicit_driver.map(|value| {
         ExecutionDriver::from_manifest(value).ok_or_else(|| {
             AtoExecutionError::policy_violation(format!(
-                "unsupported driver '{}' (allowed: browser_static|deno|node|python|wasmtime|native)",
+                "unsupported driver '{}' (allowed: static|deno|node|python|wasmtime|native)",
                 value
             ))
         })
@@ -185,8 +202,14 @@ fn resolve_driver(
         None => None,
     };
 
+    if matches!(runtime, ExecutionRuntime::Web) && parsed.is_none() {
+        return Err(AtoExecutionError::policy_violation(
+            "runtime=web requires explicit driver (static|node|deno|python)",
+        ));
+    }
+
     let inferred = match runtime {
-        ExecutionRuntime::Web => ExecutionDriver::BrowserStatic,
+        ExecutionRuntime::Web => ExecutionDriver::Static,
         ExecutionRuntime::Wasm => ExecutionDriver::Wasmtime,
         ExecutionRuntime::Source => {
             match language
@@ -213,7 +236,10 @@ fn resolve_driver(
     let chosen = parsed.unwrap_or(inferred);
 
     match (runtime, chosen) {
-        (ExecutionRuntime::Web, ExecutionDriver::BrowserStatic)
+        (ExecutionRuntime::Web, ExecutionDriver::Static)
+        | (ExecutionRuntime::Web, ExecutionDriver::Deno)
+        | (ExecutionRuntime::Web, ExecutionDriver::Node)
+        | (ExecutionRuntime::Web, ExecutionDriver::Python)
         | (ExecutionRuntime::Wasm, ExecutionDriver::Wasmtime)
         | (ExecutionRuntime::Source, ExecutionDriver::Deno)
         | (ExecutionRuntime::Source, ExecutionDriver::Node)
@@ -232,11 +258,14 @@ pub fn derive_tier(
     driver: ExecutionDriver,
 ) -> Result<ExecutionTier, AtoExecutionError> {
     match (runtime, driver) {
-        (ExecutionRuntime::Web, ExecutionDriver::BrowserStatic)
+        (ExecutionRuntime::Web, ExecutionDriver::Static)
+        | (ExecutionRuntime::Web, ExecutionDriver::Deno)
+        | (ExecutionRuntime::Web, ExecutionDriver::Node)
         | (ExecutionRuntime::Source, ExecutionDriver::Deno)
         | (ExecutionRuntime::Source, ExecutionDriver::Node)
         | (ExecutionRuntime::Wasm, ExecutionDriver::Wasmtime) => Ok(ExecutionTier::Tier1),
-        (ExecutionRuntime::Source, ExecutionDriver::Python)
+        (ExecutionRuntime::Web, ExecutionDriver::Python)
+        | (ExecutionRuntime::Source, ExecutionDriver::Python)
         | (ExecutionRuntime::Source, ExecutionDriver::Native) => Ok(ExecutionTier::Tier2),
         _ => Err(AtoExecutionError::policy_violation(format!(
             "unable to derive tier from runtime='{}' driver='{}'",
@@ -273,8 +302,20 @@ mod tests {
     #[test]
     fn tier_derivation_accepts_supported_pairs() {
         assert!(matches!(
-            derive_tier(ExecutionRuntime::Web, ExecutionDriver::BrowserStatic).unwrap(),
+            derive_tier(ExecutionRuntime::Web, ExecutionDriver::Static).unwrap(),
             ExecutionTier::Tier1
+        ));
+        assert!(matches!(
+            derive_tier(ExecutionRuntime::Web, ExecutionDriver::Node).unwrap(),
+            ExecutionTier::Tier1
+        ));
+        assert!(matches!(
+            derive_tier(ExecutionRuntime::Web, ExecutionDriver::Deno).unwrap(),
+            ExecutionTier::Tier1
+        ));
+        assert!(matches!(
+            derive_tier(ExecutionRuntime::Web, ExecutionDriver::Python).unwrap(),
+            ExecutionTier::Tier2
         ));
         assert!(matches!(
             derive_tier(ExecutionRuntime::Source, ExecutionDriver::Deno).unwrap(),
@@ -328,6 +369,13 @@ mod tests {
     fn driver_resolution_rejects_mismatch() {
         let err = resolve_driver(ExecutionRuntime::Web, Some("native"), None).unwrap_err();
         assert_eq!(err.code, "ATO_ERR_POLICY_VIOLATION");
+    }
+
+    #[test]
+    fn driver_resolution_requires_explicit_driver_for_web() {
+        let err = resolve_driver(ExecutionRuntime::Web, None, None).unwrap_err();
+        assert_eq!(err.code, "ATO_ERR_POLICY_VIOLATION");
+        assert!(err.message.contains("requires explicit driver"));
     }
 
     #[test]

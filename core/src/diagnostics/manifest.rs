@@ -33,24 +33,67 @@ pub fn validate_manifest_for_build(
             )
         })?;
 
+    let runtime = target
+        .get("runtime")
+        .and_then(|v| v.as_str())
+        .map(|v| v.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let driver = target
+        .get("driver")
+        .and_then(|v| v.as_str())
+        .map(|v| v.trim().to_ascii_lowercase());
+
     let clean_entrypoint = entrypoint.trim_start_matches("./");
-    if clean_entrypoint.contains('/') || clean_entrypoint.contains('\\') {
-        let path_in_root = manifest_dir.join(clean_entrypoint);
-        let path_in_source = manifest_dir.join("source").join(clean_entrypoint);
-        if !path_in_root.exists() && !path_in_source.exists() {
+    if runtime == "web" {
+        let driver = driver.ok_or_else(|| {
+            manifest_err(
+                manifest_path,
+                format!(
+                    "targets.{target_label}.driver is required for runtime=web (static|node|deno|python)"
+                ),
+            )
+        })?;
+        if matches!(driver.as_str(), "browser_static" | "browser-static") {
             return Err(manifest_err(
                 manifest_path,
                 format!(
-                    "entrypoint not found: targets.{target_label}.entrypoint='{}'. Checked '{}' and '{}'",
-                    entrypoint,
-                    path_in_root.display(),
-                    path_in_source.display()
+                    "targets.{target_label}.driver='{}' is not supported. Use 'static'",
+                    driver
                 ),
             ));
         }
-    }
+        if !matches!(driver.as_str(), "static" | "node" | "deno" | "python") {
+            return Err(manifest_err(
+                manifest_path,
+                format!(
+                    "targets.{target_label}.driver='{}' is invalid for runtime=web (allowed: static|node|deno|python)",
+                    driver
+                ),
+            ));
+        }
+        if target.get("public").is_some() {
+            return Err(manifest_err(
+                manifest_path,
+                format!("targets.{target_label}.public is no longer supported"),
+            ));
+        }
 
-    if let Some(port_raw) = target.get("port") {
+        if !is_safe_relative_path(clean_entrypoint) {
+            return Err(manifest_err(
+                manifest_path,
+                format!(
+                    "targets.{target_label}.entrypoint='{}' must be a safe relative path",
+                    entrypoint
+                ),
+            ));
+        }
+
+        let port_raw = target.get("port").ok_or_else(|| {
+            manifest_err(
+                manifest_path,
+                format!("targets.{target_label}.port is required for runtime=web"),
+            )
+        })?;
         let port = port_raw.as_integer().ok_or_else(|| {
             manifest_err(
                 manifest_path,
@@ -62,6 +105,78 @@ pub fn validate_manifest_for_build(
                 manifest_path,
                 format!("targets.{target_label}.port must be between 1 and 65535"),
             ));
+        }
+
+        let path_in_root = manifest_dir.join(clean_entrypoint);
+        let path_in_source = manifest_dir.join("source").join(clean_entrypoint);
+        match driver.as_str() {
+            "static" => {
+                if !path_in_root.exists() || !path_in_root.is_dir() {
+                    return Err(manifest_err(
+                        manifest_path,
+                        format!(
+                            "targets.{target_label}.entrypoint='{}' must be an existing directory under project root ('{}')",
+                            entrypoint,
+                            path_in_root.display()
+                        ),
+                    ));
+                }
+            }
+            "node" | "deno" | "python" => {
+                if entrypoint.split_whitespace().count() > 1 {
+                    return Err(manifest_err(
+                        manifest_path,
+                        format!(
+                            "targets.{target_label}.entrypoint must be a script file path (shell command strings are not allowed)"
+                        ),
+                    ));
+                }
+                if (!path_in_root.exists() || !path_in_root.is_file())
+                    && (!path_in_source.exists() || !path_in_source.is_file())
+                {
+                    return Err(manifest_err(
+                        manifest_path,
+                        format!(
+                            "entrypoint file not found: targets.{target_label}.entrypoint='{}'. Checked '{}' and '{}'",
+                            entrypoint,
+                            path_in_root.display(),
+                            path_in_source.display()
+                        ),
+                    ));
+                }
+            }
+            _ => unreachable!(),
+        }
+    } else {
+        if clean_entrypoint.contains('/') || clean_entrypoint.contains('\\') {
+            let path_in_root = manifest_dir.join(clean_entrypoint);
+            let path_in_source = manifest_dir.join("source").join(clean_entrypoint);
+            if !path_in_root.exists() && !path_in_source.exists() {
+                return Err(manifest_err(
+                    manifest_path,
+                    format!(
+                        "entrypoint not found: targets.{target_label}.entrypoint='{}'. Checked '{}' and '{}'",
+                        entrypoint,
+                        path_in_root.display(),
+                        path_in_source.display()
+                    ),
+                ));
+            }
+        }
+
+        if let Some(port_raw) = target.get("port") {
+            let port = port_raw.as_integer().ok_or_else(|| {
+                manifest_err(
+                    manifest_path,
+                    format!("targets.{target_label}.port must be an integer"),
+                )
+            })?;
+            if !(1..=65535).contains(&port) {
+                return Err(manifest_err(
+                    manifest_path,
+                    format!("targets.{target_label}.port must be between 1 and 65535"),
+                ));
+            }
         }
     }
 
@@ -125,6 +240,16 @@ fn manifest_err(path: &Path, message: String) -> CapsuleError {
     CapsuleError::Manifest(path.to_path_buf(), message)
 }
 
+fn is_safe_relative_path(path: &str) -> bool {
+    use std::path::Component;
+    !Path::new(path).components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,5 +305,62 @@ check_commands = ["python -V"]
         std::fs::write(dir.path().join("main.py"), "print('ok')").unwrap();
 
         assert!(validate_manifest_for_build(&manifest_path, "cli").is_ok());
+    }
+
+    #[test]
+    fn web_static_requires_existing_directory_entrypoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("capsule.toml");
+        std::fs::write(
+            &manifest_path,
+            r#"
+schema_version = "0.2"
+name = "web-static"
+version = "0.1.0"
+default_target = "static"
+
+[targets.static]
+runtime = "web"
+driver = "static"
+entrypoint = "dist"
+port = 8080
+"#,
+        )
+        .unwrap();
+
+        let err = validate_manifest_for_build(&manifest_path, "static").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("must be an existing directory under project root"));
+
+        std::fs::create_dir_all(dir.path().join("dist")).unwrap();
+        assert!(validate_manifest_for_build(&manifest_path, "static").is_ok());
+    }
+
+    #[test]
+    fn web_dynamic_rejects_shell_style_entrypoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("capsule.toml");
+        std::fs::write(
+            &manifest_path,
+            r#"
+schema_version = "0.2"
+name = "web-node"
+version = "0.1.0"
+default_target = "web"
+
+[targets.web]
+runtime = "web"
+driver = "node"
+entrypoint = "npm run start"
+port = 3000
+"#,
+        )
+        .unwrap();
+
+        let err = validate_manifest_for_build(&manifest_path, "web").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("entrypoint must be a script file path"));
     }
 }

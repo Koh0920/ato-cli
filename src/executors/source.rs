@@ -40,6 +40,12 @@ pub fn execute(
         .execution_entrypoint()
         .map(|entry| entry.trim().to_ascii_lowercase().ends_with(".py"))
         .unwrap_or(false);
+    let injected_port = plan
+        .execution_runtime()
+        .map(|runtime| runtime.trim().eq_ignore_ascii_case("web"))
+        .unwrap_or(false)
+        .then(|| plan.execution_port().map(|port| port.to_string()))
+        .flatten();
 
     let nacelle = engine::discover_nacelle(engine::EngineRequest {
         explicit_path: nacelle_override.clone(),
@@ -108,6 +114,7 @@ pub fn execute(
                 mode,
                 ipc_env,
                 force_python_no_bytecode,
+                injected_port.as_deref(),
             ))
         })?,
         Rt::Owned(runtime) => runtime.block_on(run_bundle(
@@ -117,10 +124,110 @@ pub fn execute(
             mode,
             ipc_env,
             force_python_no_bytecode,
+            injected_port.as_deref(),
         ))?,
     };
 
     Ok(CapsuleProcess { child, bundle_path })
+}
+
+pub fn execute_host(
+    plan: &ManifestData,
+    _reporter: std::sync::Arc<CliReporter>,
+    mode: ExecuteMode,
+    ipc_env: Option<&IpcEnvVars>,
+) -> Result<CapsuleProcess> {
+    let entrypoint = plan
+        .execution_entrypoint()
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| {
+            capsule_core::execution_plan::error::AtoExecutionError::policy_violation(
+                "source/native target requires entrypoint",
+            )
+        })?;
+
+    let runtime_dir = resolve_runtime_dir(&plan.manifest_dir, &entrypoint);
+    let entrypoint_path = if Path::new(&entrypoint).is_absolute() {
+        PathBuf::from(&entrypoint)
+    } else {
+        runtime_dir.join(&entrypoint)
+    };
+    let force_python_no_bytecode = is_python_entrypoint(plan, &entrypoint);
+    let injected_port = plan
+        .execution_runtime()
+        .map(|runtime| runtime.trim().eq_ignore_ascii_case("web"))
+        .unwrap_or(false)
+        .then(|| plan.execution_port().map(|port| port.to_string()))
+        .flatten();
+
+    let mut cmd = if force_python_no_bytecode {
+        let mut python = Command::new("python");
+        python.arg(&entrypoint);
+        python
+    } else {
+        Command::new(entrypoint_path)
+    };
+
+    cmd.current_dir(&runtime_dir);
+    if let Some(proxy_env) = proxy::proxy_env_from_env(&[])? {
+        proxy::apply_proxy_env(&mut cmd, &proxy_env);
+    }
+    apply_allowlisted_session_env(&mut cmd, ipc_env)?;
+    apply_python_runtime_hardening(&mut cmd, force_python_no_bytecode);
+
+    for (key, value) in plan.execution_env() {
+        cmd.env(key, value);
+    }
+    if let Some(port) = injected_port {
+        cmd.env("PORT", port);
+    }
+
+    let args = plan.targets_oci_cmd();
+    if !args.is_empty() {
+        cmd.args(args);
+    }
+
+    match mode {
+        ExecuteMode::Foreground => {
+            cmd.stdin(std::process::Stdio::inherit());
+            cmd.stdout(std::process::Stdio::inherit());
+            cmd.stderr(std::process::Stdio::inherit());
+        }
+        ExecuteMode::Background => {
+            cmd.stdin(std::process::Stdio::null());
+            cmd.stdout(std::process::Stdio::null());
+            cmd.stderr(std::process::Stdio::null());
+        }
+    }
+
+    let child = cmd
+        .spawn()
+        .context("Failed to execute host process with --dangerously-skip-permissions")?;
+
+    Ok(CapsuleProcess {
+        child,
+        bundle_path: PathBuf::new(),
+    })
+}
+
+fn resolve_runtime_dir(manifest_dir: &Path, entrypoint: &str) -> PathBuf {
+    let source_dir = manifest_dir.join("source");
+    if source_dir.is_dir() && source_dir.join(entrypoint).exists() {
+        return source_dir;
+    }
+    manifest_dir.to_path_buf()
+}
+
+fn is_python_entrypoint(plan: &ManifestData, entrypoint: &str) -> bool {
+    if plan
+        .execution_driver()
+        .map(|driver| driver.trim().eq_ignore_ascii_case("python"))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    entrypoint.trim().to_ascii_lowercase().ends_with(".py")
 }
 
 async fn run_bundle(
@@ -130,6 +237,7 @@ async fn run_bundle(
     mode: ExecuteMode,
     ipc_env: Option<&IpcEnvVars>,
     force_python_no_bytecode: bool,
+    injected_port: Option<&str>,
 ) -> Result<Child> {
     let mut cmd = Command::new(bundle_path);
     cmd.current_dir(manifest_dir);
@@ -139,6 +247,9 @@ async fn run_bundle(
 
     apply_allowlisted_session_env(&mut cmd, ipc_env)?;
     apply_python_runtime_hardening(&mut cmd, force_python_no_bytecode);
+    if let Some(port) = injected_port {
+        cmd.env("PORT", port);
+    }
 
     match mode {
         ExecuteMode::Foreground => {

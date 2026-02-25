@@ -311,28 +311,9 @@ fn build_config_json(
 }
 
 fn validate_config_json(config: &ConfigJson) -> Result<()> {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let candidate_paths = [
-        manifest_dir.join("../schema/config-schema.json"),
-        manifest_dir.join("../../schema/config-schema.json"),
-        manifest_dir.join("schema/config-schema.json"),
-        manifest_dir.join("src/schema/config-schema.json"),
-    ];
-
-    let schema_raw = candidate_paths
-        .iter()
-        .find_map(|path| std::fs::read_to_string(path).ok())
-        .with_context(|| {
-            let tried = candidate_paths
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("Failed to find config schema. Tried: {tried}")
-        })?;
-
     let schema_json: serde_json::Value =
-        serde_json::from_str(&schema_raw).context("Failed to parse config schema")?;
+        serde_json::from_str(include_str!("../../../../schema/config-schema.json"))
+            .context("Failed to parse embedded config schema")?;
     let schema_json = Box::leak(Box::new(schema_json));
 
     let compiled = JSONSchema::options()
@@ -667,6 +648,17 @@ fn resolve_command(
         .or_else(|| detect_language_from_entrypoint(entrypoint));
 
     let mut env = HashMap::new();
+    let target_env = selected_target_table(manifest)
+        .and_then(|t| t.get("env"))
+        .and_then(|e| e.as_table())
+        .map(|tbl| {
+            tbl.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.to_string(), s.to_string())))
+                .collect::<HashMap<String, String>>()
+        })
+        .unwrap_or_default();
+    env.extend(target_env);
+
     let execution_env = manifest
         .get("execution")
         .and_then(|e| e.get("env"))
@@ -964,16 +956,18 @@ mod tests {
         let manifest_path = tmp.path().join("capsule.toml");
 
         let manifest = r#"
-    schema_version = "1.0"
+    schema_version = "0.2"
     name = "demo"
     version = "0.1.0"
     type = "app"
+    default_target = "cli"
 
-    [execution]
+    [targets.cli]
     runtime = "source"
+    language = "python"
     entrypoint = "main.py"
 
-[execution.env]
+[targets.cli.env]
 MODEL = "demo"
 
 [network]
@@ -997,24 +991,19 @@ egress_allow = ["1.1.1.1"]
         let manifest_path = tmp.path().join("capsule.toml");
 
         let manifest = r#"
-    schema_version = "1.0"
+    schema_version = "0.2"
     name = "python-demo"
     version = "0.1.0"
     type = "app"
+    default_target = "cli"
 
-    [targets]
-    source_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-
-    [targets.source]
+    [targets.cli]
+    runtime = "source"
     language = "python"
     version = "3.11"
     entrypoint = "main.py"
 
-    [execution]
-    runtime = "source"
-    entrypoint = "main.py"
-
-    [execution.env]
+    [targets.cli.env]
     PORT = "8080"
     "#;
 
@@ -1050,24 +1039,19 @@ egress_allow = ["1.1.1.1"]
         let manifest_path = tmp.path().join("capsule.toml");
 
         let manifest = r#"
-    schema_version = "1.0"
+    schema_version = "0.2"
     name = "python-demo"
     version = "0.1.0"
     type = "app"
+    default_target = "cli"
 
-    [targets]
-    source_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-
-    [targets.source]
+    [targets.cli]
+    runtime = "source"
     language = "python"
     version = "3.11"
     entrypoint = "main.py"
 
-    [execution]
-    runtime = "source"
-    entrypoint = "main.py"
-
-    [execution.env]
+    [targets.cli.env]
     PORT = "8080"
     "#;
 
@@ -1099,21 +1083,16 @@ egress_allow = ["1.1.1.1"]
         let manifest_path = tmp.path().join("capsule.toml");
 
         let manifest = r#"
-    schema_version = "1.0"
+    schema_version = "0.2"
     name = "node-demo"
     version = "0.1.0"
     type = "app"
+    default_target = "cli"
 
-    [targets]
-    source_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-
-    [targets.source]
+    [targets.cli]
+    runtime = "source"
     language = "node"
     version = "20"
-    entrypoint = "index.js"
-
-    [execution]
-    runtime = "source"
     entrypoint = "index.js"
     "#;
 
@@ -1134,21 +1113,16 @@ egress_allow = ["1.1.1.1"]
         let manifest_path = tmp.path().join("capsule.toml");
 
         let manifest = r#"
-    schema_version = "1.0"
+    schema_version = "0.2"
     name = "node-demo"
     version = "0.1.0"
     type = "app"
+    default_target = "cli"
 
-    [targets]
-    source_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-
-    [targets.source]
+    [targets.cli]
+    runtime = "source"
     language = "node"
     version = "20"
-    entrypoint = "index.js"
-
-    [execution]
-    runtime = "source"
     entrypoint = "index.js"
     "#;
 
@@ -1169,21 +1143,16 @@ egress_allow = ["1.1.1.1"]
         let manifest_path = tmp.path().join("capsule.toml");
 
         let manifest = r#"
-    schema_version = "1.0"
+    schema_version = "0.2"
     name = "deno-demo"
     version = "0.1.0"
     type = "app"
+    default_target = "cli"
 
-    [targets]
-    source_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-
-    [targets.source]
+    [targets.cli]
+    runtime = "source"
     language = "deno"
     version = "1.40"
-    entrypoint = "server.ts"
-
-    [execution]
-    runtime = "source"
     entrypoint = "server.ts"
     "#;
 
@@ -1194,7 +1163,10 @@ egress_allow = ["1.1.1.1"]
         let config: ConfigJson = serde_json::from_str(&config_raw).unwrap();
 
         assert_eq!(config.services["main"].executable, "runtime/deno/bin/deno");
-        assert_eq!(config.services["main"].args, vec!["source/server.ts"]);
+        assert_eq!(
+            config.services["main"].args,
+            vec!["run", "-A", "source/server.ts"]
+        );
     }
 
     #[test]
@@ -1203,21 +1175,16 @@ egress_allow = ["1.1.1.1"]
         let manifest_path = tmp.path().join("capsule.toml");
 
         let manifest = r#"
-    schema_version = "1.0"
+    schema_version = "0.2"
     name = "deno-demo"
     version = "0.1.0"
     type = "app"
+    default_target = "cli"
 
-    [targets]
-    source_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-
-    [targets.source]
+    [targets.cli]
+    runtime = "source"
     language = "deno"
     version = "1.40"
-    entrypoint = "server.ts"
-
-    [execution]
-    runtime = "source"
     entrypoint = "server.ts"
     "#;
 
@@ -1228,7 +1195,7 @@ egress_allow = ["1.1.1.1"]
         let config: ConfigJson = serde_json::from_str(&config_raw).unwrap();
 
         assert_eq!(config.services["main"].executable, "deno");
-        assert_eq!(config.services["main"].args, vec!["server.ts"]);
+        assert_eq!(config.services["main"].args, vec!["run", "-A", "server.ts"]);
     }
 
     #[test]
@@ -1237,21 +1204,16 @@ egress_allow = ["1.1.1.1"]
         let manifest_path = tmp.path().join("capsule.toml");
 
         let manifest = r#"
-    schema_version = "1.0"
+    schema_version = "0.2"
     name = "bun-demo"
     version = "0.1.0"
     type = "app"
+    default_target = "cli"
 
-    [targets]
-    source_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-
-    [targets.source]
+    [targets.cli]
+    runtime = "source"
     language = "bun"
     version = "1.1"
-    entrypoint = "main.ts"
-
-    [execution]
-    runtime = "source"
     entrypoint = "main.ts"
     "#;
 
@@ -1271,21 +1233,16 @@ egress_allow = ["1.1.1.1"]
         let manifest_path = tmp.path().join("capsule.toml");
 
         let manifest = r#"
-    schema_version = "1.0"
+    schema_version = "0.2"
     name = "bun-demo"
     version = "0.1.0"
     type = "app"
+    default_target = "cli"
 
-    [targets]
-    source_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-
-    [targets.source]
+    [targets.cli]
+    runtime = "source"
     language = "bun"
     version = "1.1"
-    entrypoint = "main.ts"
-
-    [execution]
-    runtime = "source"
     entrypoint = "main.ts"
     "#;
 
@@ -1305,20 +1262,15 @@ egress_allow = ["1.1.1.1"]
         let manifest_path = tmp.path().join("capsule.toml");
 
         let manifest = r#"
-    schema_version = "1.0"
+    schema_version = "0.2"
     name = "custom-demo"
     version = "0.1.0"
     type = "app"
+    default_target = "cli"
 
-    [targets]
-    source_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-
-    [targets.source]
-    language = "binary"
-    entrypoint = "./my-app"
-
-    [execution]
+    [targets.cli]
     runtime = "source"
+    language = "binary"
     entrypoint = "./my-app"
     "#;
 

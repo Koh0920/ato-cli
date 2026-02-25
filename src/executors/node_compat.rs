@@ -16,7 +16,7 @@ use capsule_core::execution_plan::canonical::{
     compute_policy_segment_hash, compute_provisioning_policy_hash,
 };
 use capsule_core::execution_plan::error::AtoExecutionError;
-use capsule_core::execution_plan::model::ExecutionPlan;
+use capsule_core::execution_plan::model::{ExecutionPlan, ExecutionRuntime};
 use capsule_core::router::ManifestData;
 
 use crate::common::proxy;
@@ -27,6 +27,7 @@ pub fn execute(
     plan: &ManifestData,
     execution_plan: &ExecutionPlan,
     ipc_env: Option<&IpcEnvVars>,
+    dangerously_skip_permissions: bool,
 ) -> Result<i32> {
     if which::which("deno").is_err() {
         return Err(AtoExecutionError::policy_violation(
@@ -64,6 +65,7 @@ pub fn execute(
         &entrypoint,
         ipc_env,
         use_compat_flag,
+        dangerously_skip_permissions,
     )
 }
 
@@ -110,50 +112,64 @@ fn run_runtime(
     entrypoint: &str,
     ipc_env: Option<&IpcEnvVars>,
     use_compat_flag: bool,
+    dangerously_skip_permissions: bool,
 ) -> Result<i32> {
     let mut cmd = Command::new("deno");
     cmd.current_dir(runtime_dir)
         .arg("run")
         .arg("--node-modules-dir=auto")
-        .arg("--cached-only")
         .arg("--no-prompt");
+    if !dangerously_skip_permissions {
+        cmd.arg("--cached-only");
+    }
     if use_compat_flag {
         cmd.arg("--compat");
     }
 
-    if !execution_plan.runtime.policy.network.allow_hosts.is_empty() {
-        cmd.arg(format!(
-            "--allow-net={}",
-            execution_plan.runtime.policy.network.allow_hosts.join(",")
-        ));
-    }
+    let runtime_dir_allow = runtime_dir.to_string_lossy().to_string();
 
-    let mut allow_read = execution_plan.runtime.policy.filesystem.read_only.clone();
-    allow_read.extend(execution_plan.runtime.policy.filesystem.read_write.clone());
-    if !allow_read.is_empty() {
-        cmd.arg(format!("--allow-read={}", allow_read.join(",")));
-    }
+    if dangerously_skip_permissions {
+        cmd.arg("-A");
+    } else {
+        if !execution_plan.runtime.policy.network.allow_hosts.is_empty() {
+            cmd.arg(format!(
+                "--allow-net={}",
+                execution_plan.runtime.policy.network.allow_hosts.join(",")
+            ));
+        }
 
-    if !execution_plan
-        .runtime
-        .policy
-        .filesystem
-        .read_write
-        .is_empty()
-    {
-        cmd.arg(format!(
-            "--allow-write={}",
-            execution_plan
-                .runtime
-                .policy
-                .filesystem
-                .read_write
-                .join(",")
-        ));
+        let mut allow_read = execution_plan.runtime.policy.filesystem.read_only.clone();
+        allow_read.extend(execution_plan.runtime.policy.filesystem.read_write.clone());
+        if !allow_read.iter().any(|path| path == &runtime_dir_allow) {
+            allow_read.push(runtime_dir_allow.clone());
+        }
+        if !allow_read.is_empty() {
+            cmd.arg(format!("--allow-read={}", allow_read.join(",")));
+        }
+
+        let mut allow_write = execution_plan.runtime.policy.filesystem.read_write.clone();
+        if execution_plan.target.runtime == ExecutionRuntime::Web
+            && !allow_write.iter().any(|path| path == &runtime_dir_allow)
+        {
+            allow_write.push(runtime_dir_allow.clone());
+        }
+        if !allow_write.is_empty() {
+            cmd.arg(format!("--allow-write={}", allow_write.join(",")));
+        }
     }
 
     for (key, value) in plan.execution_env() {
         cmd.env(key, value);
+    }
+    if execution_plan.target.runtime == ExecutionRuntime::Web {
+        if let Some(port) = plan.execution_port() {
+            cmd.env("PORT", port.to_string());
+        }
+        if !dangerously_skip_permissions {
+            cmd.arg("--allow-env");
+            cmd.arg("--allow-sys");
+            cmd.arg(format!("--allow-ffi={runtime_dir_allow}"));
+        }
     }
 
     #[cfg(unix)]

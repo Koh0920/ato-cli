@@ -16,16 +16,16 @@ pub enum RequiredLock {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutorKind {
+    WebStatic,
     Deno,
     NodeCompat,
     Native,
     Wasm,
-    BrowserStatic,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeGuardResult {
-    pub requires_unsafe_opt_in: bool,
+    pub requires_sandbox_opt_in: bool,
     pub required_lock: Option<RequiredLock>,
     pub executor_kind: ExecutorKind,
 }
@@ -34,13 +34,17 @@ pub fn evaluate(
     plan: &ExecutionPlan,
     manifest_dir: &Path,
     enforcement: &str,
-    unsafe_mode: bool,
+    sandbox_mode: bool,
+    dangerously_skip_permissions: bool,
 ) -> Result<RuntimeGuardResult, AtoExecutionError> {
     let runtime = plan.target.runtime;
     let driver = plan.target.driver;
 
     let tier = derive_tier(runtime, driver)?;
-    if matches!(tier, ExecutionTier::Tier1) && !resolve_capsule_lock_path(manifest_dir).exists() {
+    if requires_capsule_lock(runtime, driver)
+        && matches!(tier, ExecutionTier::Tier1)
+        && !resolve_capsule_lock_path(manifest_dir).exists()
+    {
         return Err(AtoExecutionError::lock_incomplete(
             "capsule.lock is required for Tier1 execution",
             Some("capsule.lock"),
@@ -76,19 +80,20 @@ pub fn evaluate(
         Some(RequiredLock::CapsuleLock) | None => {}
     }
 
-    let requires_unsafe_opt_in = matches!(
+    let requires_sandbox_opt_in = matches!(
         (runtime, driver),
         (ExecutionRuntime::Source, ExecutionDriver::Native)
             | (ExecutionRuntime::Source, ExecutionDriver::Python)
+            | (ExecutionRuntime::Web, ExecutionDriver::Python)
     );
 
-    if requires_unsafe_opt_in && !unsafe_mode {
+    if requires_sandbox_opt_in && !(sandbox_mode || dangerously_skip_permissions) {
         return Err(AtoExecutionError::policy_violation(
-            "source/native|python execution requires explicit --unsafe opt-in",
+            "source/native|python execution requires explicit --sandbox opt-in or --dangerously-skip-permissions",
         ));
     }
 
-    if requires_unsafe_opt_in && enforcement != "strict" {
+    if requires_sandbox_opt_in && !dangerously_skip_permissions && enforcement != "strict" {
         return Err(AtoExecutionError::policy_violation(
             "source/native|python execution requires strict sandbox enforcement",
         ));
@@ -97,7 +102,7 @@ pub fn evaluate(
     let executor_kind = resolve_executor_kind(runtime, driver)?;
 
     Ok(RuntimeGuardResult {
-        requires_unsafe_opt_in,
+        requires_sandbox_opt_in,
         required_lock,
         executor_kind,
     })
@@ -108,7 +113,10 @@ fn resolve_executor_kind(
     driver: ExecutionDriver,
 ) -> Result<ExecutorKind, AtoExecutionError> {
     match (runtime, driver) {
-        (ExecutionRuntime::Web, ExecutionDriver::BrowserStatic) => Ok(ExecutorKind::BrowserStatic),
+        (ExecutionRuntime::Web, ExecutionDriver::Static) => Ok(ExecutorKind::WebStatic),
+        (ExecutionRuntime::Web, ExecutionDriver::Deno) => Ok(ExecutorKind::Deno),
+        (ExecutionRuntime::Web, ExecutionDriver::Node) => Ok(ExecutorKind::NodeCompat),
+        (ExecutionRuntime::Web, ExecutionDriver::Python) => Ok(ExecutorKind::Native),
         (ExecutionRuntime::Wasm, ExecutionDriver::Wasmtime) => Ok(ExecutorKind::Wasm),
         (ExecutionRuntime::Source, ExecutionDriver::Deno) => Ok(ExecutorKind::Deno),
         (ExecutionRuntime::Source, ExecutionDriver::Node) => Ok(ExecutorKind::NodeCompat),
@@ -127,15 +135,16 @@ fn resolve_required_lock(
     driver: ExecutionDriver,
 ) -> Result<Option<RequiredLock>, AtoExecutionError> {
     match (runtime, driver) {
-        (ExecutionRuntime::Web, ExecutionDriver::BrowserStatic)
-        | (ExecutionRuntime::Wasm, ExecutionDriver::Wasmtime) => {
-            Ok(Some(RequiredLock::CapsuleLock))
-        }
-        (ExecutionRuntime::Source, ExecutionDriver::Deno) => {
+        (ExecutionRuntime::Web, ExecutionDriver::Static) => Ok(None),
+        (ExecutionRuntime::Web, ExecutionDriver::Deno)
+        | (ExecutionRuntime::Source, ExecutionDriver::Deno) => {
             Ok(Some(RequiredLock::DenoLockOrPackageLock))
         }
-        (ExecutionRuntime::Source, ExecutionDriver::Node) => Ok(Some(RequiredLock::PackageLock)),
-        (ExecutionRuntime::Source, ExecutionDriver::Python) => Ok(Some(RequiredLock::UvLock)),
+        (ExecutionRuntime::Web, ExecutionDriver::Node)
+        | (ExecutionRuntime::Source, ExecutionDriver::Node) => Ok(Some(RequiredLock::PackageLock)),
+        (ExecutionRuntime::Web, ExecutionDriver::Python)
+        | (ExecutionRuntime::Source, ExecutionDriver::Python) => Ok(Some(RequiredLock::UvLock)),
+        (ExecutionRuntime::Wasm, ExecutionDriver::Wasmtime) => Ok(Some(RequiredLock::CapsuleLock)),
         (ExecutionRuntime::Source, ExecutionDriver::Native) => Ok(None),
         _ => Err(AtoExecutionError::policy_violation(format!(
             "unsupported runtime/driver pair for lock policy: runtime='{}' driver='{}'",
@@ -147,6 +156,13 @@ fn resolve_required_lock(
 
 fn resolve_capsule_lock_path(manifest_dir: &Path) -> PathBuf {
     manifest_dir.join("capsule.lock")
+}
+
+fn requires_capsule_lock(runtime: ExecutionRuntime, driver: ExecutionDriver) -> bool {
+    !matches!(
+        (runtime, driver),
+        (ExecutionRuntime::Web, ExecutionDriver::Static)
+    )
 }
 
 fn resolve_deno_lock_path(manifest_dir: &Path) -> Option<PathBuf> {
@@ -247,27 +263,38 @@ mod tests {
     }
 
     #[test]
-    fn node_tier1_does_not_require_unsafe_when_locks_exist() {
+    fn node_tier1_does_not_require_sandbox_when_locks_exist() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::write(tmp.path().join("capsule.lock"), "").expect("write capsule.lock");
         std::fs::write(tmp.path().join("package-lock.json"), "{}").expect("write package-lock");
 
         let plan = sample_plan(ExecutionRuntime::Source, ExecutionDriver::Node);
-        let result = evaluate(&plan, tmp.path(), "strict", false).expect("guard pass");
-        assert!(!result.requires_unsafe_opt_in);
+        let result = evaluate(&plan, tmp.path(), "strict", false, false).expect("guard pass");
+        assert!(!result.requires_sandbox_opt_in);
         assert_eq!(result.required_lock, Some(RequiredLock::PackageLock));
         assert_eq!(result.executor_kind, ExecutorKind::NodeCompat);
     }
 
     #[test]
-    fn python_tier2_requires_unsafe() {
+    fn python_tier2_requires_sandbox_opt_in() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::write(tmp.path().join("uv.lock"), "").expect("write uv.lock");
         let plan = sample_plan(ExecutionRuntime::Source, ExecutionDriver::Python);
 
-        let err = evaluate(&plan, tmp.path(), "strict", false).expect_err("must reject");
+        let err = evaluate(&plan, tmp.path(), "strict", false, false).expect_err("must reject");
         assert_eq!(err.code, "ATO_ERR_POLICY_VIOLATION");
-        assert!(err.message.contains("--unsafe"));
+        assert!(err.message.contains("--sandbox"));
+    }
+
+    #[test]
+    fn python_tier2_allows_dangerous_skip_permissions() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("uv.lock"), "").expect("write uv.lock");
+        let plan = sample_plan(ExecutionRuntime::Source, ExecutionDriver::Python);
+
+        let result = evaluate(&plan, tmp.path(), "strict", false, true).expect("guard pass");
+        assert!(result.requires_sandbox_opt_in);
+        assert_eq!(result.executor_kind, ExecutorKind::Native);
     }
 
     #[test]
@@ -283,7 +310,7 @@ mod tests {
         );
 
         let plan = sample_plan(ExecutionRuntime::Source, ExecutionDriver::Node);
-        let result = evaluate(&plan, tmp.path(), "strict", false).expect("guard pass");
+        let result = evaluate(&plan, tmp.path(), "strict", false, false).expect("guard pass");
         assert_eq!(result.required_lock, Some(RequiredLock::PackageLock));
     }
 
@@ -293,8 +320,37 @@ mod tests {
         std::fs::write(tmp.path().join("package-lock.json"), "{}").expect("write package-lock");
 
         let plan = sample_plan(ExecutionRuntime::Source, ExecutionDriver::Node);
-        let err = evaluate(&plan, tmp.path(), "strict", false).expect_err("must reject");
+        let err = evaluate(&plan, tmp.path(), "strict", false, false).expect_err("must reject");
         assert_eq!(err.code, "ATO_ERR_PROVISIONING_LOCK_INCOMPLETE");
         assert!(err.message.contains("capsule.lock"));
+    }
+
+    #[test]
+    fn web_static_does_not_require_capsule_lock() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let plan = sample_plan(ExecutionRuntime::Web, ExecutionDriver::Static);
+        let result = evaluate(&plan, tmp.path(), "strict", false, false).expect("guard pass");
+        assert_eq!(result.required_lock, None);
+        assert_eq!(result.executor_kind, ExecutorKind::WebStatic);
+    }
+
+    #[test]
+    fn web_node_requires_package_lock() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("capsule.lock"), "").expect("write capsule.lock");
+        let plan = sample_plan(ExecutionRuntime::Web, ExecutionDriver::Node);
+        let err = evaluate(&plan, tmp.path(), "strict", false, false).expect_err("must reject");
+        assert_eq!(err.code, "ATO_ERR_PROVISIONING_LOCK_INCOMPLETE");
+        assert!(err.message.contains("package-lock.json"));
+    }
+
+    #[test]
+    fn web_python_requires_sandbox_opt_in() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("uv.lock"), "").expect("write uv.lock");
+        let plan = sample_plan(ExecutionRuntime::Web, ExecutionDriver::Python);
+        let err = evaluate(&plan, tmp.path(), "strict", false, false).expect_err("must reject");
+        assert_eq!(err.code, "ATO_ERR_POLICY_VIOLATION");
+        assert!(err.message.contains("--sandbox"));
     }
 }

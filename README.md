@@ -42,14 +42,23 @@ ato run <publisher>/<slug> --registry http://127.0.0.1:8787 --yes
 
 ## ランタイム隔離ポリシー（Tier）
 
+- `web/static`: Tier1（`driver = "static"` + `targets.<label>.port` 必須。`capsule.lock` 不要）
+- `web/deno`: Tier1（`capsule.lock` + `deno.lock` または `package-lock.json`）
+- `web/node`: Tier1（Deno compat 実行。`capsule.lock` + `package-lock.json` 必須）
+- `web/python`: Tier2（`uv.lock` 必須、`--unsafe` 必須）
 - `source/deno`: Tier1（`capsule.lock` + `deno.lock` または `package-lock.json`）
-- `source/node`: Tier1（Deno compat 実行、`capsule.lock` + `package-lock.json` 必須）
+- `source/node`: Tier1（Deno compat 実行。`capsule.lock` + `package-lock.json` 必須）
 - `source/python`: Tier2（`uv.lock` 必須、`--unsafe` 必須）
 - `source/native`: Tier2（`--unsafe` 必須）
 
 補足:
 - Node は Tier1 として `--unsafe` 不要です。
+- Tier2（`source/native|python`, `web/python`）は `nacelle` エンジンが必須です。
+  未登録時は fail-closed で停止するため、事前に `ato engine register` か `--nacelle` / `NACELLE_PATH` で設定してください。
 - Node/Python で非対応・逸脱が発生した場合は自動フォールバックせず fail-closed で停止します。
+- `runtime=web` は `driver` が必須です（`static|node|deno|python`）。
+- `runtime=web` では `public` は廃止されました。
+- `runtime=web` 実行時、CLI は URL を表示します（ブラウザ自動起動はしません）。
 
 ## SKILL 実行
 
@@ -67,6 +76,7 @@ ato run --from-skill /path/to/SKILL.md
 
 - 正常時は最小出力（ツールの標準出力中心）
 - 同意が必要なときのみプロンプト表示
+- 非対話環境では `-y/--yes` で同意を自動承認できます
 - ポリシー違反や未充足は `ATO_ERR_*` JSONL を `stderr` に出力
 
 ## 検索・認証
