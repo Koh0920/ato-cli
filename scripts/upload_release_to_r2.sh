@@ -17,7 +17,7 @@ set -euo pipefail
 #   TARGETS             default: infer from SOURCE_DIR/ato-*.tar.gz
 #   UPDATE_LATEST       default: 1
 #   PREFIX              default: ato
-#   WRANGLER_CONFIG     default: ../../ato-store/wrangler.toml (from this script dir)
+#   WRANGLER_CONFIG     optional (if empty, use wrangler default resolution)
 #   WRANGLER_ENV        optional
 #   REMOTE              default: 1 (set 0 to omit --remote)
 #   DRY_RUN             default: 0
@@ -43,7 +43,10 @@ put_object() {
   local object_ref="${BUCKET}/${object_key}"
   local -a cmd
 
-  cmd=(wrangler --config "$WRANGLER_CONFIG")
+  cmd=(wrangler)
+  if [[ -n "$WRANGLER_CONFIG" ]]; then
+    cmd+=(--config "$WRANGLER_CONFIG")
+  fi
   if [[ -n "$WRANGLER_ENV" ]]; then
     cmd+=(--env "$WRANGLER_ENV")
   fi
@@ -82,12 +85,19 @@ SOURCE_DIR="${SOURCE_DIR:-/tmp/ato-release/${VERSION}}"
 TARGETS="${TARGETS:-}"
 UPDATE_LATEST="${UPDATE_LATEST:-1}"
 PREFIX="${PREFIX:-ato}"
-WRANGLER_CONFIG="${WRANGLER_CONFIG:-$WORKSPACE_ROOT/apps/ato-store/wrangler.toml}"
+DEFAULT_WRANGLER_CONFIG="$WORKSPACE_ROOT/apps/ato-store/wrangler.toml"
+if [[ "${WRANGLER_CONFIG+x}" == "x" ]]; then
+  WRANGLER_CONFIG="${WRANGLER_CONFIG}"
+elif [[ -f "$DEFAULT_WRANGLER_CONFIG" ]]; then
+  WRANGLER_CONFIG="$DEFAULT_WRANGLER_CONFIG"
+else
+  WRANGLER_CONFIG=""
+fi
 WRANGLER_ENV="${WRANGLER_ENV:-}"
 REMOTE="${REMOTE:-1}"
 DRY_RUN="${DRY_RUN:-0}"
 
-if [[ ! -f "$WRANGLER_CONFIG" ]]; then
+if [[ -n "$WRANGLER_CONFIG" && ! -f "$WRANGLER_CONFIG" ]]; then
   echo "error: WRANGLER_CONFIG not found: $WRANGLER_CONFIG" >&2
   exit 1
 fi
@@ -147,3 +157,4 @@ echo "    prefix : $PREFIX"
 echo "    targets: ${target_list[*]}"
 echo "    latest : $UPDATE_LATEST"
 echo "    remote : $REMOTE"
+echo "    config : ${WRANGLER_CONFIG:-<wrangler default>}"
