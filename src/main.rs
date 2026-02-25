@@ -88,6 +88,7 @@ mod engine_manager;
 mod env;
 mod error_codes;
 mod executors;
+mod guest_protocol;
 mod init;
 mod install;
 mod ipc;
