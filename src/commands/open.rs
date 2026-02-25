@@ -8,6 +8,7 @@ use regex::Regex;
 use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
 use std::process::Command;
 use std::sync::Arc;
 use tracing::debug;
@@ -312,8 +313,7 @@ fn is_source_file(file_name: &std::ffi::OsString) -> bool {
 }
 
 fn is_hidden(file_name: &std::ffi::OsString) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    let bytes = file_name.as_os_str().as_bytes();
+    let bytes = file_name.as_os_str().as_encoded_bytes();
     bytes.first() == Some(&b'.') && bytes.len() > 1
 }
 

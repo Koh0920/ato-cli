@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use std::path::PathBuf;
 use std::process::{Child, Stdio};
 use std::time::Duration;

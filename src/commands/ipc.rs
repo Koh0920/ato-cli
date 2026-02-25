@@ -223,6 +223,58 @@ pub fn run_ipc_stop(name: String, force: bool, json_output: bool) -> Result<()> 
                 }
             }
         }
+
+        #[cfg(windows)]
+        {
+            let mut command = std::process::Command::new("taskkill");
+            command.arg("/PID").arg(pid.to_string());
+            if force {
+                command.arg("/F");
+            }
+
+            let status = command.status();
+            match status {
+                Ok(code) if code.success() => {}
+                Ok(code) => {
+                    if json_output {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "warning": "signal_failed",
+                                "service": name,
+                                "pid": pid,
+                                "error": format!("taskkill exited with {}", code),
+                            })
+                        );
+                    } else {
+                        eprintln!(
+                            "⚠️  Failed to stop PID {} (taskkill exited with {}).",
+                            pid, code
+                        );
+                    }
+                }
+                Err(err) => {
+                    if json_output {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "warning": "signal_failed",
+                                "service": name,
+                                "pid": pid,
+                                "error": err.to_string(),
+                            })
+                        );
+                    } else {
+                        eprintln!("⚠️  Failed to run taskkill for PID {}: {}", pid, err);
+                    }
+                }
+            }
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (pid, force);
+        }
     }
 
     // Remove from registry
