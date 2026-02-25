@@ -312,7 +312,7 @@ fn build_config_json(
 
 fn validate_config_json(config: &ConfigJson) -> Result<()> {
     let schema_json: serde_json::Value =
-        serde_json::from_str(include_str!("../../../../schema/config-schema.json"))
+        serde_json::from_str(include_str!("../schema/config-schema.json"))
             .context("Failed to parse embedded config schema")?;
     let schema_json = Box::leak(Box::new(schema_json));
 
