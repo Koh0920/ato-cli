@@ -1,13 +1,14 @@
+use crate::guest_protocol::{
+    decode_payload_base64, encode_payload_base64, GuestAction, GuestContextRole, GuestError,
+    GuestErrorCode, GuestMode, GuestPermission, GuestRequest, GuestResponse,
+    GUEST_PROTOCOL_VERSION,
+};
 use anyhow::Result;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use sync_runtime::{
-    decode_payload_base64, encode_payload_base64, GuestAction, GuestContextRole, GuestError,
-    GuestErrorCode, GuestPermission, GuestRequest, GuestResponse, GUEST_PROTOCOL_VERSION,
-};
 use tempfile::TempDir;
 use wasi_common::pipe::{ReadPipe, WritePipe};
 use wasmtime::{Config, Engine, Linker, Module, Store, StoreLimitsBuilder};
@@ -17,6 +18,40 @@ use zip::{write::FileOptions, ZipArchive, ZipWriter};
 struct WasiState {
     wasi: wasmtime_wasi::WasiCtx,
     limits: wasmtime::StoreLimits,
+}
+
+#[derive(Clone, serde::Deserialize)]
+struct GuestManifest {
+    #[serde(default)]
+    policy: GuestManifestPolicy,
+    #[serde(default)]
+    permissions: GuestManifestPermissions,
+    #[serde(default)]
+    ownership: GuestManifestOwnership,
+}
+
+#[derive(Clone, Default, serde::Deserialize)]
+struct GuestManifestPolicy {
+    #[serde(default = "default_policy_timeout")]
+    timeout: u64,
+}
+
+#[derive(Clone, Default, serde::Deserialize)]
+struct GuestManifestPermissions {
+    #[serde(default)]
+    allow_hosts: Vec<String>,
+    #[serde(default)]
+    allow_env: Vec<String>,
+}
+
+#[derive(Clone, Default, serde::Deserialize)]
+struct GuestManifestOwnership {
+    #[serde(default)]
+    write_allowed: bool,
+}
+
+fn default_policy_timeout() -> u64 {
+    30
 }
 
 pub struct GuestArgs {
@@ -135,10 +170,7 @@ fn ensure_permissions(
     request: &GuestRequest,
     permissions: &GuestPermission,
 ) -> Result<(), GuestError> {
-    if matches!(
-        request.context.role,
-        sync_runtime::GuestContextRole::Consumer
-    ) {
+    if matches!(request.context.role, GuestContextRole::Consumer) {
         match request.action {
             GuestAction::ReadPayload | GuestAction::ReadContext => {}
             _ => {
@@ -208,8 +240,8 @@ fn validate_env_context(request: &GuestRequest) -> Result<(), GuestError> {
 
     if let Ok(mode) = std::env::var("GUEST_MODE") {
         let expected = match request.context.mode {
-            sync_runtime::GuestMode::Widget => "widget",
-            sync_runtime::GuestMode::Headless => "headless",
+            GuestMode::Widget => "widget",
+            GuestMode::Headless => "headless",
         };
         if mode.to_ascii_lowercase() != expected {
             return Err(GuestError::new(
@@ -221,8 +253,8 @@ fn validate_env_context(request: &GuestRequest) -> Result<(), GuestError> {
 
     if let Ok(role) = std::env::var("GUEST_ROLE") {
         let expected = match request.context.role {
-            sync_runtime::GuestContextRole::Consumer => "consumer",
-            sync_runtime::GuestContextRole::Owner => "owner",
+            GuestContextRole::Consumer => "consumer",
+            GuestContextRole::Owner => "owner",
         };
         if role.to_ascii_lowercase() != expected {
             return Err(GuestError::new(
@@ -243,7 +275,7 @@ fn validate_env_context(request: &GuestRequest) -> Result<(), GuestError> {
 
     let widget_bounds = std::env::var("GUEST_WIDGET_BOUNDS").ok();
     match request.context.mode {
-        sync_runtime::GuestMode::Widget => {
+        GuestMode::Widget => {
             let value = widget_bounds.ok_or_else(|| {
                 GuestError::new(
                     GuestErrorCode::InvalidRequest,
@@ -252,7 +284,7 @@ fn validate_env_context(request: &GuestRequest) -> Result<(), GuestError> {
             })?;
             parse_widget_bounds(&value)?;
         }
-        sync_runtime::GuestMode::Headless => {
+        GuestMode::Headless => {
             if widget_bounds.is_some() {
                 return Err(GuestError::new(
                     GuestErrorCode::InvalidRequest,
@@ -301,13 +333,8 @@ fn effective_permissions(
     sync_path: &PathBuf,
     requested: &GuestPermission,
 ) -> Result<GuestPermission, GuestError> {
-    let archive = sync_runtime::SyncArchive::open(sync_path).map_err(|err| {
-        GuestError::new(
-            GuestErrorCode::InvalidRequest,
-            format!("Failed to open sync archive: {}", err),
-        )
-    })?;
-    let manifest_permissions = archive.manifest().permissions.clone();
+    let manifest = load_manifest(sync_path)?;
+    let manifest_permissions = manifest.permissions;
 
     let mut permissions = requested.clone();
     permissions.allowed_env =
@@ -400,16 +427,7 @@ fn write_payload(sync_path: &PathBuf, input: &Value) -> Result<(), GuestError> {
 
     let decoded = decode_payload_base64(payload)?;
 
-    let mut archive = sync_runtime::SyncArchive::open(sync_path).map_err(|err| {
-        GuestError::new(
-            GuestErrorCode::InvalidRequest,
-            format!("Failed to open sync archive: {}", err),
-        )
-    })?;
-
-    archive
-        .update_payload(&decoded)
-        .map_err(|err| GuestError::new(GuestErrorCode::IoError, err.to_string()))
+    update_zip_entry(sync_path, "payload", &decoded)
 }
 
 fn update_payload(
@@ -422,10 +440,7 @@ fn update_payload(
     })?;
     let decoded = decode_payload_base64(payload)?;
 
-    let manifest = sync_runtime::SyncArchive::open(sync_path)
-        .map_err(|err| GuestError::new(GuestErrorCode::InvalidRequest, err.to_string()))?
-        .manifest()
-        .clone();
+    let manifest = load_manifest(sync_path)?;
 
     if !manifest.ownership.write_allowed {
         return Err(GuestError::new(
@@ -464,10 +479,7 @@ fn execute_wasm(
     let context =
         read_optional_zip_entry_bytes(sync_path, "context.json")?.unwrap_or_else(|| b"{}".to_vec());
 
-    let manifest = sync_runtime::SyncArchive::open(sync_path)
-        .map_err(|err| GuestError::new(GuestErrorCode::InvalidRequest, err.to_string()))?
-        .manifest()
-        .clone();
+    let manifest = load_manifest(sync_path)?;
 
     let mut config = Config::new();
     config.wasm_component_model(false);
@@ -663,6 +675,14 @@ fn read_optional_zip_entry_bytes(
         .map_err(|err| GuestError::new(GuestErrorCode::IoError, err.to_string()))?;
 
     Ok(Some(buffer))
+}
+
+fn load_manifest(sync_path: &PathBuf) -> Result<GuestManifest, GuestError> {
+    let manifest_bytes = read_zip_entry_bytes(sync_path, "manifest.toml")?;
+    let manifest_text = std::str::from_utf8(&manifest_bytes)
+        .map_err(|err| GuestError::new(GuestErrorCode::InvalidRequest, err.to_string()))?;
+    toml::from_str(manifest_text)
+        .map_err(|err| GuestError::new(GuestErrorCode::InvalidRequest, err.to_string()))
 }
 
 fn update_zip_entry(

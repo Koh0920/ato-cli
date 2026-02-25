@@ -4,17 +4,20 @@
 //! They test permission enforcement, payload read/write, context operations, and WASM execution.
 
 use assert_cmd::Command;
-use serde_json::Value;
+use base64::{engine::general_purpose, Engine as _};
+use serde_json::{json, Value};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use sync_runtime::{
-    encode_payload_base64, GuestAction, GuestContext, GuestContextRole, GuestMode, GuestPermission,
-    GuestRequest, GuestResponse, GUEST_PROTOCOL_VERSION,
-};
 use tempfile::TempDir;
 use wat::parse_str as wat_parse;
 use zip::{write::FileOptions, ZipArchive, ZipWriter};
+
+const GUEST_PROTOCOL_VERSION: &str = "guest.v1";
+
+fn encode_payload_base64(payload: &[u8]) -> String {
+    general_purpose::STANDARD.encode(payload)
+}
 
 fn create_test_sync_file(
     temp_dir: &PathBuf,
@@ -75,7 +78,30 @@ write_allowed = {}
     sync_path
 }
 
-fn run_guest(sync_path: &PathBuf, request: &GuestRequest) -> GuestResponse {
+fn build_request(
+    sync_path: &PathBuf,
+    request_id: &str,
+    action: &str,
+    role: &str,
+    permissions: Value,
+    input: Value,
+) -> Value {
+    json!({
+        "version": GUEST_PROTOCOL_VERSION,
+        "request_id": request_id,
+        "action": action,
+        "context": {
+            "mode": "Headless",
+            "role": role,
+            "permissions": permissions,
+            "sync_path": sync_path.to_string_lossy(),
+            "host_app": null
+        },
+        "input": input
+    })
+}
+
+fn run_guest(sync_path: &PathBuf, request: &Value) -> Value {
     let request_json = serde_json::to_string(request).unwrap();
     let mut cmd = Command::cargo_bin("ato").unwrap();
     let output = cmd
@@ -87,6 +113,24 @@ fn run_guest(sync_path: &PathBuf, request: &GuestRequest) -> GuestResponse {
 
     assert!(output.status.success());
     serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn permissions(
+    can_read_payload: bool,
+    can_read_context: bool,
+    can_write_payload: bool,
+    can_write_context: bool,
+    can_execute_wasm: bool,
+) -> Value {
+    json!({
+        "can_read_payload": can_read_payload,
+        "can_read_context": can_read_context,
+        "can_write_payload": can_write_payload,
+        "can_write_context": can_write_context,
+        "can_execute_wasm": can_execute_wasm,
+        "allowed_hosts": [],
+        "allowed_env": []
+    })
 }
 
 #[test]
@@ -114,37 +158,21 @@ fn guest_read_payload_returns_base64() {
         Some(wasm_bytes),
     );
 
-    let context = GuestContext {
-        mode: GuestMode::Headless,
-        role: GuestContextRole::Consumer,
-        permissions: GuestPermission {
-            can_read_payload: true,
-            can_read_context: false,
-            can_write_payload: false,
-            can_write_context: false,
-            can_execute_wasm: false,
-            allowed_hosts: Vec::new(),
-            allowed_env: Vec::new(),
-        },
-        sync_path: sync_path.to_string_lossy().to_string(),
-        host_app: None,
-    };
-
-    let request = GuestRequest {
-        version: GUEST_PROTOCOL_VERSION.to_string(),
-        request_id: "req-1".to_string(),
-        action: GuestAction::ReadPayload,
-        context,
-        input: Value::Null,
-    };
+    let request = build_request(
+        &sync_path,
+        "req-1",
+        "ReadPayload",
+        "Consumer",
+        permissions(true, false, false, false, false),
+        Value::Null,
+    );
 
     let response = run_guest(&sync_path, &request);
-    if !response.ok {
-        panic!("execute_wasm failed: {:?}", response.error);
+    if !response["ok"].as_bool().unwrap_or(false) {
+        panic!("execute_wasm failed: {:?}", response["error"]);
     }
 
-    let result = response.result.unwrap();
-    let payload_b64 = result.as_str().unwrap();
+    let payload_b64 = response["result"].as_str().unwrap();
     assert_eq!(payload_b64, encode_payload_base64(&payload));
 }
 
@@ -176,33 +204,18 @@ fn guest_write_payload_accepts_base64() {
     let new_payload = vec![9, 8, 7, 6, 5];
     let payload_b64 = encode_payload_base64(&new_payload);
 
-    let context = GuestContext {
-        mode: GuestMode::Headless,
-        role: GuestContextRole::Owner,
-        permissions: GuestPermission {
-            can_read_payload: false,
-            can_read_context: false,
-            can_write_payload: true,
-            can_write_context: false,
-            can_execute_wasm: false,
-            allowed_hosts: Vec::new(),
-            allowed_env: Vec::new(),
-        },
-        sync_path: sync_path.to_string_lossy().to_string(),
-        host_app: None,
-    };
-
-    let request = GuestRequest {
-        version: GUEST_PROTOCOL_VERSION.to_string(),
-        request_id: "req-2".to_string(),
-        action: GuestAction::WritePayload,
-        context,
-        input: Value::String(payload_b64),
-    };
+    let request = build_request(
+        &sync_path,
+        "req-2",
+        "WritePayload",
+        "Owner",
+        permissions(false, false, true, false, false),
+        Value::String(payload_b64),
+    );
 
     let response = run_guest(&sync_path, &request);
-    if !response.ok {
-        panic!("execute_wasm failed: {:?}", response.error);
+    if !response["ok"].as_bool().unwrap_or(false) {
+        panic!("execute_wasm failed: {:?}", response["error"]);
     }
 
     let file = File::open(&sync_path).unwrap();
@@ -241,37 +254,21 @@ fn guest_execute_wasm_runs_sync_module() {
         Some(wasm_bytes),
     );
 
-    let context = GuestContext {
-        mode: GuestMode::Headless,
-        role: GuestContextRole::Owner,
-        permissions: GuestPermission {
-            can_read_payload: false,
-            can_read_context: false,
-            can_write_payload: false,
-            can_write_context: false,
-            can_execute_wasm: true,
-            allowed_hosts: Vec::new(),
-            allowed_env: Vec::new(),
-        },
-        sync_path: sync_path.to_string_lossy().to_string(),
-        host_app: None,
-    };
-
-    let request = GuestRequest {
-        version: GUEST_PROTOCOL_VERSION.to_string(),
-        request_id: "req-wasm".to_string(),
-        action: GuestAction::ExecuteWasm,
-        context,
-        input: Value::Null,
-    };
+    let request = build_request(
+        &sync_path,
+        "req-wasm",
+        "ExecuteWasm",
+        "Owner",
+        permissions(false, false, false, false, true),
+        Value::Null,
+    );
 
     let response = run_guest(&sync_path, &request);
-    if !response.ok {
-        panic!("execute_wasm failed: {:?}", response.error);
+    if !response["ok"].as_bool().unwrap_or(false) {
+        panic!("execute_wasm failed: {:?}", response["error"]);
     }
 
-    let result = response.result.unwrap();
-    let payload_b64 = result.as_str().unwrap();
+    let payload_b64 = response["result"].as_str().unwrap();
     assert_eq!(payload_b64, encode_payload_base64(b"ok"));
 }
 
@@ -284,32 +281,17 @@ fn guest_update_payload_requires_write_allowed() {
     let new_payload = vec![9, 9, 9];
     let payload_b64 = encode_payload_base64(&new_payload);
 
-    let context = GuestContext {
-        mode: GuestMode::Headless,
-        role: GuestContextRole::Owner,
-        permissions: GuestPermission {
-            can_read_payload: false,
-            can_read_context: false,
-            can_write_payload: true,
-            can_write_context: false,
-            can_execute_wasm: false,
-            allowed_hosts: Vec::new(),
-            allowed_env: Vec::new(),
-        },
-        sync_path: sync_path.to_string_lossy().to_string(),
-        host_app: None,
-    };
-
-    let request = GuestRequest {
-        version: GUEST_PROTOCOL_VERSION.to_string(),
-        request_id: "req-update".to_string(),
-        action: GuestAction::UpdatePayload,
-        context,
-        input: Value::String(payload_b64),
-    };
+    let request = build_request(
+        &sync_path,
+        "req-update",
+        "UpdatePayload",
+        "Owner",
+        permissions(false, false, true, false, false),
+        Value::String(payload_b64),
+    );
 
     let response = run_guest(&sync_path, &request);
-    assert!(!response.ok);
+    assert!(!response["ok"].as_bool().unwrap_or(true));
 }
 
 #[test]
@@ -336,61 +318,30 @@ fn guest_read_context_respects_permissions() {
         Some(wasm_bytes),
     );
 
-    let denied_context = GuestContext {
-        mode: GuestMode::Headless,
-        role: GuestContextRole::Consumer,
-        permissions: GuestPermission {
-            can_read_payload: false,
-            can_read_context: false,
-            can_write_payload: false,
-            can_write_context: false,
-            can_execute_wasm: false,
-            allowed_hosts: Vec::new(),
-            allowed_env: Vec::new(),
-        },
-        sync_path: sync_path.to_string_lossy().to_string(),
-        host_app: None,
-    };
-
-    let request = GuestRequest {
-        version: GUEST_PROTOCOL_VERSION.to_string(),
-        request_id: "read-context-denied".to_string(),
-        action: GuestAction::ReadContext,
-        context: denied_context,
-        input: Value::Null,
-    };
+    let request = build_request(
+        &sync_path,
+        "read-context-denied",
+        "ReadContext",
+        "Consumer",
+        permissions(false, false, false, false, false),
+        Value::Null,
+    );
 
     let response = run_guest(&sync_path, &request);
-    assert!(!response.ok);
+    assert!(!response["ok"].as_bool().unwrap_or(true));
 
-    let allowed_context = GuestContext {
-        mode: GuestMode::Headless,
-        role: GuestContextRole::Consumer,
-        permissions: GuestPermission {
-            can_read_payload: false,
-            can_read_context: true,
-            can_write_payload: false,
-            can_write_context: false,
-            can_execute_wasm: false,
-            allowed_hosts: Vec::new(),
-            allowed_env: Vec::new(),
-        },
-        sync_path: sync_path.to_string_lossy().to_string(),
-        host_app: None,
-    };
-
-    let request = GuestRequest {
-        version: GUEST_PROTOCOL_VERSION.to_string(),
-        request_id: "read-context-allowed".to_string(),
-        action: GuestAction::ReadContext,
-        context: allowed_context,
-        input: Value::Null,
-    };
+    let request = build_request(
+        &sync_path,
+        "read-context-allowed",
+        "ReadContext",
+        "Consumer",
+        permissions(false, true, false, false, false),
+        Value::Null,
+    );
 
     let response = run_guest(&sync_path, &request);
-    assert!(response.ok);
-    let result = response.result.unwrap();
-    assert!(result.get("ok").is_some());
+    assert!(response["ok"].as_bool().unwrap_or(false));
+    assert!(response["result"].get("ok").is_some());
 }
 
 #[test]
@@ -417,59 +368,29 @@ fn guest_write_context_respects_permissions() {
         Some(wasm_bytes),
     );
 
-    let denied_context = GuestContext {
-        mode: GuestMode::Headless,
-        role: GuestContextRole::Owner,
-        permissions: GuestPermission {
-            can_read_payload: false,
-            can_read_context: false,
-            can_write_payload: false,
-            can_write_context: false,
-            can_execute_wasm: false,
-            allowed_hosts: Vec::new(),
-            allowed_env: Vec::new(),
-        },
-        sync_path: sync_path.to_string_lossy().to_string(),
-        host_app: None,
-    };
-
-    let request = GuestRequest {
-        version: GUEST_PROTOCOL_VERSION.to_string(),
-        request_id: "write-context-denied".to_string(),
-        action: GuestAction::WriteContext,
-        context: denied_context,
-        input: serde_json::json!({"updated": true}),
-    };
+    let request = build_request(
+        &sync_path,
+        "write-context-denied",
+        "WriteContext",
+        "Owner",
+        permissions(false, false, false, false, false),
+        json!({"updated": true}),
+    );
 
     let response = run_guest(&sync_path, &request);
-    assert!(!response.ok);
+    assert!(!response["ok"].as_bool().unwrap_or(true));
 
-    let allowed_context = GuestContext {
-        mode: GuestMode::Headless,
-        role: GuestContextRole::Owner,
-        permissions: GuestPermission {
-            can_read_payload: false,
-            can_read_context: false,
-            can_write_payload: false,
-            can_write_context: true,
-            can_execute_wasm: false,
-            allowed_hosts: Vec::new(),
-            allowed_env: Vec::new(),
-        },
-        sync_path: sync_path.to_string_lossy().to_string(),
-        host_app: None,
-    };
-
-    let request = GuestRequest {
-        version: GUEST_PROTOCOL_VERSION.to_string(),
-        request_id: "write-context-allowed".to_string(),
-        action: GuestAction::WriteContext,
-        context: allowed_context,
-        input: serde_json::json!({"updated": true}),
-    };
+    let request = build_request(
+        &sync_path,
+        "write-context-allowed",
+        "WriteContext",
+        "Owner",
+        permissions(false, false, false, true, false),
+        json!({"updated": true}),
+    );
 
     let response = run_guest(&sync_path, &request);
-    assert!(response.ok);
+    assert!(response["ok"].as_bool().unwrap_or(false));
 }
 
 #[test]
@@ -499,57 +420,27 @@ fn guest_execute_wasm_requires_owner_and_permission() {
         Some(wasm_bytes),
     );
 
-    let denied_context = GuestContext {
-        mode: GuestMode::Headless,
-        role: GuestContextRole::Consumer,
-        permissions: GuestPermission {
-            can_read_payload: false,
-            can_read_context: false,
-            can_write_payload: false,
-            can_write_context: false,
-            can_execute_wasm: true,
-            allowed_hosts: Vec::new(),
-            allowed_env: Vec::new(),
-        },
-        sync_path: sync_path.to_string_lossy().to_string(),
-        host_app: None,
-    };
-
-    let request = GuestRequest {
-        version: GUEST_PROTOCOL_VERSION.to_string(),
-        request_id: "execute-wasm-denied".to_string(),
-        action: GuestAction::ExecuteWasm,
-        context: denied_context,
-        input: Value::Null,
-    };
+    let request = build_request(
+        &sync_path,
+        "execute-wasm-denied",
+        "ExecuteWasm",
+        "Consumer",
+        permissions(false, false, false, false, true),
+        Value::Null,
+    );
 
     let response = run_guest(&sync_path, &request);
-    assert!(!response.ok);
+    assert!(!response["ok"].as_bool().unwrap_or(true));
 
-    let denied_permission_context = GuestContext {
-        mode: GuestMode::Headless,
-        role: GuestContextRole::Owner,
-        permissions: GuestPermission {
-            can_read_payload: false,
-            can_read_context: false,
-            can_write_payload: false,
-            can_write_context: false,
-            can_execute_wasm: false,
-            allowed_hosts: Vec::new(),
-            allowed_env: Vec::new(),
-        },
-        sync_path: sync_path.to_string_lossy().to_string(),
-        host_app: None,
-    };
-
-    let request = GuestRequest {
-        version: GUEST_PROTOCOL_VERSION.to_string(),
-        request_id: "execute-wasm-denied-perm".to_string(),
-        action: GuestAction::ExecuteWasm,
-        context: denied_permission_context,
-        input: Value::Null,
-    };
+    let request = build_request(
+        &sync_path,
+        "execute-wasm-denied-perm",
+        "ExecuteWasm",
+        "Owner",
+        permissions(false, false, false, false, false),
+        Value::Null,
+    );
 
     let response = run_guest(&sync_path, &request);
-    assert!(!response.ok);
+    assert!(!response["ok"].as_bool().unwrap_or(true));
 }
