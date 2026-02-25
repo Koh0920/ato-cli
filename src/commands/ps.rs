@@ -98,7 +98,6 @@ pub fn execute(args: PsArgs, reporter: Arc<CliReporter>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::SystemTime;
 
     #[test]
     fn test_ps_args_default() {

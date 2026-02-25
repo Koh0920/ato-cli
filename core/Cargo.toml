@@ -55,9 +55,6 @@ tempfile = "3"
 
 [dev-dependencies]
 
-[build-dependencies]
-tonic-build = "0.12"
-
 [features]
 default = []
 manifest-signing = ["capnp"]

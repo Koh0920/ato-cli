@@ -10,7 +10,7 @@
 use std::path::Path;
 
 use super::dag::{self, DagError, RESERVED_PREFIXES};
-use super::types::{IpcConfig, IpcExportsConfig};
+use super::types::IpcConfig;
 
 /// A single IPC validation diagnostic.
 #[derive(Debug, Clone)]
@@ -379,7 +379,6 @@ mod tests {
         IpcSharingConfig, SharingMode,
     };
     use std::collections::HashMap;
-    use std::path::PathBuf;
 
     fn empty_config() -> IpcConfig {
         IpcConfig {

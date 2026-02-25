@@ -25,6 +25,15 @@ cargo build -p ato-cli
 ./target/debug/ato run .
 ```
 
+## Proto 再生成（メンテナンス時のみ）
+
+通常ビルドでは `protoc` は不要です。  
+`core/proto/tsnet/v1/tsnet.proto` を変更したときだけ、次を実行してください。
+
+```bash
+./core/scripts/gen_tsnet_proto.sh
+```
+
 ## ローカルレジストリ E2E
 
 ```bash

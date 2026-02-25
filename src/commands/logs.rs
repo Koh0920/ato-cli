@@ -21,7 +21,7 @@ pub struct LogsArgs {
 pub fn execute(args: LogsArgs, reporter: Arc<CliReporter>) -> Result<()> {
     let pm = ProcessManager::new()?;
 
-    let (process_info, log_path) = if let Some(id) = &args.id {
+    let (_process_info, log_path) = if let Some(id) = &args.id {
         let info = pm
             .read_pid(id)
             .with_context(|| format!("Failed to read PID file for: {}", id))?;
@@ -57,7 +57,7 @@ pub fn execute(args: LogsArgs, reporter: Arc<CliReporter>) -> Result<()> {
     if args.follow {
         follow_log(&log_path, args.tail, reporter.clone())?;
     } else {
-        show_log(&log_path, args.tail, reporter.clone())?;
+        show_log(&log_path, args.tail)?;
     }
 
     Ok(())
@@ -70,7 +70,7 @@ fn get_log_path(id: &str) -> PathBuf {
         .join(format!("{}{}", id, LOG_FILE_EXT))
 }
 
-fn show_log(log_path: &PathBuf, tail: Option<usize>, reporter: Arc<CliReporter>) -> Result<()> {
+fn show_log(log_path: &PathBuf, tail: Option<usize>) -> Result<()> {
     let file = File::open(log_path)
         .with_context(|| format!("Failed to open log file: {}", log_path.display()))?;
     let reader = BufReader::new(file);
@@ -146,8 +146,6 @@ fn follow_log(log_path: &PathBuf, tail: Option<usize>, reporter: Arc<CliReporter
 
         std::thread::sleep(Duration::from_millis(100));
     }
-
-    Ok(())
 }
 
 #[cfg(test)]

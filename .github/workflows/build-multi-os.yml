@@ -3,10 +3,17 @@ name: Build (Multi OS)
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
   workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
+
+concurrency:
+  group: build-multi-os-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:

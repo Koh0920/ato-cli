@@ -5,7 +5,7 @@
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use blake3::Hasher;
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::Signer;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 use capsule_core::types::profile::{
     ProfileInfo, ProfileManifest, ProfileMeta, ProfilePermissions, ProfilePolicy, ProfileSignature,
-    ProfileSync, PROFILE_CONTENT_TYPE,
+    ProfileSync,
 };
 use capsule_core::types::signing::StoredKey;
 use capsule_core::CapsuleReporter;

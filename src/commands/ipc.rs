@@ -12,9 +12,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 
 use crate::ipc::broker::IpcBroker;
-use crate::ipc::types::{
-    ActivationMode, IpcRuntimeKind, IpcServiceInfo, IpcTransport, SharingMode,
-};
+use crate::ipc::types::{ActivationMode, IpcRuntimeKind, IpcServiceInfo, IpcTransport};
 
 /// Run `ato ipc status`.
 ///
