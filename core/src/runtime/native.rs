@@ -2,7 +2,9 @@ use crate::error::{CapsuleError, Result};
 use crate::metrics::{MetricsSession, ResourceStats, RuntimeMetadata, UnifiedMetrics};
 use crate::runtime::{Measurable, RuntimeHandle};
 use async_trait::async_trait;
+#[cfg(unix)]
 use std::io;
+#[cfg(unix)]
 use std::mem;
 
 /// Native/Nacelle 実行のメトリクスハンドル。
@@ -26,14 +28,17 @@ impl NativeHandle {
         }
     }
 
+    #[cfg(unix)]
     fn timeval_to_seconds(tv: libc::timeval) -> f64 {
         tv.tv_sec as f64 + (tv.tv_usec as f64 / 1_000_000.0)
     }
 
+    #[cfg(unix)]
     fn rusage_cpu_seconds(usage: &libc::rusage) -> f64 {
         Self::timeval_to_seconds(usage.ru_utime) + Self::timeval_to_seconds(usage.ru_stime)
     }
 
+    #[cfg(unix)]
     fn rusage_memory_bytes(usage: &libc::rusage) -> u64 {
         #[cfg(target_os = "linux")]
         {
