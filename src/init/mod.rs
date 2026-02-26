@@ -1,9 +1,11 @@
-//! `capsule init` - initialize an existing project as a capsule.
+//! `ato init` - initialize an existing project as a capsule.
 
 use anyhow::{Context, Result};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+
+use capsule_core::CapsuleReporter;
 
 pub mod detect;
 pub mod recipe;
@@ -13,47 +15,58 @@ pub struct InitArgs {
     pub yes: bool,
 }
 
-pub fn execute(args: InitArgs) -> Result<()> {
+pub fn execute(
+    args: InitArgs,
+    reporter: std::sync::Arc<crate::reporters::CliReporter>,
+) -> Result<()> {
     let project_dir = args
         .path
         .unwrap_or_else(|| PathBuf::from("."))
         .canonicalize()
         .context("Failed to resolve project directory")?;
 
-    println!("🔍 Initializing capsule in: {}\n", project_dir.display());
+    futures::executor::block_on(reporter.notify(format!(
+        "🔍 Initializing capsule in: {}\n",
+        project_dir.display()
+    )))?;
 
     let manifest_path = project_dir.join("capsule.toml");
     if manifest_path.exists() {
         anyhow::bail!(
             "capsule.toml already exists!\n\
-            Use 'capsule dev --manifest capsule.toml' to run, or delete the file to re-initialize."
+            Use 'ato dev --manifest capsule.toml' to run, or delete the file to re-initialize."
         );
     }
 
     let detected = detect::detect_project(&project_dir)?;
-    println!("   Detected: {} project", detected.project_type.as_str());
+    futures::executor::block_on(reporter.notify(format!(
+        "   Detected: {} project",
+        detected.project_type.as_str()
+    )))?;
     if let Some(node) = detected.node.as_ref() {
         if node.is_bun {
-            println!("   Node runtime: bun");
+            futures::executor::block_on(reporter.notify("   Node runtime: bun".to_string()))?;
         }
         if node.has_hono {
-            println!("   Framework: hono");
+            futures::executor::block_on(reporter.notify("   Framework: hono".to_string()))?;
         }
     }
 
     let mut info = recipe::project_info_from_detection(&detected)?;
     if !info.entrypoint.is_empty() {
-        println!("   Entrypoint: {}", info.entrypoint.join(" "));
+        futures::executor::block_on(
+            reporter.notify(format!("   Entrypoint: {}", info.entrypoint.join(" "))),
+        )?;
     }
     if let Some(dev) = info.node_dev_entrypoint.as_ref() {
-        println!("   Dev: {}", dev.join(" "));
+        futures::executor::block_on(reporter.notify(format!("   Dev: {}", dev.join(" "))))?;
     }
     if let Some(release) = info.node_release_entrypoint.as_ref() {
-        println!("   Release: {}", release.join(" "));
+        futures::executor::block_on(reporter.notify(format!("   Release: {}", release.join(" "))))?;
     }
 
     if !args.yes {
-        info = prompt_for_details(info)?;
+        info = prompt_for_details(info, reporter.clone())?;
     }
 
     let description = format!(
@@ -63,49 +76,62 @@ pub fn execute(args: InitArgs) -> Result<()> {
     let manifest_content = recipe::generate_manifest(
         &info,
         recipe::ManifestMeta {
-            generated_by: "capsule init",
+            generated_by: "ato init",
             description: &description,
         },
     );
     fs::write(&manifest_path, &manifest_content).context("Failed to write capsule.toml")?;
 
     if project_dir.join(".git").exists() {
-        add_to_gitignore(&project_dir)?;
+        add_to_gitignore(&project_dir, reporter.clone())?;
     }
 
     // Opt-in packaging control: if this looks like a Node project and node_modules exists,
     // create a minimal .capsuleignore if it doesn't exist yet.
-    maybe_create_capsuleignore(&project_dir, &info)?;
+    maybe_create_capsuleignore(&project_dir, &info, reporter.clone())?;
 
-    println!("\n✨ Created capsule.toml!");
-    println!("\nNext steps:");
-    println!("   capsule dev           # Run locally (no bundling)");
-    println!("   capsule pack --bundle # Create self-extracting bundle");
+    futures::executor::block_on(reporter.notify("\n✨ Created capsule.toml!".to_string()))?;
+    futures::executor::block_on(reporter.notify("\nNext steps:".to_string()))?;
+    futures::executor::block_on(
+        reporter.notify("   ato dev           # Run locally (no bundling)".to_string()),
+    )?;
+    futures::executor::block_on(
+        reporter.notify("   ato pack --bundle # Create self-extracting bundle".to_string()),
+    )?;
 
     if matches!(info.project_type, detect::ProjectType::Rust) {
-        println!("\nNote:");
-        println!("   For Rust, build a release binary before packing:");
+        futures::executor::block_on(reporter.notify("\nNote:".to_string()))?;
+        futures::executor::block_on(
+            reporter.notify("   For Rust, build a release binary before packing:".to_string()),
+        )?;
         if let Some(bin) = release_binary_name(&info) {
-            println!("   cargo build --release && cp target/release/{bin} ./{bin}");
+            futures::executor::block_on(reporter.notify(format!(
+                "   cargo build --release && cp target/release/{bin} ./{bin}"
+            )))?;
         } else {
-            println!("   cargo build --release");
+            futures::executor::block_on(reporter.notify("   cargo build --release".to_string()))?;
         }
     }
     if matches!(info.project_type, detect::ProjectType::Go) {
-        println!("\nNote:");
-        println!("   For Go, build a binary before packing:");
+        futures::executor::block_on(reporter.notify("\nNote:".to_string()))?;
+        futures::executor::block_on(
+            reporter.notify("   For Go, build a binary before packing:".to_string()),
+        )?;
         if let Some(bin) = release_binary_name(&info) {
-            println!("   go build -o {bin} .");
+            futures::executor::block_on(reporter.notify(format!("   go build -o {bin} .")))?;
         } else {
-            println!("   go build -o app .");
+            futures::executor::block_on(reporter.notify("   go build -o app .".to_string()))?;
         }
     }
 
     Ok(())
 }
 
-fn prompt_for_details(mut info: recipe::ProjectInfo) -> Result<recipe::ProjectInfo> {
-    print!("\n? Package name: ({}) ", info.name);
+fn prompt_for_details(
+    mut info: recipe::ProjectInfo,
+    reporter: std::sync::Arc<crate::reporters::CliReporter>,
+) -> Result<recipe::ProjectInfo> {
+    futures::executor::block_on(reporter.notify(format!("\n? Package name: ({}) ", info.name)))?;
     io::stdout().flush()?;
 
     let mut input = String::new();
@@ -122,9 +148,11 @@ fn prompt_for_details(mut info: recipe::ProjectInfo) -> Result<recipe::ProjectIn
     };
 
     if default_cmd.is_empty() {
-        print!("? Entry command: ");
+        futures::executor::block_on(reporter.notify("? Entry command: ".to_string()))?;
     } else {
-        print!("? Entry command: ({}) ", default_cmd);
+        futures::executor::block_on(
+            reporter.notify(format!("? Entry command: ({}) ", default_cmd)),
+        )?;
     }
     io::stdout().flush()?;
 
@@ -142,7 +170,10 @@ fn prompt_for_details(mut info: recipe::ProjectInfo) -> Result<recipe::ProjectIn
     Ok(info)
 }
 
-fn add_to_gitignore(dir: &Path) -> Result<()> {
+fn add_to_gitignore(
+    dir: &Path,
+    reporter: std::sync::Arc<crate::reporters::CliReporter>,
+) -> Result<()> {
     let gitignore_path = dir.join(".gitignore");
 
     let existing = if gitignore_path.exists() {
@@ -159,11 +190,15 @@ fn add_to_gitignore(dir: &Path) -> Result<()> {
     let new_content = format!("{}{}", existing.trim_end(), addition);
 
     fs::write(&gitignore_path, new_content).context("Failed to update .gitignore")?;
-    println!("   ✓ Updated .gitignore");
+    futures::executor::block_on(reporter.notify("   ✓ Updated .gitignore".to_string()))?;
     Ok(())
 }
 
-fn maybe_create_capsuleignore(dir: &Path, info: &recipe::ProjectInfo) -> Result<()> {
+fn maybe_create_capsuleignore(
+    dir: &Path,
+    info: &recipe::ProjectInfo,
+    reporter: std::sync::Arc<crate::reporters::CliReporter>,
+) -> Result<()> {
     let capsuleignore_path = dir.join(".capsuleignore");
     if capsuleignore_path.exists() {
         return Ok(());
@@ -177,7 +212,9 @@ fn maybe_create_capsuleignore(dir: &Path, info: &recipe::ProjectInfo) -> Result<
 
             fs::write(&capsuleignore_path, "node_modules/\n")
                 .context("Failed to write .capsuleignore")?;
-            println!("   ✓ Created .capsuleignore (excludes node_modules/)");
+            futures::executor::block_on(
+                reporter.notify("   ✓ Created .capsuleignore (excludes node_modules/)".to_string()),
+            )?;
         }
         detect::ProjectType::Rust => {
             if !dir.join("target").exists() {
@@ -186,7 +223,9 @@ fn maybe_create_capsuleignore(dir: &Path, info: &recipe::ProjectInfo) -> Result<
 
             fs::write(&capsuleignore_path, "target/\n")
                 .context("Failed to write .capsuleignore")?;
-            println!("   ✓ Created .capsuleignore (excludes target/)");
+            futures::executor::block_on(
+                reporter.notify("   ✓ Created .capsuleignore (excludes target/)".to_string()),
+            )?;
         }
         _ => {}
     }
