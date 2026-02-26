@@ -11,15 +11,16 @@ const TARGET_ARCHIVE: &str = "ato-x86_64-unknown-linux-gnu.tar.gz";
 const VERSIONED_CHECKSUM_PATH: &str = "/ato/releases/{version}/SHA256SUMS";
 const LATEST_CHECKSUM_PATH: &str = "/ato/latest/SHA256SUMS";
 
+#[derive(Debug, Clone)]
+pub struct WorkflowSyncOutcome {
+    pub workflow_path: PathBuf,
+    pub changed: bool,
+    pub created: bool,
+    pub used_latest_fallback: bool,
+}
+
 pub fn execute(reporter: std::sync::Arc<crate::reporters::CliReporter>) -> Result<()> {
     let cwd = std::env::current_dir().context("Failed to resolve current directory")?;
-    let manifest_path = cwd.join("capsule.toml");
-    if !manifest_path.exists() {
-        anyhow::bail!(
-            "capsule.toml not found in current directory: {}",
-            cwd.display()
-        );
-    }
 
     if !cwd.join(".git").exists() {
         futures::executor::block_on(reporter.warn(
@@ -28,8 +29,49 @@ pub fn execute(reporter: std::sync::Arc<crate::reporters::CliReporter>) -> Resul
         ))?;
     }
 
-    let workflow_path = cwd.join(WORKFLOW_REL_PATH);
+    let outcome = sync_workflow_in_dir(&cwd)?;
+    if outcome.used_latest_fallback {
+        futures::executor::block_on(
+            reporter.warn(
+                "⚠️  Versioned release checksum was unavailable; fell back to latest channel."
+                    .to_string(),
+            ),
+        )?;
+    }
 
+    if !outcome.changed {
+        futures::executor::block_on(reporter.notify(format!(
+            "✅ CI workflow is already up-to-date: {}",
+            outcome.workflow_path.display()
+        )))?;
+    } else {
+        let action = if outcome.created {
+            "Generated"
+        } else {
+            "Updated"
+        };
+        futures::executor::block_on(reporter.notify(format!(
+            "✅ {} CI workflow: {}",
+            action,
+            outcome.workflow_path.display()
+        )))?;
+        futures::executor::block_on(
+            reporter.notify("   Next step: commit and push this workflow file.".to_string()),
+        )?;
+    }
+    Ok(())
+}
+
+pub fn sync_workflow_in_dir(cwd: &Path) -> Result<WorkflowSyncOutcome> {
+    let manifest_path = cwd.join("capsule.toml");
+    if !manifest_path.exists() {
+        anyhow::bail!(
+            "capsule.toml not found in current directory: {}",
+            cwd.display()
+        );
+    }
+
+    let workflow_path = cwd.join(WORKFLOW_REL_PATH);
     let ato_version = env!("CARGO_PKG_VERSION");
     let release_base_url = resolve_release_base_url();
     let checksum_resolution =
@@ -40,45 +82,27 @@ pub fn execute(reporter: std::sync::Arc<crate::reporters::CliReporter>) -> Resul
         &checksum_resolution.checksum,
         &checksum_resolution.archive_path,
     );
-    if checksum_resolution.used_latest_fallback {
-        futures::executor::block_on(
-            reporter.warn(
-                "⚠️  Versioned release checksum was unavailable; fell back to latest channel."
-                    .to_string(),
-            ),
-        )?;
-    }
 
-    if let Some(parent) = workflow_path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!("Failed to create workflow directory: {}", parent.display())
-        })?;
-    }
     let previous = fs::read_to_string(&workflow_path).ok();
-    if previous.as_deref() == Some(workflow.as_str()) {
-        futures::executor::block_on(reporter.notify(format!(
-            "✅ CI workflow is already up-to-date: {}",
-            workflow_path.display()
-        )))?;
-    } else {
+    let changed = previous.as_deref() != Some(workflow.as_str());
+    let created = changed && previous.is_none();
+
+    if changed {
+        if let Some(parent) = workflow_path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create workflow directory: {}", parent.display())
+            })?;
+        }
         fs::write(&workflow_path, workflow)
             .with_context(|| format!("Failed to write workflow: {}", workflow_path.display()))?;
-
-        let action = if previous.is_some() {
-            "Updated"
-        } else {
-            "Generated"
-        };
-        futures::executor::block_on(reporter.notify(format!(
-            "✅ {} CI workflow: {}",
-            action,
-            workflow_path.display()
-        )))?;
-        futures::executor::block_on(
-            reporter.notify("   Next step: commit and push this workflow file.".to_string()),
-        )?;
     }
-    Ok(())
+
+    Ok(WorkflowSyncOutcome {
+        workflow_path,
+        changed,
+        created,
+        used_latest_fallback: checksum_resolution.used_latest_fallback,
+    })
 }
 
 fn resolve_release_base_url() -> String {
@@ -231,7 +255,11 @@ jobs:
           rm -f ato.tar.gz
 
       - name: Publish to Ato Store
-        run: ato publish --ci
+        run: |
+          set -euo pipefail
+          # Backward-compatible: old ato binaries still require a signing key.
+          # Newer keyless binaries ignore this env and continue with OIDC-only provenance.
+          ATO_SIGNING_KEY_JSON="$(ato key gen --json)" ato publish --ci
 "#
     )
 }
