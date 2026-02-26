@@ -256,6 +256,7 @@ jobs:
           )
 
           echo "release_version=$release_version" >> "$GITHUB_OUTPUT"
+          echo "cargo_version=$cargo_version" >> "$GITHUB_OUTPUT"
           echo "deploy_env=$deploy_env" >> "$GITHUB_OUTPUT"
           echo "update_latest=$update_latest" >> "$GITHUB_OUTPUT"
           echo "bucket=$bucket_input" >> "$GITHUB_OUTPUT"
@@ -279,6 +280,29 @@ jobs:
           VERSION: ${{ steps.prepare.outputs.release_version }}
           DEPLOY_ENV: production
           UPDATE_LATEST: ${{ steps.prepare.outputs.update_latest }}
+          SOURCE_DIR: ${{ steps.prepare.outputs.source_dir }}
+          WRANGLER_CONFIG: ""
+        run: ./scripts/upload_release_to_r2.sh
+
+      - name: Upload archives to R2 (semver alias for main push)
+        if: ${{ github.event_name == 'push' }}
+        shell: bash
+        env:
+          VERSION: ${{ steps.prepare.outputs.cargo_version }}
+          DEPLOY_ENV: ${{ steps.prepare.outputs.deploy_env }}
+          UPDATE_LATEST: 0
+          BUCKET: ${{ steps.prepare.outputs.bucket }}
+          SOURCE_DIR: ${{ steps.prepare.outputs.source_dir }}
+          WRANGLER_CONFIG: ""
+        run: ./scripts/upload_release_to_r2.sh
+
+      - name: Upload archives to R2 (production semver alias for main push)
+        if: ${{ github.event_name == 'push' }}
+        shell: bash
+        env:
+          VERSION: ${{ steps.prepare.outputs.cargo_version }}
+          DEPLOY_ENV: production
+          UPDATE_LATEST: 0
           SOURCE_DIR: ${{ steps.prepare.outputs.source_dir }}
           WRANGLER_CONFIG: ""
         run: ./scripts/upload_release_to_r2.sh
