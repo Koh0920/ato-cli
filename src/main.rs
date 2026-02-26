@@ -100,6 +100,8 @@ mod process_manager;
 mod profile;
 mod publish_ci;
 mod publish_dry_run;
+mod publish_preflight;
+mod publish_tui;
 mod registry;
 mod registry_serve;
 mod reporters;
@@ -149,7 +151,7 @@ Auth:
 Advanced Commands:
   key      Manage signing keys
   config   Manage configuration (registry, engine, source)
-  publish  Upload a local .capsule or register a GitHub repository source
+  publish  CI-first publish (TTY: GitOps release TUI, CI: --ci)
   gen-ci   Generate GitHub Actions workflow for OIDC CI publish
   registry Manage registry commands (resolve/list/cache/serve)
 
@@ -452,10 +454,6 @@ enum Commands {
         about = "Publish via CI-first flow (use --ci in GitHub Actions or --dry-run locally)"
     )]
     Publish {
-        /// Registry URL (default: localhost:8787 for beta)
-        #[arg(long)]
-        registry: Option<String>,
-
         /// Publish from GitHub Actions with OIDC token (CI-only mode)
         #[arg(long, conflicts_with = "dry_run")]
         ci: bool,
@@ -463,6 +461,10 @@ enum Commands {
         /// Validate local capsule build inputs without publishing
         #[arg(long, conflicts_with = "ci")]
         dry_run: bool,
+
+        /// Disable interactive TUI and show CI guidance instead
+        #[arg(long, conflicts_with_all = ["ci", "dry_run", "json"])]
+        no_tui: bool,
 
         /// Emit machine-readable JSON output
         #[arg(long)]
@@ -1483,15 +1485,17 @@ fn run() -> Result<()> {
         },
 
         Commands::Publish {
-            registry,
             ci,
             dry_run,
+            no_tui,
             json,
         } => {
             if ci {
-                execute_publish_ci_command(registry, json, reporter.clone())
+                execute_publish_ci_command(json, reporter.clone())
             } else if dry_run {
                 execute_publish_dry_run_command(json, reporter.clone())
+            } else if std::io::stdout().is_terminal() && !json && !no_tui {
+                execute_publish_tui_command(reporter.clone())
             } else {
                 execute_publish_guidance_command(json)
             }
@@ -1758,17 +1762,12 @@ fn execute_registry_command(command: RegistryCommands) -> Result<()> {
 }
 
 fn execute_publish_ci_command(
-    registry_url: Option<String>,
     json_output: bool,
     reporter: std::sync::Arc<reporters::CliReporter>,
 ) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        let result = publish_ci::execute(publish_ci::PublishCiArgs {
-            registry_url,
-            json_output,
-        })
-        .await?;
+        let result = publish_ci::execute(publish_ci::PublishCiArgs { json_output }).await?;
 
         if json_output {
             println!("{}", serde_json::to_string_pretty(&result)?);
@@ -1853,6 +1852,66 @@ fn execute_publish_guidance_command(json_output: bool) -> Result<()> {
         println!("💡 Tip: Run `ato publish --dry-run` to validate locally before pushing.");
     }
     Ok(())
+}
+
+fn execute_publish_tui_command(reporter: std::sync::Arc<reporters::CliReporter>) -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let outcome = publish_tui::execute().await?;
+        match outcome {
+            publish_tui::PublishTuiOutcome::Success(summary) => {
+                println!("✅ Ato publish completed successfully.");
+                println!("   Capsule: {} v{}", summary.capsule, summary.version);
+                println!("   Run URL: {}", summary.run_url);
+                futures::executor::block_on(
+                    reporter.notify("Interactive publish orchestration completed.".to_string()),
+                )?;
+                Ok(())
+            }
+            publish_tui::PublishTuiOutcome::Failure(summary) => {
+                println!("❌ Ato publish failed.");
+                println!("   {}", summary.message);
+                if let Some(conclusion) = summary.conclusion {
+                    println!("   Conclusion: {}", conclusion);
+                }
+                if let Some(run_url) = summary.run_url {
+                    println!("   Run URL: {}", run_url);
+                }
+                if !summary.details.is_empty() {
+                    println!();
+                    println!("Failure details:");
+                    for job in summary.details {
+                        println!(" - Job: {} ({})", job.name, job.status);
+                        if job.failed_steps.is_empty() {
+                            println!("   Failed steps: (not available)");
+                        } else {
+                            println!("   Failed steps: {}", job.failed_steps.join(", "));
+                        }
+                        if let Some(excerpt) = job.log_excerpt {
+                            for line in excerpt.lines().take(12) {
+                                println!("   {}", line);
+                            }
+                            if excerpt.lines().count() > 12 {
+                                println!("   ... (truncated)");
+                            }
+                        }
+                    }
+                }
+                if let Some(tag) = summary.tag {
+                    println!();
+                    println!("💡 Recovery:");
+                    println!("   git tag -d {}", tag);
+                    println!("   git push --delete origin {}", tag);
+                    println!("   fix and run `ato publish` again");
+                }
+                anyhow::bail!(summary.message)
+            }
+            publish_tui::PublishTuiOutcome::Cancelled => {
+                println!("Publish was cancelled.");
+                Ok(())
+            }
+        }
+    })
 }
 
 fn execute_setup_command(

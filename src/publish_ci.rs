@@ -9,10 +9,11 @@ use serde::{Deserialize, Serialize};
 const DEFAULT_STORE_API_URL: &str = "https://api.ato.run";
 const ENV_STORE_API_URL: &str = "ATO_STORE_API_URL";
 const OIDC_AUDIENCE: &str = "api.ato.run";
+const ENV_SIGNING_KEY_PATH: &str = "ATO_SIGNING_KEY";
+const ENV_SIGNING_KEY_JSON: &str = "ATO_SIGNING_KEY_JSON";
 
 #[derive(Debug, Clone)]
 pub struct PublishCiArgs {
-    pub registry_url: Option<String>,
     pub json_output: bool,
 }
 
@@ -65,7 +66,8 @@ struct CiMetadataPayload {
     workflow_run_id: Option<String>,
     builder_identity: String,
     idempotency_key: String,
-    did_signature: DidSignaturePayload,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    did_signature: Option<DidSignaturePayload>,
     artifact_sha256: String,
     artifact_blake3: String,
     file_name: String,
@@ -121,7 +123,8 @@ pub async fn execute(args: PublishCiArgs) -> Result<PublishCiResult> {
     let artifact_sha256 = compute_sha256_hex(&artifact_bytes);
     let artifact_blake3 = compute_blake3_label(&artifact_bytes);
 
-    let (did, signature_b64) = sign_content_hash(&artifact_blake3)?;
+    let did_signature = build_optional_signature(&artifact_blake3)?;
+    let keyless_mode = did_signature.is_none();
     let file_name = artifact_path
         .file_name()
         .and_then(|v| v.to_str())
@@ -138,13 +141,7 @@ pub async fn execute(args: PublishCiArgs) -> Result<PublishCiResult> {
         workflow_run_id: github.run_id.clone(),
         builder_identity: format!("github-actions:{}", github.workflow_ref),
         idempotency_key: format!("{}:{}:{}", source_repo, expected_tag, github.sha),
-        did_signature: DidSignaturePayload {
-            algorithm: "Ed25519".to_string(),
-            public_key: did,
-            content_hash: artifact_blake3.clone(),
-            signature: signature_b64,
-            signed_at: chrono::Utc::now().timestamp(),
-        },
+        did_signature,
         artifact_sha256,
         artifact_blake3,
         file_name: file_name.clone(),
@@ -154,11 +151,7 @@ pub async fn execute(args: PublishCiArgs) -> Result<PublishCiResult> {
         request_playground,
     };
 
-    let registry_url = args
-        .registry_url
-        .as_deref()
-        .map(trim_trailing_slash)
-        .unwrap_or_else(resolve_store_api_base_url);
+    let registry_url = resolve_store_api_base_url();
     let endpoint = format!("{}/v1/publish/ci", registry_url);
 
     let metadata_json = serde_json::to_string(&metadata).context("Failed to serialize metadata")?;
@@ -190,6 +183,9 @@ pub async fn execute(args: PublishCiArgs) -> Result<PublishCiResult> {
 
     if !args.json_output {
         eprintln!("CI artifact built: {}", artifact_path.display());
+        if keyless_mode {
+            eprintln!("CI publish mode: keyless (OIDC-backed provenance, no local signing key)");
+        }
     }
 
     Ok(result)
@@ -414,16 +410,51 @@ pub(crate) fn build_capsule_artifact(
     Ok(artifact_path)
 }
 
-fn sign_content_hash(content_hash: &str) -> Result<(String, String)> {
-    let key_path = read_env_trimmed("ATO_SIGNING_KEY")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("private.key"));
-    let stored = capsule_core::types::signing::StoredKey::read(&key_path)
-        .with_context(|| format!("Failed to read signing key: {}", key_path.display()))?;
+fn sign_content_hash_with_stored_key(
+    content_hash: &str,
+    stored: &capsule_core::types::signing::StoredKey,
+) -> Result<DidSignaturePayload> {
     let did = stored.did()?;
     let signing_key = stored.to_signing_key()?;
     let signature = signing_key.sign(content_hash.as_bytes());
-    Ok((did, BASE64_STANDARD.encode(signature.to_bytes())))
+    Ok(DidSignaturePayload {
+        algorithm: "Ed25519".to_string(),
+        public_key: did,
+        content_hash: content_hash.to_string(),
+        signature: BASE64_STANDARD.encode(signature.to_bytes()),
+        signed_at: chrono::Utc::now().timestamp(),
+    })
+}
+
+fn build_optional_signature(content_hash: &str) -> Result<Option<DidSignaturePayload>> {
+    if let Some(key_json) = read_env_trimmed(ENV_SIGNING_KEY_JSON) {
+        let stored = serde_json::from_str::<capsule_core::types::signing::StoredKey>(&key_json)
+            .with_context(|| {
+                format!(
+                    "Failed to parse signing key from {} (expected StoredKey JSON)",
+                    ENV_SIGNING_KEY_JSON
+                )
+            })?;
+        return sign_content_hash_with_stored_key(content_hash, &stored).map(Some);
+    }
+
+    if let Some(path_raw) = read_env_trimmed(ENV_SIGNING_KEY_PATH) {
+        let key_path = PathBuf::from(path_raw);
+        let stored = capsule_core::types::signing::StoredKey::read(&key_path)
+            .with_context(|| format!("Failed to read signing key: {}", key_path.display()))?;
+        return sign_content_hash_with_stored_key(content_hash, &stored).map(Some);
+    }
+
+    let default_key_path = PathBuf::from("private.key");
+    if default_key_path.exists() {
+        let stored = capsule_core::types::signing::StoredKey::read(&default_key_path)
+            .with_context(|| {
+                format!("Failed to read signing key: {}", default_key_path.display())
+            })?;
+        return sign_content_hash_with_stored_key(content_hash, &stored).map(Some);
+    }
+
+    Ok(None)
 }
 
 fn compute_sha256_hex(data: &[u8]) -> String {

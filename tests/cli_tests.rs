@@ -173,11 +173,10 @@ fn test_publish_command_exists() {
     cmd.args(["publish", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains(
-            "Upload a local .capsule or register a GitHub repository source",
-        ))
-        .stdout(predicate::str::contains("--artifact <ARTIFACT>"))
-        .stdout(predicate::str::contains("--scoped-id <SCOPED_ID>"));
+        .stdout(predicate::str::contains("Publish via CI-first flow"))
+        .stdout(predicate::str::contains("--ci"))
+        .stdout(predicate::str::contains("--dry-run"))
+        .stdout(predicate::str::contains("--no-tui"));
 }
 
 #[test]
@@ -256,26 +255,15 @@ fn test_build_invalid_manifest_outputs_single_json_error() {
 fn test_publish_json_error_uses_diagnostic_envelope() {
     let output = Command::cargo_bin("ato")
         .unwrap()
-        .args([
-            "--json",
-            "publish",
-            "https://github.com/example/repo",
-            "--registry",
-            "http://127.0.0.1:9",
-        ])
+        .args(["publish", "--json"])
         .output()
         .unwrap();
 
-    assert!(!output.status.success());
+    assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    let lines: Vec<&str> = stdout
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .collect();
-    let value: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
-    assert_eq!(value["schema_version"], "1");
-    assert_eq!(value["type"], "error");
-    assert_eq!(value["code"], "E201");
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["code"], "CI_ONLY_PUBLISH");
 }
 
 #[test]
