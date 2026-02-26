@@ -1,0 +1,290 @@
+use std::fs;
+use std::io::{Cursor, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use anyhow::Result;
+use tar::Builder;
+use tracing::debug;
+use zstd::stream::encode_all;
+
+use crate::error::Result as CapsuleResult;
+use crate::r3_config;
+
+/// Capsule Format v2 PAX TAR Archive Structure:
+/// ```text
+/// my-app.capsule (PAX TAR)
+/// ├── capsule.toml
+/// ├── signature.json
+/// └── payload.tar.zst
+///     ├── source/ (code)
+///     ├── config.json (generated)
+///     └── capsule.lock (generated)
+/// ```
+
+#[derive(Debug, Clone)]
+pub struct CapsulePackOptions {
+    pub manifest_path: PathBuf,
+    pub manifest_dir: PathBuf,
+    pub output: Option<PathBuf>,
+    pub enforcement: String,
+    pub standalone: bool,
+}
+
+const ZSTD_COMPRESSION_LEVEL: i32 = 19;
+
+pub async fn pack(
+    _plan: &crate::router::ManifestData,
+    opts: CapsulePackOptions,
+    _reporter: Arc<dyn crate::reporter::CapsuleReporter + 'static>,
+) -> CapsuleResult<PathBuf> {
+    debug!("Creating capsule archive (.capsule format)");
+
+    let loaded = crate::manifest::load_manifest(&opts.manifest_path)?;
+    let manifest_content = loaded.raw_text;
+
+    // Step 1: Generate config.json
+    debug!("Phase 1: generating config.json");
+
+    let config_path = r3_config::generate_and_write_config(
+        &opts.manifest_path,
+        Some(opts.enforcement.clone()),
+        false,
+    )?;
+
+    // Step 2: Generate capsule.lock (skip for now, placeholder)
+    debug!("Phase 2: generating capsule.lock (placeholder)");
+
+    let lockfile_path = opts.manifest_dir.join("capsule.lock");
+    if !lockfile_path.exists() {
+        fs::write(&lockfile_path, "# Placeholder - generated during pack")?;
+    }
+
+    // Step 3: Resolve source payload input
+    let source_dir = opts.manifest_dir.join("source");
+
+    // Step 4: Create payload.tar.zst
+    debug!("Phase 3: creating payload.tar.zst");
+
+    let temp_dir = std::env::temp_dir().join(format!("capsule-payload-{}", std::process::id()));
+    fs::create_dir_all(&temp_dir)?;
+
+    let payload_tar_path = temp_dir.join("payload.tar");
+    let payload_zst_path = temp_dir.join("payload.tar.zst");
+
+    // Create payload.tar
+    let mut payload_file = fs::File::create(&payload_tar_path)?;
+    let mut ar = Builder::new(&mut payload_file);
+
+    // Add source/ directory contents.
+    // If source/ does not exist, fallback to project root contents (excluding generated/build files).
+    if source_dir.exists() {
+        copy_dir_to_tar(&mut ar, &source_dir, "source")?;
+    } else {
+        debug!("No source/ directory found; packaging project root as source/");
+        copy_project_root_to_tar(&mut ar, &opts.manifest_dir, "source")?;
+    }
+
+    // Add config.json using append_path_with_name
+    ar.append_path_with_name(&config_path, "config.json")?;
+
+    // Add capsule.lock using append_path_with_name
+    ar.append_path_with_name(&lockfile_path, "capsule.lock")?;
+
+    ar.finish()?;
+    drop(ar);
+
+    // Compress with zstd
+    debug!(
+        "Compressing payload with zstd level {}",
+        ZSTD_COMPRESSION_LEVEL
+    );
+
+    let payload_tar_size = fs::metadata(&payload_tar_path)?.len();
+    let payload_tar_content = fs::read(&payload_tar_path)?;
+    let mut cursor = Cursor::new(payload_tar_content);
+    let compressed = encode_all(&mut cursor, ZSTD_COMPRESSION_LEVEL)?;
+
+    let mut zst_file = fs::File::create(&payload_zst_path)?;
+    zst_file.write_all(&compressed)?;
+
+    let compression_ratio = (compressed.len() as f64 / payload_tar_size as f64) * 100.0;
+    debug!(
+        "Compressed payload size: {} (ratio: {:.1}%)",
+        format_bytes(compressed.len()),
+        compression_ratio
+    );
+
+    // Step 5: Create final .capsule archive
+    debug!("Phase 4: creating final .capsule archive");
+
+    let output_path = opts.output.clone().unwrap_or_else(|| {
+        let name_str = loaded.model.name.replace('\"', "-");
+        opts.manifest_dir.join(format!("{}.capsule", name_str))
+    });
+
+    let mut capsule_file = fs::File::create(&output_path)?;
+    let mut outer_ar = Builder::new(&mut capsule_file);
+
+    // Write actual manifest content
+    let manifest_temp_path = temp_dir.join("capsule.toml");
+    fs::write(&manifest_temp_path, &manifest_content)?;
+    outer_ar.append_path_with_name(&manifest_temp_path, "capsule.toml")?;
+
+    // Add signature.json (placeholder for now)
+    let sig_temp_path = temp_dir.join("signature.json");
+    fs::write(
+        &sig_temp_path,
+        r#"{"signed": false, "note": "To be signed"}"#,
+    )?;
+    outer_ar.append_path_with_name(&sig_temp_path, "signature.json")?;
+
+    // Add payload.tar.zst
+    outer_ar.append_path_with_name(&payload_zst_path, "payload.tar.zst")?;
+
+    outer_ar.finish()?;
+    drop(outer_ar);
+
+    // Clean up temp directory
+    fs::remove_dir_all(&temp_dir)?;
+
+    let final_size = fs::metadata(&output_path)?.len();
+    debug!(
+        "Capsule created: {} ({})",
+        output_path.display(),
+        format_bytes(final_size as usize)
+    );
+
+    Ok(output_path)
+}
+
+fn copy_dir_to_tar(ar: &mut Builder<&mut fs::File>, src: &Path, prefix: &str) -> Result<()> {
+    let target = prefix.to_string();
+    if !src.exists() {
+        ar.append_dir(&target, &src)?;
+        return Ok(());
+    }
+
+    let mut entries = fs::read_dir(src)?;
+    if entries.next().is_none() {
+        ar.append_dir(&target, &src)?;
+        return Ok(());
+    }
+
+    drop(entries);
+
+    copy_dir_to_tar_recursive(ar, src, prefix)?;
+
+    Ok(())
+}
+
+fn copy_dir_to_tar_recursive(
+    ar: &mut Builder<&mut fs::File>,
+    src: &Path,
+    prefix: &str,
+) -> Result<()> {
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let target = format!("{}/{}", prefix, name.to_string_lossy());
+
+        if entry.file_type()?.is_dir() {
+            ar.append_dir(&target, &path)?;
+            copy_dir_to_tar_recursive(ar, &path, &target)?;
+        } else {
+            ar.append_path_with_name(&path, &target)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn copy_project_root_to_tar(
+    ar: &mut Builder<&mut fs::File>,
+    project_root: &Path,
+    prefix: &str,
+) -> Result<()> {
+    ar.append_dir(prefix, project_root)?;
+    copy_project_root_recursive(ar, project_root, project_root, prefix)
+}
+
+fn copy_project_root_recursive(
+    ar: &mut Builder<&mut fs::File>,
+    project_root: &Path,
+    current_dir: &Path,
+    prefix: &str,
+) -> Result<()> {
+    for entry in fs::read_dir(current_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let rel = match path.strip_prefix(project_root) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let file_type = entry.file_type()?;
+
+        if should_skip_project_entry(rel, file_type.is_dir()) {
+            continue;
+        }
+
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        let target = format!("{}/{}", prefix, rel_str);
+
+        if file_type.is_dir() {
+            ar.append_dir(&target, &path)?;
+            copy_project_root_recursive(ar, project_root, &path, prefix)?;
+        } else {
+            ar.append_path_with_name(&path, &target)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn should_skip_project_entry(rel: &Path, is_dir: bool) -> bool {
+    let first = rel
+        .components()
+        .next()
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    if matches!(first.as_str(), ".git" | ".capsule" | "target") {
+        return true;
+    }
+
+    if is_dir {
+        return false;
+    }
+
+    let file_name = rel
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    if matches!(
+        file_name.as_str(),
+        "capsule.toml"
+            | "config.json"
+            | "capsule.lock"
+            | "signature.json"
+            | "payload.tar"
+            | "payload.tar.zst"
+    ) {
+        return true;
+    }
+
+    file_name.ends_with(".capsule") || file_name.ends_with(".sig")
+}
+
+fn format_bytes(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{}B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1}KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.1}GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}

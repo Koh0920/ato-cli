@@ -1,97 +1,111 @@
-# capsule-cli
+# ato-cli
 
-`capsule` は **メタレイヤー / CLI** として、`capsule.toml` を読み、適切な下位エンジン（例: `nacelle`）へディスパッチします。
+`ato` は `capsule.toml` を解釈して、実行・配布・インストールを行うメタCLIです。  
+Zero-Trust / fail-closed を前提に、通常実行時は静かに動作し、同意や違反時のみ明示的に出力します。
 
-このワークスペースでは、プロセス境界（JSON over stdio）の最小契約に従って `nacelle internal ...` を呼び出します。
-
-- 契約: ../nacelle/docs/ENGINE_INTERFACE_CONTRACT.md
-
-## Quick Start
+## 主要コマンド
 
 ```bash
-# nacelle をビルド（エンジン）
-cd ../nacelle/cli
-cargo build
-
-# capsule をビルド（メタCLI）
-cd ../../capsule-cli
-cargo build
-
-# 一度だけ engine を登録（PATH探索は無効化されているため）
-./target/debug/capsule engine register --name default --path ../nacelle/target/debug/nacelle --default
-
-# 1) Create
-./target/debug/capsule new my-app --template node
-cd my-app
-
-# 2) Run (dev)
-# `execution.dev.entrypoint` があればそれを優先
-../target/debug/capsule dev
-
-# (Node/Bun) 3) Build (recommended)
-# `execution.release.entrypoint` を実行できるように、配布前にビルド成果物を生成
-bun install
-bun run build
-
-# (Bun) Note: `--hot` / `--watch` のフラグ位置
-# Bun のフラグは `bun` の直後に置きます（`bun --hot run ...`）。
-# `bun run <script> --hot` のように末尾へ置くと、フラグがスクリプト側に渡って Bun が解釈しないことがあります。
-# `capsule.toml` の `execution.dev.entrypoint` では、以下のような形を推奨します:
-#   - bun --hot run src/index.ts
-#   - bun --watch run src/index.ts
-
-# 3) Ship (bundle)
-../target/debug/capsule pack --bundle
-
-# 4) Execute (deploy artifact)
-./nacelle-bundle
+ato run [path|publisher/slug]
+ato install <publisher/slug>
+ato build [path]
+ato publish <repo_url>
+ato publish --artifact <file.capsule> --scoped-id <publisher/slug> --registry <http://127.0.0.1:port>
+ato search [query]
+ato registry serve --host 127.0.0.1 --port 8787
 ```
 
-## Dev / Release Profiles
-
-`capsule.toml` の `[execution]` に加えて、以下のプロファイルをサポートします。
-
-- `[execution.dev]`:
-	- `capsule dev` / `nacelle dev` が優先して使う
-- `[execution.release]`:
-	- `nacelle-bundle` 実行（=配布物）が優先して使う
-
-## .capsuleignore
-
-`.capsuleignore`（オプション）を置くと、bundle に含めるファイルを制御できます。
-
-- Node/Bun の場合は `node_modules/` を除外し、`bun build` の成果物（例: `dist/`）だけを同梱する運用を推奨します。
-
-## build / isolation
-
-`capsule.toml` は packaging-time / runtime-time の追加設定をサポートします。
-
-```toml
-[build]
-# `.capsuleignore` に追加で適用される除外パターン（pack / bundle の両方）
-exclude_libs = ["**/.venv/**", "**/site-packages/torch/**"]
-
-# GPU向けのスキャフォールド/テンプレ選択用（挙動の自動変更はしない）
-gpu = true
-
-[isolation]
-# ホスト環境変数の透過を allowlist 方式で許可（bundle 実行時）
-allow_env = ["HF_TOKEN", "LD_LIBRARY_PATH"]
-
-[execution.env]
-GUMBALL_MODEL = "qwen3-8b"
-```
-
-## Scaffold Docker
-
-self-extracting bundle（`nacelle-bundle`）をコンテナで実行するための雛形を生成します。
+## クイックスタート（ローカル）
 
 ```bash
-# capsule.toml の build.gpu を見て Dockerfile を選択
-capsule scaffold docker --manifest capsule.toml
+# build
+cargo build -p ato-cli
 
-# 既存ファイルを上書き
-capsule scaffold docker --force
+# 実行
+./target/debug/ato run .
+```
+
+## Proto 再生成（メンテナンス時のみ）
+
+通常ビルドでは `protoc` は不要です。  
+`core/proto/tsnet/v1/tsnet.proto` を変更したときだけ、次を実行してください。
+
+```bash
+./core/scripts/gen_tsnet_proto.sh
+```
+
+## ローカルレジストリ E2E
+
+```bash
+# ターミナル1: ローカルHTTPレジストリ起動
+ato registry serve --host 127.0.0.1 --port 8787
+
+# ターミナル2: build -> publish(artifact) -> install -> run
+ato build .
+ato publish --artifact ./<name>.capsule --scoped-id <publisher>/<slug> --registry http://127.0.0.1:8787
+ato install <publisher>/<slug> --registry http://127.0.0.1:8787
+ato run <publisher>/<slug> --registry http://127.0.0.1:8787 --yes
+```
+
+`publish --artifact` はローカル用途向けです。`--registry` は loopback (`127.0.0.1` / `localhost`) を想定します。
+
+## ランタイム隔離ポリシー（Tier）
+
+- `web/static`: Tier1（`driver = "static"` + `targets.<label>.port` 必須。`capsule.lock` 不要）
+- `web/deno`: Tier1（`capsule.lock` + `deno.lock` または `package-lock.json`）
+- `web/node`: Tier1（Deno compat 実行。`capsule.lock` + `package-lock.json` 必須）
+- `web/python`: Tier2（`uv.lock` 必須、`--unsafe` 必須）
+- `source/deno`: Tier1（`capsule.lock` + `deno.lock` または `package-lock.json`）
+- `source/node`: Tier1（Deno compat 実行。`capsule.lock` + `package-lock.json` 必須）
+- `source/python`: Tier2（`uv.lock` 必須、`--unsafe` 必須）
+- `source/native`: Tier2（`--unsafe` 必須）
+
+補足:
+- Node は Tier1 として `--unsafe` 不要です。
+- Tier2（`source/native|python`, `web/python`）は `nacelle` エンジンが必須です。
+  未登録時は fail-closed で停止するため、事前に `ato engine register` か `--nacelle` / `NACELLE_PATH` で設定してください。
+- Node/Python で非対応・逸脱が発生した場合は自動フォールバックせず fail-closed で停止します。
+- `runtime=web` は `driver` が必須です（`static|node|deno|python`）。
+- `runtime=web` では `public` は廃止されました。
+- `runtime=web` 実行時、CLI は URL を表示します（ブラウザ自動起動はしません）。
+
+## SKILL 実行
+
+```bash
+# 名前解決して実行（標準探索パス）
+ato run --skill <skill-name>
+
+# SKILL.md を直接指定
+ato run --from-skill /path/to/SKILL.md
+```
+
+`--skill` と `--from-skill` は排他的です。
+
+## UX方針（Silent Runner）
+
+- 正常時は最小出力（ツールの標準出力中心）
+- 同意が必要なときのみプロンプト表示
+- 非対話環境では `-y/--yes` で同意を自動承認できます
+- ポリシー違反や未充足は `ATO_ERR_*` JSONL を `stderr` に出力
+
+## 検索・認証
+
+```bash
+ato search ai
+ato login
+ato whoami
+```
+
+既定API:
+- `ATO_STORE_API_URL` (default: `https://api.ato.run`)
+- `ATO_STORE_SITE_URL` (default: `https://store.ato.run`)
+- `ATO_SESSION_TOKEN` (`CAPSULE_SESSION_TOKEN` は互換)
+
+## 開発用テスト
+
+```bash
+cargo test -p capsule-core execution_plan:: --lib
+cargo test -p ato-cli --test local_registry_e2e -- --nocapture
 ```
 
 ## License

@@ -1,0 +1,222 @@
+name: Build (Multi OS)
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+  workflow_dispatch:
+    inputs:
+      upload_r2:
+        description: "Upload packaged artifacts to R2"
+        required: false
+        default: true
+        type: boolean
+      deploy_env:
+        description: "R2 deployment environment"
+        required: false
+        default: "staging"
+        type: choice
+        options:
+          - staging
+          - production
+      version:
+        description: "Release version (optional; empty uses Cargo.toml version)"
+        required: false
+        type: string
+      update_latest:
+        description: "Update ato/latest/* in addition to versioned path"
+        required: false
+        default: true
+        type: boolean
+      bucket:
+        description: "R2 bucket override (optional)"
+        required: false
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: build-multi-os-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            binary_name: ato
+            build_target: ""
+            rustflags: ""
+          - os: macos-latest
+            binary_name: ato
+            build_target: ""
+            rustflags: ""
+          - os: windows-latest
+            binary_name: ato.exe
+            build_target: x86_64-pc-windows-msvc
+            rustflags: -C target-feature=+crt-static
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        shell: bash
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${{ matrix.build_target }}" ]]; then
+            cargo build --release --locked --target "${{ matrix.build_target }}" --bin ato
+          else
+            cargo build --release --locked --bin ato
+          fi
+
+      - name: Package target archive
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          target_triple="$(rustc -vV | sed -n 's/^host: //p')"
+          if [[ -z "$target_triple" ]]; then
+            echo "failed to detect host target triple" >&2
+            exit 1
+          fi
+
+          mkdir -p dist/payload
+          binary_path="target/release/${{ matrix.binary_name }}"
+          if [[ -n "${{ matrix.build_target }}" ]]; then
+            binary_path="target/${{ matrix.build_target }}/release/${{ matrix.binary_name }}"
+          fi
+          cp "$binary_path" "dist/payload/${{ matrix.binary_name }}"
+          tar -C dist/payload -czf "dist/ato-${target_triple}.tar.gz" "${{ matrix.binary_name }}"
+          echo "$target_triple" > "dist/target-triple.txt"
+          echo "archive=dist/ato-${target_triple}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.os }}
+          path: |
+            dist/ato-*.tar.gz
+            dist/target-triple.txt
+          if-no-files-found: error
+
+  upload_r2:
+    name: Upload to R2
+    needs: build
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.upload_r2 == 'true') }}
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: /tmp/ato-ci-artifacts
+          merge-multiple: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Wrangler CLI
+        run: npm install -g wrangler@4
+
+      - name: Prepare upload bundle
+        id: prepare
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${CLOUDFLARE_API_TOKEN:-}" || -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]]; then
+            echo "Missing required secrets: CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID" >&2
+            exit 1
+          fi
+
+          cargo_version="$(sed -nE 's/^version = \"([^\"]+)\"/\1/p' Cargo.toml | head -n1)"
+          if [[ -z "$cargo_version" ]]; then
+            echo "Failed to read version from Cargo.toml" >&2
+            exit 1
+          fi
+
+          version_input="${{ github.event.inputs.version }}"
+          if [[ -n "$version_input" ]]; then
+            release_version="$version_input"
+          elif [[ "${{ github.event_name }}" == "push" ]]; then
+            release_version="${cargo_version}-${GITHUB_SHA::7}"
+          else
+            release_version="$cargo_version"
+          fi
+
+          deploy_env_input="${{ github.event.inputs.deploy_env }}"
+          if [[ "${{ github.event_name }}" == "push" || -z "$deploy_env_input" ]]; then
+            deploy_env="staging"
+          else
+            deploy_env="$deploy_env_input"
+          fi
+
+          update_latest_input="${{ github.event.inputs.update_latest }}"
+          if [[ "$update_latest_input" == "false" ]]; then
+            update_latest="0"
+          else
+            update_latest="1"
+          fi
+
+          bucket_input="${{ github.event.inputs.bucket }}"
+          source_dir="/tmp/ato-release/${release_version}"
+          mkdir -p "$source_dir"
+
+          shopt -s nullglob
+          archives=(/tmp/ato-ci-artifacts/ato-*.tar.gz)
+          if [[ "${#archives[@]}" -eq 0 ]]; then
+            echo "No packaged archives found under /tmp/ato-ci-artifacts" >&2
+            exit 1
+          fi
+
+          cp "${archives[@]}" "$source_dir/"
+          (
+            cd "$source_dir"
+            if command -v shasum >/dev/null 2>&1; then
+              shasum -a 256 ato-*.tar.gz > SHA256SUMS
+            else
+              sha256sum ato-*.tar.gz > SHA256SUMS
+            fi
+          )
+
+          echo "release_version=$release_version" >> "$GITHUB_OUTPUT"
+          echo "deploy_env=$deploy_env" >> "$GITHUB_OUTPUT"
+          echo "update_latest=$update_latest" >> "$GITHUB_OUTPUT"
+          echo "bucket=$bucket_input" >> "$GITHUB_OUTPUT"
+          echo "source_dir=$source_dir" >> "$GITHUB_OUTPUT"
+
+      - name: Upload archives to R2
+        shell: bash
+        env:
+          VERSION: ${{ steps.prepare.outputs.release_version }}
+          DEPLOY_ENV: ${{ steps.prepare.outputs.deploy_env }}
+          UPDATE_LATEST: ${{ steps.prepare.outputs.update_latest }}
+          BUCKET: ${{ steps.prepare.outputs.bucket }}
+          SOURCE_DIR: ${{ steps.prepare.outputs.source_dir }}
+          WRANGLER_CONFIG: ""
+        run: ./scripts/upload_release_to_r2.sh

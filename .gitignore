@@ -1,5 +1,5 @@
 # Rust
-/target
+target/
 **/*.rmeta
 **/*.rs.bk
 # If this is an application, you may want to commit Cargo.lock; uncomment to ignore it
@@ -27,3 +27,4 @@
 
 # Ignore npm/node_modules if any (not typical for Rust projects)
 node_modules/
+session-*.md

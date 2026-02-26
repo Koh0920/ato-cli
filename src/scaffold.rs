@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use capsule_core::CapsuleReporter;
+
 pub struct ScaffoldDockerArgs {
     pub manifest_path: PathBuf,
     pub output_dir: Option<PathBuf>,
@@ -9,7 +11,10 @@ pub struct ScaffoldDockerArgs {
     pub force: bool,
 }
 
-pub fn execute_docker(args: ScaffoldDockerArgs) -> Result<()> {
+pub fn execute_docker(
+    args: ScaffoldDockerArgs,
+    reporter: std::sync::Arc<crate::reporters::CliReporter>,
+) -> Result<()> {
     let manifest_path = args.manifest_path.canonicalize().with_context(|| {
         format!(
             "Failed to resolve manifest path: {}",
@@ -65,13 +70,18 @@ pub fn execute_docker(args: ScaffoldDockerArgs) -> Result<()> {
     write_if_allowed(&dockerfile_path, &dockerfile, args.force)?;
     write_if_allowed(&dockerignore_path, &dockerignore_template(), args.force)?;
 
-    println!("✅ Scaffolded Docker files");
-    println!("- {}", dockerfile_path.display());
-    println!("- {}", dockerignore_path.display());
+    futures::executor::block_on(reporter.notify("✅ Scaffolded Docker files".to_string()))?;
+    futures::executor::block_on(reporter.notify(format!("- {}", dockerfile_path.display())))?;
+    futures::executor::block_on(reporter.notify(format!("- {}", dockerignore_path.display())))?;
 
     if gpu {
-        println!("\nGPU mode detected: build.gpu=true");
-        println!("Run with: docker run --rm --gpus all -p 8000:8000 <image>");
+        futures::executor::block_on(
+            reporter.notify("\nGPU mode detected: build.gpu=true".to_string()),
+        )?;
+        futures::executor::block_on(
+            reporter
+                .notify("Run with: docker run --rm --gpus all -p 8000:8000 <image>".to_string()),
+        )?;
     }
 
     Ok(())
@@ -105,7 +115,7 @@ fn dockerfile_distroless_template() -> String {
 # Thin Capsule runner (CPU) on Distroless
 #
 # Expected workflow:
-#   1) Build a Linux self-extracting bundle (nacelle-bundle) via: capsule pack
+#   1) Build a Linux self-extracting bundle (nacelle-bundle) via: ato pack
 #   2) docker build -t my-capsule .
 #   3) docker run --rm -p 8000:8000 my-capsule
 
@@ -113,7 +123,7 @@ FROM gcr.io/distroless/base-debian12:nonroot
 
 WORKDIR /app
 
-# Copy the self-extracting bundle produced by `capsule pack`.
+# Copy the self-extracting bundle produced by `ato pack`.
 # (Name is configurable; update as needed.)
 COPY --chown=nonroot:nonroot nacelle-bundle /app/nacelle-bundle
 
@@ -133,7 +143,7 @@ fn dockerfile_gpu_template() -> String {
 # Thin Capsule runner (GPU) on CUDA Runtime
 #
 # Expected workflow:
-#   1) Build a Linux self-extracting bundle (nacelle-bundle) via: capsule pack
+#   1) Build a Linux self-extracting bundle (nacelle-bundle) via: ato pack
 #   2) docker build -t my-capsule-gpu .
 #   3) docker run --rm --gpus all -p 8000:8000 my-capsule-gpu
 
