@@ -29,12 +29,6 @@ pub fn execute(reporter: std::sync::Arc<crate::reporters::CliReporter>) -> Resul
     }
 
     let workflow_path = cwd.join(WORKFLOW_REL_PATH);
-    if workflow_path.exists() {
-        anyhow::bail!(
-            "Refusing to overwrite existing workflow: {}",
-            workflow_path.display()
-        );
-    }
 
     let ato_version = env!("CARGO_PKG_VERSION");
     let release_base_url = resolve_release_base_url();
@@ -60,16 +54,30 @@ pub fn execute(reporter: std::sync::Arc<crate::reporters::CliReporter>) -> Resul
             format!("Failed to create workflow directory: {}", parent.display())
         })?;
     }
-    fs::write(&workflow_path, workflow)
-        .with_context(|| format!("Failed to write workflow: {}", workflow_path.display()))?;
+    let previous = fs::read_to_string(&workflow_path).ok();
+    if previous.as_deref() == Some(workflow.as_str()) {
+        futures::executor::block_on(reporter.notify(format!(
+            "✅ CI workflow is already up-to-date: {}",
+            workflow_path.display()
+        )))?;
+    } else {
+        fs::write(&workflow_path, workflow)
+            .with_context(|| format!("Failed to write workflow: {}", workflow_path.display()))?;
 
-    futures::executor::block_on(reporter.notify(format!(
-        "✅ Generated CI workflow: {}",
-        workflow_path.display()
-    )))?;
-    futures::executor::block_on(
-        reporter.notify("   Next step: commit and push this workflow file.".to_string()),
-    )?;
+        let action = if previous.is_some() {
+            "Updated"
+        } else {
+            "Generated"
+        };
+        futures::executor::block_on(reporter.notify(format!(
+            "✅ {} CI workflow: {}",
+            action,
+            workflow_path.display()
+        )))?;
+        futures::executor::block_on(
+            reporter.notify("   Next step: commit and push this workflow file.".to_string()),
+        )?;
+    }
     Ok(())
 }
 
@@ -101,15 +109,17 @@ fn resolve_release_checksum(
             used_latest_fallback: false,
         }),
         Err(versioned_err) => {
-            let checksum = fetch_checksum_from_path(release_base_url, LATEST_CHECKSUM_PATH, target_archive)
-                .with_context(|| {
+            let checksum =
+                fetch_checksum_from_path(release_base_url, LATEST_CHECKSUM_PATH, target_archive)
+                    .with_context(|| {
                     format!(
                         "Failed to resolve checksum from both versioned and latest channels.\nversioned_error: {versioned_err}"
                     )
-                })?;
+                    })?;
             Ok(ChecksumResolution {
                 checksum,
-                archive_path: "/ato/latest/ato-x86_64-unknown-linux-gnu.tar.gz".to_string(),
+                archive_path: "/ato/releases/${ATO_VERSION}/ato-x86_64-unknown-linux-gnu.tar.gz"
+                    .to_string(),
                 used_latest_fallback: true,
             })
         }
@@ -219,19 +229,6 @@ jobs:
           chmod +x ./ato
           sudo mv ./ato /usr/local/bin/ato
           rm -f ato.tar.gz
-
-      - name: Request GitHub OIDC token
-        env:
-          OIDC_AUDIENCE: "api.ato.run"
-        run: |
-          set -euo pipefail
-          resp="$(curl -fsSL -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=${{OIDC_AUDIENCE}}")"
-          token="$(printf '%s' "$resp" | python3 -c 'import json,sys; print(json.load(sys.stdin)["value"])')"
-          if [ -z "$token" ]; then
-            echo "Failed to acquire OIDC token" >&2
-            exit 1
-          fi
-          echo "ATO_OIDC_TOKEN=$token" >> "$GITHUB_ENV"
 
       - name: Publish to Ato Store
         run: ato publish --ci
