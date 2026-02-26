@@ -52,10 +52,16 @@ jobs:
         include:
           - os: ubuntu-latest
             binary_name: ato
+            build_target: ""
+            rustflags: ""
           - os: macos-latest
             binary_name: ato
+            build_target: ""
+            rustflags: ""
           - os: windows-latest
             binary_name: ato.exe
+            build_target: x86_64-pc-windows-msvc
+            rustflags: -C target-feature=+crt-static
 
     steps:
       - name: Checkout
@@ -68,7 +74,16 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build release binary
-        run: cargo build --release --locked --bin ato
+        shell: bash
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${{ matrix.build_target }}" ]]; then
+            cargo build --release --locked --target "${{ matrix.build_target }}" --bin ato
+          else
+            cargo build --release --locked --bin ato
+          fi
 
       - name: Package target archive
         id: package
@@ -83,7 +98,11 @@ jobs:
           fi
 
           mkdir -p dist/payload
-          cp "target/release/${{ matrix.binary_name }}" "dist/payload/${{ matrix.binary_name }}"
+          binary_path="target/release/${{ matrix.binary_name }}"
+          if [[ -n "${{ matrix.build_target }}" ]]; then
+            binary_path="target/${{ matrix.build_target }}/release/${{ matrix.binary_name }}"
+          fi
+          cp "$binary_path" "dist/payload/${{ matrix.binary_name }}"
           tar -C dist/payload -czf "dist/ato-${target_triple}.tar.gz" "${{ matrix.binary_name }}"
           echo "$target_triple" > "dist/target-triple.txt"
           echo "archive=dist/ato-${target_triple}.tar.gz" >> "$GITHUB_OUTPUT"
