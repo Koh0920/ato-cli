@@ -220,3 +220,14 @@ jobs:
           SOURCE_DIR: ${{ steps.prepare.outputs.source_dir }}
           WRANGLER_CONFIG: ""
         run: ./scripts/upload_release_to_r2.sh
+
+      - name: Upload archives to R2 (production mirror for main push)
+        if: ${{ github.event_name == 'push' }}
+        shell: bash
+        env:
+          VERSION: ${{ steps.prepare.outputs.release_version }}
+          DEPLOY_ENV: production
+          UPDATE_LATEST: ${{ steps.prepare.outputs.update_latest }}
+          SOURCE_DIR: ${{ steps.prepare.outputs.source_dir }}
+          WRANGLER_CONFIG: ""
+        run: ./scripts/upload_release_to_r2.sh

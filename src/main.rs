@@ -88,6 +88,7 @@ mod engine_manager;
 mod env;
 mod error_codes;
 mod executors;
+mod gen_ci;
 mod guest_protocol;
 mod init;
 mod install;
@@ -97,7 +98,8 @@ mod new;
 mod observability;
 mod process_manager;
 mod profile;
-mod publish_artifact;
+mod publish_ci;
+mod publish_dry_run;
 mod registry;
 mod registry_serve;
 mod reporters;
@@ -107,6 +109,7 @@ mod sign;
 mod skill;
 mod skill_resolver;
 mod source;
+mod tui;
 mod verify;
 
 fn cli_styles() -> clap::builder::Styles {
@@ -147,6 +150,7 @@ Advanced Commands:
   key      Manage signing keys
   config   Manage configuration (registry, engine, source)
   publish  Upload a local .capsule or register a GitHub repository source
+  gen-ci   Generate GitHub Actions workflow for OIDC CI publish
   registry Manage registry commands (resolve/list/cache/serve)
 
 Options:
@@ -350,6 +354,14 @@ enum Commands {
         /// Emit machine-readable JSON output
         #[arg(long)]
         json: bool,
+
+        /// Disable interactive TUI even when running in TTY
+        #[arg(long, default_value_t = false)]
+        no_tui: bool,
+
+        /// Show selected capsule's capsule.toml in the TUI right panel
+        #[arg(long, default_value_t = false)]
+        show_manifest: bool,
     },
 
     #[command(next_help_heading = "Management", about = "List running capsules")]
@@ -428,7 +440,7 @@ enum Commands {
 
     #[command(
         next_help_heading = "Advanced Commands",
-        about = "Manage configuration (registry, engine, source)"
+        about = "Manage configuration (registry, engine)"
     )]
     Config {
         #[command(subcommand)]
@@ -437,46 +449,31 @@ enum Commands {
 
     #[command(
         next_help_heading = "Advanced Commands",
-        about = "Upload a local .capsule or register a GitHub repository source"
+        about = "Publish via CI-first flow (use --ci in GitHub Actions or --dry-run locally)"
     )]
     Publish {
-        /// GitHub repository URL (public). Required unless --artifact is supplied.
-        #[arg(required_unless_present = "artifact", conflicts_with = "artifact")]
-        repo_url: Option<String>,
-
-        /// Path to local .capsule artifact for direct upload to local registry
-        #[arg(long, conflicts_with = "repo_url")]
-        artifact: Option<PathBuf>,
-
-        /// Scoped capsule ID (publisher/slug). Required with --artifact.
-        #[arg(long, requires = "artifact")]
-        scoped_id: Option<String>,
-
         /// Registry URL (default: localhost:8787 for beta)
         #[arg(long)]
         registry: Option<String>,
 
-        /// Distribution channel (stable|beta)
-        #[arg(long, conflicts_with = "artifact")]
-        channel: Option<String>,
+        /// Publish from GitHub Actions with OIDC token (CI-only mode)
+        #[arg(long, conflicts_with = "dry_run")]
+        ci: bool,
 
-        /// Automatically submit to playground review queue after sync
-        #[arg(
-            short = 'p',
-            long = "apply-playground",
-            default_value_t = false,
-            conflicts_with = "artifact"
-        )]
-        apply_playground: bool,
-
-        /// GitHub App installation ID (required for session-token based flow)
-        #[arg(long, conflicts_with = "artifact")]
-        installation_id: Option<u64>,
+        /// Validate local capsule build inputs without publishing
+        #[arg(long, conflicts_with = "ci")]
+        dry_run: bool,
 
         /// Emit machine-readable JSON output
         #[arg(long)]
         json: bool,
     },
+
+    #[command(
+        next_help_heading = "Advanced Commands",
+        about = "Generate fixed GitHub Actions workflow for OIDC CI publish"
+    )]
+    GenCi,
 
     #[command(hide = true)]
     Engine {
@@ -770,12 +767,6 @@ enum ConfigCommands {
         #[command(subcommand)]
         command: ConfigRegistryCommands,
     },
-
-    /// Source configuration
-    Source {
-        #[command(subcommand)]
-        command: ConfigSourceCommands,
-    },
 }
 
 #[derive(Subcommand)]
@@ -835,35 +826,6 @@ enum ConfigRegistryCommands {
 
     /// Clear registry cache
     ClearCache,
-}
-
-#[derive(Subcommand)]
-enum ConfigSourceCommands {
-    /// Register a public GitHub repository URL as a distribution source
-    Register {
-        /// GitHub repository URL (public)
-        repo_url: String,
-
-        /// Registry URL (default: localhost:8787 for beta)
-        #[arg(long)]
-        registry: Option<String>,
-
-        /// Distribution channel (stable|beta)
-        #[arg(long)]
-        channel: Option<String>,
-
-        /// Automatically submit to playground review queue after sync
-        #[arg(short = 'p', long = "apply-playground", default_value_t = false)]
-        apply_playground: bool,
-
-        /// GitHub App installation ID (required for session-token based flow)
-        #[arg(long)]
-        installation_id: Option<u64>,
-
-        /// Emit machine-readable JSON output
-        #[arg(long)]
-        json: bool,
-    },
 }
 
 #[derive(Subcommand)]
@@ -1034,31 +996,6 @@ enum RegistryCommands {
 
 #[derive(Subcommand)]
 enum SourceCommands {
-    /// Register a public GitHub repository URL as a distribution source
-    Register {
-        /// GitHub repository URL (public)
-        repo_url: String,
-
-        /// Registry URL (default: localhost:8787 for beta)
-        #[arg(long)]
-        registry: Option<String>,
-
-        /// Distribution channel (stable|beta)
-        #[arg(long)]
-        channel: Option<String>,
-
-        /// Automatically submit to playground review queue after sync
-        #[arg(short = 'p', long = "apply-playground", default_value_t = false)]
-        apply_playground: bool,
-
-        /// GitHub App installation ID (required for session-token based flow)
-        #[arg(long)]
-        installation_id: Option<u64>,
-
-        /// Emit machine-readable JSON output
-        #[arg(long)]
-        json: bool,
-    },
     /// Show sync run status for a source
     SyncStatus {
         /// Source ID
@@ -1131,6 +1068,14 @@ enum PackageCommands {
         /// Emit machine-readable JSON output
         #[arg(long)]
         json: bool,
+
+        /// Disable interactive TUI even when running in TTY
+        #[arg(long, default_value_t = false)]
+        no_tui: bool,
+
+        /// Show selected capsule's capsule.toml in the TUI right panel
+        #[arg(long, default_value_t = false)]
+        show_manifest: bool,
     },
 }
 
@@ -1140,7 +1085,7 @@ fn main() {
     let command_context = diagnostics::detect_command_context(&args);
 
     if let Err(err) = run() {
-        if ato_error_jsonl::try_emit_from_anyhow(&err) {
+        if ato_error_jsonl::try_emit_from_anyhow(&err, json_mode) {
             std::process::exit(error_codes::EXIT_USER_ERROR);
         }
 
@@ -1487,7 +1432,19 @@ fn run() -> Result<()> {
             cursor,
             registry,
             json,
-        } => execute_search_command(query, category, tags, limit, cursor, registry, json),
+            no_tui,
+            show_manifest,
+        } => execute_search_command(
+            query,
+            category,
+            tags,
+            limit,
+            cursor,
+            registry,
+            json,
+            no_tui,
+            show_manifest,
+        ),
 
         Commands::Config { command } => match command {
             ConfigCommands::Engine { command } => match command {
@@ -1523,72 +1480,24 @@ fn run() -> Result<()> {
                 };
                 execute_registry_command(mapped)
             }
-            ConfigCommands::Source { command } => match command {
-                ConfigSourceCommands::Register {
-                    repo_url,
-                    registry,
-                    channel,
-                    apply_playground,
-                    installation_id,
-                    json,
-                } => execute_source_register_command(
-                    repo_url,
-                    registry,
-                    channel,
-                    apply_playground,
-                    installation_id,
-                    false,
-                    json,
-                ),
-            },
         },
 
         Commands::Publish {
-            repo_url,
-            artifact,
-            scoped_id,
             registry,
-            channel,
-            apply_playground,
-            installation_id,
+            ci,
+            dry_run,
             json,
         } => {
-            if let Some(artifact_path) = artifact {
-                let scoped_id = scoped_id
-                    .ok_or_else(|| anyhow::anyhow!("--scoped-id is required with --artifact"))?;
-                let registry_url = registry.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "--registry is required with --artifact and must use http://127.0.0.1:<port>"
-                    )
-                })?;
-                execute_publish_artifact_command(
-                    artifact_path,
-                    scoped_id,
-                    registry_url,
-                    json,
-                    reporter.clone(),
-                )
+            if ci {
+                execute_publish_ci_command(registry, json, reporter.clone())
+            } else if dry_run {
+                execute_publish_dry_run_command(json, reporter.clone())
             } else {
-                let repo_url = repo_url.ok_or_else(|| {
-                    anyhow::anyhow!("repo_url is required unless --artifact is supplied")
-                })?;
-                if !json {
-                    println!("Registering GitHub repository as the source of truth...");
-                    println!(
-                        "(Not uploading local artifacts. Ensure your changes are pushed to main.)"
-                    );
-                }
-                execute_source_register_command(
-                    repo_url,
-                    registry,
-                    channel,
-                    apply_playground,
-                    installation_id,
-                    true,
-                    json,
-                )
+                execute_publish_guidance_command(json)
             }
         }
+
+        Commands::GenCi => gen_ci::execute(reporter.clone()),
 
         Commands::Package {
             command:
@@ -1600,26 +1509,22 @@ fn run() -> Result<()> {
                     cursor,
                     registry,
                     json,
+                    no_tui,
+                    show_manifest,
                 },
-        } => execute_search_command(query, category, tags, limit, cursor, registry, json),
+        } => execute_search_command(
+            query,
+            category,
+            tags,
+            limit,
+            cursor,
+            registry,
+            json,
+            no_tui,
+            show_manifest,
+        ),
 
         Commands::Source { command } => match command {
-            SourceCommands::Register {
-                repo_url,
-                registry,
-                channel,
-                apply_playground,
-                installation_id,
-                json,
-            } => execute_source_register_command(
-                repo_url,
-                registry,
-                channel,
-                apply_playground,
-                installation_id,
-                false,
-                json,
-            ),
             SourceCommands::SyncStatus {
                 source_id,
                 sync_run_id,
@@ -1852,41 +1757,102 @@ fn execute_registry_command(command: RegistryCommands) -> Result<()> {
     })
 }
 
-fn execute_publish_artifact_command(
-    artifact: PathBuf,
-    scoped_id: String,
-    registry_url: String,
+fn execute_publish_ci_command(
+    registry_url: Option<String>,
     json_output: bool,
     reporter: std::sync::Arc<reporters::CliReporter>,
 ) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        if !json_output {
-            futures::executor::block_on(reporter.notify(format!(
-                "🚀 Uploading local artifact '{}' to {}",
-                artifact.display(),
-                registry_url
-            )))?;
-        }
-
-        let result = publish_artifact::publish_artifact(publish_artifact::PublishArtifactArgs {
-            artifact_path: artifact,
-            scoped_id,
+        let result = publish_ci::execute(publish_ci::PublishCiArgs {
             registry_url,
+            json_output,
         })
         .await?;
 
         if json_output {
             println!("{}", serde_json::to_string_pretty(&result)?);
         } else {
-            println!("✅ Published successfully!");
-            println!("   Scoped ID: {}", result.scoped_id);
-            println!("   Version:   {}", result.version);
-            println!("   Artifact:  {}", result.artifact_url);
+            println!("✅ Successfully published to Ato Store!");
+            println!();
+            println!(
+                "📦 Capsule:   {} v{}",
+                result.capsule_scoped_id, result.version
+            );
+            if let Some(sha256) = &result.artifact_sha256 {
+                println!("🛡️  Integrity: sha256:{}", sha256);
+            } else if let Some(blake3) = &result.artifact_blake3 {
+                println!("🛡️  Integrity: {}", blake3);
+            }
+            println!();
+            println!("🌐 Store URL:      {}", result.urls.store);
+            if let Some(playground) = &result.urls.playground {
+                println!("🎮 Playground URL: {}", playground);
+            }
+            println!();
+            println!("👉 Next step: ato run {}", result.capsule_scoped_id);
+            println!();
+            println!("   Event ID:   {}", result.publish_event_id);
+            println!("   Release ID: {}", result.release_id);
+            println!("   Artifact:   {}", result.artifact_id);
+            println!("   Status:     {}", result.verification_status);
         }
-
+        futures::executor::block_on(
+            reporter
+                .notify("CI publish completed using GitHub OIDC workflow identity.".to_string()),
+        )?;
         Ok(())
     })
+}
+
+fn execute_publish_dry_run_command(
+    json_output: bool,
+    reporter: std::sync::Arc<reporters::CliReporter>,
+) -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let result =
+            publish_dry_run::execute(publish_dry_run::PublishDryRunArgs { json_output }).await?;
+
+        if json_output {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        } else {
+            println!("✅ Dry-run successful! Your capsule is ready to be published via CI.");
+            println!("   Capsule: {}", result.capsule_name);
+            println!("   Version: {}", result.version);
+            println!("   Artifact: {}", result.artifact_path.display());
+            println!("   Size: {} bytes", result.artifact_size_bytes);
+        }
+        futures::executor::block_on(
+            reporter.notify("Local publish dry-run completed (no upload performed).".to_string()),
+        )?;
+        Ok(())
+    })
+}
+
+fn execute_publish_guidance_command(json_output: bool) -> Result<()> {
+    if json_output {
+        let payload = serde_json::json!({
+            "ok": false,
+            "code": "CI_ONLY_PUBLISH",
+            "message": "Direct local publishing is disabled. Use `ato publish --ci` in GitHub Actions, or `ato publish --dry-run` locally."
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        println!("❌ Direct local publishing is disabled to ensure supply-chain security.");
+        println!();
+        println!("Ato uses a strict CI-first publishing model via GitHub Actions (OIDC).");
+        println!("This guarantees published capsules match committed source.");
+        println!();
+        println!("👉 Next steps:");
+        println!("  1. Run `ato gen-ci` to generate `.github/workflows/ato-publish.yml`.");
+        println!("  2. Commit and tag your release (e.g. `git tag v0.1.0`).");
+        println!("  3. Push the tag to GitHub (`git push origin v0.1.0`).");
+        println!("  4. GitHub Actions runs `ato publish --ci` automatically.");
+        println!();
+        println!("💡 Tip: Run `ato publish --dry-run` to validate locally before pushing.");
+    }
+    Ok(())
 }
 
 fn execute_setup_command(
@@ -2562,35 +2528,6 @@ fn execute_open_command(
     }))
 }
 
-fn execute_source_register_command(
-    repo_url: String,
-    registry: Option<String>,
-    channel: Option<String>,
-    apply_playground: bool,
-    installation_id: Option<u64>,
-    auto_sync_on_exists: bool,
-    json: bool,
-) -> Result<()> {
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
-        let result = source::register_github_source(
-            &repo_url,
-            registry.as_deref(),
-            channel.as_deref(),
-            apply_playground,
-            installation_id,
-            auto_sync_on_exists,
-            json,
-        )
-        .await?;
-
-        if json {
-            println!("{}", serde_json::to_string_pretty(&result)?);
-        }
-        Ok(())
-    })
-}
-
 fn execute_source_sync_status_command(
     source_id: String,
     sync_run_id: String,
@@ -2641,7 +2578,25 @@ fn execute_search_command(
     cursor: Option<String>,
     registry: Option<String>,
     json: bool,
+    no_tui: bool,
+    show_manifest: bool,
 ) -> Result<()> {
+    if std::io::stdout().is_terminal() && !json && !no_tui {
+        let selected = tui::run_search_tui(tui::SearchTuiArgs {
+            query: query.clone(),
+            category: category.clone(),
+            tags: tags.clone(),
+            limit,
+            cursor: cursor.clone(),
+            registry: registry.clone(),
+            show_manifest,
+        })?;
+        if let Some(scoped_id) = selected {
+            println!("{}", scoped_id);
+        }
+        return Ok(());
+    }
+
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let result = search::search_capsules(

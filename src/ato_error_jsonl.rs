@@ -31,7 +31,11 @@ pub fn emit_ato_error_jsonl(err: &AtoExecutionError) {
     }
 }
 
-pub fn try_emit_from_anyhow(err: &AnyhowError) -> bool {
+pub fn try_emit_from_anyhow(err: &AnyhowError, json_mode: bool) -> bool {
+    if !json_mode {
+        return false;
+    }
+
     if let Some(execution_err) = err.downcast_ref::<AtoExecutionError>() {
         emit_ato_error_jsonl(execution_err);
         return true;
