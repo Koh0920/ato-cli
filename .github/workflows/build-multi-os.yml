@@ -2,12 +2,8 @@ name: Build (Multi OS)
 
 on:
   push:
-    branches: [main]
     tags:
       - "v*.*.*"
-    paths-ignore:
-      - "docs/**"
-      - "**/*.md"
   workflow_dispatch:
     inputs:
       upload_r2:
