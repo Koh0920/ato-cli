@@ -40,6 +40,7 @@ resolve_bucket_from_env() {
 put_object() {
   local object_key="$1"
   local source_file="$2"
+  local cache_control="${3:-}"
   local object_ref="${BUCKET}/${object_key}"
   local -a cmd
 
@@ -51,6 +52,9 @@ put_object() {
     cmd+=(--env "$WRANGLER_ENV")
   fi
   cmd+=(r2 object put "$object_ref" --file "$source_file")
+  if [[ -n "$cache_control" ]]; then
+    cmd+=(--cache-control "$cache_control")
+  fi
   if [[ "$REMOTE" == "1" ]]; then
     cmd+=(--remote)
   fi
@@ -96,6 +100,8 @@ fi
 WRANGLER_ENV="${WRANGLER_ENV:-}"
 REMOTE="${REMOTE:-1}"
 DRY_RUN="${DRY_RUN:-0}"
+RELEASE_CACHE_CONTROL="${RELEASE_CACHE_CONTROL:-public, max-age=31536000, immutable}"
+LATEST_CACHE_CONTROL="${LATEST_CACHE_CONTROL:-no-store, max-age=0}"
 
 if [[ -n "$WRANGLER_CONFIG" && ! -f "$WRANGLER_CONFIG" ]]; then
   echo "error: WRANGLER_CONFIG not found: $WRANGLER_CONFIG" >&2
@@ -137,16 +143,16 @@ for target in "${target_list[@]}"; do
     exit 1
   fi
 
-  put_object "$PREFIX/releases/$VERSION/ato-$target.tar.gz" "$archive_file"
+  put_object "$PREFIX/releases/$VERSION/ato-$target.tar.gz" "$archive_file" "$RELEASE_CACHE_CONTROL"
 
   if [[ "$UPDATE_LATEST" == "1" ]]; then
-    put_object "$PREFIX/latest/ato-$target.tar.gz" "$archive_file"
+    put_object "$PREFIX/latest/ato-$target.tar.gz" "$archive_file" "$LATEST_CACHE_CONTROL"
   fi
 done
 
-put_object "$PREFIX/releases/$VERSION/SHA256SUMS" "$checksum_file"
+put_object "$PREFIX/releases/$VERSION/SHA256SUMS" "$checksum_file" "$RELEASE_CACHE_CONTROL"
 if [[ "$UPDATE_LATEST" == "1" ]]; then
-  put_object "$PREFIX/latest/SHA256SUMS" "$checksum_file"
+  put_object "$PREFIX/latest/SHA256SUMS" "$checksum_file" "$LATEST_CACHE_CONTROL"
 fi
 
 echo "==> upload completed"
@@ -158,3 +164,5 @@ echo "    targets: ${target_list[*]}"
 echo "    latest : $UPDATE_LATEST"
 echo "    remote : $REMOTE"
 echo "    config : ${WRANGLER_CONFIG:-<wrangler default>}"
+echo "    cache(versioned): $RELEASE_CACHE_CONTROL"
+echo "    cache(latest)   : $LATEST_CACHE_CONTROL"
