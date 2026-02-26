@@ -61,8 +61,9 @@ pub enum PublishTuiOutcome {
 }
 
 pub async fn execute() -> Result<PublishTuiOutcome> {
-    let context = preflight()?;
+    let mut context = preflight()?;
     let token = resolve_github_token()?;
+    context.registration_note = ensure_capsule_registered(&context, &token.token).await?;
     let remote_workflow = fetch_remote_workflow_state(&context.repository, &token.token).await?;
     let mut app = PublishApp::new(context, token, remote_workflow);
 
@@ -77,6 +78,7 @@ struct PublishContext {
     git: GitCheckResult,
     ci_workflow: CiWorkflowCheckResult,
     ci_workflow_refreshed: bool,
+    registration_note: Option<String>,
     branch: String,
     repository: String,
     current_version: Version,
@@ -143,6 +145,7 @@ fn preflight() -> Result<PublishContext> {
         git,
         ci_workflow,
         ci_workflow_refreshed: workflow_sync.changed,
+        registration_note: None,
         branch,
         repository: expected_repo,
         current_version,
@@ -280,6 +283,111 @@ fn read_gh_cli_token() -> Option<String> {
         return None;
     }
     Some(token)
+}
+
+fn resolve_store_api_base_url() -> String {
+    std::env::var("ATO_STORE_API_URL")
+        .ok()
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "https://api.ato.run".to_string())
+}
+
+async fn ensure_capsule_registered(
+    context: &PublishContext,
+    github_token: &str,
+) -> Result<Option<String>> {
+    let (owner, _) = context
+        .repository
+        .split_once('/')
+        .context("Invalid repository format (expected owner/repo)")?;
+    let slug = context.manifest.name.trim();
+    if slug.is_empty() {
+        anyhow::bail!("capsule.toml name is empty");
+    }
+
+    let base = resolve_store_api_base_url();
+    let check_url = format!(
+        "{}/v1/capsules/by/{}/{}",
+        base,
+        urlencoding::encode(owner),
+        urlencoding::encode(slug)
+    );
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .context("Failed to create Store API client")?;
+
+    let check_resp = client
+        .get(&check_url)
+        .header(reqwest::header::USER_AGENT, "ato-cli")
+        .send()
+        .await
+        .with_context(|| "Failed to check capsule registration status")?;
+
+    if check_resp.status().is_success() {
+        return Ok(None);
+    }
+
+    if check_resp.status() != reqwest::StatusCode::NOT_FOUND {
+        let status = check_resp.status();
+        let body = check_resp.text().await.unwrap_or_default();
+        anyhow::bail!(
+            "Failed to check capsule registration ({}): {}",
+            status,
+            body
+        );
+    }
+
+    let register_url = format!("{}/v1/sources/github/register", base);
+    let repo_url = format!("https://github.com/{}", context.repository);
+    let register_resp = client
+        .post(&register_url)
+        .header(reqwest::header::USER_AGENT, "ato-cli")
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", github_token))
+        .json(&serde_json::json!({
+            "repo_url": repo_url,
+            "channel": "stable",
+            "apply_playground": false
+        }))
+        .send()
+        .await
+        .with_context(|| "Failed to auto-register source repository")?;
+
+    let status = register_resp.status();
+    if !(status.is_success() || status == reqwest::StatusCode::CONFLICT) {
+        let body = register_resp.text().await.unwrap_or_default();
+        anyhow::bail!("Source auto-registration failed ({}): {}", status, body);
+    }
+
+    let started = Instant::now();
+    let timeout = Duration::from_secs(45);
+    let poll = Duration::from_secs(2);
+    loop {
+        let resp = client
+            .get(&check_url)
+            .header(reqwest::header::USER_AGENT, "ato-cli")
+            .send()
+            .await
+            .with_context(|| "Failed while waiting for capsule registration")?;
+        if resp.status().is_success() {
+            return Ok(Some(format!(
+                "Capsule registration ensured: {}/{}",
+                owner, slug
+            )));
+        }
+        if started.elapsed() >= timeout {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Capsule registration did not complete in time. Last response ({}): {}",
+                status,
+                body
+            );
+        }
+        tokio::time::sleep(poll).await;
+    }
 }
 
 #[derive(Debug)]
@@ -449,6 +557,9 @@ impl PublishApp {
         ));
         if self.context.ci_workflow_refreshed {
             self.push_log("✔ Workflow updated to latest recommended template");
+        }
+        if let Some(note) = &self.context.registration_note {
+            self.push_log(format!("✔ {}", note));
         }
         self.push_log(format!(
             "✔ GitHub auth token source: {}",

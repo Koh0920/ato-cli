@@ -257,9 +257,12 @@ jobs:
       - name: Publish to Ato Store
         run: |
           set -euo pipefail
-          # Backward-compatible: old ato binaries still require a signing key.
+          # Backward-compatible: old ato binaries still require a signing key file.
           # Newer keyless binaries ignore this env and continue with OIDC-only provenance.
-          ATO_SIGNING_KEY_JSON="$(ato key gen --json)" ato publish --ci
+          tmp_key="$(mktemp /tmp/ato-ci-signing-key.XXXXXX)"
+          ato key gen --json --out "$tmp_key" --force >/dev/null
+          ATO_SIGNING_KEY="$tmp_key" ato publish --ci
+          rm -f "$tmp_key"
 "#
     )
 }
