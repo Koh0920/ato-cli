@@ -1,0 +1,440 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use ed25519_dalek::Signer;
+use serde::{Deserialize, Serialize};
+
+const DEFAULT_STORE_API_URL: &str = "https://api.ato.run";
+const ENV_STORE_API_URL: &str = "ATO_STORE_API_URL";
+const OIDC_AUDIENCE: &str = "api.ato.run";
+
+#[derive(Debug, Clone)]
+pub struct PublishCiArgs {
+    pub registry_url: Option<String>,
+    pub json_output: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublishCiResult {
+    pub publish_event_id: String,
+    pub release_id: String,
+    pub artifact_id: String,
+    pub verification_status: String,
+    pub rejection_reason: Option<String>,
+    pub capsule_scoped_id: String,
+    pub version: String,
+    pub artifact_sha256: Option<String>,
+    pub artifact_blake3: Option<String>,
+    pub urls: PublishUrls,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublishUrls {
+    pub store: String,
+    pub playground: Option<String>,
+}
+
+#[derive(Debug)]
+struct GitHubContext {
+    repository: String,
+    r#ref: String,
+    ref_type: String,
+    sha: String,
+    workflow_ref: String,
+    run_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DidSignaturePayload {
+    algorithm: String,
+    public_key: String,
+    content_hash: String,
+    signature: String,
+    signed_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct CiMetadataPayload {
+    capsule_slug: String,
+    version: String,
+    source_repo: String,
+    source_commit: String,
+    workflow_ref: String,
+    workflow_run_id: Option<String>,
+    builder_identity: String,
+    idempotency_key: String,
+    did_signature: DidSignaturePayload,
+    artifact_sha256: String,
+    artifact_blake3: String,
+    file_name: String,
+    platform_os: String,
+    platform_arch: String,
+    release_notes: String,
+    request_playground: bool,
+}
+
+pub async fn execute(args: PublishCiArgs) -> Result<PublishCiResult> {
+    let github = load_github_context()?;
+    if github.ref_type != "tag" {
+        anyhow::bail!(
+            "--ci mode requires GITHUB_REF_TYPE=tag (got '{}')",
+            github.ref_type
+        );
+    }
+
+    let oidc_token = acquire_oidc_token().await?;
+
+    let cwd = std::env::current_dir().context("Failed to resolve current directory")?;
+    let manifest_path = cwd.join("capsule.toml");
+    let manifest_raw = fs::read_to_string(&manifest_path)
+        .with_context(|| format!("Failed to read {}", manifest_path.display()))?;
+    let manifest = capsule_core::types::capsule_v1::CapsuleManifestV1::from_toml(&manifest_raw)
+        .map_err(|err| anyhow::anyhow!("Failed to parse capsule.toml: {}", err))?;
+
+    let tag = github.r#ref.strip_prefix("refs/tags/").unwrap_or_default();
+    let expected_tag = format!("v{}", manifest.version);
+    if tag != expected_tag {
+        anyhow::bail!(
+            "Tag/version mismatch: expected refs/tags/{} from capsule.toml version {}, got {}",
+            expected_tag,
+            manifest.version,
+            github.r#ref
+        );
+    }
+
+    let source_repo = find_manifest_repository(&manifest_raw)
+        .and_then(|v| normalize_source_repo(&v).ok())
+        .unwrap_or_else(|| github.repository.clone());
+    if source_repo != github.repository {
+        anyhow::bail!(
+            "GITHUB_REPOSITORY '{}' does not match capsule repository '{}'",
+            github.repository,
+            source_repo
+        );
+    }
+
+    let artifact_path = build_capsule_artifact(&manifest_path, &manifest.name, &manifest.version)?;
+    let artifact_bytes = fs::read(&artifact_path)
+        .with_context(|| format!("Failed to read artifact: {}", artifact_path.display()))?;
+    let artifact_sha256 = compute_sha256_hex(&artifact_bytes);
+    let artifact_blake3 = compute_blake3_label(&artifact_bytes);
+
+    let (did, signature_b64) = sign_content_hash(&artifact_blake3)?;
+    let file_name = artifact_path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .map(|v| v.to_string())
+        .context("Failed to derive artifact file name")?;
+
+    let request_playground = manifest_store_playground_enabled(&manifest_raw);
+    let metadata = CiMetadataPayload {
+        capsule_slug: manifest.name.clone(),
+        version: manifest.version.clone(),
+        source_repo: source_repo.clone(),
+        source_commit: github.sha.clone(),
+        workflow_ref: github.workflow_ref.clone(),
+        workflow_run_id: github.run_id.clone(),
+        builder_identity: format!("github-actions:{}", github.workflow_ref),
+        idempotency_key: format!("{}:{}:{}", source_repo, expected_tag, github.sha),
+        did_signature: DidSignaturePayload {
+            algorithm: "Ed25519".to_string(),
+            public_key: did,
+            content_hash: artifact_blake3.clone(),
+            signature: signature_b64,
+            signed_at: chrono::Utc::now().timestamp(),
+        },
+        artifact_sha256,
+        artifact_blake3,
+        file_name: file_name.clone(),
+        platform_os: read_env_trimmed("RUNNER_OS").unwrap_or_else(|| "linux".to_string()),
+        platform_arch: read_env_trimmed("RUNNER_ARCH").unwrap_or_else(|| "x64".to_string()),
+        release_notes: String::new(),
+        request_playground,
+    };
+
+    let registry_url = args
+        .registry_url
+        .as_deref()
+        .map(trim_trailing_slash)
+        .unwrap_or_else(resolve_store_api_base_url);
+    let endpoint = format!("{}/v1/publish/ci", registry_url);
+
+    let metadata_json = serde_json::to_string(&metadata).context("Failed to serialize metadata")?;
+    let form = reqwest::multipart::Form::new()
+        .text("metadata", metadata_json)
+        .part(
+            "artifact",
+            reqwest::multipart::Part::bytes(artifact_bytes)
+                .file_name(file_name)
+                .mime_str("application/octet-stream")?,
+        );
+
+    let response = reqwest::Client::new()
+        .post(&endpoint)
+        .header("Authorization", format!("Bearer {}", oidc_token))
+        .multipart(form)
+        .send()
+        .await
+        .with_context(|| format!("Failed to upload CI artifact to {}", endpoint))?;
+
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!("CI publish failed ({}): {}", status, body);
+    }
+
+    let result = serde_json::from_str::<PublishCiResult>(&body)
+        .context("Invalid /v1/publish/ci response payload")?;
+
+    if !args.json_output {
+        eprintln!("CI artifact built: {}", artifact_path.display());
+    }
+
+    Ok(result)
+}
+
+fn load_github_context() -> Result<GitHubContext> {
+    Ok(GitHubContext {
+        repository: required_env("GITHUB_REPOSITORY")?,
+        r#ref: required_env("GITHUB_REF")?,
+        ref_type: required_env("GITHUB_REF_TYPE")?,
+        sha: required_env("GITHUB_SHA")?,
+        workflow_ref: required_env("GITHUB_WORKFLOW_REF")?,
+        run_id: read_env_trimmed("GITHUB_RUN_ID"),
+    })
+}
+
+fn required_env(key: &str) -> Result<String> {
+    read_env_trimmed(key).with_context(|| format!("{} is required in --ci mode", key))
+}
+
+fn read_env_trimmed(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+#[derive(Debug, Deserialize)]
+struct OidcTokenResponse {
+    value: String,
+}
+
+async fn acquire_oidc_token() -> Result<String> {
+    if let Some(token) = read_env_trimmed("ATO_OIDC_TOKEN") {
+        return Ok(token);
+    }
+
+    let request_url = required_env("ACTIONS_ID_TOKEN_REQUEST_URL")
+        .context("ACTIONS_ID_TOKEN_REQUEST_URL is required when ATO_OIDC_TOKEN is not set")?;
+    let request_token = required_env("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+        .context("ACTIONS_ID_TOKEN_REQUEST_TOKEN is required when ATO_OIDC_TOKEN is not set")?;
+
+    let separator = if request_url.contains('?') { "&" } else { "?" };
+    let url = format!(
+        "{request_url}{separator}audience={}",
+        urlencoding::encode(OIDC_AUDIENCE)
+    );
+
+    let payload = reqwest::Client::new()
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", request_token))
+        .send()
+        .await
+        .with_context(|| "Failed to request GitHub OIDC token")?
+        .error_for_status()
+        .with_context(|| "Failed to request GitHub OIDC token")?
+        .json::<OidcTokenResponse>()
+        .await
+        .with_context(|| "Failed to parse GitHub OIDC token response")?;
+
+    let token = payload.value.trim().to_string();
+    if token.is_empty() {
+        anyhow::bail!("GitHub OIDC token response did not include token value");
+    }
+    Ok(token)
+}
+
+fn resolve_store_api_base_url() -> String {
+    read_env_trimmed(ENV_STORE_API_URL)
+        .as_deref()
+        .map(trim_trailing_slash)
+        .unwrap_or_else(|| DEFAULT_STORE_API_URL.to_string())
+}
+
+fn trim_trailing_slash(input: &str) -> String {
+    input.trim_end_matches('/').to_string()
+}
+
+fn find_manifest_repository(manifest_raw: &str) -> Option<String> {
+    let parsed = toml::from_str::<toml::Value>(manifest_raw).ok()?;
+    parsed
+        .get("metadata")
+        .and_then(|v| v.get("repository"))
+        .and_then(|v| v.as_str())
+        .or_else(|| parsed.get("repository").and_then(|v| v.as_str()))
+        .map(|v| v.to_string())
+}
+
+fn manifest_store_playground_enabled(manifest_raw: &str) -> bool {
+    let Ok(parsed) = toml::from_str::<toml::Value>(manifest_raw) else {
+        return false;
+    };
+    parsed
+        .get("store")
+        .and_then(|v| v.get("playground"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+fn normalize_source_repo(raw: &str) -> Result<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        anyhow::bail!("repository is empty");
+    }
+
+    if raw.contains("://") {
+        let parsed = reqwest::Url::parse(raw).with_context(|| "Invalid repository URL")?;
+        if !parsed
+            .host_str()
+            .map(|h| h.eq_ignore_ascii_case("github.com"))
+            .unwrap_or(false)
+        {
+            anyhow::bail!("repository must point to github.com");
+        }
+        let mut segs = parsed
+            .path_segments()
+            .context("repository URL has no path segments")?;
+        let owner = segs.next().unwrap_or("").trim();
+        let repo = segs.next().unwrap_or("").trim_end_matches(".git").trim();
+        if owner.is_empty() || repo.is_empty() {
+            anyhow::bail!("repository URL must include owner/repo");
+        }
+        return Ok(format!("{}/{}", owner, repo));
+    }
+
+    let mut it = raw.split('/');
+    let owner = it.next().unwrap_or("").trim();
+    let repo = it.next().unwrap_or("").trim_end_matches(".git").trim();
+    if owner.is_empty() || repo.is_empty() || it.next().is_some() {
+        anyhow::bail!("repository must be 'owner/repo' or GitHub URL");
+    }
+    Ok(format!("{}/{}", owner, repo))
+}
+
+pub(crate) fn build_capsule_artifact(
+    manifest_path: &Path,
+    name: &str,
+    version: &str,
+) -> Result<PathBuf> {
+    let decision = capsule_core::router::route_manifest(
+        manifest_path,
+        capsule_core::router::ExecutionProfile::Release,
+        None,
+    )?;
+
+    let artifact_dir = std::env::temp_dir().join("ato-ci-artifacts");
+    fs::create_dir_all(&artifact_dir)
+        .with_context(|| format!("Failed to create {}", artifact_dir.display()))?;
+
+    let artifact_path = artifact_dir.join(format!("{}-{}.capsule", name, version));
+
+    let reporter: std::sync::Arc<dyn capsule_core::reporter::CapsuleReporter + 'static> =
+        std::sync::Arc::new(capsule_core::reporter::NoOpReporter);
+
+    match decision.kind {
+        capsule_core::router::RuntimeKind::Source => {
+            capsule_core::packers::source::pack(
+                &decision.plan,
+                capsule_core::packers::source::SourcePackOptions {
+                    manifest_path: decision.plan.manifest_path.clone(),
+                    manifest_dir: decision.plan.manifest_dir.clone(),
+                    output: Some(artifact_path.clone()),
+                    runtime: None,
+                    skip_l1: false,
+                    skip_validation: false,
+                    enforcement: "strict".to_string(),
+                    nacelle_override: None,
+                    standalone: false,
+                },
+                reporter,
+            )?;
+        }
+        capsule_core::router::RuntimeKind::Web => {
+            let driver = decision
+                .plan
+                .execution_driver()
+                .map(|v| v.trim().to_ascii_lowercase())
+                .unwrap_or_default();
+            if driver == "static" {
+                capsule_core::packers::web::pack(
+                    &decision.plan,
+                    capsule_core::packers::web::WebPackOptions {
+                        manifest_path: decision.plan.manifest_path.clone(),
+                        manifest_dir: decision.plan.manifest_dir.clone(),
+                        output: Some(artifact_path.clone()),
+                    },
+                    reporter,
+                )?;
+            } else {
+                capsule_core::packers::source::pack(
+                    &decision.plan,
+                    capsule_core::packers::source::SourcePackOptions {
+                        manifest_path: decision.plan.manifest_path.clone(),
+                        manifest_dir: decision.plan.manifest_dir.clone(),
+                        output: Some(artifact_path.clone()),
+                        runtime: None,
+                        skip_l1: false,
+                        skip_validation: false,
+                        enforcement: "strict".to_string(),
+                        nacelle_override: None,
+                        standalone: false,
+                    },
+                    reporter,
+                )?;
+            }
+        }
+        capsule_core::router::RuntimeKind::Wasm => {
+            anyhow::bail!("--ci publish currently supports runtime=source/web only");
+        }
+        capsule_core::router::RuntimeKind::Oci => {
+            anyhow::bail!("--ci publish currently supports runtime=source/web only");
+        }
+    }
+
+    if !artifact_path.exists() {
+        anyhow::bail!(
+            "Build did not produce expected artifact: {}",
+            artifact_path.display()
+        );
+    }
+
+    Ok(artifact_path)
+}
+
+fn sign_content_hash(content_hash: &str) -> Result<(String, String)> {
+    let key_path = read_env_trimmed("ATO_SIGNING_KEY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("private.key"));
+    let stored = capsule_core::types::signing::StoredKey::read(&key_path)
+        .with_context(|| format!("Failed to read signing key: {}", key_path.display()))?;
+    let did = stored.did()?;
+    let signing_key = stored.to_signing_key()?;
+    let signature = signing_key.sign(content_hash.as_bytes());
+    Ok((did, BASE64_STANDARD.encode(signature.to_bytes())))
+}
+
+fn compute_sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hex::encode(hasher.finalize())
+}
+
+fn compute_blake3_label(data: &[u8]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(data);
+    format!("blake3:{}", hex::encode(hasher.finalize().as_bytes()))
+}

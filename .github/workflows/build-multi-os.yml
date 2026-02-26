@@ -3,6 +3,8 @@ name: Build (Multi OS)
 on:
   push:
     branches: [main]
+    tags:
+      - "v*.*.*"
     paths-ignore:
       - "docs/**"
       - "**/*.md"
@@ -72,6 +74,38 @@ jobs:
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
+
+      - name: Verify version source of truth
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cargo_version="$(sed -nE 's/^version = \"([^\"]+)\"/\1/p' Cargo.toml | head -n1)"
+          if [[ -z "$cargo_version" ]]; then
+            echo "Failed to read version from Cargo.toml" >&2
+            exit 1
+          fi
+
+          if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
+            tag_version="${GITHUB_REF#refs/tags/v}"
+            if [[ "$tag_version" != "$cargo_version" ]]; then
+              echo "Tag version ($tag_version) does not match Cargo.toml version ($cargo_version)" >&2
+              exit 1
+            fi
+          fi
+
+          version_input="${{ github.event.inputs.version }}"
+          if [[ -n "$version_input" ]]; then
+            version_input="${version_input#v}"
+            if [[ ! "$version_input" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+              echo "Invalid workflow input version: $version_input" >&2
+              exit 1
+            fi
+            if [[ "$version_input" != "$cargo_version" ]]; then
+              echo "workflow_dispatch version ($version_input) must match Cargo.toml version ($cargo_version)" >&2
+              exit 1
+            fi
+          fi
 
       - name: Build release binary
         shell: bash
@@ -161,7 +195,14 @@ jobs:
           fi
 
           version_input="${{ github.event.inputs.version }}"
-          if [[ -n "$version_input" ]]; then
+          if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
+            release_version="${GITHUB_REF#refs/tags/}"
+          elif [[ -n "$version_input" ]]; then
+            version_input="${version_input#v}"
+            if [[ "$version_input" != "$cargo_version" ]]; then
+              echo "workflow_dispatch version ($version_input) must match Cargo.toml version ($cargo_version)" >&2
+              exit 1
+            fi
             release_version="$version_input"
           elif [[ "${{ github.event_name }}" == "push" ]]; then
             release_version="${cargo_version}-${GITHUB_SHA::7}"
@@ -217,6 +258,17 @@ jobs:
           DEPLOY_ENV: ${{ steps.prepare.outputs.deploy_env }}
           UPDATE_LATEST: ${{ steps.prepare.outputs.update_latest }}
           BUCKET: ${{ steps.prepare.outputs.bucket }}
+          SOURCE_DIR: ${{ steps.prepare.outputs.source_dir }}
+          WRANGLER_CONFIG: ""
+        run: ./scripts/upload_release_to_r2.sh
+
+      - name: Upload archives to R2 (production mirror for main push)
+        if: ${{ github.event_name == 'push' }}
+        shell: bash
+        env:
+          VERSION: ${{ steps.prepare.outputs.release_version }}
+          DEPLOY_ENV: production
+          UPDATE_LATEST: ${{ steps.prepare.outputs.update_latest }}
           SOURCE_DIR: ${{ steps.prepare.outputs.source_dir }}
           WRANGLER_CONFIG: ""
         run: ./scripts/upload_release_to_r2.sh
