@@ -2,6 +2,7 @@ use std::fmt;
 use std::path::Path;
 
 use anyhow::Error as AnyhowError;
+use capsule_core::execution_plan::error::AtoExecutionError;
 use miette::Diagnostic;
 use serde::Serialize;
 use thiserror::Error;
@@ -167,6 +168,19 @@ pub fn detect_command_context(args: &[String]) -> CommandContext {
 
 pub fn from_anyhow(err: &AnyhowError, command_context: CommandContext) -> CliDiagnostic {
     let causes = collect_causes(err);
+    if let Some(execution_err) = err.downcast_ref::<AtoExecutionError>() {
+        return CliDiagnostic::new(
+            CliDiagnosticCode::E999,
+            format!("{}: {}", execution_err.code, execution_err.message),
+            execution_err.hint.as_deref().or(Some(
+                "capsule.toml と runtime policy 設定を確認してください。",
+            )),
+            None,
+            None,
+            causes,
+        );
+    }
+
     if let Some(core_err) = err.downcast_ref::<capsule_core::CapsuleError>() {
         return from_capsule_error(core_err, causes);
     }
