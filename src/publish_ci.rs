@@ -175,7 +175,7 @@ pub async fn execute(args: PublishCiArgs) -> Result<PublishCiResult> {
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
     if !status.is_success() {
-        anyhow::bail!("CI publish failed ({}): {}", status, body);
+        anyhow::bail!("{}", classify_ci_publish_http_error(status, &body));
     }
 
     let result = serde_json::from_str::<PublishCiResult>(&body)
@@ -468,4 +468,24 @@ fn compute_blake3_label(data: &[u8]) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(data);
     format!("blake3:{}", hex::encode(hasher.finalize().as_bytes()))
+}
+
+fn classify_ci_publish_http_error(status: reqwest::StatusCode, body: &str) -> String {
+    let normalized = body.to_ascii_lowercase();
+    let looks_like_legacy_contract = status == reqwest::StatusCode::BAD_REQUEST
+        && normalized.contains("validation_error")
+        && normalized.contains("artifact_url")
+        && normalized.contains("did_signature")
+        && normalized.contains("required");
+
+    if looks_like_legacy_contract {
+        return format!(
+            "CI publish failed ({}): target Store API appears to be running legacy /v1/publish/ci contract (artifact_url JSON). \
+This ato-cli sends OIDC multipart metadata+artifact. \
+Deploy latest ato-store (OIDC multipart CI publish), or point ATO_STORE_API_URL to an updated environment.\nraw_response: {}",
+            status, body
+        );
+    }
+
+    format!("CI publish failed ({}): {}", status, body)
 }
