@@ -17,6 +17,7 @@ pub struct PublishDryRunResult {
     pub artifact_path: PathBuf,
     pub artifact_size_bytes: u64,
     pub git: GitCheckResult,
+    pub ci_workflow: CiWorkflowCheckResult,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -28,6 +29,15 @@ pub struct GitCheckResult {
     pub dirty: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct CiWorkflowCheckResult {
+    pub path: String,
+    pub exists: bool,
+    pub has_oidc_permission: bool,
+    pub has_tag_trigger: bool,
+    pub has_checksum_verification: bool,
+}
+
 pub async fn execute(args: PublishDryRunArgs) -> Result<PublishDryRunResult> {
     let cwd = std::env::current_dir().context("Failed to resolve current directory")?;
     let manifest_path = cwd.join("capsule.toml");
@@ -37,6 +47,7 @@ pub async fn execute(args: PublishDryRunArgs) -> Result<PublishDryRunResult> {
         .map_err(|err| anyhow::anyhow!("Failed to parse capsule.toml: {}", err))?;
     let manifest_repo = find_manifest_repository(&manifest_raw);
     let git = run_git_checks(manifest_repo.as_deref())?;
+    let ci_workflow = validate_ci_workflow(&cwd)?;
 
     if !args.json_output {
         eprintln!("🔍 Validating capsule.toml... OK");
@@ -59,6 +70,13 @@ pub async fn execute(args: PublishDryRunArgs) -> Result<PublishDryRunResult> {
         } else {
             eprintln!("   ✔ Working tree is clean.");
         }
+
+        eprintln!();
+        eprintln!("🛡️  Validating CI Workflow (.github/workflows/ato-publish.yml)...");
+        eprintln!("   ✔ Workflow file exists.");
+        eprintln!("   ✔ OIDC permissions are configured (id-token: write).");
+        eprintln!("   ✔ Secure binary verification is enabled (sha256sum).");
+        eprintln!("   ✔ Tag-based trigger is configured.");
         eprintln!();
         eprintln!("📦 Simulating deterministic build...");
     }
@@ -79,6 +97,52 @@ pub async fn execute(args: PublishDryRunArgs) -> Result<PublishDryRunResult> {
         artifact_path,
         artifact_size_bytes,
         git,
+        ci_workflow,
+    })
+}
+
+fn validate_ci_workflow(cwd: &PathBuf) -> Result<CiWorkflowCheckResult> {
+    let rel_path = ".github/workflows/ato-publish.yml";
+    let path = cwd.join(rel_path);
+    if !path.exists() {
+        anyhow::bail!(
+            "CI workflow not found: {}. Run `ato gen-ci` first.",
+            path.display()
+        );
+    }
+
+    let content = fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read CI workflow: {}", path.display()))?;
+
+    let has_oidc_permission = content.contains("id-token: write");
+    if !has_oidc_permission {
+        anyhow::bail!(
+            "CI workflow is missing `id-token: write` permission. Regenerate with `ato gen-ci`."
+        );
+    }
+
+    let has_tag_trigger =
+        content.contains("push:") && content.contains("tags:") && content.contains("v*.*.*");
+    if !has_tag_trigger {
+        anyhow::bail!(
+            "CI workflow is missing tag-based trigger (`on.push.tags`). Regenerate with `ato gen-ci`."
+        );
+    }
+
+    let has_checksum_verification =
+        content.contains("ATO_VERSION") && content.contains("sha256sum -c");
+    if !has_checksum_verification {
+        anyhow::bail!(
+            "CI workflow is missing pinned checksum verification. Regenerate with `ato gen-ci`."
+        );
+    }
+
+    Ok(CiWorkflowCheckResult {
+        path: rel_path.to_string(),
+        exists: true,
+        has_oidc_permission,
+        has_tag_trigger,
+        has_checksum_verification,
     })
 }
 

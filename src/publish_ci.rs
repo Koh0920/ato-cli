@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 const DEFAULT_STORE_API_URL: &str = "https://api.ato.run";
 const ENV_STORE_API_URL: &str = "ATO_STORE_API_URL";
+const OIDC_AUDIENCE: &str = "api.ato.run";
 
 #[derive(Debug, Clone)]
 pub struct PublishCiArgs {
@@ -83,11 +84,7 @@ pub async fn execute(args: PublishCiArgs) -> Result<PublishCiResult> {
         );
     }
 
-    let oidc_token = std::env::var("ATO_OIDC_TOKEN")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .context("ATO_OIDC_TOKEN is required in --ci mode")?;
+    let oidc_token = acquire_oidc_token().await?;
 
     let cwd = std::env::current_dir().context("Failed to resolve current directory")?;
     let manifest_path = cwd.join("capsule.toml");
@@ -218,6 +215,46 @@ fn read_env_trimmed(key: &str) -> Option<String> {
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
+}
+
+#[derive(Debug, Deserialize)]
+struct OidcTokenResponse {
+    value: String,
+}
+
+async fn acquire_oidc_token() -> Result<String> {
+    if let Some(token) = read_env_trimmed("ATO_OIDC_TOKEN") {
+        return Ok(token);
+    }
+
+    let request_url = required_env("ACTIONS_ID_TOKEN_REQUEST_URL")
+        .context("ACTIONS_ID_TOKEN_REQUEST_URL is required when ATO_OIDC_TOKEN is not set")?;
+    let request_token = required_env("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+        .context("ACTIONS_ID_TOKEN_REQUEST_TOKEN is required when ATO_OIDC_TOKEN is not set")?;
+
+    let separator = if request_url.contains('?') { "&" } else { "?" };
+    let url = format!(
+        "{request_url}{separator}audience={}",
+        urlencoding::encode(OIDC_AUDIENCE)
+    );
+
+    let payload = reqwest::Client::new()
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", request_token))
+        .send()
+        .await
+        .with_context(|| "Failed to request GitHub OIDC token")?
+        .error_for_status()
+        .with_context(|| "Failed to request GitHub OIDC token")?
+        .json::<OidcTokenResponse>()
+        .await
+        .with_context(|| "Failed to parse GitHub OIDC token response")?;
+
+    let token = payload.value.trim().to_string();
+    if token.is_empty() {
+        anyhow::bail!("GitHub OIDC token response did not include token value");
+    }
+    Ok(token)
 }
 
 fn resolve_store_api_base_url() -> String {
