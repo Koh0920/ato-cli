@@ -21,6 +21,8 @@ set -euo pipefail
 #   WRANGLER_ENV        optional
 #   REMOTE              default: 1 (set 0 to omit --remote)
 #   DRY_RUN             default: 0
+#   PUT_RETRIES         default: 5
+#   PUT_RETRY_SLEEP     default: 2 (seconds; exponential backoff base)
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -64,7 +66,23 @@ put_object() {
     return
   fi
 
-  "${cmd[@]}"
+  local attempt=1
+  local max_attempts="$PUT_RETRIES"
+  local sleep_base="$PUT_RETRY_SLEEP"
+  local sleep_seconds
+  while true; do
+    if "${cmd[@]}"; then
+      return 0
+    fi
+    if (( attempt >= max_attempts )); then
+      echo "error: upload failed after $attempt attempt(s): $object_ref" >&2
+      return 1
+    fi
+    sleep_seconds=$(( sleep_base ** (attempt - 1) ))
+    echo "warn: upload failed for $object_ref (attempt $attempt/$max_attempts), retrying in ${sleep_seconds}s..." >&2
+    sleep "$sleep_seconds"
+    attempt=$((attempt + 1))
+  done
 }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -100,6 +118,8 @@ fi
 WRANGLER_ENV="${WRANGLER_ENV:-}"
 REMOTE="${REMOTE:-1}"
 DRY_RUN="${DRY_RUN:-0}"
+PUT_RETRIES="${PUT_RETRIES:-5}"
+PUT_RETRY_SLEEP="${PUT_RETRY_SLEEP:-2}"
 RELEASE_CACHE_CONTROL="${RELEASE_CACHE_CONTROL:-public, max-age=31536000, immutable}"
 LATEST_CACHE_CONTROL="${LATEST_CACHE_CONTROL:-no-store, max-age=0}"
 
