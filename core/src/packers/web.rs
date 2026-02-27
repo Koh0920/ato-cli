@@ -8,6 +8,7 @@ use tracing::debug;
 use zstd::stream::encode_all;
 
 use crate::error::{CapsuleError, Result};
+use crate::lockfile;
 use crate::manifest;
 use crate::router::ManifestData;
 
@@ -23,7 +24,7 @@ const ZSTD_COMPRESSION_LEVEL: i32 = 19;
 pub fn pack(
     plan: &ManifestData,
     opts: WebPackOptions,
-    _reporter: Arc<dyn crate::reporter::CapsuleReporter + 'static>,
+    reporter: Arc<dyn crate::reporter::CapsuleReporter + 'static>,
 ) -> Result<PathBuf> {
     let runtime = plan
         .execution_runtime()
@@ -80,8 +81,18 @@ pub fn pack(
     let mut outer = Builder::new(&mut capsule_file);
     let manifest_tmp = temp_dir.path().join("capsule.toml");
     fs::write(&manifest_tmp, &loaded.raw_text).map_err(CapsuleError::Io)?;
+    let lockfile_path = ensure_lockfile(
+        &opts.manifest_path,
+        &opts.manifest_dir,
+        &loaded.raw,
+        &loaded.raw_text,
+        reporter.clone(),
+    )?;
     outer
         .append_path_with_name(&manifest_tmp, "capsule.toml")
+        .map_err(CapsuleError::Io)?;
+    outer
+        .append_path_with_name(&lockfile_path, "capsule.lock")
         .map_err(CapsuleError::Io)?;
 
     let signature_tmp = temp_dir.path().join("signature.json");
@@ -99,6 +110,38 @@ pub fn pack(
     outer.finish().map_err(CapsuleError::Io)?;
 
     Ok(output_path)
+}
+
+fn ensure_lockfile(
+    manifest_path: &Path,
+    manifest_dir: &Path,
+    manifest_raw: &toml::Value,
+    manifest_text: &str,
+    reporter: Arc<dyn crate::reporter::CapsuleReporter + 'static>,
+) -> Result<PathBuf> {
+    let lock_path = manifest_dir.join("capsule.lock");
+    if lock_path.exists() {
+        return Ok(lock_path);
+    }
+
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        return tokio::task::block_in_place(|| {
+            handle.block_on(lockfile::generate_and_write_lockfile(
+                manifest_path,
+                manifest_raw,
+                manifest_text,
+                reporter,
+            ))
+        });
+    }
+
+    let rt = tokio::runtime::Runtime::new().map_err(CapsuleError::Io)?;
+    rt.block_on(lockfile::generate_and_write_lockfile(
+        manifest_path,
+        manifest_raw,
+        manifest_text,
+        reporter,
+    ))
 }
 
 fn resolve_static_entrypoint(manifest_dir: &Path, entrypoint: &str) -> Result<(PathBuf, PathBuf)> {
@@ -248,13 +291,23 @@ mod tests {
     use std::io::Read;
 
     #[test]
-    fn pack_static_emits_capsule_without_config_or_lock() {
+    fn pack_static_emits_capsule_with_lock_and_without_config() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let manifest_path = tmp.path().join("capsule.toml");
         std::fs::create_dir_all(tmp.path().join("dist/assets")).expect("mkdir");
         std::fs::write(tmp.path().join("dist/index.html"), "<h1>hello</h1>").expect("write html");
         std::fs::write(tmp.path().join("dist/assets/app.js"), "console.log('ok')")
             .expect("write js");
+        std::fs::write(
+            tmp.path().join("capsule.lock"),
+            r#"version = "1"
+
+[meta]
+created_at = "2026-01-01T00:00:00Z"
+manifest_hash = "sha256:dummy"
+"#,
+        )
+        .expect("write lock");
         std::fs::write(
             &manifest_path,
             r#"
@@ -291,6 +344,7 @@ port = 8080
 
         let mut outer = tar::Archive::new(fs::File::open(&out).expect("open capsule"));
         let mut has_capsule_toml = false;
+        let mut has_lock = false;
         let mut has_payload = false;
         let mut has_signature = false;
         let mut payload_bytes = Vec::new();
@@ -299,6 +353,8 @@ port = 8080
             let path = entry.path().expect("path").to_string_lossy().to_string();
             if path == "capsule.toml" {
                 has_capsule_toml = true;
+            } else if path == "capsule.lock" {
+                has_lock = true;
             } else if path == "signature.json" {
                 has_signature = true;
             } else if path == "payload.tar.zst" {
@@ -308,6 +364,7 @@ port = 8080
         }
 
         assert!(has_capsule_toml);
+        assert!(has_lock);
         assert!(has_signature);
         assert!(has_payload);
 
