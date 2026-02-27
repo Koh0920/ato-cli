@@ -203,9 +203,23 @@ pub fn write_lockfile(
         let mut targets = HashMap::new();
         let deno_version = selected_runtime_version(&loaded.raw)
             .unwrap_or_else(|| DEFAULT_DENO_VERSION.to_string());
+        let deno_target = match (os.as_str(), arch.as_str()) {
+            ("macos", "x86_64") => "x86_64-apple-darwin",
+            ("macos", "aarch64") => "aarch64-apple-darwin",
+            ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
+            ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
+            ("windows", "x86_64") => "x86_64-pc-windows-msvc",
+            ("windows", "aarch64") => "aarch64-pc-windows-msvc",
+            _ => {
+                return Err(CapsuleError::Pack(format!(
+                    "Unsupported Deno platform: {} {}",
+                    os, arch
+                )))
+            }
+        };
         let deno_url = format!(
-            "https://github.com/denoland/deno/releases/download/v{}/deno-{}-{}.zip",
-            deno_version, os, arch
+            "https://github.com/denoland/deno/releases/download/v{}/deno-{}.zip",
+            deno_version, deno_target
         );
         targets.insert(
             triple.to_string(),
