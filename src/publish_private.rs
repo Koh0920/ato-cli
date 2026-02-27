@@ -40,13 +40,12 @@ pub fn execute(args: PublishPrivateArgs) -> Result<PublishPrivateResult> {
     )
     .with_context(|| "Failed to build artifact for private registry publish")?;
 
-    let uploaded = crate::publish_artifact::publish_artifact(
-        crate::publish_artifact::PublishArtifactArgs {
+    let uploaded =
+        crate::publish_artifact::publish_artifact(crate::publish_artifact::PublishArtifactArgs {
             artifact_path,
             scoped_id,
             registry_url: args.registry_url.clone(),
-        },
-    )?;
+        })?;
 
     Ok(PublishPrivateResult {
         scoped_id: uploaded.scoped_id,

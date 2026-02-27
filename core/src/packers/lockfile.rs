@@ -15,6 +15,7 @@ const DEFAULT_UV_VERSION: &str = "0.4.19";
 const DEFAULT_PNPM_VERSION: &str = "9.9.0";
 const DEFAULT_NODE_VERSION: &str = "20.12.0";
 const DEFAULT_PYTHON_VERSION: &str = "3.11.9";
+const DEFAULT_DENO_VERSION: &str = "1.46.3";
 
 const DEFAULT_ALLOWLIST: &[&str] = &["nodejs.org", "registry.npmjs.org", "github.com"];
 
@@ -64,6 +65,8 @@ pub struct LockToolArtifact {
 pub struct LockRuntimes {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub python: Option<LockRuntime>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deno: Option<LockRuntime>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node: Option<LockRuntime>,
 }
@@ -143,6 +146,7 @@ pub fn write_lockfile(
 
     let mut runtimes = LockRuntimes {
         python: None,
+        deno: None,
         node: None,
     };
     if languages.contains("python") {
@@ -195,6 +199,27 @@ pub fn write_lockfile(
             targets: Some(targets),
         });
     }
+    if languages.contains("deno") {
+        let mut targets = HashMap::new();
+        let deno_version = selected_runtime_version(&loaded.raw)
+            .unwrap_or_else(|| DEFAULT_DENO_VERSION.to_string());
+        let deno_url = format!(
+            "https://github.com/denoland/deno/releases/download/v{}/deno-{}-{}.zip",
+            deno_version, os, arch
+        );
+        targets.insert(
+            triple.to_string(),
+            LockRuntimeArtifact {
+                url: deno_url,
+                sha256: None,
+            },
+        );
+        runtimes.deno = Some(LockRuntime {
+            provider: "official".to_string(),
+            version: deno_version,
+            targets: Some(targets),
+        });
+    }
 
     let mut targets = HashMap::new();
     let mut target = LockTarget {
@@ -229,7 +254,8 @@ pub fn write_lockfile(
         } else {
             None
         },
-        runtimes: if runtimes.python.is_some() || runtimes.node.is_some() {
+        runtimes: if runtimes.python.is_some() || runtimes.node.is_some() || runtimes.deno.is_some()
+        {
             Some(runtimes)
         } else {
             None
@@ -313,6 +339,16 @@ fn detect_languages(
     {
         langs.insert(language.to_string());
     }
+    if manifest
+        .get("targets")
+        .and_then(|t| t.get("source"))
+        .and_then(|t| t.get("driver"))
+        .and_then(|v| v.as_str())
+        .map(|v| v.eq_ignore_ascii_case("deno"))
+        .unwrap_or(false)
+    {
+        langs.insert("deno".to_string());
+    }
 
     let entrypoint = manifest
         .get("execution")
@@ -394,8 +430,23 @@ fn collect_urls(lockfile: &CapsuleLock) -> Vec<String> {
                 out.extend(targets.values().map(|t| t.url.clone()));
             }
         }
+        if let Some(deno) = &runtimes.deno {
+            if let Some(targets) = &deno.targets {
+                out.extend(targets.values().map(|t| t.url.clone()));
+            }
+        }
     }
     out
+}
+
+fn selected_runtime_version(manifest: &toml::Value) -> Option<String> {
+    manifest
+        .get("targets")
+        .and_then(|t| t.get("source"))
+        .and_then(|t| t.get("runtime_version"))
+        .and_then(|v| v.as_str())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 fn is_allowed(url: &str, allowlist: &[String]) -> bool {
