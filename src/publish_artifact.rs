@@ -33,8 +33,8 @@ struct ArtifactPayload {
     blake3: String,
 }
 
-pub async fn publish_artifact(args: PublishArtifactArgs) -> Result<PublishArtifactResult> {
-    let base_url = normalize_local_registry_url(&args.registry_url)?;
+pub fn publish_artifact(args: PublishArtifactArgs) -> Result<PublishArtifactResult> {
+    let base_url = normalize_registry_url(&args.registry_url)?;
     let payload = load_artifact_payload(&args.artifact_path, &args.scoped_id)?;
     let endpoint = format!(
         "{}/v1/local/capsules/{}/{}/{}?file_name={}",
@@ -45,25 +45,31 @@ pub async fn publish_artifact(args: PublishArtifactArgs) -> Result<PublishArtifa
         urlencoding::encode(&payload.file_name),
     );
 
-    let response = reqwest::Client::new()
+    let request = reqwest::blocking::Client::new()
         .put(&endpoint)
         .header("content-type", "application/octet-stream")
         .header("x-ato-sha256", &payload.sha256)
-        .header("x-ato-blake3", &payload.blake3)
+        .header("x-ato-blake3", &payload.blake3);
+
+    let request = if let Some(token) = read_ato_token() {
+        request.header("authorization", format!("Bearer {}", token))
+    } else {
+        request
+    };
+
+    let response = request
         .body(payload.bytes)
         .send()
-        .await
         .with_context(|| format!("Failed to upload artifact to {}", endpoint))?;
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body = response.text().unwrap_or_default();
         bail!("Artifact upload failed ({}): {}", status, body);
     }
 
     let result = response
         .json::<PublishArtifactResult>()
-        .await
         .context("Invalid local registry upload response")?;
     Ok(result)
 }
@@ -138,25 +144,24 @@ fn extract_manifest_from_capsule(bytes: &[u8]) -> Result<String> {
     bail!("Invalid artifact: capsule.toml not found in .capsule archive")
 }
 
-fn normalize_local_registry_url(raw: &str) -> Result<String> {
+fn normalize_registry_url(raw: &str) -> Result<String> {
     let url = reqwest::Url::parse(raw)
         .with_context(|| format!("Invalid --registry URL for artifact publish: {}", raw))?;
-    if url.scheme() != "http" {
+    let scheme = url.scheme().to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
         bail!(
-            "Artifact publish is local-only. Use http://127.0.0.1:<port> (got scheme '{}')",
+            "Registry URL must use http or https scheme (got '{}')",
             url.scheme()
         );
     }
-    let host = url
-        .host_str()
-        .ok_or_else(|| anyhow::anyhow!("Registry URL must include host"))?;
-    if host != "127.0.0.1" {
-        bail!(
-            "Artifact publish is local-only. Use http://127.0.0.1:<port> (got host '{}')",
-            host
-        );
-    }
     Ok(raw.trim().trim_end_matches('/').to_string())
+}
+
+fn read_ato_token() -> Option<String> {
+    std::env::var("ATO_TOKEN")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 fn compute_blake3(data: &[u8]) -> String {

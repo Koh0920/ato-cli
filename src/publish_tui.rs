@@ -1,15 +1,13 @@
 use std::collections::VecDeque;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use crossterm::event::{self as crossterm_event, Event, KeyCode, KeyEvent};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use ed25519_dalek::Signer;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -30,7 +28,6 @@ const POLL_INTERVAL: Duration = Duration::from_secs(4);
 const POLL_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const UI_TICK: Duration = Duration::from_millis(120);
 const MAX_LOG_LINES: usize = 200;
-const REPO_SIGNING_SECRET_NAME: &str = "ATO_SIGNING_KEY_JSON";
 
 #[derive(Debug, Clone)]
 pub struct PublishSuccessSummary {
@@ -64,17 +61,8 @@ pub enum PublishTuiOutcome {
 }
 
 pub async fn execute() -> Result<PublishTuiOutcome> {
-    let mut context = preflight()?;
+    let context = preflight()?;
     let token = resolve_github_token()?;
-    let store_session_token = resolve_store_session_token()?;
-    let signing_key = ensure_repo_signing_secret(&context.repository)?;
-    context.registration_note = ensure_capsule_registered(
-        &context,
-        &token.token,
-        store_session_token.as_deref(),
-        &signing_key,
-    )
-    .await?;
     let remote_workflow = fetch_remote_workflow_state(&context.repository, &token.token).await?;
     let mut app = PublishApp::new(context, token, remote_workflow);
 
@@ -88,7 +76,6 @@ struct PublishContext {
     git: GitCheckResult,
     ci_workflow: CiWorkflowCheckResult,
     ci_workflow_refreshed: bool,
-    registration_note: Option<String>,
     branch: String,
     repository: String,
     current_version: Version,
@@ -155,7 +142,6 @@ fn preflight() -> Result<PublishContext> {
         git,
         ci_workflow,
         ci_workflow_refreshed: workflow_sync.changed,
-        registration_note: None,
         branch,
         repository: expected_repo,
         current_version,
@@ -293,437 +279,6 @@ fn read_gh_cli_token() -> Option<String> {
         return None;
     }
     Some(token)
-}
-
-fn resolve_store_api_base_url() -> String {
-    std::env::var("ATO_STORE_API_URL")
-        .ok()
-        .map(|v| v.trim().trim_end_matches('/').to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "https://api.ato.run".to_string())
-}
-
-async fn ensure_capsule_registered(
-    context: &PublishContext,
-    github_token: &str,
-    store_session_token: Option<&str>,
-    signing_key: &capsule_core::types::signing::StoredKey,
-) -> Result<Option<String>> {
-    let (owner, _) = context
-        .repository
-        .split_once('/')
-        .context("Invalid repository format (expected owner/repo)")?;
-    let slug = context.manifest.name.trim();
-    if slug.is_empty() {
-        anyhow::bail!("capsule.toml name is empty");
-    }
-
-    let base = resolve_store_api_base_url();
-    let check_url = format!(
-        "{}/v1/capsules/by/{}/{}",
-        base,
-        urlencoding::encode(owner),
-        urlencoding::encode(slug)
-    );
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .context("Failed to create Store API client")?;
-
-    let check_resp = client
-        .get(&check_url)
-        .header(reqwest::header::USER_AGENT, "ato-cli")
-        .send()
-        .await
-        .with_context(|| "Failed to check capsule registration status")?;
-
-    if check_resp.status().is_success() {
-        return Ok(None);
-    }
-
-    if check_resp.status() != reqwest::StatusCode::NOT_FOUND {
-        let status = check_resp.status();
-        let body = check_resp.text().await.unwrap_or_default();
-        anyhow::bail!(
-            "Failed to check capsule registration ({}): {}",
-            status,
-            body
-        );
-    }
-
-    match register_source_repo(context, github_token, store_session_token, &client, &base).await {
-        Ok(()) => {}
-        Err(err) if is_publisher_required_error(&err) => {
-            if let Err(register_err) = register_publisher(
-                context,
-                github_token,
-                store_session_token,
-                signing_key,
-                &client,
-                &base,
-            )
-            .await
-            {
-                anyhow::bail!(
-                    "Publisher auto-registration failed: {}",
-                    format_anyhow_chain(&register_err)
-                );
-            }
-            if let Err(retry_err) =
-                register_source_repo(context, github_token, store_session_token, &client, &base)
-                    .await
-            {
-                anyhow::bail!(
-                    "Source auto-registration retry failed after publisher registration: {}",
-                    format_anyhow_chain(&retry_err)
-                );
-            }
-        }
-        Err(err) => return Err(err),
-    }
-
-    let started = Instant::now();
-    let timeout = Duration::from_secs(45);
-    let poll = Duration::from_secs(2);
-    loop {
-        let resp = client
-            .get(&check_url)
-            .header(reqwest::header::USER_AGENT, "ato-cli")
-            .send()
-            .await
-            .with_context(|| "Failed while waiting for capsule registration")?;
-        if resp.status().is_success() {
-            return Ok(Some(format!(
-                "Capsule registration ensured: {}/{}",
-                owner, slug
-            )));
-        }
-        if started.elapsed() >= timeout {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "Capsule registration did not complete in time. Last response ({}): {}",
-                status,
-                body
-            );
-        }
-        tokio::time::sleep(poll).await;
-    }
-}
-
-#[derive(Debug)]
-struct RegisterError {
-    status: reqwest::StatusCode,
-    body: String,
-}
-
-impl std::fmt::Display for RegisterError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "({}) {}", self.status, self.body)
-    }
-}
-
-impl std::error::Error for RegisterError {}
-
-fn is_publisher_required_error(err: &anyhow::Error) -> bool {
-    let text = format!("{err:#}").to_ascii_lowercase();
-    text.contains("publisher_required")
-        || text.contains("publisher registration is required")
-        || text.contains("before source registration")
-}
-
-async fn register_source_repo(
-    context: &PublishContext,
-    github_token: &str,
-    store_session_token: Option<&str>,
-    client: &reqwest::Client,
-    store_base_url: &str,
-) -> Result<()> {
-    let register_url = format!("{}/v1/sources/github/register", store_base_url);
-    let repo_url = format!("https://github.com/{}", context.repository);
-    let payload = serde_json::json!({
-        "repo_url": repo_url,
-        "channel": "stable",
-        "apply_playground": false
-    });
-
-    let mut attempts: Vec<(&str, Option<&str>)> = Vec::new();
-    if let Some(session) = store_session_token {
-        attempts.push(("session", Some(session)));
-    }
-    attempts.push(("bearer", None));
-
-    let mut last_error: Option<RegisterError> = None;
-    for (mode, session) in attempts {
-        let req = client
-            .post(&register_url)
-            .header(reqwest::header::USER_AGENT, "ato-cli")
-            .header(reqwest::header::ACCEPT, "application/json");
-        let req = apply_store_auth(req, session, github_token)?;
-        let resp = req
-            .json(&payload)
-            .send()
-            .await
-            .with_context(|| "Failed to auto-register source repository")?;
-        let status = resp.status();
-        if status.is_success() || status == reqwest::StatusCode::CONFLICT {
-            return Ok(());
-        }
-        let body = resp.text().await.unwrap_or_default();
-        if mode == "session" && is_auth_required_response(status, &body) {
-            continue;
-        }
-        if is_publisher_required_response(status, &body) {
-            return Err(anyhow::anyhow!(
-                "publisher_required from source registration ({}): {}",
-                status,
-                body
-            ));
-        }
-        last_error = Some(RegisterError { status, body });
-        break;
-    }
-
-    Err(last_error
-        .unwrap_or(RegisterError {
-            status: reqwest::StatusCode::UNAUTHORIZED,
-            body: "authentication failed for both session and bearer modes".to_string(),
-        })
-        .into())
-}
-
-fn normalize_handle_from_owner(owner: &str) -> String {
-    let lowered = owner.trim().to_ascii_lowercase();
-    let mut out = String::with_capacity(lowered.len());
-    let mut prev_dash = false;
-    for ch in lowered.chars() {
-        let ok = ch.is_ascii_lowercase() || ch.is_ascii_digit();
-        if ok {
-            out.push(ch);
-            prev_dash = false;
-        } else if !prev_dash {
-            out.push('-');
-            prev_dash = true;
-        }
-    }
-    let out = out.trim_matches('-').to_string();
-    if out.len() >= 3 {
-        out
-    } else {
-        format!("{}-pub", out)
-    }
-}
-
-async fn register_publisher(
-    context: &PublishContext,
-    github_token: &str,
-    store_session_token: Option<&str>,
-    signing_key: &capsule_core::types::signing::StoredKey,
-    client: &reqwest::Client,
-    store_base_url: &str,
-) -> Result<()> {
-    let (owner, _) = context
-        .repository
-        .split_once('/')
-        .context("Invalid repository format (expected owner/repo)")?;
-    let handle = normalize_handle_from_owner(owner);
-    let did = signing_key.did()?;
-    let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let signature = signing_key
-        .to_signing_key()?
-        .sign(timestamp.as_bytes())
-        .to_bytes();
-    let signature_b64 = BASE64_STANDARD.encode(signature);
-
-    let url = format!("{}/v1/publishers/register", store_base_url);
-    let payload = serde_json::json!({
-        "handle": handle,
-        "author_did": did,
-        "did_proof": {
-            "did": did,
-            "timestamp": timestamp,
-            "signature": signature_b64
-        }
-    });
-
-    let mut attempts: Vec<(&str, Option<&str>)> = Vec::new();
-    if let Some(session) = store_session_token {
-        attempts.push(("session", Some(session)));
-    }
-    attempts.push(("bearer", None));
-
-    let mut last_error: Option<RegisterError> = None;
-    for (mode, session) in attempts {
-        let req = client
-            .post(&url)
-            .header(reqwest::header::USER_AGENT, "ato-cli")
-            .header(reqwest::header::ACCEPT, "application/json");
-        let req = apply_store_auth(req, session, github_token)?;
-        let resp = req
-            .json(&payload)
-            .send()
-            .await
-            .with_context(|| "Failed to register publisher")?;
-
-        let status = resp.status();
-        if status.is_success() {
-            return Ok(());
-        }
-
-        let body = resp.text().await.unwrap_or_default();
-        if status == reqwest::StatusCode::CONFLICT
-            && (body.contains("\"already_registered\"") || body.contains("\"did_taken\""))
-        {
-            return Ok(());
-        }
-        if mode == "session" && is_auth_required_response(status, &body) {
-            continue;
-        }
-        last_error = Some(RegisterError { status, body });
-        break;
-    }
-
-    Err(last_error
-        .unwrap_or(RegisterError {
-            status: reqwest::StatusCode::UNAUTHORIZED,
-            body: "authentication failed for both session and bearer modes".to_string(),
-        })
-        .into())
-}
-
-fn ensure_repo_signing_secret(repository: &str) -> Result<capsule_core::types::signing::StoredKey> {
-    let key_path = publisher_signing_key_path()?;
-    let stored = if key_path.exists() {
-        capsule_core::types::signing::StoredKey::read(&key_path)
-            .with_context(|| format!("Failed to read {}", key_path.display()))?
-    } else {
-        if let Some(parent) = key_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create {}", parent.display()))?;
-        }
-        let generated = capsule_core::types::signing::StoredKey::generate();
-        generated
-            .write(&key_path)
-            .with_context(|| format!("Failed to write {}", key_path.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&key_path)?.permissions();
-            perms.set_mode(0o600);
-            fs::set_permissions(&key_path, perms)?;
-        }
-        generated
-    };
-
-    let key_json = fs::read_to_string(&key_path)
-        .with_context(|| format!("Failed to read {}", key_path.display()))?;
-    let mut child = Command::new("gh")
-        .args([
-            "secret",
-            "set",
-            REPO_SIGNING_SECRET_NAME,
-            "--repo",
-            repository,
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| {
-            "Failed to execute `gh secret set`. Install GitHub CLI and run `gh auth login`."
-        })?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(key_json.as_bytes())
-            .context("Failed to pass signing key JSON to `gh secret set`")?;
-    }
-    let output = child
-        .wait_with_output()
-        .context("Failed while waiting for `gh secret set`")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        anyhow::bail!(
-            "Failed to set GitHub secret {} for {}: {}",
-            REPO_SIGNING_SECRET_NAME,
-            repository,
-            if stderr.is_empty() {
-                "unknown error"
-            } else {
-                &stderr
-            }
-        );
-    }
-
-    Ok(stored)
-}
-
-fn publisher_signing_key_path() -> Result<PathBuf> {
-    let home = dirs::home_dir().context("Cannot determine home directory")?;
-    Ok(home
-        .join(".capsule")
-        .join("keys")
-        .join("publisher-signing-key.json"))
-}
-
-fn resolve_store_session_token() -> Result<Option<String>> {
-    Ok(auth::AuthManager::new()?
-        .load()?
-        .and_then(|creds| creds.session_token)
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty()))
-}
-
-fn apply_store_auth(
-    request: reqwest::RequestBuilder,
-    store_session_token: Option<&str>,
-    github_token: &str,
-) -> Result<reqwest::RequestBuilder> {
-    if let Some(token) = store_session_token {
-        return Ok(request.header(
-            reqwest::header::COOKIE,
-            format!(
-                "better-auth.session_token={}; __Secure-better-auth.session_token={}",
-                token, token
-            ),
-        ));
-    }
-
-    if github_token.trim().is_empty() {
-        anyhow::bail!(
-            "Store auth token is unavailable. Run `ato login` and retry (session preferred), or set a valid GitHub token."
-        );
-    }
-    Ok(request.header(
-        reqwest::header::AUTHORIZATION,
-        format!("Bearer {}", github_token),
-    ))
-}
-
-fn is_auth_required_response(status: reqwest::StatusCode, body: &str) -> bool {
-    if status != reqwest::StatusCode::UNAUTHORIZED && status != reqwest::StatusCode::FORBIDDEN {
-        return false;
-    }
-    let normalized = body.to_ascii_lowercase();
-    normalized.contains("auth_required")
-        || normalized.contains("authentication required")
-        || normalized.contains("invalid session")
-}
-
-fn is_publisher_required_response(status: reqwest::StatusCode, body: &str) -> bool {
-    if status != reqwest::StatusCode::FORBIDDEN {
-        return false;
-    }
-    let normalized = body.to_ascii_lowercase();
-    normalized.contains("publisher_required")
-        || normalized.contains("publisher registration is required")
-        || normalized.contains("before source registration")
-}
-
-fn format_anyhow_chain(err: &anyhow::Error) -> String {
-    err.chain()
-        .map(|e| e.to_string())
-        .collect::<Vec<_>>()
-        .join(" | ")
 }
 
 #[derive(Debug)]
@@ -893,9 +448,6 @@ impl PublishApp {
         ));
         if self.context.ci_workflow_refreshed {
             self.push_log("✔ Workflow updated to latest recommended template");
-        }
-        if let Some(note) = &self.context.registration_note {
-            self.push_log(format!("✔ {}", note));
         }
         self.push_log(format!(
             "✔ GitHub auth token source: {}",
