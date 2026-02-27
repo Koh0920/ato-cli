@@ -427,34 +427,86 @@ fn sign_content_hash_with_stored_key(
 }
 
 fn build_optional_signature(content_hash: &str) -> Result<Option<DidSignaturePayload>> {
-    if let Some(key_json) = read_env_trimmed(ENV_SIGNING_KEY_JSON) {
-        let stored = serde_json::from_str::<capsule_core::types::signing::StoredKey>(&key_json)
-            .with_context(|| {
-                format!(
-                    "Failed to parse signing key from {} (expected StoredKey JSON)",
-                    ENV_SIGNING_KEY_JSON
-                )
-            })?;
-        return sign_content_hash_with_stored_key(content_hash, &stored).map(Some);
-    }
-
     if let Some(path_raw) = read_env_trimmed(ENV_SIGNING_KEY_PATH) {
         let key_path = PathBuf::from(path_raw);
-        let stored = capsule_core::types::signing::StoredKey::read(&key_path)
-            .with_context(|| format!("Failed to read signing key: {}", key_path.display()))?;
-        return sign_content_hash_with_stored_key(content_hash, &stored).map(Some);
+        match capsule_core::types::signing::StoredKey::read(&key_path) {
+            Ok(stored) => {
+                return sign_content_hash_with_stored_key(content_hash, &stored).map(Some)
+            }
+            Err(err) => {
+                eprintln!(
+                    "warning: failed to read signing key at {}: {} (continuing in keyless mode)",
+                    key_path.display(),
+                    err
+                );
+                return Ok(None);
+            }
+        }
+    }
+
+    if let Some(key_json) = read_env_trimmed(ENV_SIGNING_KEY_JSON) {
+        match parse_stored_key_json_relaxed(&key_json) {
+            Ok(stored) => {
+                return sign_content_hash_with_stored_key(content_hash, &stored).map(Some)
+            }
+            Err(err) => {
+                eprintln!(
+                    "warning: failed to parse {}: {} (continuing in keyless mode)",
+                    ENV_SIGNING_KEY_JSON, err
+                );
+                return Ok(None);
+            }
+        }
     }
 
     let default_key_path = PathBuf::from("private.key");
     if default_key_path.exists() {
-        let stored = capsule_core::types::signing::StoredKey::read(&default_key_path)
-            .with_context(|| {
-                format!("Failed to read signing key: {}", default_key_path.display())
-            })?;
-        return sign_content_hash_with_stored_key(content_hash, &stored).map(Some);
+        match capsule_core::types::signing::StoredKey::read(&default_key_path) {
+            Ok(stored) => {
+                return sign_content_hash_with_stored_key(content_hash, &stored).map(Some)
+            }
+            Err(err) => {
+                eprintln!(
+                    "warning: failed to read signing key: {} (continuing in keyless mode)",
+                    err
+                );
+                return Ok(None);
+            }
+        }
     }
 
     Ok(None)
+}
+
+fn parse_stored_key_json_relaxed(raw: &str) -> Result<capsule_core::types::signing::StoredKey> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("signing key JSON is empty");
+    }
+
+    if let Ok(parsed) = serde_json::from_str::<capsule_core::types::signing::StoredKey>(trimmed) {
+        return Ok(parsed);
+    }
+
+    if let Ok(unwrapped) = serde_json::from_str::<String>(trimmed) {
+        if let Ok(parsed) =
+            serde_json::from_str::<capsule_core::types::signing::StoredKey>(unwrapped.trim())
+        {
+            return Ok(parsed);
+        }
+    }
+
+    if let Ok(decoded) = BASE64_STANDARD.decode(trimmed) {
+        if let Ok(decoded_str) = String::from_utf8(decoded) {
+            if let Ok(parsed) =
+                serde_json::from_str::<capsule_core::types::signing::StoredKey>(decoded_str.trim())
+            {
+                return Ok(parsed);
+            }
+        }
+    }
+
+    anyhow::bail!("expected StoredKey JSON")
 }
 
 fn compute_sha256_hex(data: &[u8]) -> String {
