@@ -7,4 +7,5 @@ default_target = "cli"
 [targets.cli]
 runtime = "source"
 driver = "deno"
+runtime_version = "1.46.3"
 entrypoint = "main.ts"

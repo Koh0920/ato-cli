@@ -62,7 +62,7 @@ pub async fn build_bundle(
         runtime
     } else if let Some(spec) = &runtime_to_bundle {
         let fetcher = RuntimeFetcher::new_with_reporter(reporter.clone())?;
-        let version = runtime_version_for(spec.language.as_str(), spec.version.as_deref());
+        let version = runtime_version_for(spec.language.as_str(), spec.version.as_deref())?;
         match spec.language.as_str() {
             "python" => {
                 reporter
@@ -116,7 +116,7 @@ pub async fn build_bundle(
     };
 
     if let Some(spec) = &runtime_to_bundle {
-        let version = runtime_version_for(spec.language.as_str(), spec.version.as_deref());
+        let version = runtime_version_for(spec.language.as_str(), spec.version.as_deref())?;
         reporter
             .notify(format!(
                 "✓ Using runtime: {:?} ({} {})",
@@ -315,9 +315,15 @@ fn read_manifest_source_target_hint(manifest_path: &Path) -> Result<Option<Sourc
         .map(|v| v.to_string());
 
     let version = target
-        .get("version")
+        .get("runtime_version")
         .and_then(|v| v.as_str())
-        .map(|v| v.to_string());
+        .map(|v| v.to_string())
+        .or_else(|| {
+            target
+                .get("version")
+                .and_then(|v| v.as_str())
+                .map(|v| v.to_string())
+        });
 
     let entrypoint = target
         .get("entrypoint")
@@ -437,18 +443,17 @@ fn resolve_runtime_root(runtime_dir: &Path, language: &str) -> Result<PathBuf> {
     Ok(runtime_dir.to_path_buf())
 }
 
-fn runtime_version_for(language: &str, version: Option<&str>) -> String {
+fn runtime_version_for(language: &str, version: Option<&str>) -> Result<String> {
     if let Some(v) = version {
-        return v.to_string();
+        return Ok(v.to_string());
     }
-
-    match language {
-        "python" => "3.11".to_string(),
-        "node" => "20".to_string(),
-        "deno" => "1.40".to_string(),
-        "bun" => "1.1".to_string(),
-        _ => "latest".to_string(),
+    if matches!(language, "python" | "node" | "deno") {
+        return Err(CapsuleError::Config(format!(
+            "targets.source.runtime_version is required for language '{}'",
+            language
+        )));
     }
+    Ok("latest".to_string())
 }
 
 fn create_bundle_archive(
