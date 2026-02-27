@@ -107,6 +107,7 @@ mod publish_tui;
 mod registry;
 mod registry_serve;
 mod reporters;
+mod runtime_manager;
 mod scaffold;
 mod search;
 mod sign;
@@ -1906,7 +1907,9 @@ fn execute_publish_private_command(
             result.scoped_id, result.registry_url
         );
     }
-    futures::executor::block_on(reporter.notify("Private registry publish completed.".to_string()))?;
+    futures::executor::block_on(
+        reporter.notify("Private registry publish completed.".to_string()),
+    )?;
     Ok(())
 }
 
