@@ -59,6 +59,9 @@ pub fn execute(reporter: std::sync::Arc<crate::reporters::CliReporter>) -> Resul
             reporter.notify("   Next step: commit and push this workflow file.".to_string()),
         )?;
     }
+    futures::executor::block_on(reporter.notify(
+        "🔐 Workflow uses keyless OIDC CI publish (no signing key secret required).".to_string(),
+    ))?;
     Ok(())
 }
 
@@ -255,19 +258,7 @@ jobs:
           rm -f ato.tar.gz
 
       - name: Publish to Ato Store
-        env:
-          ATO_SIGNING_KEY_JSON: ${{ secrets.ATO_SIGNING_KEY_JSON }}
-        run: |
-          set -euo pipefail
-          if [ -n "${{ATO_SIGNING_KEY_JSON:-}}" ]; then
-            tmp_key="$(mktemp /tmp/ato-ci-signing-key.XXXXXX)"
-            printf '%s' "$ATO_SIGNING_KEY_JSON" > "$tmp_key"
-            ATO_SIGNING_KEY="$tmp_key" ato publish --ci
-            rm -f "$tmp_key"
-          else
-            echo "ATO_SIGNING_KEY_JSON is not set; continuing in keyless mode."
-            ato publish --ci
-          fi
+        run: ato publish --ci
 "#
     )
 }
