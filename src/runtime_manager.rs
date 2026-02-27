@@ -20,8 +20,20 @@ pub struct RuntimeManager {
 impl RuntimeManager {
     pub fn for_plan(plan: &ManifestData) -> Result<Self> {
         let lockfile_path = plan.manifest_dir.join(LOCKFILE_NAME);
-        let lockfile_raw = fs::read_to_string(&lockfile_path)
-            .with_context(|| format!("Failed to read {}", lockfile_path.display()))?;
+        let lockfile_raw = match fs::read_to_string(&lockfile_path) {
+            Ok(raw) => raw,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                bail!(
+                    "Missing {} in capsule payload ({}). Rebuild and republish this capsule with the latest ato-cli.",
+                    LOCKFILE_NAME,
+                    lockfile_path.display()
+                );
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("Failed to read {}", lockfile_path.display()));
+            }
+        };
         let lockfile: CapsuleLock = toml::from_str(&lockfile_raw)
             .with_context(|| format!("Failed to parse {}", lockfile_path.display()))?;
         let (target_triple, platform_key) = current_platform_keys()?;
