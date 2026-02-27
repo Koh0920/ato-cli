@@ -464,12 +464,10 @@ async fn generate_deno_lock(
     let deno_path = ensure_deno(deno_version, reporter.clone()).await?;
     let mut cmd = std::process::Command::new(&deno_path);
     cmd.args([
-        "install",
-        "--entrypoint",
+        "cache",
         entrypoint.as_str(),
-        "--lock",
-        "deno.lock",
-        "--lockfile-only",
+        "--lock=deno.lock",
+        "--lock-write",
     ])
     .current_dir(manifest_dir);
 
@@ -820,13 +818,12 @@ async fn resolve_deno_runtime(
 ) -> Result<RuntimeEntry> {
     let fetcher = RuntimeFetcher::new_with_reporter(reporter)?;
     let (os, arch) = RuntimeFetcher::detect_platform()?;
+    let filename = deno_artifact_filename(&os, &arch)?;
     let url = format!(
-        "https://github.com/denoland/deno/releases/download/v{}/deno-{}-{}.zip",
-        version, os, arch
+        "https://github.com/denoland/deno/releases/download/v{}/{}",
+        version, filename
     );
-    let sha256 = fetcher
-        .fetch_expected_sha256(&(url.clone() + ".sha256"), None)
-        .await?;
+    let sha256 = resolve_deno_sha256(&fetcher, version, &filename).await?;
     let mut targets = HashMap::new();
     targets.insert(target_triple.to_string(), RuntimeArtifact { url, sha256 });
     Ok(RuntimeEntry {
@@ -834,6 +831,94 @@ async fn resolve_deno_runtime(
         version: version.to_string(),
         targets,
     })
+}
+
+fn deno_artifact_filename(os: &str, arch: &str) -> Result<String> {
+    let target = match (os, arch) {
+        ("macos", "x86_64") => "x86_64-apple-darwin",
+        ("macos", "aarch64") => "aarch64-apple-darwin",
+        ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
+        ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
+        ("windows", "x86_64") => "x86_64-pc-windows-msvc",
+        ("windows", "aarch64") => "aarch64-pc-windows-msvc",
+        _ => {
+            return Err(CapsuleError::Pack(format!(
+                "Unsupported Deno platform: {} {}",
+                os, arch
+            )))
+        }
+    };
+    Ok(format!("deno-{}.zip", target))
+}
+
+async fn resolve_deno_sha256(
+    fetcher: &RuntimeFetcher,
+    version: &str,
+    filename: &str,
+) -> Result<String> {
+    let candidates = [
+        (
+            format!(
+                "https://github.com/denoland/deno/releases/download/v{}/{}.sha256sum",
+                version, filename
+            ),
+            None,
+        ),
+        (
+            format!(
+                "https://github.com/denoland/deno/releases/download/v{}/{}.sha256",
+                version, filename
+            ),
+            None,
+        ),
+        (
+            format!(
+                "https://github.com/denoland/deno/releases/download/v{}/SHASUMS256.txt",
+                version
+            ),
+            Some(filename),
+        ),
+    ];
+
+    let mut last_not_found = None;
+    for (checksum_url, hint) in candidates {
+        match fetcher.fetch_expected_sha256(&checksum_url, hint).await {
+            Ok(sum) => return Ok(sum),
+            Err(CapsuleError::NotFound(_)) => {
+                last_not_found = Some(checksum_url);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    let artifact_url = format!(
+        "https://github.com/denoland/deno/releases/download/v{}/{}",
+        version, filename
+    );
+    match download_and_sha256(&artifact_url).await {
+        Ok(sum) => Ok(sum),
+        Err(_) => {
+            let detail = last_not_found.unwrap_or_else(|| "Deno checksum".to_string());
+            Err(CapsuleError::NotFound(detail))
+        }
+    }
+}
+
+async fn download_and_sha256(url: &str) -> Result<String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .build()
+        .map_err(CapsuleError::Network)?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(CapsuleError::Network)?;
+    if !response.status().is_success() {
+        return Err(CapsuleError::NotFound(url.to_string()));
+    }
+    let bytes = response.bytes().await.map_err(CapsuleError::Network)?;
+    Ok(sha256_hex(&bytes))
 }
 
 fn detect_tools(target_triple: &str) -> Option<ToolSection> {
@@ -1241,5 +1326,21 @@ mod tests {
         fs::write(&lockfile_path, toml).unwrap();
 
         verify_lockfile_manifest(&manifest_path, &lockfile_path).unwrap();
+    }
+
+    #[test]
+    fn deno_artifact_filename_uses_release_target_triplets() {
+        assert_eq!(
+            deno_artifact_filename("macos", "aarch64").unwrap(),
+            "deno-aarch64-apple-darwin.zip"
+        );
+        assert_eq!(
+            deno_artifact_filename("linux", "x86_64").unwrap(),
+            "deno-x86_64-unknown-linux-gnu.zip"
+        );
+        assert_eq!(
+            deno_artifact_filename("windows", "x86_64").unwrap(),
+            "deno-x86_64-pc-windows-msvc.zip"
+        );
     }
 }
