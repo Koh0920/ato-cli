@@ -16,6 +16,7 @@ use tracing::debug;
 use crate::executors::source::ExecuteMode;
 use crate::ipc::inject::IpcContext;
 use crate::reporters::CliReporter;
+use crate::runtime_manager;
 use capsule_core::execution_plan::error::AtoExecutionError;
 use capsule_core::execution_plan::guard::{self, ExecutorKind};
 use capsule_core::{lockfile, router, CapsuleReporter};
@@ -731,20 +732,15 @@ fn preflight_python_uv_binary_for_source_driver(
         return Ok(());
     }
 
-    let status = std::process::Command::new("uv")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-
-    match status {
-        Ok(exit) if exit.success() => Ok(()),
-        _ => Err(AtoExecutionError::lock_incomplete(
-            "source/python target requires uv CLI (uv run --offline)",
-            Some("uv"),
-        )
-        .into()),
-    }
+    runtime_manager::ensure_uv_binary(plan)
+        .map(|_| ())
+        .map_err(|_| {
+            AtoExecutionError::lock_incomplete(
+                "source/python target requires hermetic uv from capsule.lock (tools.uv)",
+                Some("capsule.lock"),
+            )
+            .into()
+        })
 }
 
 fn is_python_source_target(plan: &capsule_core::router::ManifestData) -> bool {

@@ -19,4 +19,5 @@ egress_allow = [
 [targets.cli]
 runtime = "source"
 driver = "deno"
+runtime_version = "1.46.3"
 entrypoint = "main.ts"

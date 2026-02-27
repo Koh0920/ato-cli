@@ -20,6 +20,7 @@ use capsule_core::execution_plan::model::{ExecutionPlan, ExecutionRuntime};
 use capsule_core::router::ManifestData;
 
 use crate::common::proxy;
+use crate::runtime_manager;
 
 use super::source::IpcEnvVars;
 
@@ -34,9 +35,7 @@ pub fn execute(
     ipc_env: Option<&IpcEnvVars>,
     dangerously_skip_permissions: bool,
 ) -> Result<i32> {
-    if which::which("deno").is_err() {
-        anyhow::bail!("deno is not installed or not on PATH");
-    }
+    let deno_bin = runtime_manager::ensure_deno_binary(plan)?;
 
     verify_execution_plan_hashes(execution_plan)?;
 
@@ -57,8 +56,9 @@ pub fn execute(
         .into());
     };
 
-    run_provisioning(plan, &runtime_dir, &entrypoint, &lock, ipc_env)?;
+    run_provisioning(&deno_bin, plan, &runtime_dir, &entrypoint, &lock, ipc_env)?;
     run_runtime(
+        &deno_bin,
         plan,
         execution_plan,
         &runtime_dir,
@@ -70,13 +70,14 @@ pub fn execute(
 }
 
 fn run_provisioning(
+    deno_bin: &Path,
     _plan: &ManifestData,
     runtime_dir: &Path,
     entrypoint: &str,
     lock: &DependencyLock,
     ipc_env: Option<&IpcEnvVars>,
 ) -> Result<()> {
-    let mut cmd = Command::new("deno");
+    let mut cmd = Command::new(deno_bin);
     cmd.current_dir(runtime_dir).arg("cache");
     match lock {
         DependencyLock::Deno(lock_path) => {
@@ -116,6 +117,7 @@ fn run_provisioning(
 }
 
 fn run_runtime(
+    deno_bin: &Path,
     plan: &ManifestData,
     execution_plan: &ExecutionPlan,
     runtime_dir: &Path,
@@ -124,7 +126,7 @@ fn run_runtime(
     ipc_env: Option<&IpcEnvVars>,
     dangerously_skip_permissions: bool,
 ) -> Result<i32> {
-    let mut cmd = Command::new("deno");
+    let mut cmd = Command::new(deno_bin);
     cmd.current_dir(runtime_dir).arg("run").arg("--no-prompt");
     if !dangerously_skip_permissions {
         cmd.arg("--cached-only");

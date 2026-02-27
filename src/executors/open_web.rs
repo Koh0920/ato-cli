@@ -1,10 +1,14 @@
 use anyhow::{Context, Result};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use capsule_core::router::ManifestData;
 
 use crate::reporters::CliReporter;
+use crate::runtime_manager;
+
+const STATIC_SERVER_SCRIPT: &str = include_str!("../assets/static_file_server.ts");
 
 pub fn execute(plan: &ManifestData, _reporter: std::sync::Arc<CliReporter>) -> Result<()> {
     let driver = plan
@@ -18,9 +22,7 @@ pub fn execute(plan: &ManifestData, _reporter: std::sync::Arc<CliReporter>) -> R
         );
     }
 
-    if which::which("deno").is_err() {
-        anyhow::bail!("deno is required for runtime=web driver=static execution");
-    }
+    let deno_bin = runtime_manager::ensure_deno_binary(plan)?;
 
     let entrypoint = plan
         .execution_entrypoint()
@@ -34,9 +36,10 @@ pub fn execute(plan: &ManifestData, _reporter: std::sync::Arc<CliReporter>) -> R
     })?;
 
     let serve_dir = resolve_static_serve_dir(&plan.manifest_dir, &entrypoint)?;
-    let args = build_deno_file_server_args(&serve_dir, port);
+    let script_path = ensure_static_server_script()?;
+    let args = build_deno_file_server_args(&script_path, &serve_dir, port);
 
-    let status = Command::new("deno")
+    let status = Command::new(deno_bin)
         .args(&args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -80,19 +83,34 @@ fn resolve_static_serve_dir(manifest_dir: &Path, entrypoint: &str) -> Result<Pat
     Ok(canonical_path)
 }
 
-fn build_deno_file_server_args(serve_dir: &Path, port: u16) -> Vec<String> {
+fn ensure_static_server_script() -> Result<PathBuf> {
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Failed to resolve home directory"))?;
+    let script_path = home
+        .join(".capsule")
+        .join("cache")
+        .join("scripts")
+        .join("static_file_server.ts");
+    if let Some(parent) = script_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}", parent.display()))?;
+    }
+    fs::write(&script_path, STATIC_SERVER_SCRIPT)
+        .with_context(|| format!("Failed to write {}", script_path.display()))?;
+    Ok(script_path)
+}
+
+fn build_deno_file_server_args(script_path: &Path, serve_dir: &Path, port: u16) -> Vec<String> {
     vec![
         "run".to_string(),
         "--no-prompt".to_string(),
         format!("--allow-read={}", serve_dir.to_string_lossy()),
         format!("--allow-net=127.0.0.1:{port},localhost:{port}"),
-        "jsr:@std/http/file-server".to_string(),
+        script_path.to_string_lossy().to_string(),
         serve_dir.to_string_lossy().to_string(),
+        port.to_string(),
         "--host".to_string(),
         "127.0.0.1".to_string(),
-        "--port".to_string(),
-        port.to_string(),
-        "--no-dir-listing".to_string(),
     ]
 }
 
@@ -102,12 +120,16 @@ mod tests {
 
     #[test]
     fn deno_file_server_args_are_hardened_for_loopback_only() {
-        let args = build_deno_file_server_args(Path::new("/tmp/site"), 61357);
+        let args = build_deno_file_server_args(
+            Path::new("/tmp/static_file_server.ts"),
+            Path::new("/tmp/site"),
+            61357,
+        );
         let rendered = args.join(" ");
         assert!(rendered.contains("--allow-read=/tmp/site"));
         assert!(rendered.contains("--allow-net=127.0.0.1:61357,localhost:61357"));
+        assert!(rendered.contains("/tmp/static_file_server.ts"));
         assert!(rendered.contains("--host 127.0.0.1"));
-        assert!(rendered.contains("--port 61357"));
-        assert!(rendered.contains("--no-dir-listing"));
+        assert!(rendered.contains("61357"));
     }
 }
