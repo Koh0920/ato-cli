@@ -98,9 +98,11 @@ mod new;
 mod observability;
 mod process_manager;
 mod profile;
+mod publish_artifact;
 mod publish_ci;
 mod publish_dry_run;
 mod publish_preflight;
+mod publish_private;
 mod publish_tui;
 mod registry;
 mod registry_serve;
@@ -151,7 +153,7 @@ Auth:
 Advanced Commands:
   key      Manage signing keys
   config   Manage configuration (registry, engine, source)
-  publish  CI-first publish (TTY: GitOps release TUI, CI: --ci)
+  publish  Publish capsule (official: CI-first, private: direct upload)
   gen-ci   Generate GitHub Actions workflow for OIDC CI publish
   registry Manage registry commands (resolve/list/cache/serve)
 
@@ -451,9 +453,13 @@ enum Commands {
 
     #[command(
         next_help_heading = "Advanced Commands",
-        about = "Publish via CI-first flow (use --ci in GitHub Actions or --dry-run locally)"
+        about = "Publish capsule (official registry: CI-first, private registry: direct upload)"
     )]
     Publish {
+        /// Registry URL override (default: https://api.ato.run)
+        #[arg(long)]
+        registry: Option<String>,
+
         /// Publish from GitHub Actions with OIDC token (CI-only mode)
         #[arg(long, conflicts_with = "dry_run")]
         ci: bool,
@@ -990,9 +996,13 @@ enum RegistryCommands {
         #[arg(long, default_value = "~/.capsule/local-registry")]
         data_dir: String,
 
-        /// Listen host (loopback only)
+        /// Listen host (non-loopback requires --auth-token)
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
+
+        /// Bearer token required for write API (recommended when exposing non-loopback host)
+        #[arg(long)]
+        auth_token: Option<String>,
     },
 }
 
@@ -1485,6 +1495,7 @@ fn run() -> Result<()> {
         },
 
         Commands::Publish {
+            registry,
             ci,
             dry_run,
             no_tui,
@@ -1494,10 +1505,17 @@ fn run() -> Result<()> {
                 execute_publish_ci_command(json, reporter.clone())
             } else if dry_run {
                 execute_publish_dry_run_command(json, reporter.clone())
-            } else if std::io::stdout().is_terminal() && !json && !no_tui {
-                execute_publish_tui_command(reporter.clone())
             } else {
-                execute_publish_guidance_command(json)
+                let resolved_registry = resolve_publish_registry_url(registry)?;
+                if is_official_publish_registry(&resolved_registry) {
+                    if std::io::stdout().is_terminal() && !json && !no_tui {
+                        execute_publish_tui_command(reporter.clone())
+                    } else {
+                        execute_publish_guidance_command(json, &resolved_registry)
+                    }
+                } else {
+                    execute_publish_private_command(resolved_registry, json, reporter.clone())
+                }
             }
         }
 
@@ -1746,14 +1764,22 @@ fn execute_registry_command(command: RegistryCommands) -> Result<()> {
                 port,
                 data_dir,
                 host,
+                auth_token,
             } => {
-                if host != "127.0.0.1" {
-                    anyhow::bail!("--host must be exactly 127.0.0.1");
+                if host != "127.0.0.1"
+                    && auth_token
+                        .as_deref()
+                        .map(str::trim)
+                        .unwrap_or("")
+                        .is_empty()
+                {
+                    anyhow::bail!("--auth-token is required when --host is not 127.0.0.1");
                 }
                 registry_serve::serve(registry_serve::RegistryServerConfig {
                     host,
                     port,
                     data_dir,
+                    auth_token,
                 })
                 .await
             }
@@ -1829,16 +1855,19 @@ fn execute_publish_dry_run_command(
     })
 }
 
-fn execute_publish_guidance_command(json_output: bool) -> Result<()> {
+fn execute_publish_guidance_command(json_output: bool, registry_url: &str) -> Result<()> {
     if json_output {
         let payload = serde_json::json!({
             "ok": false,
             "code": "CI_ONLY_PUBLISH",
-            "message": "Direct local publishing is disabled. Use `ato publish --ci` in GitHub Actions, or `ato publish --dry-run` locally."
+            "message": "Official registry publishing is CI-first. Use `ato publish --ci` in GitHub Actions, or `ato publish --dry-run` locally."
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
-        println!("❌ Direct local publishing is disabled to ensure supply-chain security.");
+        println!(
+            "❌ Direct local publishing is disabled for official registry ({}).",
+            registry_url
+        );
         println!();
         println!("Ato uses a strict CI-first publishing model via GitHub Actions (OIDC).");
         println!("This guarantees published capsules match committed source.");
@@ -1850,8 +1879,88 @@ fn execute_publish_guidance_command(json_output: bool) -> Result<()> {
         println!("  4. GitHub Actions runs `ato publish --ci` automatically.");
         println!();
         println!("💡 Tip: Run `ato publish --dry-run` to validate locally before pushing.");
+        println!("💡 Private registry directly publish: `ato publish --registry <url>`");
     }
     Ok(())
+}
+
+fn execute_publish_private_command(
+    registry_url: String,
+    json_output: bool,
+    reporter: std::sync::Arc<reporters::CliReporter>,
+) -> Result<()> {
+    let result = publish_private::execute(publish_private::PublishPrivateArgs { registry_url })?;
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        println!("✅ Successfully published to private registry!");
+        println!();
+        println!("📦 Capsule:   {} v{}", result.scoped_id, result.version);
+        println!("🛡️  Integrity: {}, {}", result.sha256, result.blake3);
+        println!();
+        println!("🌐 Artifact URL: {}", result.artifact_url);
+        println!();
+        println!(
+            "👉 Next step: ato install {} --registry {}",
+            result.scoped_id, result.registry_url
+        );
+    }
+    futures::executor::block_on(reporter.notify("Private registry publish completed.".to_string()))?;
+    Ok(())
+}
+
+fn resolve_publish_registry_url(cli_registry: Option<String>) -> Result<String> {
+    if let Some(url) = cli_registry {
+        return normalize_registry_url(&url);
+    }
+
+    let cwd = std::env::current_dir().context("Failed to resolve current directory")?;
+    let manifest_path = cwd.join("capsule.toml");
+    if manifest_path.exists() {
+        let raw = std::fs::read_to_string(&manifest_path)
+            .with_context(|| format!("Failed to read {}", manifest_path.display()))?;
+        let parsed: toml::Value = toml::from_str(&raw)
+            .with_context(|| format!("Failed to parse {}", manifest_path.display()))?;
+        if let Some(url) = parsed
+            .get("store")
+            .and_then(|v| v.get("registry"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            return normalize_registry_url(url);
+        }
+    }
+
+    Ok(DEFAULT_RUN_REGISTRY_URL.to_string())
+}
+
+fn normalize_registry_url(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("Registry URL cannot be empty");
+    }
+    let parsed =
+        reqwest::Url::parse(trimmed).with_context(|| format!("Invalid registry URL: {}", raw))?;
+    let scheme = parsed.scheme().to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        anyhow::bail!(
+            "Registry URL must use http or https scheme (got '{}')",
+            parsed.scheme()
+        );
+    }
+    Ok(trimmed.trim_end_matches('/').to_string())
+}
+
+fn is_official_publish_registry(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("api.ato.run") || host.eq_ignore_ascii_case("staging.api.ato.run")
 }
 
 fn execute_publish_tui_command(reporter: std::sync::Arc<reporters::CliReporter>) -> Result<()> {

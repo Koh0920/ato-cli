@@ -20,12 +20,14 @@ pub struct RegistryServerConfig {
     pub host: String,
     pub port: u16,
     pub data_dir: String,
+    pub auth_token: Option<String>,
 }
 
 #[derive(Clone)]
 struct AppState {
     base_url: String,
     data_dir: PathBuf,
+    auth_token: Option<String>,
     lock: Arc<Mutex<()>>,
 }
 
@@ -174,8 +176,14 @@ struct ArtifactMeta {
 
 pub async fn serve(config: RegistryServerConfig) -> Result<()> {
     let host = config.host;
-    if host != "127.0.0.1" {
-        bail!("Local registry can bind only to 127.0.0.1");
+    let auth_token = config
+        .auth_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string());
+    if host != "127.0.0.1" && auth_token.is_none() {
+        bail!("--auth-token is required when binding local registry to non-loopback host");
     }
     let data_dir = expand_data_dir(&config.data_dir)?;
     initialize_storage(&data_dir)?;
@@ -183,6 +191,7 @@ pub async fn serve(config: RegistryServerConfig) -> Result<()> {
     let state = AppState {
         base_url: base_url.clone(),
         data_dir,
+        auth_token,
         lock: Arc::new(Mutex::new(())),
     };
 
@@ -493,6 +502,10 @@ async fn handle_put_local_capsule(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
+    if let Err(err) = validate_write_auth(&headers, state.auth_token.as_deref()) {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized", &err);
+    }
+
     if let Err(err) = validate_capsule_segments(&publisher, &slug) {
         return json_error(StatusCode::BAD_REQUEST, "invalid_scope", &err.to_string());
     }
@@ -644,6 +657,26 @@ async fn handle_put_local_capsule(
         }),
     )
         .into_response()
+}
+
+fn validate_write_auth(headers: &HeaderMap, expected_token: Option<&str>) -> Result<(), String> {
+    let Some(expected) = expected_token.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(());
+    };
+
+    let actual = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+
+    if actual == Some(expected) {
+        return Ok(());
+    }
+
+    Err("Bearer token is required for upload".to_string())
 }
 
 fn publisher_info(handle: &str) -> PublisherInfo {
@@ -964,5 +997,21 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].publisher.handle, "koh0920");
+    }
+
+    #[test]
+    fn validate_write_auth_allows_when_disabled() {
+        let headers = HeaderMap::new();
+        assert!(validate_write_auth(&headers, None).is_ok());
+    }
+
+    #[test]
+    fn validate_write_auth_requires_matching_bearer_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Bearer secret-token".parse().unwrap());
+        assert!(validate_write_auth(&headers, Some("secret-token")).is_ok());
+        assert!(validate_write_auth(&headers, Some("wrong-token")).is_err());
+        let empty = HeaderMap::new();
+        assert!(validate_write_auth(&empty, Some("secret-token")).is_err());
     }
 }

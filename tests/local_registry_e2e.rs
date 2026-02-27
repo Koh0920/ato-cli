@@ -91,16 +91,7 @@ fn build_publish_install(
 
     let publish = run_ato(
         ato,
-        &[
-            "publish",
-            "--artifact",
-            capsule_path.to_string_lossy().as_ref(),
-            "--scoped-id",
-            scoped_id,
-            "--registry",
-            base_url,
-            "--json",
-        ],
+        &["publish", "--registry", base_url, "--json"],
         project_dir,
     )?;
     assert!(
