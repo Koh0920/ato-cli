@@ -6,9 +6,11 @@ use std::sync::Arc;
 use anyhow::Result;
 use tar::Builder;
 use tracing::debug;
+use walkdir::WalkDir;
 use zstd::stream::encode_all;
 
 use crate::error::Result as CapsuleResult;
+use crate::packers::pack_filter::PackFilter;
 use crate::r3_config;
 
 /// Capsule Format v2 PAX TAR Archive Structure:
@@ -42,6 +44,7 @@ pub async fn pack(
 
     let loaded = crate::manifest::load_manifest(&opts.manifest_path)?;
     let manifest_content = loaded.raw_text;
+    let pack_filter = PackFilter::from_manifest(&loaded.model)?;
 
     // Step 1: Generate config.json
     debug!("Phase 1: generating config.json");
@@ -79,10 +82,10 @@ pub async fn pack(
     // Add source/ directory contents.
     // If source/ does not exist, fallback to project root contents (excluding generated/build files).
     if source_dir.exists() {
-        copy_dir_to_tar(&mut ar, &source_dir, "source")?;
+        copy_dir_to_tar(&mut ar, &source_dir, "source", &pack_filter)?;
     } else {
         debug!("No source/ directory found; packaging project root as source/");
-        copy_project_root_to_tar(&mut ar, &opts.manifest_dir, "source")?;
+        copy_dir_to_tar(&mut ar, &opts.manifest_dir, "source", &pack_filter)?;
     }
 
     // Add config.json using append_path_with_name
@@ -158,105 +161,39 @@ pub async fn pack(
     Ok(output_path)
 }
 
-fn copy_dir_to_tar(ar: &mut Builder<&mut fs::File>, src: &Path, prefix: &str) -> Result<()> {
-    let target = prefix.to_string();
-    if !src.exists() {
-        ar.append_dir(&target, &src)?;
-        return Ok(());
-    }
-
-    let mut entries = fs::read_dir(src)?;
-    if entries.next().is_none() {
-        ar.append_dir(&target, &src)?;
-        return Ok(());
-    }
-
-    drop(entries);
-
-    copy_dir_to_tar_recursive(ar, src, prefix)?;
-
-    Ok(())
-}
-
-fn copy_dir_to_tar_recursive(
+fn copy_dir_to_tar(
     ar: &mut Builder<&mut fs::File>,
-    src: &Path,
+    src_root: &Path,
     prefix: &str,
+    filter: &PackFilter,
 ) -> Result<()> {
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
+    for entry in WalkDir::new(src_root)
+        .follow_links(true)
+        .into_iter()
+        .flatten()
+    {
         let path = entry.path();
-        let name = entry.file_name();
-        let target = format!("{}/{}", prefix, name.to_string_lossy());
-
-        if entry.file_type()?.is_dir() {
-            ar.append_dir(&target, &path)?;
-            copy_dir_to_tar_recursive(ar, &path, &target)?;
-        } else {
-            ar.append_path_with_name(&path, &target)?;
-        }
-    }
-
-    Ok(())
-}
-
-fn copy_project_root_to_tar(
-    ar: &mut Builder<&mut fs::File>,
-    project_root: &Path,
-    prefix: &str,
-) -> Result<()> {
-    ar.append_dir(prefix, project_root)?;
-    copy_project_root_recursive(ar, project_root, project_root, prefix)
-}
-
-fn copy_project_root_recursive(
-    ar: &mut Builder<&mut fs::File>,
-    project_root: &Path,
-    current_dir: &Path,
-    prefix: &str,
-) -> Result<()> {
-    for entry in fs::read_dir(current_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let rel = match path.strip_prefix(project_root) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let file_type = entry.file_type()?;
-
-        if should_skip_project_entry(rel, file_type.is_dir()) {
+        if !entry.file_type().is_file() {
             continue;
         }
-
+        let rel = match path.strip_prefix(src_root) {
+            Ok(rel) => rel,
+            Err(_) => continue,
+        };
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        if !filter.should_include_file(rel) || should_skip_reserved_file(rel) {
+            continue;
+        }
         let rel_str = rel.to_string_lossy().replace('\\', "/");
         let target = format!("{}/{}", prefix, rel_str);
-
-        if file_type.is_dir() {
-            ar.append_dir(&target, &path)?;
-            copy_project_root_recursive(ar, project_root, &path, prefix)?;
-        } else {
-            ar.append_path_with_name(&path, &target)?;
-        }
+        ar.append_path_with_name(path, &target)?;
     }
-
     Ok(())
 }
 
-fn should_skip_project_entry(rel: &Path, is_dir: bool) -> bool {
-    let first = rel
-        .components()
-        .next()
-        .map(|c| c.as_os_str().to_string_lossy().to_string())
-        .unwrap_or_default();
-
-    if matches!(first.as_str(), ".git" | ".capsule" | "target") {
-        return true;
-    }
-
-    if is_dir {
-        return false;
-    }
-
+fn should_skip_reserved_file(rel: &Path) -> bool {
     let file_name = rel
         .file_name()
         .map(|n| n.to_string_lossy().to_string())

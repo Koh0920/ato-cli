@@ -14,6 +14,7 @@ const OIDC_AUDIENCE: &str = "api.ato.run";
 #[derive(Debug, Clone)]
 pub struct PublishCiArgs {
     pub json_output: bool,
+    pub force_large_payload: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +117,11 @@ pub async fn execute(args: PublishCiArgs) -> Result<PublishCiResult> {
     }
 
     let artifact_path = build_capsule_artifact(&manifest_path, &manifest.name, &manifest.version)?;
+    crate::payload_guard::ensure_payload_size(
+        &artifact_path,
+        args.force_large_payload,
+        "--force-large-payload",
+    )?;
     let artifact_bytes = fs::read(&artifact_path)
         .with_context(|| format!("Failed to read artifact: {}", artifact_path.display()))?;
     let artifact_sha256 = compute_sha256_hex(&artifact_bytes);

@@ -56,8 +56,24 @@ impl RuntimeManager {
         self.ensure_runtime_entry(
             "deno",
             runtime,
-            required_runtime_version(plan, &["deno", "node"])?,
+            required_runtime_version(plan, &["deno"])?,
             &["deno", "deno.exe"],
+        )
+    }
+
+    pub fn ensure_node_binary_for_plan(&self, plan: &ManifestData) -> Result<PathBuf> {
+        let runtime = self
+            .lockfile
+            .runtimes
+            .as_ref()
+            .and_then(|r| r.node.as_ref())
+            .ok_or_else(|| anyhow::anyhow!("capsule.lock is missing runtimes.node entry"))?;
+        self.ensure_runtime_entry(
+            "node",
+            runtime,
+            required_runtime_tool_version(plan, "node")?
+                .or(required_runtime_version(plan, &["node"])?),
+            &["node", "node.exe"],
         )
     }
 
@@ -71,7 +87,8 @@ impl RuntimeManager {
         self.ensure_runtime_entry(
             "python",
             runtime,
-            required_runtime_version(plan, &["python"])?,
+            required_runtime_tool_version(plan, "python")?
+                .or(required_runtime_version(plan, &["python"])?),
             &["python", "python3", "python.exe"],
         )
     }
@@ -242,6 +259,10 @@ pub fn ensure_python_binary(plan: &ManifestData) -> Result<PathBuf> {
     RuntimeManager::for_plan(plan)?.ensure_python_binary_for_plan(plan)
 }
 
+pub fn ensure_node_binary(plan: &ManifestData) -> Result<PathBuf> {
+    RuntimeManager::for_plan(plan)?.ensure_node_binary_for_plan(plan)
+}
+
 pub fn ensure_uv_binary(plan: &ManifestData) -> Result<PathBuf> {
     RuntimeManager::for_plan(plan)?.ensure_uv_binary_for_plan(plan)
 }
@@ -251,29 +272,54 @@ fn required_runtime_version(plan: &ManifestData, drivers: &[&str]) -> Result<Opt
         Some(runtime) => runtime,
         None => return Ok(None),
     };
-    if !runtime.eq_ignore_ascii_case("source") {
+    let runtime_is_source = runtime.eq_ignore_ascii_case("source");
+    let runtime_is_web = runtime.eq_ignore_ascii_case("web");
+    if !runtime_is_source && !runtime_is_web {
         return Ok(None);
     }
     let driver = match plan.execution_driver() {
         Some(driver) => driver,
         None => return Ok(None),
     };
-    if !drivers.iter().any(|d| driver.eq_ignore_ascii_case(d)) {
+    let supports_driver = drivers.iter().any(|d| driver.eq_ignore_ascii_case(d));
+    if !supports_driver {
+        return Ok(None);
+    }
+    // web/deno orchestrator also pins runtime_version deterministically.
+    if runtime_is_web && !driver.eq_ignore_ascii_case("deno") {
         return Ok(None);
     }
     let value = plan.execution_runtime_version().ok_or_else(|| {
         anyhow::anyhow!(
-            "targets.{}.runtime_version is required for source driver '{}'",
+            "targets.{}.runtime_version is required for runtime '{}' driver '{}'",
             plan.selected_target_label(),
+            runtime,
             driver
         )
     })?;
     let trimmed = value.trim();
     if trimmed.is_empty() {
         bail!(
-            "targets.{}.runtime_version is required for source driver '{}'",
+            "targets.{}.runtime_version is required for runtime '{}' driver '{}'",
             plan.selected_target_label(),
+            runtime,
             driver
+        );
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+fn required_runtime_tool_version(plan: &ManifestData, tool: &str) -> Result<Option<String>> {
+    let value = match plan.execution_runtime_tool_version(tool) {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!(
+            "targets.{}.runtime_tools.{} must be a non-empty string",
+            plan.selected_target_label(),
+            tool
         );
     }
     Ok(Some(trimmed.to_string()))
@@ -351,11 +397,23 @@ fn archive_extension_from_url(url: &str) -> Result<&'static str> {
 }
 
 fn download_to_file(url: &str, dest: &Path) -> Result<()> {
-    let response = reqwest::blocking::Client::builder()
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| handle.block_on(download_to_file_async(url, dest)))
+    } else {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        rt.block_on(download_to_file_async(url, dest))
+    }
+}
+
+async fn download_to_file_async(url: &str, dest: &Path) -> Result<()> {
+    let response = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(600))
         .build()?
         .get(url)
         .send()
+        .await
         .with_context(|| format!("Failed to download runtime from {}", url))?;
 
     if !response.status().is_success() {
@@ -365,8 +423,8 @@ fn download_to_file(url: &str, dest: &Path) -> Result<()> {
             response.status()
         );
     }
-    let bytes = response.bytes()?;
-    fs::write(dest, bytes).with_context(|| format!("Failed to write {}", dest.display()))?;
+    let bytes = response.bytes().await?;
+    fs::write(dest, &bytes).with_context(|| format!("Failed to write {}", dest.display()))?;
     Ok(())
 }
 
@@ -444,7 +502,7 @@ fn find_binary_recursive(root: &Path, candidates: &[&str]) -> Result<Option<Path
         return Ok(None);
     }
     for entry in walkdir::WalkDir::new(root).into_iter().flatten() {
-        if !entry.file_type().is_file() {
+        if !entry.file_type().is_file() && !entry.file_type().is_symlink() {
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
