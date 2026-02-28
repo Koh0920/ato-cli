@@ -12,6 +12,7 @@ pub fn execute_pack_command(
     init_if_missing: bool,
     key: Option<PathBuf>,
     standalone: bool,
+    force_large_payload: bool,
     keep_failed_artifacts: bool,
     enforcement: String,
     reporter: std::sync::Arc<reporters::CliReporter>,
@@ -139,6 +140,11 @@ pub fn execute_pack_command(
                 }
             }
 
+            crate::payload_guard::ensure_payload_size(
+                &artifact_path,
+                force_large_payload,
+                "--force-large-payload",
+            )?;
             let _ = sign_if_requested(&artifact_path, key.as_ref(), reporter.clone())?;
             let size = std::fs::metadata(&artifact_path)?.len();
             futures::executor::block_on(reporter.notify(format!(
@@ -150,6 +156,11 @@ pub fn execute_pack_command(
         capsule_core::router::RuntimeKind::Oci => {
             let result = capsule_core::packers::oci::pack(&decision.plan, None, reporter.as_ref())?;
             if let Some(path) = result.archive {
+                crate::payload_guard::ensure_payload_size(
+                    &path,
+                    force_large_payload,
+                    "--force-large-payload",
+                )?;
                 let _ = sign_if_requested(&path, key.as_ref(), reporter.clone())?;
                 let size = std::fs::metadata(&path)?.len();
                 futures::executor::block_on(reporter.notify(format!(
@@ -172,6 +183,11 @@ pub fn execute_pack_command(
         capsule_core::router::RuntimeKind::Wasm => {
             let result =
                 capsule_core::packers::wasm::pack(&decision.plan, None, None, reporter.as_ref())?;
+            crate::payload_guard::ensure_payload_size(
+                &result.artifact,
+                force_large_payload,
+                "--force-large-payload",
+            )?;
             let size = std::fs::metadata(&result.artifact)?.len();
             futures::executor::block_on(reporter.notify(format!(
                 "✅ Successfully built: {} ({:.1} KB)",
@@ -228,6 +244,11 @@ pub fn execute_pack_command(
                 artifact
             };
 
+            crate::payload_guard::ensure_payload_size(
+                &artifact_path,
+                force_large_payload,
+                "--force-large-payload",
+            )?;
             let _ = sign_if_requested(&artifact_path, key.as_ref(), reporter.clone())?;
             let size = std::fs::metadata(&artifact_path)?.len();
             futures::executor::block_on(reporter.notify(format!(

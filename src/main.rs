@@ -96,6 +96,7 @@ mod ipc;
 mod keygen;
 mod new;
 mod observability;
+mod payload_guard;
 mod process_manager;
 mod profile;
 mod publish_artifact;
@@ -323,6 +324,10 @@ enum Commands {
         #[arg(long)]
         standalone: bool,
 
+        /// Allow building payloads larger than 200MB
+        #[arg(long, default_value_t = false)]
+        force_large_payload: bool,
+
         /// Keep failed build artifacts when smoke test fails
         #[arg(long, default_value_t = false)]
         keep_failed_artifacts: bool,
@@ -460,6 +465,14 @@ enum Commands {
         /// Registry URL override (default: https://api.ato.run)
         #[arg(long)]
         registry: Option<String>,
+
+        /// Use prebuilt .capsule artifact (skip repackaging for private registry publish)
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["ci", "dry_run"])]
+        artifact: Option<PathBuf>,
+
+        /// Allow publishing payloads larger than 200MB
+        #[arg(long, default_value_t = false)]
+        force_large_payload: bool,
 
         /// Publish from GitHub Actions with OIDC token (CI-only mode)
         #[arg(long, conflicts_with = "dry_run")]
@@ -615,6 +628,10 @@ enum Commands {
         /// Create self-extracting executable installer (includes nacelle runtime)
         #[arg(long)]
         standalone: bool,
+
+        /// Allow building payloads larger than 200MB
+        #[arg(long, hide = true, default_value_t = false)]
+        force_large_payload: bool,
 
         /// Keep failed build artifacts when smoke test fails
         #[arg(long, hide = true, default_value_t = false)]
@@ -1238,6 +1255,7 @@ fn run() -> Result<()> {
             init,
             key,
             standalone,
+            force_large_payload,
             enforcement,
             keep_failed_artifacts,
         } => commands::build::execute_pack_command(
@@ -1245,6 +1263,7 @@ fn run() -> Result<()> {
             init,
             key,
             standalone,
+            force_large_payload,
             keep_failed_artifacts,
             enforcement.as_str().to_string(),
             reporter.clone(),
@@ -1284,6 +1303,7 @@ fn run() -> Result<()> {
             init,
             key,
             standalone,
+            force_large_payload,
             enforcement,
             keep_failed_artifacts,
         } => {
@@ -1293,6 +1313,7 @@ fn run() -> Result<()> {
                 init,
                 key,
                 standalone,
+                force_large_payload,
                 keep_failed_artifacts,
                 enforcement.as_str().to_string(),
                 reporter.clone(),
@@ -1497,13 +1518,15 @@ fn run() -> Result<()> {
 
         Commands::Publish {
             registry,
+            artifact,
+            force_large_payload,
             ci,
             dry_run,
             no_tui,
             json,
         } => {
             if ci {
-                execute_publish_ci_command(json, reporter.clone())
+                execute_publish_ci_command(json, force_large_payload, reporter.clone())
             } else if dry_run {
                 execute_publish_dry_run_command(json, reporter.clone())
             } else {
@@ -1515,7 +1538,13 @@ fn run() -> Result<()> {
                         execute_publish_guidance_command(json, &resolved_registry)
                     }
                 } else {
-                    execute_publish_private_command(resolved_registry, json, reporter.clone())
+                    execute_publish_private_command(
+                        resolved_registry,
+                        artifact,
+                        force_large_payload,
+                        json,
+                        reporter.clone(),
+                    )
                 }
             }
         }
@@ -1790,11 +1819,16 @@ fn execute_registry_command(command: RegistryCommands) -> Result<()> {
 
 fn execute_publish_ci_command(
     json_output: bool,
+    force_large_payload: bool,
     reporter: std::sync::Arc<reporters::CliReporter>,
 ) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        let result = publish_ci::execute(publish_ci::PublishCiArgs { json_output }).await?;
+        let result = publish_ci::execute(publish_ci::PublishCiArgs {
+            json_output,
+            force_large_payload,
+        })
+        .await?;
 
         if json_output {
             println!("{}", serde_json::to_string_pretty(&result)?);
@@ -1887,10 +1921,16 @@ fn execute_publish_guidance_command(json_output: bool, registry_url: &str) -> Re
 
 fn execute_publish_private_command(
     registry_url: String,
+    artifact_path: Option<PathBuf>,
+    force_large_payload: bool,
     json_output: bool,
     reporter: std::sync::Arc<reporters::CliReporter>,
 ) -> Result<()> {
-    let result = publish_private::execute(publish_private::PublishPrivateArgs { registry_url })?;
+    let result = publish_private::execute(publish_private::PublishPrivateArgs {
+        registry_url,
+        artifact_path,
+        force_large_payload,
+    })?;
 
     if json_output {
         println!("{}", serde_json::to_string_pretty(&result)?);
