@@ -195,31 +195,14 @@ fn run_runtime(
         cmd.args(args);
     }
 
-    let output = cmd
+    let status = cmd
         .stdin(Stdio::inherit())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
         .context("Failed to execute deno run for node compat")?;
 
-    if !output.stdout.is_empty() {
-        let _ = std::io::stdout().write_all(&output.stdout);
-        let _ = std::io::stdout().flush();
-    }
-    if !output.stderr.is_empty() {
-        let _ = std::io::stderr().write_all(&output.stderr);
-        let _ = std::io::stderr().flush();
-    }
-
-    let exit_code = output.status.code().unwrap_or(1);
-    if exit_code != 0 {
-        if let Some(err) = map_deno_permission_error(&output.stderr) {
-            return Err(err.into());
-        }
-        if let Some(err) = map_node_compat_error(&output.stderr) {
-            return Err(err.into());
-        }
-    }
+    let exit_code = status.code().unwrap_or(1);
 
     Ok(exit_code)
 }

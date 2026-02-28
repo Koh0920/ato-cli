@@ -121,7 +121,9 @@ fn ensure_lockfile(
 ) -> Result<PathBuf> {
     let lock_path = manifest_dir.join("capsule.lock");
     if lock_path.exists() {
-        return Ok(lock_path);
+        if lockfile::verify_lockfile_manifest(manifest_path, &lock_path).is_ok() {
+            return Ok(lock_path);
+        }
     }
 
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -252,13 +254,14 @@ fn append_directory_tree_recursive(
 }
 
 fn should_skip_entry(rel: &Path, is_dir: bool) -> bool {
-    let first = rel
-        .components()
-        .next()
-        .map(|c| c.as_os_str().to_string_lossy().to_string())
-        .unwrap_or_default();
-    if matches!(first.as_str(), ".git" | ".capsule" | "target") {
-        return true;
+    for component in rel.components() {
+        let part = component.as_os_str().to_string_lossy();
+        if matches!(
+            part.as_ref(),
+            ".git" | ".capsule" | "target" | "node_modules" | ".venv" | "__pycache__"
+        ) {
+            return true;
+        }
     }
 
     if is_dir {

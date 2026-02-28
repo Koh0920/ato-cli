@@ -354,6 +354,8 @@ async fn execute_normal_mode(args: OpenArgs) -> Result<()> {
     let decision = compiled.runtime_decision;
     let tier = compiled.tier;
 
+    preflight_deno_orchestrator_requirements(&decision.plan)?;
+
     let lockfile_path = manifest_path.parent().map(|p| p.join("capsule.lock"));
     if let Some(lock_path) = lockfile_path {
         if lock_path.exists() {
@@ -654,6 +656,61 @@ fn preflight_native_sandbox(
     Ok(())
 }
 
+fn preflight_deno_orchestrator_requirements(
+    plan: &capsule_core::router::ManifestData,
+) -> Result<()> {
+    if !is_deno_orchestrator_target(plan) {
+        return Ok(());
+    }
+
+    let is_default_target = plan.selected_target_label().eq_ignore_ascii_case("default");
+    if is_default_target {
+        let build_markers = [
+            plan.manifest_dir.join("apps/dashboard/.next/BUILD_ID"),
+            plan.manifest_dir
+                .join("apps/dashboard/.next/standalone/server.js"),
+            plan.manifest_dir
+                .join("source/apps/dashboard/.next/BUILD_ID"),
+            plan.manifest_dir
+                .join("source/apps/dashboard/.next/standalone/server.js"),
+        ];
+        if !build_markers.iter().any(|p| p.exists()) {
+            return Err(AtoExecutionError::policy_violation(
+                "default target requires dashboard build artifacts (.next). Run `npm run -w apps/dashboard build` before publish/run.",
+            )
+            .into());
+        }
+    }
+
+    let required_envs = plan
+        .execution_env()
+        .get("ATO_ORCH_REQUIRED_ENVS")
+        .cloned()
+        .unwrap_or_default();
+    if required_envs.trim().is_empty() {
+        return Ok(());
+    }
+
+    let missing: Vec<String> = required_envs
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .filter(|name| std::env::var_os(name).is_none())
+        .map(|name| name.to_string())
+        .collect();
+
+    if !missing.is_empty() {
+        return Err(AtoExecutionError::policy_violation(format!(
+            "missing required environment variables for orchestrator target '{}': {}",
+            plan.selected_target_label(),
+            missing.join(", ")
+        ))
+        .into());
+    }
+
+    Ok(())
+}
+
 fn preflight_macos_compat(plan: &capsule_core::router::ManifestData) -> Result<()> {
     let required_raw = match detect_required_macos_from_entrypoint(plan)? {
         Some(value) => value,
@@ -756,6 +813,23 @@ fn is_python_source_target(plan: &capsule_core::router::ManifestData) -> bool {
 
     plan.execution_entrypoint()
         .map(|entry| entry.trim().to_ascii_lowercase().ends_with(".py"))
+        .unwrap_or(false)
+}
+
+fn is_deno_orchestrator_target(plan: &capsule_core::router::ManifestData) -> bool {
+    let runtime = plan.execution_runtime().unwrap_or_default();
+    let driver = plan.execution_driver().unwrap_or_default();
+    if !runtime.eq_ignore_ascii_case("web") || !driver.eq_ignore_ascii_case("deno") {
+        return false;
+    }
+    plan.execution_entrypoint()
+        .map(|entry| {
+            std::path::Path::new(entry.trim())
+                .file_name()
+                .and_then(|v| v.to_str())
+                .map(|v| v.eq_ignore_ascii_case("ato-entry.ts"))
+                .unwrap_or(false)
+        })
         .unwrap_or(false)
 }
 

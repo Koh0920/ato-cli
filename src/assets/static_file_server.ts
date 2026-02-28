@@ -51,26 +51,60 @@ const contentType = (path: string): string => {
   return mimeByExt[path.slice(idx).toLowerCase()] ?? "application/octet-stream";
 };
 
+const logRequest = (
+  method: string,
+  pathname: string,
+  status: number,
+  detail?: string,
+) => {
+  const suffix = detail ? ` (${detail})` : "";
+  console.log(`[ato-static] ${method} ${pathname} -> ${status}${suffix}`);
+};
+
+const rootIndexPath = `${root}/index.html`;
+const rootIndexStat = await Deno.stat(rootIndexPath).catch(() => null);
+console.log(`[ato-static] Serving root: ${root}`);
+console.log(`[ato-static] Listening on http://${host}:${port}/`);
+if (!rootIndexStat || !rootIndexStat.isFile) {
+  console.warn(
+    `[ato-static] Warning: ${rootIndexPath} is missing. GET / will return 404.`,
+  );
+}
+
 Deno.serve({ hostname: host, port }, async (request) => {
   const url = new URL(request.url);
   const resolved = await safeJoin(url.pathname);
   if (!resolved) {
+    logRequest(request.method, url.pathname, 404, "path outside root or missing");
     return new Response("Not found", { status: 404 });
   }
   let filePath = resolved;
   const stat = await Deno.stat(filePath).catch(() => null);
-  if (!stat) return new Response("Not found", { status: 404 });
+  if (!stat) {
+    logRequest(request.method, url.pathname, 404, "path stat failed");
+    return new Response("Not found", { status: 404 });
+  }
   if (stat.isDirectory) {
     const indexPath = `${filePath}/index.html`;
     const indexStat = await Deno.stat(indexPath).catch(() => null);
     if (!indexStat || !indexStat.isFile) {
+      logRequest(
+        request.method,
+        url.pathname,
+        404,
+        "directory has no index.html",
+      );
       return new Response("Not found", { status: 404 });
     }
     filePath = indexPath;
   }
 
   const file = await Deno.readFile(filePath).catch(() => null);
-  if (!file) return new Response("Not found", { status: 404 });
+  if (!file) {
+    logRequest(request.method, url.pathname, 404, "read failed");
+    return new Response("Not found", { status: 404 });
+  }
+  logRequest(request.method, url.pathname, 200, filePath);
   return new Response(file, {
     status: 200,
     headers: { "content-type": contentType(filePath) },

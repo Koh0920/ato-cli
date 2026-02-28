@@ -1,4 +1,5 @@
 use std::fs;
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -6,6 +7,8 @@ use serde::Serialize;
 #[derive(Debug, Clone)]
 pub struct PublishPrivateArgs {
     pub registry_url: String,
+    pub artifact_path: Option<PathBuf>,
+    pub force_large_payload: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -33,18 +36,19 @@ pub fn execute(args: PublishPrivateArgs) -> Result<PublishPrivateResult> {
     let publisher = resolve_private_publisher(&manifest_raw);
     let scoped_id = format!("{}/{}", publisher, slug);
 
-    let artifact_path = crate::publish_ci::build_capsule_artifact(
-        &manifest_path,
-        &manifest.name,
-        &manifest.version,
-    )
-    .with_context(|| "Failed to build artifact for private registry publish")?;
+    let artifact_path = if let Some(path) = args.artifact_path {
+        path
+    } else {
+        crate::publish_ci::build_capsule_artifact(&manifest_path, &manifest.name, &manifest.version)
+            .with_context(|| "Failed to build artifact for private registry publish")?
+    };
 
     let uploaded =
         crate::publish_artifact::publish_artifact(crate::publish_artifact::PublishArtifactArgs {
             artifact_path,
             scoped_id,
             registry_url: args.registry_url.clone(),
+            force_large_payload: args.force_large_payload,
         })?;
 
     Ok(PublishPrivateResult {
