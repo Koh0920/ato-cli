@@ -9,6 +9,7 @@ pub struct PublishArtifactArgs {
     pub artifact_path: PathBuf,
     pub scoped_id: String,
     pub registry_url: String,
+    pub force_large_payload: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +36,11 @@ struct ArtifactPayload {
 
 pub fn publish_artifact(args: PublishArtifactArgs) -> Result<PublishArtifactResult> {
     let base_url = normalize_registry_url(&args.registry_url)?;
+    crate::payload_guard::ensure_payload_size(
+        &args.artifact_path,
+        args.force_large_payload,
+        "--force-large-payload",
+    )?;
     let payload = load_artifact_payload(&args.artifact_path, &args.scoped_id)?;
     let endpoint = format!(
         "{}/v1/local/capsules/{}/{}/{}?file_name={}",

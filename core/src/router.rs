@@ -103,6 +103,10 @@ impl ManifestData {
         self.get_str(&["targets", &self.selected_target, "runtime_version"])
     }
 
+    pub fn execution_runtime_tool_version(&self, tool: &str) -> Option<String> {
+        self.get_str(&["targets", &self.selected_target, "runtime_tools", tool])
+    }
+
     pub fn execution_language(&self) -> Option<String> {
         self.get_str(&["targets", &self.selected_target, "language"])
     }

@@ -264,6 +264,20 @@ pub struct BuildPolicyConfig {
     pub require_did_signature: Option<bool>,
 }
 
+/// Packaging filter configuration
+///
+/// Controls which project files are included in the capsule payload.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PackConfig {
+    /// Strict allowlist patterns. When specified, only matched files are included.
+    #[serde(default)]
+    pub include: Vec<String>,
+
+    /// Exclusion patterns applied after include/default selection.
+    #[serde(default)]
+    pub exclude: Vec<String>,
+}
+
 /// Isolation configuration (runtime-time behavior)
 ///
 /// This section controls what host environment data is allowed to pass into the
@@ -384,6 +398,10 @@ pub struct CapsuleManifestV1 {
     /// Build configuration (packaging-time)
     #[serde(default)]
     pub build: Option<BuildConfig>,
+
+    /// Packaging filter configuration
+    #[serde(default)]
+    pub pack: Option<PackConfig>,
 
     /// Isolation configuration (runtime-time)
     #[serde(default)]
@@ -791,6 +809,13 @@ pub struct NamedTarget {
     #[serde(default)]
     pub runtime_version: Option<String>,
 
+    /// Additional hermetic runtime versions required by orchestrators.
+    ///
+    /// Example:
+    /// runtime_tools = { node = "20.11.0", python = "3.11.7" }
+    #[serde(default)]
+    pub runtime_tools: HashMap<String, String>,
+
     /// Entrypoint path for the target.
     #[serde(default)]
     pub entrypoint: String,
@@ -1088,6 +1113,19 @@ impl CapsuleManifestV1 {
         // Version must be semver
         if !is_semver(&self.version) {
             errors.push(ValidationError::InvalidVersion(self.version.clone()));
+        }
+
+        if let Some(pack) = &self.pack {
+            if pack.include.iter().any(|pattern| pattern.trim().is_empty()) {
+                errors.push(ValidationError::InvalidTarget(
+                    "pack.include must not contain empty patterns".to_string(),
+                ));
+            }
+            if pack.exclude.iter().any(|pattern| pattern.trim().is_empty()) {
+                errors.push(ValidationError::InvalidTarget(
+                    "pack.exclude must not contain empty patterns".to_string(),
+                ));
+            }
         }
 
         // Requirements memory strings must be parseable if present

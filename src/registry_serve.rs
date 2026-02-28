@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use axum::body::Bytes;
-use axum::extract::{Path as AxumPath, Query, State};
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, put};
@@ -215,6 +215,7 @@ pub async fn serve(config: RegistryServerConfig) -> Result<()> {
             "/v1/local/capsules/:publisher/:slug/:version",
             put(handle_put_local_capsule),
         )
+        .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
         .with_state(state);
 
     println!("🚀 Local registry serving at {}", listen_url);
