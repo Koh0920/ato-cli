@@ -120,6 +120,9 @@ pub async fn execute(args: PublishCiArgs) -> Result<PublishCiResult> {
         println!("📦 Building capsule artifact for CI publish...");
     }
     let artifact_path = build_capsule_artifact(&manifest_path, &manifest.name, &manifest.version)?;
+    if !args.json_output {
+        println!("✅ CI artifact built: {}", artifact_path.display());
+    }
     crate::payload_guard::ensure_payload_size(
         &artifact_path,
         args.force_large_payload,
@@ -191,7 +194,6 @@ pub async fn execute(args: PublishCiArgs) -> Result<PublishCiResult> {
         .context("Invalid /v1/publish/ci response payload")?;
 
     if !args.json_output {
-        println!("✅ CI artifact built: {}", artifact_path.display());
         println!("CI publish mode: keyless ephemeral Ed25519 signature");
         println!("CI did:key: {}", did_signature.public_key);
     }
