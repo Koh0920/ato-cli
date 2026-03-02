@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
@@ -80,7 +81,7 @@ pub fn generate_embedded_sbom(
         name: format!("{}-sbom", capsule_name),
         document_namespace: format!(
             "https://ato.run/sbom/{}/{}",
-            capsule_name,
+            url::form_urlencoded::byte_serialize(capsule_name.as_bytes()).collect::<String>(),
             Utc::now().format("%Y%m%d%H%M%S")
         ),
         creation_info: SpdxCreationInfo {
@@ -110,12 +111,10 @@ pub fn extract_and_verify_embedded_sbom(capsule_path: &Path) -> Result<String> {
             .to_string();
         if path == SBOM_PATH {
             let mut bytes = Vec::new();
-            use std::io::Read;
             entry.read_to_end(&mut bytes).map_err(CapsuleError::Io)?;
             sbom = Some(bytes);
         } else if path == "signature.json" {
             let mut text = String::new();
-            use std::io::Read;
             entry.read_to_string(&mut text).map_err(CapsuleError::Io)?;
             let parsed: serde_json::Value = serde_json::from_str(&text)
                 .map_err(|e| CapsuleError::Pack(format!("Invalid signature.json: {e}")))?;
@@ -153,9 +152,25 @@ fn sha256_hex(data: &[u8]) -> String {
 }
 
 fn sanitize_spdx_id(path: &str) -> String {
-    path.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect()
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for c in path.chars() {
+        let next = if c.is_ascii_alphanumeric() || c == '.' {
+            prev_dash = false;
+            c
+        } else if prev_dash {
+            continue;
+        } else {
+            prev_dash = true;
+            '-'
+        };
+        out.push(next);
+    }
+    if out.trim_matches('-').is_empty() {
+        "file".to_string()
+    } else {
+        out.trim_matches('-').to_string()
+    }
 }
 
 #[cfg(test)]
@@ -189,19 +204,16 @@ mod tests {
                 "format": "spdx-json"
             }
         });
+        let signature_text = signature.to_string();
 
         let mut file = fs::File::create(&capsule_path).expect("create capsule");
         let mut ar = Builder::new(&mut file);
         let mut sig_header = tar::Header::new_gnu();
-        sig_header.set_size(signature.to_string().len() as u64);
+        sig_header.set_size(signature_text.len() as u64);
         sig_header.set_mode(0o644);
         sig_header.set_cksum();
-        ar.append_data(
-            &mut sig_header,
-            "signature.json",
-            signature.to_string().as_bytes(),
-        )
-        .expect("append signature");
+        ar.append_data(&mut sig_header, "signature.json", signature_text.as_bytes())
+            .expect("append signature");
 
         let mut sbom_header = tar::Header::new_gnu();
         sbom_header.set_size(sbom_text.len() as u64);
