@@ -110,6 +110,74 @@ ATO_TOKEN=pwd ato publish --registry http://100.x.y.z:8787 --artifact ./<name>.c
 - `targets.<label>.required_env = ["KEY1", "KEY2"]`（推奨）
 - 既存互換: `targets.<label>.env.ATO_ORCH_REQUIRED_ENVS = "KEY1,KEY2"`
 
+## 動的アプリのカプセル化手順（Web + Deno Orchestrator）
+
+複数サービス（例: dashboard + API + worker）を1つのカプセルで動かす場合は、`web/deno` ターゲット1つに統一し、`ato-entry.ts` で子プロセスを起動します。
+
+1. パッキング前に成果物を事前ビルドする（例: `next build`、worker build、lockfile）。
+2. `[pack].include` で実行成果物だけを同梱する（生の `node_modules`、`.venv`、キャッシュは同梱しない）。
+3. `ato build` で一度だけ作成し、`publish --artifact` で再パッキングを避ける。
+
+最小構成の `capsule.toml` 例:
+
+```toml
+schema_version = "0.2"
+name = "my-dynamic-app"
+version = "0.1.0"
+default_target = "default"
+
+[pack]
+include = [
+  "ato-entry.ts",
+  "capsule.toml",
+  "capsule.lock",
+  "apps/dashboard/.next/standalone/**",
+  "apps/dashboard/.next/static/**",
+  "apps/control-plane/src/**",
+  "apps/control-plane/pyproject.toml",
+  "apps/control-plane/uv.lock",
+  "apps/worker/src/**",
+  "apps/worker/wrangler.dev.jsonc"
+]
+exclude = [
+  ".deno/**",
+  "node_modules/**",
+  "**/__pycache__/**",
+  "apps/dashboard/.next/cache/**"
+]
+
+[targets.default]
+runtime = "web"
+driver = "deno"
+runtime_version = "1.46.3"
+runtime_tools = { node = "20.11.0", python = "3.11.10" }
+entrypoint = "ato-entry.ts"
+port = 4173
+required_env = ["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID"]
+```
+
+推奨フロー:
+
+```bash
+# 1) 事前ビルド
+npm run capsule:prepare
+
+# 2) カプセル化
+ato build .
+
+# 3) 成果物をpublish（private/local registry）
+ATO_TOKEN=pwd ato publish --registry http://127.0.0.1:8787 --artifact ./my-dynamic-app.capsule
+
+# 4) install + run
+ato install <publisher>/<slug> --registry http://127.0.0.1:8787
+ato run <publisher>/<slug> --registry http://127.0.0.1:8787
+```
+
+補足:
+- Next.js standalone は `ato build` 前に `.next/static`（必要なら `public` も）を standalone 出力へコピーしてください。
+- `required_env` 未設定時、`ato run` は起動前に停止します。
+- `ato-entry.ts` は、子プロセス1つの異常終了で全体停止する fail-fast 実装を推奨します。
+
 ## ランタイム隔離ポリシー（Tier）
 
 - `web/static`: Tier1（`driver = "static"` + `targets.<label>.port` 必須。`capsule.lock` 不要）

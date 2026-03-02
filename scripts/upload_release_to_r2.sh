@@ -47,6 +47,7 @@ put_object() {
   local cache_control="${3:-}"
   local object_ref="${BUCKET}/${object_key}"
   local -a cmd
+  local cmd_output
 
   cmd=(wrangler)
   if [[ -n "$WRANGLER_CONFIG" ]]; then
@@ -73,8 +74,18 @@ put_object() {
   local sleep_base="$PUT_RETRY_SLEEP"
   local sleep_seconds
   while true; do
-    if "${cmd[@]}"; then
+    if cmd_output="$("${cmd[@]}" 2>&1)"; then
+      if [[ -n "$cmd_output" ]]; then
+        echo "$cmd_output"
+      fi
       return 0
+    fi
+    if [[ -n "$cmd_output" ]]; then
+      echo "$cmd_output" >&2
+    fi
+    if grep -qiE 'specified bucket does not exist|bucket does not exist|authentication error|not authorized|permission denied|account id' <<<"$cmd_output"; then
+      echo "error: non-retriable upload error for $object_ref. Verify BUCKET / DEFAULT_BUCKET_* and Cloudflare credentials." >&2
+      return 1
     fi
     if (( attempt >= max_attempts )); then
       echo "error: upload failed after $attempt attempt(s): $object_ref" >&2
