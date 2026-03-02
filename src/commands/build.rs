@@ -92,6 +92,9 @@ pub fn execute_pack_command(
 
     match decision.kind {
         capsule_core::router::RuntimeKind::Source => {
+            futures::executor::block_on(
+                reporter.notify("⏳ Preparing source runtime bundle...".to_string()),
+            )?;
             let artifact_path = capsule_core::packers::source::pack(
                 &decision.plan,
                 capsule_core::packers::source::SourcePackOptions {
@@ -117,6 +120,9 @@ pub fn execute_pack_command(
                 )?;
             } else {
                 debug!("Running smoke test");
+                futures::executor::block_on(
+                    reporter.notify("🧪 Running smoke test...".to_string()),
+                )?;
                 match capsule_core::smoke::run_capsule_smoke(
                     &artifact_path,
                     decision.plan.selected_target_label(),
@@ -217,6 +223,9 @@ pub fn execute_pack_command(
                     reporter.clone(),
                 )?
             } else {
+                futures::executor::block_on(
+                    reporter.notify("⏳ Preparing web runtime bundle...".to_string()),
+                )?;
                 let artifact = capsule_core::packers::source::pack(
                     &decision.plan,
                     capsule_core::packers::source::SourcePackOptions {
