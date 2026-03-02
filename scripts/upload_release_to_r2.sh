@@ -13,7 +13,8 @@ set -euo pipefail
 #   VERSION             required
 #   BUCKET              optional (if omitted, inferred from DEPLOY_ENV)
 #   DEPLOY_ENV          optional: staging|stg|production|prod
-#                      note: 公開版の既定BUCKETは汎用値。実運用では BUCKET を明示指定することを推奨。
+#   DEFAULT_BUCKET_STAGING     optional fallback bucket when DEPLOY_ENV=staging|stg
+#   DEFAULT_BUCKET_PRODUCTION  optional fallback bucket when DEPLOY_ENV=production|prod
 #   SOURCE_DIR          default: /tmp/ato-release/$VERSION
 #   TARGETS             default: infer from SOURCE_DIR/ato-*.tar.gz|ato-*.zip
 #   UPDATE_LATEST       default: 1
@@ -34,8 +35,8 @@ need_cmd() {
 
 resolve_bucket_from_env() {
   case "${DEPLOY_ENV:-}" in
-    staging|stg) echo "releases-staging" ;;
-    production|prod) echo "releases-production" ;;
+    staging|stg) echo "${DEFAULT_BUCKET_STAGING:-}" ;;
+    production|prod) echo "${DEFAULT_BUCKET_PRODUCTION:-}" ;;
     *) echo "" ;;
   esac
 }
@@ -101,21 +102,20 @@ find_archive_for_target() {
   return 1
 }
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-
 need_cmd wrangler
 need_cmd find
 
 VERSION="${VERSION:-}"
 DEPLOY_ENV="${DEPLOY_ENV:-}"
+DEFAULT_BUCKET_STAGING="${DEFAULT_BUCKET_STAGING:-}"
+DEFAULT_BUCKET_PRODUCTION="${DEFAULT_BUCKET_PRODUCTION:-}"
 BUCKET="${BUCKET:-$(resolve_bucket_from_env)}"
 if [[ -z "$VERSION" ]]; then
   echo "error: VERSION is required" >&2
   exit 1
 fi
 if [[ -z "$BUCKET" ]]; then
-  echo "error: BUCKET is required (or set DEPLOY_ENV=staging|production)" >&2
+  echo "error: BUCKET is required (or set DEPLOY_ENV plus DEFAULT_BUCKET_STAGING/DEFAULT_BUCKET_PRODUCTION)" >&2
   exit 1
 fi
 
@@ -123,14 +123,7 @@ SOURCE_DIR="${SOURCE_DIR:-/tmp/ato-release/${VERSION}}"
 TARGETS="${TARGETS:-}"
 UPDATE_LATEST="${UPDATE_LATEST:-1}"
 PREFIX="${PREFIX:-ato}"
-DEFAULT_WRANGLER_CONFIG="$WORKSPACE_ROOT/apps/ato-store/wrangler.toml"
-if [[ "${WRANGLER_CONFIG+x}" == "x" ]]; then
-  WRANGLER_CONFIG="${WRANGLER_CONFIG}"
-elif [[ -f "$DEFAULT_WRANGLER_CONFIG" ]]; then
-  WRANGLER_CONFIG="$DEFAULT_WRANGLER_CONFIG"
-else
-  WRANGLER_CONFIG=""
-fi
+WRANGLER_CONFIG="${WRANGLER_CONFIG:-}"
 WRANGLER_ENV="${WRANGLER_ENV:-}"
 REMOTE="${REMOTE:-1}"
 DRY_RUN="${DRY_RUN:-0}"
