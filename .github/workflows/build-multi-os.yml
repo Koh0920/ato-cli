@@ -149,10 +149,7 @@ jobs:
 
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
             archive_name="ato-${target_triple}.zip"
-            (
-              cd dist/payload
-              zip -q "../${archive_name}" "${{ matrix.binary_name }}"
-            )
+            powershell.exe -NoProfile -Command "Compress-Archive -Path 'dist/payload/${{ matrix.binary_name }}' -DestinationPath 'dist/${archive_name}' -Force"
           else
             archive_name="ato-${target_triple}.tar.gz"
             tar -C dist/payload -czf "dist/${archive_name}" "${{ matrix.binary_name }}"
