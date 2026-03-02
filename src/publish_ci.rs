@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use capsule_core::CapsuleReporter;
 use ed25519_dalek::Signer;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
@@ -76,7 +77,10 @@ struct CiMetadataPayload {
     request_playground: bool,
 }
 
-pub async fn execute(args: PublishCiArgs) -> Result<PublishCiResult> {
+pub async fn execute(
+    args: PublishCiArgs,
+    reporter: std::sync::Arc<crate::reporters::CliReporter>,
+) -> Result<PublishCiResult> {
     let github = load_github_context()?;
     if github.ref_type != "tag" {
         anyhow::bail!(
@@ -117,9 +121,18 @@ pub async fn execute(args: PublishCiArgs) -> Result<PublishCiResult> {
     }
 
     if !args.json_output {
-        println!("📦 Building capsule artifact for CI publish...");
+        reporter
+            .progress_start(
+                "📦 [publish] Building capsule artifact for CI publish...".to_string(),
+                None,
+            )
+            .await?;
     }
-    let artifact_path = build_capsule_artifact(&manifest_path, &manifest.name, &manifest.version)?;
+    let artifact_path = build_capsule_artifact(&manifest_path, &manifest.name, &manifest.version);
+    if !args.json_output {
+        reporter.progress_finish(None).await?;
+    }
+    let artifact_path = artifact_path?;
     if !args.json_output {
         println!("✅ CI artifact built: {}", artifact_path.display());
     }
@@ -174,7 +187,12 @@ pub async fn execute(args: PublishCiArgs) -> Result<PublishCiResult> {
         );
 
     if !args.json_output {
-        println!("📤 Uploading artifact to Store API...");
+        reporter
+            .progress_start(
+                "📤 [publish] Uploading artifact to Store API...".to_string(),
+                None,
+            )
+            .await?;
     }
     let response = reqwest::Client::new()
         .post(&endpoint)
@@ -182,7 +200,11 @@ pub async fn execute(args: PublishCiArgs) -> Result<PublishCiResult> {
         .multipart(form)
         .send()
         .await
-        .with_context(|| format!("Failed to upload CI artifact to {}", endpoint))?;
+        .with_context(|| format!("Failed to upload CI artifact to {}", endpoint));
+    if !args.json_output {
+        reporter.progress_finish(None).await?;
+    }
+    let response = response?;
 
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
