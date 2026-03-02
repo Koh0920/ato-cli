@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-#[cfg(windows)]
+#[cfg(any(unix, windows))]
 use std::process::Command;
 use std::time::SystemTime;
 
@@ -130,7 +130,7 @@ impl ProcessManager {
             return info.clone();
         }
 
-        let is_alive = is_process_alive(info.pid);
+        let is_alive = is_process_alive(info.pid) && process_identity_matches(info);
         ProcessInfo {
             status: if is_alive {
                 ProcessStatus::Running
@@ -164,6 +164,11 @@ impl ProcessManager {
             return Ok(false);
         }
 
+        if !process_identity_matches(&info) {
+            self.delete_pid(id)?;
+            return Ok(false);
+        }
+
         if terminate_process(info.pid, force)? {
             wait_for_process_exit(info.pid, 10)?;
             self.delete_pid(id)?;
@@ -191,7 +196,8 @@ impl ProcessManager {
                         if let Ok(info) = self.read_pid(id) {
                             if info.status == ProcessStatus::Stopped
                                 || (info.status == ProcessStatus::Running
-                                    && !is_process_alive(info.pid))
+                                    && (!is_process_alive(info.pid)
+                                        || !process_identity_matches(&info)))
                             {
                                 let _ = fs::remove_file(&path);
                                 cleaned += 1;
@@ -243,6 +249,103 @@ fn is_process_alive(pid: i32) -> bool {
 #[cfg(unix)]
 fn errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+}
+
+fn process_identity_matches(info: &ProcessInfo) -> bool {
+    runtime_identity_matches(&info.runtime, read_process_commandline(info.pid).as_deref())
+}
+
+fn runtime_identity_matches(runtime: &str, commandline: Option<&str>) -> bool {
+    if !runtime.eq_ignore_ascii_case("nacelle") {
+        return true;
+    }
+
+    let Some(commandline) = commandline else {
+        return false;
+    };
+
+    is_expected_nacelle_commandline(commandline)
+}
+
+fn is_expected_nacelle_commandline(commandline: &str) -> bool {
+    let normalized = commandline.to_ascii_lowercase();
+    normalized.contains("nacelle") || normalized.contains("capsule open")
+}
+
+fn read_process_commandline(pid: i32) -> Option<String> {
+    if pid <= 0 {
+        return None;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let proc_path = format!("/proc/{pid}/cmdline");
+        if let Ok(raw) = fs::read(proc_path) {
+            if !raw.is_empty() {
+                let mut out = String::new();
+                for byte in raw {
+                    if byte == 0 {
+                        out.push(' ');
+                    } else {
+                        out.push(byte as char);
+                    }
+                }
+                let trimmed = out.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        let output = Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "command="])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let cmd = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if cmd.is_empty() {
+            None
+        } else {
+            Some(cmd)
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let output = Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {}", pid), "/FO", "CSV", "/NH"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let line = stdout.lines().next()?.trim();
+        if line.is_empty() || line.starts_with("INFO:") {
+            return None;
+        }
+        let image = line
+            .split(',')
+            .next()
+            .map(|v| v.trim_matches('"'))
+            .unwrap_or("")
+            .trim();
+        if image.is_empty() {
+            None
+        } else {
+            Some(image.to_string())
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
 }
 
 fn wait_for_process_exit(pid: i32, timeout_secs: u64) -> Result<()> {
@@ -415,5 +518,35 @@ mod tests {
     #[test]
     fn test_pid_file_extension() {
         assert_eq!(PID_FILE_EXT, ".pid");
+    }
+
+    #[test]
+    fn nacelle_identity_matches_expected_commandline() {
+        assert!(runtime_identity_matches(
+            "nacelle",
+            Some("/usr/local/bin/nacelle run ...")
+        ));
+        assert!(runtime_identity_matches(
+            "nacelle",
+            Some("/usr/bin/ato capsule open ./sample")
+        ));
+        assert!(!runtime_identity_matches(
+            "nacelle",
+            Some("/usr/sbin/launchd")
+        ));
+    }
+
+    #[test]
+    fn nacelle_identity_fails_closed_when_commandline_missing() {
+        assert!(!runtime_identity_matches("nacelle", None));
+    }
+
+    #[test]
+    fn non_nacelle_runtime_skips_strict_identity_check() {
+        assert!(runtime_identity_matches("host", None));
+        assert!(runtime_identity_matches(
+            "host",
+            Some("/usr/bin/python app.py")
+        ));
     }
 }

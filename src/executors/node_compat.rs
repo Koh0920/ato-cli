@@ -75,7 +75,7 @@ fn run_provisioning(
     let mut cmd = Command::new(deno_bin);
     cmd.current_dir(runtime_dir)
         .arg("cache")
-        .arg("--node-modules-dir=auto")
+        .arg("--node-modules-dir")
         .arg(entrypoint)
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
@@ -116,7 +116,7 @@ fn run_runtime(
     let mut cmd = Command::new(deno_bin);
     cmd.current_dir(runtime_dir)
         .arg("run")
-        .arg("--node-modules-dir=auto")
+        .arg("--node-modules-dir")
         .arg("--no-prompt");
     if !dangerously_skip_permissions {
         cmd.arg("--cached-only");

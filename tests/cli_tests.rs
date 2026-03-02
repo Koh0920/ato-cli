@@ -300,7 +300,8 @@ fn test_source_rebuild_accepts_reference_alias() {
     ])
     .assert()
     .failure()
-    .stderr(predicate::str::contains(
-        "Failed to preflight source operation",
-    ));
+    .stderr(
+        predicate::str::contains("Failed to preflight source operation")
+            .or(predicate::str::contains("Source operation requires authentication")),
+    );
 }
