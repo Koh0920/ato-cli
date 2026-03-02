@@ -13,6 +13,7 @@ set -euo pipefail
 #   VERSION             required
 #   BUCKET              optional (if omitted, inferred from DEPLOY_ENV)
 #   DEPLOY_ENV          optional: staging|stg|production|prod
+#                      note: 公開版の既定BUCKETは汎用値。実運用では BUCKET を明示指定することを推奨。
 #   SOURCE_DIR          default: /tmp/ato-release/$VERSION
 #   TARGETS             default: infer from SOURCE_DIR/ato-*.tar.gz|ato-*.zip
 #   UPDATE_LATEST       default: 1
@@ -33,8 +34,8 @@ need_cmd() {
 
 resolve_bucket_from_env() {
   case "${DEPLOY_ENV:-}" in
-    staging|stg) echo "ato-releases-stg" ;;
-    production|prod) echo "ato-releases-prod" ;;
+    staging|stg) echo "releases-staging" ;;
+    production|prod) echo "releases-production" ;;
     *) echo "" ;;
   esac
 }
