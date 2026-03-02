@@ -11,6 +11,7 @@ use zstd::stream::encode_all;
 
 use crate::error::Result as CapsuleResult;
 use crate::packers::pack_filter::PackFilter;
+use crate::packers::sbom::{generate_embedded_sbom, SBOM_PATH};
 use crate::r3_config;
 
 /// Capsule Format v2 PAX TAR Archive Structure:
@@ -81,18 +82,33 @@ pub async fn pack(
 
     // Add source/ directory contents.
     // If source/ does not exist, fallback to project root contents (excluding generated/build files).
+    let mut sbom_files = Vec::new();
     if source_dir.exists() {
-        copy_dir_to_tar(&mut ar, &source_dir, "source", &pack_filter)?;
+        copy_dir_to_tar(
+            &mut ar,
+            &source_dir,
+            "source",
+            &pack_filter,
+            &mut sbom_files,
+        )?;
     } else {
         debug!("No source/ directory found; packaging project root as source/");
-        copy_dir_to_tar(&mut ar, &opts.manifest_dir, "source", &pack_filter)?;
+        copy_dir_to_tar(
+            &mut ar,
+            &opts.manifest_dir,
+            "source",
+            &pack_filter,
+            &mut sbom_files,
+        )?;
     }
 
     // Add config.json using append_path_with_name
     ar.append_path_with_name(&config_path, "config.json")?;
+    sbom_files.push(("config.json".to_string(), config_path.clone()));
 
     // Add capsule.lock using append_path_with_name
     ar.append_path_with_name(&lockfile_path, "capsule.lock")?;
+    sbom_files.push(("capsule.lock".to_string(), lockfile_path.clone()));
 
     ar.finish()?;
     drop(ar);
@@ -134,12 +150,26 @@ pub async fn pack(
     fs::write(&manifest_temp_path, &manifest_content)?;
     outer_ar.append_path_with_name(&manifest_temp_path, "capsule.toml")?;
 
-    // Add signature.json (placeholder for now)
+    let sbom = generate_embedded_sbom(&loaded.model.name, &sbom_files)?;
+    let sbom_temp_path = temp_dir.join(SBOM_PATH);
+    fs::write(&sbom_temp_path, &sbom.document)?;
+    outer_ar.append_path_with_name(&sbom_temp_path, SBOM_PATH)?;
+
+    // Add signature.json metadata
     let sig_temp_path = temp_dir.join("signature.json");
-    fs::write(
-        &sig_temp_path,
-        r#"{"signed": false, "note": "To be signed"}"#,
-    )?;
+    let signature = serde_json::json!({
+        "signed": false,
+        "note": "To be signed",
+        "sbom": {
+            "path": SBOM_PATH,
+            "sha256": sbom.sha256,
+            "format": "spdx-json",
+        }
+    });
+    let signature_bytes = serde_json::to_vec_pretty(&signature).map_err(|e| {
+        crate::error::CapsuleError::Pack(format!("Failed to serialize signature metadata: {e}"))
+    })?;
+    fs::write(&sig_temp_path, signature_bytes)?;
     outer_ar.append_path_with_name(&sig_temp_path, "signature.json")?;
 
     // Add payload.tar.zst
@@ -166,6 +196,7 @@ fn copy_dir_to_tar(
     src_root: &Path,
     prefix: &str,
     filter: &PackFilter,
+    sbom_files: &mut Vec<(String, PathBuf)>,
 ) -> Result<()> {
     for entry in WalkDir::new(src_root)
         .follow_links(false)
@@ -200,6 +231,7 @@ fn copy_dir_to_tar(
             ar.append_link(&mut header, &target, link_target)?;
         } else if entry.file_type().is_file() {
             ar.append_path_with_name(path, &target)?;
+            sbom_files.push((target, path.to_path_buf()));
         }
     }
     Ok(())
@@ -217,6 +249,7 @@ fn should_skip_reserved_file(rel: &Path) -> bool {
             | "config.json"
             | "capsule.lock"
             | "signature.json"
+            | "sbom.spdx.json"
             | "payload.tar"
             | "payload.tar.zst"
     ) {
