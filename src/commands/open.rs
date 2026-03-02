@@ -1215,7 +1215,9 @@ fn resolve_python_dependency_lock_path(manifest_dir: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_python_dependency_lock_path;
+    use super::{preflight_required_environment_variables, resolve_python_dependency_lock_path};
+    use capsule_core::router::{ExecutionProfile, ManifestData};
+    use std::path::PathBuf;
 
     #[test]
     fn resolve_python_dependency_detects_uv_lock() {
@@ -1225,5 +1227,75 @@ mod tests {
 
         let found = resolve_python_dependency_lock_path(tmp.path()).expect("must resolve uv.lock");
         assert_eq!(found, tmp.path().join("source").join("uv.lock"));
+    }
+
+    #[test]
+    fn preflight_required_env_fails_when_missing_or_empty() {
+        let key_missing = "ATO_TEST_REQUIRED_ENV_MISSING";
+        let key_empty = "ATO_TEST_REQUIRED_ENV_EMPTY";
+        std::env::remove_var(key_missing);
+        std::env::set_var(key_empty, "   ");
+
+        let plan = manifest_with_required_env(vec![key_missing, key_empty]);
+        let err = preflight_required_environment_variables(&plan).expect_err("must fail-closed");
+        let msg = err.to_string();
+        assert!(msg.contains(key_missing));
+        assert!(msg.contains(key_empty));
+
+        std::env::remove_var(key_empty);
+    }
+
+    #[test]
+    fn preflight_required_env_passes_when_set() {
+        let key = "ATO_TEST_REQUIRED_ENV_SET";
+        std::env::set_var(key, "ok");
+
+        let plan = manifest_with_required_env(vec![key]);
+        assert!(preflight_required_environment_variables(&plan).is_ok());
+
+        std::env::remove_var(key);
+    }
+
+    fn manifest_with_required_env(keys: Vec<&str>) -> ManifestData {
+        let mut manifest = toml::map::Map::new();
+        manifest.insert("name".to_string(), toml::Value::String("demo".to_string()));
+        manifest.insert(
+            "default_target".to_string(),
+            toml::Value::String("default".to_string()),
+        );
+
+        let mut target = toml::map::Map::new();
+        target.insert(
+            "runtime".to_string(),
+            toml::Value::String("source".to_string()),
+        );
+        target.insert(
+            "driver".to_string(),
+            toml::Value::String("native".to_string()),
+        );
+        target.insert(
+            "entrypoint".to_string(),
+            toml::Value::String("main.py".to_string()),
+        );
+        target.insert(
+            "required_env".to_string(),
+            toml::Value::Array(
+                keys.into_iter()
+                    .map(|k| toml::Value::String(k.to_string()))
+                    .collect(),
+            ),
+        );
+
+        let mut targets = toml::map::Map::new();
+        targets.insert("default".to_string(), toml::Value::Table(target));
+        manifest.insert("targets".to_string(), toml::Value::Table(targets));
+
+        ManifestData {
+            manifest: toml::Value::Table(manifest),
+            manifest_path: PathBuf::from("/tmp/capsule.toml"),
+            manifest_dir: PathBuf::from("/tmp"),
+            profile: ExecutionProfile::Dev,
+            selected_target: "default".to_string(),
+        }
     }
 }
