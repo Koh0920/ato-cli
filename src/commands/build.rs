@@ -92,6 +92,10 @@ pub fn execute_pack_command(
 
     match decision.kind {
         capsule_core::router::RuntimeKind::Source => {
+            futures::executor::block_on(reporter.progress_start(
+                "⏳ [build] Preparing source runtime bundle...".to_string(),
+                None,
+            ))?;
             let artifact_path = capsule_core::packers::source::pack(
                 &decision.plan,
                 capsule_core::packers::source::SourcePackOptions {
@@ -106,7 +110,9 @@ pub fn execute_pack_command(
                     standalone,
                 },
                 reporter.clone(),
-            )?;
+            );
+            futures::executor::block_on(reporter.progress_finish(None))?;
+            let artifact_path = artifact_path?;
 
             if standalone {
                 futures::executor::block_on(
@@ -117,11 +123,15 @@ pub fn execute_pack_command(
                 )?;
             } else {
                 debug!("Running smoke test");
+                futures::executor::block_on(
+                    reporter.progress_start("🧪 [build] Running smoke test...".to_string(), None),
+                )?;
                 match capsule_core::smoke::run_capsule_smoke(
                     &artifact_path,
                     decision.plan.selected_target_label(),
                 ) {
                     Ok(summary) => {
+                        futures::executor::block_on(reporter.progress_finish(None))?;
                         debug!(
                             "Smoke passed (timeout={}ms, port={:?}, checks={})",
                             summary.startup_timeout_ms,
@@ -130,6 +140,7 @@ pub fn execute_pack_command(
                         );
                     }
                     Err(err) => {
+                        futures::executor::block_on(reporter.progress_finish(None))?;
                         handle_failed_artifact(
                             &artifact_path,
                             keep_failed_artifacts,
@@ -217,6 +228,10 @@ pub fn execute_pack_command(
                     reporter.clone(),
                 )?
             } else {
+                futures::executor::block_on(reporter.progress_start(
+                    "⏳ [build] Preparing web runtime bundle...".to_string(),
+                    None,
+                ))?;
                 let artifact = capsule_core::packers::source::pack(
                     &decision.plan,
                     capsule_core::packers::source::SourcePackOptions {
@@ -231,7 +246,9 @@ pub fn execute_pack_command(
                         standalone,
                     },
                     reporter.clone(),
-                )?;
+                );
+                futures::executor::block_on(reporter.progress_finish(None))?;
+                let artifact = artifact?;
 
                 if standalone {
                     futures::executor::block_on(
