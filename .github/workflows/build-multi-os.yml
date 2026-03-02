@@ -1,6 +1,9 @@
 name: Build (Multi OS)
 
 on:
+  pull_request:
+    branches:
+      - main
   push:
     tags:
       - "v*.*.*"
@@ -32,6 +35,9 @@ on:
         description: "R2 bucket override (optional)"
         required: false
         type: string
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -143,9 +149,17 @@ jobs:
             binary_path="target/${{ matrix.build_target }}/release/${{ matrix.binary_name }}"
           fi
           cp "$binary_path" "dist/payload/${{ matrix.binary_name }}"
-          tar -C dist/payload -czf "dist/ato-${target_triple}.tar.gz" "${{ matrix.binary_name }}"
+
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            archive_name="ato-${target_triple}.zip"
+            powershell.exe -NoProfile -Command "Push-Location 'dist/payload'; Compress-Archive -Path '${{ matrix.binary_name }}' -DestinationPath '../${archive_name}' -Force; Pop-Location"
+          else
+            archive_name="ato-${target_triple}.tar.gz"
+            tar -C dist/payload -czf "dist/${archive_name}" "${{ matrix.binary_name }}"
+          fi
+
           echo "$target_triple" > "dist/target-triple.txt"
-          echo "archive=dist/ato-${target_triple}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "archive=dist/${archive_name}" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -153,6 +167,7 @@ jobs:
           name: release-${{ matrix.os }}
           path: |
             dist/ato-*.tar.gz
+            dist/ato-*.zip
             dist/target-triple.txt
           if-no-files-found: error
 
@@ -235,7 +250,7 @@ jobs:
           mkdir -p "$source_dir"
 
           shopt -s nullglob
-          archives=(/tmp/ato-ci-artifacts/ato-*.tar.gz)
+          archives=(/tmp/ato-ci-artifacts/ato-*.tar.gz /tmp/ato-ci-artifacts/ato-*.zip)
           if [[ "${#archives[@]}" -eq 0 ]]; then
             echo "No packaged archives found under /tmp/ato-ci-artifacts" >&2
             exit 1
@@ -245,9 +260,9 @@ jobs:
           (
             cd "$source_dir"
             if command -v shasum >/dev/null 2>&1; then
-              shasum -a 256 ato-*.tar.gz > SHA256SUMS
+              shasum -a 256 ato-*.tar.gz ato-*.zip > SHA256SUMS
             else
-              sha256sum ato-*.tar.gz > SHA256SUMS
+              sha256sum ato-*.tar.gz ato-*.zip > SHA256SUMS
             fi
           )
 

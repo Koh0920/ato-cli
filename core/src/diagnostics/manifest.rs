@@ -13,6 +13,7 @@ pub fn validate_manifest_for_build(
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
+    validate_pack_config(manifest_path, &raw)?;
 
     let target = raw
         .get("targets")
@@ -144,6 +145,86 @@ pub fn validate_manifest_for_build(
                         ),
                     ));
                 }
+
+                if let Some(runtime_tools) = target.get("runtime_tools") {
+                    let tools_table = runtime_tools.as_table().ok_or_else(|| {
+                        manifest_err(
+                            manifest_path,
+                            format!("targets.{target_label}.runtime_tools must be a table"),
+                        )
+                    })?;
+                    for (tool, version) in tools_table {
+                        let version = version.as_str().map(str::trim).ok_or_else(|| {
+                            manifest_err(
+                                manifest_path,
+                                format!(
+                                    "targets.{target_label}.runtime_tools.{tool} must be a non-empty string"
+                                ),
+                            )
+                        })?;
+                        if version.is_empty() {
+                            return Err(manifest_err(
+                                manifest_path,
+                                format!(
+                                    "targets.{target_label}.runtime_tools.{tool} must be a non-empty string"
+                                ),
+                            ));
+                        }
+                    }
+                }
+
+                // Deno orchestrator targets require explicit runtime pins and tool pins.
+                // We detect orchestrator intent by conventional entrypoint name.
+                if driver == "deno"
+                    && std::path::Path::new(clean_entrypoint)
+                        .file_name()
+                        .and_then(|v| v.to_str())
+                        .map(|v| v.eq_ignore_ascii_case("ato-entry.ts"))
+                        .unwrap_or(false)
+                {
+                    let runtime_version_ok = target
+                        .get("runtime_version")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty())
+                        .is_some();
+                    if !runtime_version_ok {
+                        return Err(manifest_err(
+                            manifest_path,
+                            format!(
+                                "targets.{target_label}.runtime_version is required for deno orchestrator targets"
+                            ),
+                        ));
+                    }
+
+                    let tools_table = target
+                        .get("runtime_tools")
+                        .and_then(|v| v.as_table())
+                        .ok_or_else(|| {
+                            manifest_err(
+                                manifest_path,
+                                format!(
+                                    "targets.{target_label}.runtime_tools is required for deno orchestrator targets"
+                                ),
+                            )
+                        })?;
+                    for required_tool in ["node", "python"] {
+                        let ok = tools_table
+                            .get(required_tool)
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|v| !v.is_empty())
+                            .is_some();
+                        if !ok {
+                            return Err(manifest_err(
+                                manifest_path,
+                                format!(
+                                    "targets.{target_label}.runtime_tools.{required_tool} is required for deno orchestrator targets"
+                                ),
+                            ));
+                        }
+                    }
+                }
             }
             _ => unreachable!(),
         }
@@ -248,6 +329,44 @@ fn is_safe_relative_path(path: &str) -> bool {
             Component::ParentDir | Component::RootDir | Component::Prefix(_)
         )
     })
+}
+
+fn validate_pack_config(manifest_path: &Path, raw: &toml::Value) -> Result<(), CapsuleError> {
+    let Some(pack) = raw.get("pack") else {
+        return Ok(());
+    };
+    let pack = pack
+        .as_table()
+        .ok_or_else(|| manifest_err(manifest_path, "pack must be a table".to_string()))?;
+
+    for field in ["include", "exclude"] {
+        let Some(value) = pack.get(field) else {
+            continue;
+        };
+        let arr = value.as_array().ok_or_else(|| {
+            manifest_err(
+                manifest_path,
+                format!("pack.{field} must be an array of strings"),
+            )
+        })?;
+
+        for (idx, pattern) in arr.iter().enumerate() {
+            let pattern = pattern.as_str().ok_or_else(|| {
+                manifest_err(
+                    manifest_path,
+                    format!("pack.{field}[{idx}] must be a non-empty string"),
+                )
+            })?;
+            if pattern.trim().is_empty() {
+                return Err(manifest_err(
+                    manifest_path,
+                    format!("pack.{field}[{idx}] must be a non-empty string"),
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -362,5 +481,34 @@ port = 3000
         assert!(err
             .to_string()
             .contains("entrypoint must be a script file path"));
+    }
+
+    #[test]
+    fn rejects_empty_pack_patterns() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("capsule.toml");
+        std::fs::write(
+            &manifest_path,
+            r#"
+schema_version = "0.2"
+name = "pack-test"
+version = "0.1.0"
+default_target = "web"
+
+[pack]
+include = ["", "apps/**"]
+
+[targets.web]
+runtime = "web"
+driver = "deno"
+entrypoint = "ato-entry.ts"
+port = 4173
+"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("ato-entry.ts"), "console.log('ok');").unwrap();
+
+        let err = validate_manifest_for_build(&manifest_path, "web").unwrap_err();
+        assert!(err.to_string().contains("pack.include[0]"));
     }
 }

@@ -96,15 +96,19 @@ mod ipc;
 mod keygen;
 mod new;
 mod observability;
+mod payload_guard;
 mod process_manager;
 mod profile;
+mod publish_artifact;
 mod publish_ci;
 mod publish_dry_run;
 mod publish_preflight;
+mod publish_private;
 mod publish_tui;
 mod registry;
 mod registry_serve;
 mod reporters;
+mod runtime_manager;
 mod scaffold;
 mod search;
 mod sign;
@@ -151,7 +155,7 @@ Auth:
 Advanced Commands:
   key      Manage signing keys
   config   Manage configuration (registry, engine, source)
-  publish  CI-first publish (TTY: GitOps release TUI, CI: --ci)
+  publish  Publish capsule (official: CI-first, private: direct upload)
   gen-ci   Generate GitHub Actions workflow for OIDC CI publish
   registry Manage registry commands (resolve/list/cache/serve)
 
@@ -320,6 +324,10 @@ enum Commands {
         #[arg(long)]
         standalone: bool,
 
+        /// Allow building payloads larger than 200MB
+        #[arg(long, default_value_t = false)]
+        force_large_payload: bool,
+
         /// Keep failed build artifacts when smoke test fails
         #[arg(long, default_value_t = false)]
         keep_failed_artifacts: bool,
@@ -451,9 +459,21 @@ enum Commands {
 
     #[command(
         next_help_heading = "Advanced Commands",
-        about = "Publish via CI-first flow (use --ci in GitHub Actions or --dry-run locally)"
+        about = "Publish capsule (official registry: CI-first, private registry: direct upload)"
     )]
     Publish {
+        /// Registry URL override (default: https://api.ato.run)
+        #[arg(long)]
+        registry: Option<String>,
+
+        /// Use prebuilt .capsule artifact (skip repackaging for private registry publish)
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["ci", "dry_run"])]
+        artifact: Option<PathBuf>,
+
+        /// Allow publishing payloads larger than 200MB
+        #[arg(long, default_value_t = false)]
+        force_large_payload: bool,
+
         /// Publish from GitHub Actions with OIDC token (CI-only mode)
         #[arg(long, conflicts_with = "dry_run")]
         ci: bool,
@@ -608,6 +628,10 @@ enum Commands {
         /// Create self-extracting executable installer (includes nacelle runtime)
         #[arg(long)]
         standalone: bool,
+
+        /// Allow building payloads larger than 200MB
+        #[arg(long, hide = true, default_value_t = false)]
+        force_large_payload: bool,
 
         /// Keep failed build artifacts when smoke test fails
         #[arg(long, hide = true, default_value_t = false)]
@@ -990,9 +1014,13 @@ enum RegistryCommands {
         #[arg(long, default_value = "~/.capsule/local-registry")]
         data_dir: String,
 
-        /// Listen host (loopback only)
+        /// Listen host (non-loopback requires --auth-token)
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
+
+        /// Bearer token required for write API (recommended when exposing non-loopback host)
+        #[arg(long)]
+        auth_token: Option<String>,
     },
 }
 
@@ -1170,8 +1198,8 @@ fn run() -> Result<()> {
         Commands::Setup {
             engine,
             version,
-            skip_verify: _,
-        } => execute_setup_command(engine, version, reporter.clone()),
+            skip_verify,
+        } => execute_setup_command(engine, version, skip_verify, reporter.clone()),
 
         Commands::Open {
             path,
@@ -1227,6 +1255,7 @@ fn run() -> Result<()> {
             init,
             key,
             standalone,
+            force_large_payload,
             enforcement,
             keep_failed_artifacts,
         } => commands::build::execute_pack_command(
@@ -1234,6 +1263,7 @@ fn run() -> Result<()> {
             init,
             key,
             standalone,
+            force_large_payload,
             keep_failed_artifacts,
             enforcement.as_str().to_string(),
             reporter.clone(),
@@ -1273,6 +1303,7 @@ fn run() -> Result<()> {
             init,
             key,
             standalone,
+            force_large_payload,
             enforcement,
             keep_failed_artifacts,
         } => {
@@ -1282,6 +1313,7 @@ fn run() -> Result<()> {
                 init,
                 key,
                 standalone,
+                force_large_payload,
                 keep_failed_artifacts,
                 enforcement.as_str().to_string(),
                 reporter.clone(),
@@ -1469,8 +1501,8 @@ fn run() -> Result<()> {
                 ConfigEngineCommands::Install {
                     engine,
                     version,
-                    skip_verify: _,
-                } => execute_setup_command(engine, version, reporter.clone()),
+                    skip_verify,
+                } => execute_setup_command(engine, version, skip_verify, reporter.clone()),
             },
             ConfigCommands::Registry { command } => {
                 let mapped = match command {
@@ -1485,19 +1517,35 @@ fn run() -> Result<()> {
         },
 
         Commands::Publish {
+            registry,
+            artifact,
+            force_large_payload,
             ci,
             dry_run,
             no_tui,
             json,
         } => {
             if ci {
-                execute_publish_ci_command(json, reporter.clone())
+                execute_publish_ci_command(json, force_large_payload, reporter.clone())
             } else if dry_run {
                 execute_publish_dry_run_command(json, reporter.clone())
-            } else if std::io::stdout().is_terminal() && !json && !no_tui {
-                execute_publish_tui_command(reporter.clone())
             } else {
-                execute_publish_guidance_command(json)
+                let resolved_registry = resolve_publish_registry_url(registry)?;
+                if is_official_publish_registry(&resolved_registry) {
+                    if std::io::stdout().is_terminal() && !json && !no_tui {
+                        execute_publish_tui_command(reporter.clone())
+                    } else {
+                        execute_publish_guidance_command(json, &resolved_registry)
+                    }
+                } else {
+                    execute_publish_private_command(
+                        resolved_registry,
+                        artifact,
+                        force_large_payload,
+                        json,
+                        reporter.clone(),
+                    )
+                }
             }
         }
 
@@ -1746,14 +1794,22 @@ fn execute_registry_command(command: RegistryCommands) -> Result<()> {
                 port,
                 data_dir,
                 host,
+                auth_token,
             } => {
-                if host != "127.0.0.1" {
-                    anyhow::bail!("--host must be exactly 127.0.0.1");
+                if host != "127.0.0.1"
+                    && auth_token
+                        .as_deref()
+                        .map(str::trim)
+                        .unwrap_or("")
+                        .is_empty()
+                {
+                    anyhow::bail!("--auth-token is required when --host is not 127.0.0.1");
                 }
                 registry_serve::serve(registry_serve::RegistryServerConfig {
                     host,
                     port,
                     data_dir,
+                    auth_token,
                 })
                 .await
             }
@@ -1763,11 +1819,16 @@ fn execute_registry_command(command: RegistryCommands) -> Result<()> {
 
 fn execute_publish_ci_command(
     json_output: bool,
+    force_large_payload: bool,
     reporter: std::sync::Arc<reporters::CliReporter>,
 ) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        let result = publish_ci::execute(publish_ci::PublishCiArgs { json_output }).await?;
+        let result = publish_ci::execute(publish_ci::PublishCiArgs {
+            json_output,
+            force_large_payload,
+        })
+        .await?;
 
         if json_output {
             println!("{}", serde_json::to_string_pretty(&result)?);
@@ -1829,16 +1890,19 @@ fn execute_publish_dry_run_command(
     })
 }
 
-fn execute_publish_guidance_command(json_output: bool) -> Result<()> {
+fn execute_publish_guidance_command(json_output: bool, registry_url: &str) -> Result<()> {
     if json_output {
         let payload = serde_json::json!({
             "ok": false,
             "code": "CI_ONLY_PUBLISH",
-            "message": "Direct local publishing is disabled. Use `ato publish --ci` in GitHub Actions, or `ato publish --dry-run` locally."
+            "message": "Official registry publishing is CI-first. Use `ato publish --ci` in GitHub Actions, or `ato publish --dry-run` locally."
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
-        println!("❌ Direct local publishing is disabled to ensure supply-chain security.");
+        println!(
+            "❌ Direct local publishing is disabled for official registry ({}).",
+            registry_url
+        );
         println!();
         println!("Ato uses a strict CI-first publishing model via GitHub Actions (OIDC).");
         println!("This guarantees published capsules match committed source.");
@@ -1850,8 +1914,96 @@ fn execute_publish_guidance_command(json_output: bool) -> Result<()> {
         println!("  4. GitHub Actions runs `ato publish --ci` automatically.");
         println!();
         println!("💡 Tip: Run `ato publish --dry-run` to validate locally before pushing.");
+        println!("💡 Private registry directly publish: `ato publish --registry <url>`");
     }
     Ok(())
+}
+
+fn execute_publish_private_command(
+    registry_url: String,
+    artifact_path: Option<PathBuf>,
+    force_large_payload: bool,
+    json_output: bool,
+    reporter: std::sync::Arc<reporters::CliReporter>,
+) -> Result<()> {
+    let result = publish_private::execute(publish_private::PublishPrivateArgs {
+        registry_url,
+        artifact_path,
+        force_large_payload,
+    })?;
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        println!("✅ Successfully published to private registry!");
+        println!();
+        println!("📦 Capsule:   {} v{}", result.scoped_id, result.version);
+        println!("🛡️  Integrity: {}, {}", result.sha256, result.blake3);
+        println!();
+        println!("🌐 Artifact URL: {}", result.artifact_url);
+        println!();
+        println!(
+            "👉 Next step: ato install {} --registry {}",
+            result.scoped_id, result.registry_url
+        );
+    }
+    futures::executor::block_on(
+        reporter.notify("Private registry publish completed.".to_string()),
+    )?;
+    Ok(())
+}
+
+fn resolve_publish_registry_url(cli_registry: Option<String>) -> Result<String> {
+    if let Some(url) = cli_registry {
+        return normalize_registry_url(&url);
+    }
+
+    let cwd = std::env::current_dir().context("Failed to resolve current directory")?;
+    let manifest_path = cwd.join("capsule.toml");
+    if manifest_path.exists() {
+        let raw = std::fs::read_to_string(&manifest_path)
+            .with_context(|| format!("Failed to read {}", manifest_path.display()))?;
+        let parsed: toml::Value = toml::from_str(&raw)
+            .with_context(|| format!("Failed to parse {}", manifest_path.display()))?;
+        if let Some(url) = parsed
+            .get("store")
+            .and_then(|v| v.get("registry"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            return normalize_registry_url(url);
+        }
+    }
+
+    Ok(DEFAULT_RUN_REGISTRY_URL.to_string())
+}
+
+fn normalize_registry_url(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("Registry URL cannot be empty");
+    }
+    let parsed =
+        reqwest::Url::parse(trimmed).with_context(|| format!("Invalid registry URL: {}", raw))?;
+    let scheme = parsed.scheme().to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        anyhow::bail!(
+            "Registry URL must use http or https scheme (got '{}')",
+            parsed.scheme()
+        );
+    }
+    Ok(trimmed.trim_end_matches('/').to_string())
+}
+
+fn is_official_publish_registry(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("api.ato.run") || host.eq_ignore_ascii_case("staging.api.ato.run")
 }
 
 fn execute_publish_tui_command(reporter: std::sync::Arc<reporters::CliReporter>) -> Result<()> {
@@ -1917,12 +2069,13 @@ fn execute_publish_tui_command(reporter: std::sync::Arc<reporters::CliReporter>)
 fn execute_setup_command(
     engine: String,
     version: Option<String>,
+    skip_verify: bool,
     reporter: std::sync::Arc<reporters::CliReporter>,
 ) -> Result<()> {
     let em = engine_manager::EngineManager::new()?;
-    let version = version.unwrap_or_else(|| "latest".to_string());
+    let requested_version = version.unwrap_or_else(|| "latest".to_string());
 
-    let (url, sha256) = match engine.as_str() {
+    let (resolved_version, url, sha256) = match engine.as_str() {
         "nacelle" => {
             let os = if cfg!(target_os = "macos") {
                 "darwin"
@@ -1939,21 +2092,21 @@ fn execute_setup_command(
                 anyhow::bail!("Unsupported architecture");
             };
 
-            let ver = if version == "latest" {
-                let resp =
-                    reqwest::blocking::get("https://releases.capsule.dev/nacelle/latest.txt")
-                        .context("Failed to fetch latest version")?
-                        .text()?;
-                resp.trim().to_string()
+            let resolved = if requested_version == "latest" {
+                fetch_latest_nacelle_version()?
             } else {
-                version.clone()
+                requested_version.clone()
             };
 
-            let url = format!(
-                "https://releases.capsule.dev/nacelle/{}/nacelle-{}-{}-{}",
-                ver, ver, os, arch
-            );
-            (url, "".to_string())
+            let binary_name = format!("nacelle-{}-{}-{}", resolved, os, arch);
+            let base_url = format!("https://releases.capsule.dev/nacelle/{}", resolved);
+            let url = format!("{}/{}", base_url, binary_name);
+            let sha256 = if skip_verify {
+                String::new()
+            } else {
+                fetch_release_sha256(&base_url, &binary_name)?
+            };
+            (resolved, url, sha256)
         }
         _ => {
             anyhow::bail!(
@@ -1963,12 +2116,12 @@ fn execute_setup_command(
         }
     };
 
-    let path = em.download_engine(&engine, &version, &url, &sha256, &*reporter)?;
+    let path = em.download_engine(&engine, &resolved_version, &url, &sha256, &*reporter)?;
 
     futures::executor::block_on(reporter.notify(format!(
         "✅ Engine {} v{} installed at {}",
         engine,
-        version,
+        resolved_version,
         path.display()
     )))?;
 
@@ -1987,6 +2140,102 @@ fn execute_setup_command(
     futures::executor::block_on(reporter.notify("✅ Registered as default engine".to_string()))?;
 
     Ok(())
+}
+
+fn fetch_latest_nacelle_version() -> Result<String> {
+    let resp = reqwest::blocking::get("https://releases.capsule.dev/nacelle/latest.txt")
+        .context("Failed to fetch latest nacelle version")?
+        .text()?;
+    let version = resp.trim();
+    if version.is_empty() {
+        anyhow::bail!("Latest nacelle version response was empty");
+    }
+    Ok(version.to_string())
+}
+
+fn fetch_release_sha256(base_url: &str, binary_name: &str) -> Result<String> {
+    let checksum_urls = [
+        format!("{}/SHA256SUMS", base_url),
+        format!("{}/SHA256SUMS.txt", base_url),
+        format!("{}/SHASUMS256.txt", base_url),
+        format!("{}/{}.sha256", base_url, binary_name),
+    ];
+
+    for checksum_url in checksum_urls {
+        let response = match reqwest::blocking::get(&checksum_url) {
+            Ok(resp) => resp,
+            Err(_) => continue,
+        };
+
+        if !response.status().is_success() {
+            continue;
+        }
+
+        let body = response
+            .text()
+            .with_context(|| format!("Failed to read checksum file {}", checksum_url))?;
+
+        if let Some(hash) = parse_sha256_for_artifact(&body, binary_name) {
+            return Ok(hash);
+        }
+
+        if checksum_url.ends_with(".sha256") {
+            if let Some(hash) = extract_first_sha256_hex(&body) {
+                return Ok(hash);
+            }
+        }
+    }
+
+    anyhow::bail!(
+        "Failed to resolve SHA256 for {} from release metadata at {}",
+        binary_name,
+        base_url
+    )
+}
+
+fn parse_sha256_for_artifact(checksum_body: &str, binary_name: &str) -> Option<String> {
+    for raw_line in checksum_body.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        if let Some(stripped) = line
+            .strip_prefix("SHA256 (")
+            .or_else(|| line.strip_prefix("sha256 ("))
+        {
+            if let Some((name, hash_part)) = stripped.split_once(')') {
+                let hash = hash_part.trim().trim_start_matches('=').trim();
+                if name.trim() == binary_name && is_sha256_hex(hash) {
+                    return Some(hash.to_ascii_lowercase());
+                }
+            }
+        }
+
+        let mut parts = line.split_whitespace();
+        let Some(hash) = parts.next() else {
+            continue;
+        };
+        let Some(name) = parts.last() else {
+            continue;
+        };
+        let normalized_name = name.trim_start_matches('*').trim_start_matches("./");
+        if normalized_name == binary_name && is_sha256_hex(hash) {
+            return Some(hash.to_ascii_lowercase());
+        }
+    }
+
+    None
+}
+
+fn extract_first_sha256_hex(raw: &str) -> Option<String> {
+    raw.split_whitespace()
+        .find(|token| is_sha256_hex(token))
+        .map(|token| token.to_ascii_lowercase())
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.as_bytes().iter().all(|b| b.is_ascii_hexdigit())
 }
 
 fn execute_run_like_command(
@@ -2527,6 +2776,8 @@ fn enforce_sandbox_mode_flags(
     dangerously_skip_permissions: bool,
     reporter: std::sync::Arc<reporters::CliReporter>,
 ) -> Result<EnforcementMode> {
+    const ENV_ALLOW_UNSAFE: &str = "CAPSULE_ALLOW_UNSAFE";
+
     if matches!(enforcement, EnforcementMode::BestEffort) {
         anyhow::bail!("--enforcement best-effort is no longer supported; use --enforcement strict");
     }
@@ -2541,6 +2792,12 @@ fn enforce_sandbox_mode_flags(
     }
 
     if dangerously_skip_permissions {
+        if std::env::var(ENV_ALLOW_UNSAFE).ok().as_deref() != Some("1") {
+            anyhow::bail!(
+                "--dangerously-skip-permissions requires {}=1",
+                ENV_ALLOW_UNSAFE
+            );
+        }
         futures::executor::block_on(
             reporter.warn(
                 "⚠️  Dangerous mode enabled: bypassing all Ato runtime permission and sandbox barriers"
@@ -2679,6 +2936,12 @@ fn execute_search_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn explicit_local_path_rules() {
@@ -2756,5 +3019,63 @@ mod tests {
         assert!(!can_prompt_interactively(true, false));
         assert!(!can_prompt_interactively(false, true));
         assert!(!can_prompt_interactively(false, false));
+    }
+
+    #[test]
+    fn parse_sha256_for_artifact_supports_sha256sums_format() {
+        let body = "\
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  nacelle-v1.2.3-darwin-arm64
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  nacelle-v1.2.3-linux-x64
+";
+        let parsed = parse_sha256_for_artifact(body, "nacelle-v1.2.3-linux-x64");
+        assert_eq!(
+            parsed.as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+    }
+
+    #[test]
+    fn parse_sha256_for_artifact_supports_bsd_style_format() {
+        let body = "SHA256 (nacelle-v1.2.3-darwin-arm64) = CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
+        let parsed = parse_sha256_for_artifact(body, "nacelle-v1.2.3-darwin-arm64");
+        assert_eq!(
+            parsed.as_deref(),
+            Some("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+        );
+    }
+
+    #[test]
+    fn extract_first_sha256_hex_reads_single_file_checksum() {
+        let body = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd  nacelle-v1.2.3-darwin-arm64";
+        let parsed = extract_first_sha256_hex(body);
+        assert_eq!(
+            parsed.as_deref(),
+            Some("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd")
+        );
+    }
+
+    #[test]
+    fn dangerous_skip_permissions_requires_explicit_opt_in_env() {
+        let _guard = env_lock().lock().expect("env lock");
+        std::env::remove_var("CAPSULE_ALLOW_UNSAFE");
+
+        let reporter = std::sync::Arc::new(reporters::CliReporter::new(true));
+        let err = enforce_sandbox_mode_flags(EnforcementMode::Strict, false, true, reporter)
+            .expect_err("must fail closed without env opt-in");
+        assert!(err
+            .to_string()
+            .contains("--dangerously-skip-permissions requires CAPSULE_ALLOW_UNSAFE=1"));
+    }
+
+    #[test]
+    fn dangerous_skip_permissions_allows_with_explicit_opt_in_env() {
+        let _guard = env_lock().lock().expect("env lock");
+        std::env::set_var("CAPSULE_ALLOW_UNSAFE", "1");
+
+        let reporter = std::sync::Arc::new(reporters::CliReporter::new(true));
+        let result = enforce_sandbox_mode_flags(EnforcementMode::Strict, false, true, reporter);
+        assert!(result.is_ok());
+
+        std::env::remove_var("CAPSULE_ALLOW_UNSAFE");
     }
 }

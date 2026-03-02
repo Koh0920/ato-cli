@@ -14,6 +14,7 @@ use capsule_core::r3_config;
 use capsule_core::router::ManifestData;
 
 use crate::common::proxy;
+use crate::runtime_manager;
 
 /// Additional IPC environment variables to inject into the child process.
 pub type IpcEnvVars = std::collections::HashMap<String, String>;
@@ -161,7 +162,8 @@ pub fn execute_host(
         .flatten();
 
     let mut cmd = if force_python_no_bytecode {
-        let mut python = Command::new("python");
+        let python_bin = runtime_manager::ensure_python_binary(plan)?;
+        let mut python = Command::new(python_bin);
         python.arg(&entrypoint);
         python
     } else {

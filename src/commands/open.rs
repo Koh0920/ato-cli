@@ -16,6 +16,7 @@ use tracing::debug;
 use crate::executors::source::ExecuteMode;
 use crate::ipc::inject::IpcContext;
 use crate::reporters::CliReporter;
+use crate::runtime_manager;
 use capsule_core::execution_plan::error::AtoExecutionError;
 use capsule_core::execution_plan::guard::{self, ExecutorKind};
 use capsule_core::{lockfile, router, CapsuleReporter};
@@ -353,6 +354,9 @@ async fn execute_normal_mode(args: OpenArgs) -> Result<()> {
     let decision = compiled.runtime_decision;
     let tier = compiled.tier;
 
+    preflight_required_environment_variables(&decision.plan)?;
+    preflight_deno_orchestrator_requirements(&decision.plan)?;
+
     let lockfile_path = manifest_path.parent().map(|p| p.join("capsule.lock"));
     if let Some(lock_path) = lockfile_path {
         if lock_path.exists() {
@@ -653,6 +657,64 @@ fn preflight_native_sandbox(
     Ok(())
 }
 
+fn preflight_deno_orchestrator_requirements(
+    plan: &capsule_core::router::ManifestData,
+) -> Result<()> {
+    if !is_deno_orchestrator_target(plan) {
+        return Ok(());
+    }
+
+    let is_default_target = plan.selected_target_label().eq_ignore_ascii_case("default");
+    if is_default_target {
+        let build_markers = [
+            plan.manifest_dir.join("apps/dashboard/.next/BUILD_ID"),
+            plan.manifest_dir
+                .join("apps/dashboard/.next/standalone/server.js"),
+            plan.manifest_dir
+                .join("source/apps/dashboard/.next/BUILD_ID"),
+            plan.manifest_dir
+                .join("source/apps/dashboard/.next/standalone/server.js"),
+        ];
+        if !build_markers.iter().any(|p| p.exists()) {
+            return Err(AtoExecutionError::policy_violation(
+                "default target requires dashboard build artifacts (.next). Run `npm run -w apps/dashboard build` before publish/run.",
+            )
+            .into());
+        }
+    }
+
+    Ok(())
+}
+
+fn preflight_required_environment_variables(
+    plan: &capsule_core::router::ManifestData,
+) -> Result<()> {
+    let required = plan.execution_required_envs();
+    if required.is_empty() {
+        return Ok(());
+    }
+
+    let missing: Vec<String> = required
+        .into_iter()
+        .filter(|name| {
+            std::env::var(name)
+                .map(|v| v.trim().is_empty())
+                .unwrap_or(true)
+        })
+        .collect();
+
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    Err(AtoExecutionError::policy_violation(format!(
+        "missing required environment variables for target '{}': {} (set them before `ato run`)",
+        plan.selected_target_label(),
+        missing.join(", ")
+    ))
+    .into())
+}
+
 fn preflight_macos_compat(plan: &capsule_core::router::ManifestData) -> Result<()> {
     let required_raw = match detect_required_macos_from_entrypoint(plan)? {
         Some(value) => value,
@@ -731,20 +793,15 @@ fn preflight_python_uv_binary_for_source_driver(
         return Ok(());
     }
 
-    let status = std::process::Command::new("uv")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-
-    match status {
-        Ok(exit) if exit.success() => Ok(()),
-        _ => Err(AtoExecutionError::lock_incomplete(
-            "source/python target requires uv CLI (uv run --offline)",
-            Some("uv"),
-        )
-        .into()),
-    }
+    runtime_manager::ensure_uv_binary(plan)
+        .map(|_| ())
+        .map_err(|_| {
+            AtoExecutionError::lock_incomplete(
+                "source/python target requires hermetic uv from capsule.lock (tools.uv)",
+                Some("capsule.lock"),
+            )
+            .into()
+        })
 }
 
 fn is_python_source_target(plan: &capsule_core::router::ManifestData) -> bool {
@@ -760,6 +817,23 @@ fn is_python_source_target(plan: &capsule_core::router::ManifestData) -> bool {
 
     plan.execution_entrypoint()
         .map(|entry| entry.trim().to_ascii_lowercase().ends_with(".py"))
+        .unwrap_or(false)
+}
+
+fn is_deno_orchestrator_target(plan: &capsule_core::router::ManifestData) -> bool {
+    let runtime = plan.execution_runtime().unwrap_or_default();
+    let driver = plan.execution_driver().unwrap_or_default();
+    if !runtime.eq_ignore_ascii_case("web") || !driver.eq_ignore_ascii_case("deno") {
+        return false;
+    }
+    plan.execution_entrypoint()
+        .map(|entry| {
+            std::path::Path::new(entry.trim())
+                .file_name()
+                .and_then(|v| v.to_str())
+                .map(|v| v.eq_ignore_ascii_case("ato-entry.ts"))
+                .unwrap_or(false)
+        })
         .unwrap_or(false)
 }
 
@@ -1141,7 +1215,9 @@ fn resolve_python_dependency_lock_path(manifest_dir: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_python_dependency_lock_path;
+    use super::{preflight_required_environment_variables, resolve_python_dependency_lock_path};
+    use capsule_core::router::{ExecutionProfile, ManifestData};
+    use std::path::PathBuf;
 
     #[test]
     fn resolve_python_dependency_detects_uv_lock() {
@@ -1151,5 +1227,75 @@ mod tests {
 
         let found = resolve_python_dependency_lock_path(tmp.path()).expect("must resolve uv.lock");
         assert_eq!(found, tmp.path().join("source").join("uv.lock"));
+    }
+
+    #[test]
+    fn preflight_required_env_fails_when_missing_or_empty() {
+        let key_missing = "ATO_TEST_REQUIRED_ENV_MISSING";
+        let key_empty = "ATO_TEST_REQUIRED_ENV_EMPTY";
+        std::env::remove_var(key_missing);
+        std::env::set_var(key_empty, "   ");
+
+        let plan = manifest_with_required_env(vec![key_missing, key_empty]);
+        let err = preflight_required_environment_variables(&plan).expect_err("must fail-closed");
+        let msg = err.to_string();
+        assert!(msg.contains(key_missing));
+        assert!(msg.contains(key_empty));
+
+        std::env::remove_var(key_empty);
+    }
+
+    #[test]
+    fn preflight_required_env_passes_when_set() {
+        let key = "ATO_TEST_REQUIRED_ENV_SET";
+        std::env::set_var(key, "ok");
+
+        let plan = manifest_with_required_env(vec![key]);
+        assert!(preflight_required_environment_variables(&plan).is_ok());
+
+        std::env::remove_var(key);
+    }
+
+    fn manifest_with_required_env(keys: Vec<&str>) -> ManifestData {
+        let mut manifest = toml::map::Map::new();
+        manifest.insert("name".to_string(), toml::Value::String("demo".to_string()));
+        manifest.insert(
+            "default_target".to_string(),
+            toml::Value::String("default".to_string()),
+        );
+
+        let mut target = toml::map::Map::new();
+        target.insert(
+            "runtime".to_string(),
+            toml::Value::String("source".to_string()),
+        );
+        target.insert(
+            "driver".to_string(),
+            toml::Value::String("native".to_string()),
+        );
+        target.insert(
+            "entrypoint".to_string(),
+            toml::Value::String("main.py".to_string()),
+        );
+        target.insert(
+            "required_env".to_string(),
+            toml::Value::Array(
+                keys.into_iter()
+                    .map(|k| toml::Value::String(k.to_string()))
+                    .collect(),
+            ),
+        );
+
+        let mut targets = toml::map::Map::new();
+        targets.insert("default".to_string(), toml::Value::Table(target));
+        manifest.insert("targets".to_string(), toml::Value::Table(targets));
+
+        ManifestData {
+            manifest: toml::Value::Table(manifest),
+            manifest_path: PathBuf::from("/tmp/capsule.toml"),
+            manifest_dir: PathBuf::from("/tmp"),
+            profile: ExecutionProfile::Dev,
+            selected_target: "default".to_string(),
+        }
     }
 }

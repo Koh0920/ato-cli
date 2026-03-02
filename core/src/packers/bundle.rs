@@ -7,6 +7,7 @@ use tar::Builder;
 
 use super::runtime_fetcher::RuntimeFetcher;
 use crate::error::{CapsuleError, Result};
+use crate::packers::pack_filter::load_pack_filter_from_path;
 
 /// Magic bytes to identify self-extracting v2 bundles.
 const BUNDLE_MAGIC: &[u8] = b"NACELLE_V2_BUNDLE";
@@ -62,7 +63,7 @@ pub async fn build_bundle(
         runtime
     } else if let Some(spec) = &runtime_to_bundle {
         let fetcher = RuntimeFetcher::new_with_reporter(reporter.clone())?;
-        let version = runtime_version_for(spec.language.as_str(), spec.version.as_deref());
+        let version = runtime_version_for(spec.language.as_str(), spec.version.as_deref())?;
         match spec.language.as_str() {
             "python" => {
                 reporter
@@ -116,7 +117,7 @@ pub async fn build_bundle(
     };
 
     if let Some(spec) = &runtime_to_bundle {
-        let version = runtime_version_for(spec.language.as_str(), spec.version.as_deref());
+        let version = runtime_version_for(spec.language.as_str(), spec.version.as_deref())?;
         reporter
             .notify(format!(
                 "✓ Using runtime: {:?} ({} {})",
@@ -154,6 +155,7 @@ pub async fn build_bundle(
         .await?;
     let build_excludes = read_build_exclude_patterns(&manifest_path)?;
     let source_ignore = load_capsuleignore(source_dir, &build_excludes)?;
+    let pack_filter = load_pack_filter_from_path(&manifest_path)?;
     let _node_modules_guard = NodeModulesGuard::new(source_dir, source_ignore.as_ref())?;
     let config_path = source_dir.join("config.json");
     let config_ref = if config_path.exists() {
@@ -165,6 +167,7 @@ pub async fn build_bundle(
         &runtime_dir,
         source_dir,
         source_ignore.as_ref(),
+        &pack_filter,
         config_ref,
         runtime_alias.as_ref(),
     )?;
@@ -315,9 +318,15 @@ fn read_manifest_source_target_hint(manifest_path: &Path) -> Result<Option<Sourc
         .map(|v| v.to_string());
 
     let version = target
-        .get("version")
+        .get("runtime_version")
         .and_then(|v| v.as_str())
-        .map(|v| v.to_string());
+        .map(|v| v.to_string())
+        .or_else(|| {
+            target
+                .get("version")
+                .and_then(|v| v.as_str())
+                .map(|v| v.to_string())
+        });
 
     let entrypoint = target
         .get("entrypoint")
@@ -437,24 +446,24 @@ fn resolve_runtime_root(runtime_dir: &Path, language: &str) -> Result<PathBuf> {
     Ok(runtime_dir.to_path_buf())
 }
 
-fn runtime_version_for(language: &str, version: Option<&str>) -> String {
+fn runtime_version_for(language: &str, version: Option<&str>) -> Result<String> {
     if let Some(v) = version {
-        return v.to_string();
+        return Ok(v.to_string());
     }
-
-    match language {
-        "python" => "3.11".to_string(),
-        "node" => "20".to_string(),
-        "deno" => "1.40".to_string(),
-        "bun" => "1.1".to_string(),
-        _ => "latest".to_string(),
+    if matches!(language, "python" | "node" | "deno") {
+        return Err(CapsuleError::Config(format!(
+            "targets.source.runtime_version is required for language '{}'",
+            language
+        )));
     }
+    Ok("latest".to_string())
 }
 
 fn create_bundle_archive(
     runtime_dir: &Path,
     source_dir: &Path,
     source_ignore: Option<&Gitignore>,
+    source_filter: &crate::packers::pack_filter::PackFilter,
     config_path: Option<&Path>,
     runtime_alias: Option<&RuntimeAlias>,
 ) -> Result<Vec<u8>> {
@@ -463,9 +472,15 @@ fn create_bundle_archive(
         let mut builder = Builder::new(&mut data);
 
         if let Some(alias) = runtime_alias {
-            append_dir(&mut builder, &alias.source_path, &alias.archive_path, None)?;
+            append_dir(
+                &mut builder,
+                &alias.source_path,
+                &alias.archive_path,
+                None,
+                None,
+            )?;
         } else {
-            append_dir(&mut builder, runtime_dir, "runtime", None)?;
+            append_dir(&mut builder, runtime_dir, "runtime", None, None)?;
         }
 
         let source_subdir = source_dir.join("source");
@@ -480,6 +495,7 @@ fn create_bundle_archive(
             actual_source_dir,
             source_prefix,
             source_ignore,
+            Some(source_filter),
         )?;
 
         if let Some(config_path) = config_path {
@@ -498,12 +514,12 @@ fn create_bundle_archive(
 
         let locks_dir = source_dir.join("locks");
         if locks_dir.exists() {
-            append_dir(&mut builder, &locks_dir, "locks", None)?;
+            append_dir(&mut builder, &locks_dir, "locks", None, None)?;
         }
 
         let artifacts_dir = source_dir.join("artifacts");
         if artifacts_dir.exists() {
-            append_dir(&mut builder, &artifacts_dir, "artifacts", None)?;
+            append_dir(&mut builder, &artifacts_dir, "artifacts", None, None)?;
         }
 
         builder.finish()?;
@@ -516,6 +532,7 @@ fn append_dir(
     dir: &Path,
     prefix: &str,
     ignore: Option<&Gitignore>,
+    filter: Option<&crate::packers::pack_filter::PackFilter>,
 ) -> Result<()> {
     for entry in ignore::WalkBuilder::new(dir)
         .hidden(false)
@@ -523,6 +540,7 @@ fn append_dir(
         .git_exclude(false)
         .git_global(false)
         .ignore(false)
+        .follow_links(true)
         .build()
     {
         let entry = entry.map_err(|e| CapsuleError::Pack(format!("Walk error: {}", e)))?;
@@ -544,6 +562,15 @@ fn append_dir(
             }
         }
 
+        if let Some(filter) = filter {
+            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                continue;
+            }
+            if !filter.should_include_file(rel) {
+                continue;
+            }
+        }
+
         let target = if prefix.is_empty() {
             rel.to_path_buf()
         } else {
@@ -551,6 +578,9 @@ fn append_dir(
         };
 
         if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            if filter.is_some() {
+                continue;
+            }
             builder.append_dir(target, path)?;
         } else if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
             builder.append_path_with_name(path, target)?;

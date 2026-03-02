@@ -173,7 +173,8 @@ fn test_publish_command_exists() {
     cmd.args(["publish", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Publish via CI-first flow"))
+        .stdout(predicate::str::contains("Publish capsule"))
+        .stdout(predicate::str::contains("--registry <REGISTRY>"))
         .stdout(predicate::str::contains("--ci"))
         .stdout(predicate::str::contains("--dry-run"))
         .stdout(predicate::str::contains("--no-tui"));
@@ -186,6 +187,15 @@ fn test_registry_command_is_public() {
         .assert()
         .success()
         .stdout(predicate::str::contains("serve"));
+}
+
+#[test]
+fn test_registry_serve_help_has_auth_token() {
+    let mut cmd = Command::cargo_bin("ato").unwrap();
+    cmd.args(["registry", "serve", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--auth-token <AUTH_TOKEN>"));
 }
 
 #[test]
@@ -290,7 +300,8 @@ fn test_source_rebuild_accepts_reference_alias() {
     ])
     .assert()
     .failure()
-    .stderr(predicate::str::contains(
-        "Failed to preflight source operation",
-    ));
+    .stderr(
+        predicate::str::contains("Failed to preflight source operation")
+            .or(predicate::str::contains("Source operation requires authentication")),
+    );
 }

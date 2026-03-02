@@ -20,6 +20,7 @@ use capsule_core::execution_plan::model::{ExecutionPlan, ExecutionRuntime};
 use capsule_core::router::ManifestData;
 
 use crate::common::proxy;
+use crate::runtime_manager;
 
 use super::source::IpcEnvVars;
 
@@ -29,12 +30,7 @@ pub fn execute(
     ipc_env: Option<&IpcEnvVars>,
     dangerously_skip_permissions: bool,
 ) -> Result<i32> {
-    if which::which("deno").is_err() {
-        return Err(AtoExecutionError::policy_violation(
-            "deno is required for source/node Tier1 execution",
-        )
-        .into());
-    }
+    let deno_bin = runtime_manager::ensure_deno_binary(plan)?;
 
     verify_execution_plan_hashes(execution_plan)?;
 
@@ -55,10 +51,11 @@ pub fn execute(
         .into());
     };
 
-    let use_compat_flag = deno_supports_compat_flag()?;
+    let use_compat_flag = deno_supports_compat_flag(&deno_bin)?;
 
-    run_provisioning(&runtime_dir, &entrypoint, ipc_env)?;
+    run_provisioning(&deno_bin, &runtime_dir, &entrypoint, ipc_env)?;
     run_runtime(
+        &deno_bin,
         plan,
         execution_plan,
         &runtime_dir,
@@ -70,14 +67,15 @@ pub fn execute(
 }
 
 fn run_provisioning(
+    deno_bin: &Path,
     runtime_dir: &Path,
     entrypoint: &str,
     ipc_env: Option<&IpcEnvVars>,
 ) -> Result<()> {
-    let mut cmd = Command::new("deno");
+    let mut cmd = Command::new(deno_bin);
     cmd.current_dir(runtime_dir)
         .arg("cache")
-        .arg("--node-modules-dir=auto")
+        .arg("--node-modules-dir")
         .arg(entrypoint)
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
@@ -106,6 +104,7 @@ fn run_provisioning(
 }
 
 fn run_runtime(
+    deno_bin: &Path,
     plan: &ManifestData,
     execution_plan: &ExecutionPlan,
     runtime_dir: &Path,
@@ -114,10 +113,10 @@ fn run_runtime(
     use_compat_flag: bool,
     dangerously_skip_permissions: bool,
 ) -> Result<i32> {
-    let mut cmd = Command::new("deno");
+    let mut cmd = Command::new(deno_bin);
     cmd.current_dir(runtime_dir)
         .arg("run")
-        .arg("--node-modules-dir=auto")
+        .arg("--node-modules-dir")
         .arg("--no-prompt");
     if !dangerously_skip_permissions {
         cmd.arg("--cached-only");
@@ -196,37 +195,20 @@ fn run_runtime(
         cmd.args(args);
     }
 
-    let output = cmd
+    let status = cmd
         .stdin(Stdio::inherit())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
         .context("Failed to execute deno run for node compat")?;
 
-    if !output.stdout.is_empty() {
-        let _ = std::io::stdout().write_all(&output.stdout);
-        let _ = std::io::stdout().flush();
-    }
-    if !output.stderr.is_empty() {
-        let _ = std::io::stderr().write_all(&output.stderr);
-        let _ = std::io::stderr().flush();
-    }
-
-    let exit_code = output.status.code().unwrap_or(1);
-    if exit_code != 0 {
-        if let Some(err) = map_deno_permission_error(&output.stderr) {
-            return Err(err.into());
-        }
-        if let Some(err) = map_node_compat_error(&output.stderr) {
-            return Err(err.into());
-        }
-    }
+    let exit_code = status.code().unwrap_or(1);
 
     Ok(exit_code)
 }
 
-fn deno_supports_compat_flag() -> Result<bool> {
-    let output = Command::new("deno")
+fn deno_supports_compat_flag(deno_bin: &Path) -> Result<bool> {
+    let output = Command::new(deno_bin)
         .arg("run")
         .arg("--help")
         .stdin(Stdio::null())
