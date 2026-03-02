@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tracing::debug;
 
@@ -99,6 +99,14 @@ impl ManifestData {
         self.get_str(&["targets", &self.selected_target, "driver"])
     }
 
+    pub fn execution_runtime_version(&self) -> Option<String> {
+        self.get_str(&["targets", &self.selected_target, "runtime_version"])
+    }
+
+    pub fn execution_runtime_tool_version(&self, tool: &str) -> Option<String> {
+        self.get_str(&["targets", &self.selected_target, "runtime_tools", tool])
+    }
+
     pub fn execution_language(&self) -> Option<String> {
         self.get_str(&["targets", &self.selected_target, "language"])
     }
@@ -111,6 +119,36 @@ impl ManifestData {
         self.get_table(&["targets", &self.selected_target, "env"])
             .map(table_to_map)
             .unwrap_or_default()
+    }
+
+    pub fn execution_required_envs(&self) -> Vec<String> {
+        let mut ordered = Vec::new();
+        let mut seen = HashSet::new();
+
+        if let Some(required) = self.get_array(&["targets", &self.selected_target, "required_env"]) {
+            for value in required {
+                if let Some(name) = value.as_str() {
+                    let trimmed = name.trim();
+                    if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+                        ordered.push(trimmed.to_string());
+                    }
+                }
+            }
+        }
+
+        if let Some(csv) = self
+            .execution_env()
+            .get("ATO_ORCH_REQUIRED_ENVS")
+            .map(|v| v.to_string())
+        {
+            for name in csv.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                if seen.insert(name.to_string()) {
+                    ordered.push(name.to_string());
+                }
+            }
+        }
+
+        ordered
     }
 
     pub fn manifest_name(&self) -> Option<String> {

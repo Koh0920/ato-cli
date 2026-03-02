@@ -59,6 +59,9 @@ pub fn execute(reporter: std::sync::Arc<crate::reporters::CliReporter>) -> Resul
             reporter.notify("   Next step: commit and push this workflow file.".to_string()),
         )?;
     }
+    futures::executor::block_on(reporter.notify(
+        "🔐 Workflow uses keyless OIDC CI publish (no signing key secret required).".to_string(),
+    ))?;
     Ok(())
 }
 
@@ -255,14 +258,7 @@ jobs:
           rm -f ato.tar.gz
 
       - name: Publish to Ato Store
-        run: |
-          set -euo pipefail
-          # Backward-compatible: old ato binaries still require a signing key file.
-          # Newer keyless binaries ignore this env and continue with OIDC-only provenance.
-          tmp_key="$(mktemp /tmp/ato-ci-signing-key.XXXXXX)"
-          ato key gen --json --out "$tmp_key" --force >/dev/null
-          ATO_SIGNING_KEY="$tmp_key" ato publish --ci
-          rm -f "$tmp_key"
+        run: ato publish --ci
 "#
     )
 }

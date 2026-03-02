@@ -61,9 +61,8 @@ pub enum PublishTuiOutcome {
 }
 
 pub async fn execute() -> Result<PublishTuiOutcome> {
-    let mut context = preflight()?;
+    let context = preflight()?;
     let token = resolve_github_token()?;
-    context.registration_note = ensure_capsule_registered(&context, &token.token).await?;
     let remote_workflow = fetch_remote_workflow_state(&context.repository, &token.token).await?;
     let mut app = PublishApp::new(context, token, remote_workflow);
 
@@ -73,12 +72,10 @@ pub async fn execute() -> Result<PublishTuiOutcome> {
 #[derive(Debug)]
 struct PublishContext {
     manifest_path: PathBuf,
-    manifest_raw: String,
     manifest: capsule_core::types::capsule_v1::CapsuleManifestV1,
     git: GitCheckResult,
     ci_workflow: CiWorkflowCheckResult,
     ci_workflow_refreshed: bool,
-    registration_note: Option<String>,
     branch: String,
     repository: String,
     current_version: Version,
@@ -115,8 +112,9 @@ fn preflight() -> Result<PublishContext> {
         anyhow::bail!("Working tree is not clean. Commit or stash changes before `ato publish`.");
     }
 
-    let workflow_sync = tokio::task::block_in_place(|| crate::gen_ci::sync_workflow_in_dir(&cwd))
-        .with_context(|| "Failed to refresh CI workflow to latest recommended template")?;
+    let workflow_sync =
+        tokio::task::block_in_place(|| crate::gen_ci::sync_workflow_in_dir(&cwd))
+            .with_context(|| "Failed to refresh CI workflow to latest recommended template")?;
 
     let origin = git
         .origin
@@ -140,12 +138,10 @@ fn preflight() -> Result<PublishContext> {
 
     Ok(PublishContext {
         manifest_path,
-        manifest_raw,
         manifest,
         git,
         ci_workflow,
         ci_workflow_refreshed: workflow_sync.changed,
-        registration_note: None,
         branch,
         repository: expected_repo,
         current_version,
@@ -283,111 +279,6 @@ fn read_gh_cli_token() -> Option<String> {
         return None;
     }
     Some(token)
-}
-
-fn resolve_store_api_base_url() -> String {
-    std::env::var("ATO_STORE_API_URL")
-        .ok()
-        .map(|v| v.trim().trim_end_matches('/').to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "https://api.ato.run".to_string())
-}
-
-async fn ensure_capsule_registered(
-    context: &PublishContext,
-    github_token: &str,
-) -> Result<Option<String>> {
-    let (owner, _) = context
-        .repository
-        .split_once('/')
-        .context("Invalid repository format (expected owner/repo)")?;
-    let slug = context.manifest.name.trim();
-    if slug.is_empty() {
-        anyhow::bail!("capsule.toml name is empty");
-    }
-
-    let base = resolve_store_api_base_url();
-    let check_url = format!(
-        "{}/v1/capsules/by/{}/{}",
-        base,
-        urlencoding::encode(owner),
-        urlencoding::encode(slug)
-    );
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .context("Failed to create Store API client")?;
-
-    let check_resp = client
-        .get(&check_url)
-        .header(reqwest::header::USER_AGENT, "ato-cli")
-        .send()
-        .await
-        .with_context(|| "Failed to check capsule registration status")?;
-
-    if check_resp.status().is_success() {
-        return Ok(None);
-    }
-
-    if check_resp.status() != reqwest::StatusCode::NOT_FOUND {
-        let status = check_resp.status();
-        let body = check_resp.text().await.unwrap_or_default();
-        anyhow::bail!(
-            "Failed to check capsule registration ({}): {}",
-            status,
-            body
-        );
-    }
-
-    let register_url = format!("{}/v1/sources/github/register", base);
-    let repo_url = format!("https://github.com/{}", context.repository);
-    let register_resp = client
-        .post(&register_url)
-        .header(reqwest::header::USER_AGENT, "ato-cli")
-        .header(reqwest::header::ACCEPT, "application/json")
-        .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", github_token))
-        .json(&serde_json::json!({
-            "repo_url": repo_url,
-            "channel": "stable",
-            "apply_playground": false
-        }))
-        .send()
-        .await
-        .with_context(|| "Failed to auto-register source repository")?;
-
-    let status = register_resp.status();
-    if !(status.is_success() || status == reqwest::StatusCode::CONFLICT) {
-        let body = register_resp.text().await.unwrap_or_default();
-        anyhow::bail!("Source auto-registration failed ({}): {}", status, body);
-    }
-
-    let started = Instant::now();
-    let timeout = Duration::from_secs(45);
-    let poll = Duration::from_secs(2);
-    loop {
-        let resp = client
-            .get(&check_url)
-            .header(reqwest::header::USER_AGENT, "ato-cli")
-            .send()
-            .await
-            .with_context(|| "Failed while waiting for capsule registration")?;
-        if resp.status().is_success() {
-            return Ok(Some(format!(
-                "Capsule registration ensured: {}/{}",
-                owner, slug
-            )));
-        }
-        if started.elapsed() >= timeout {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "Capsule registration did not complete in time. Last response ({}): {}",
-                status,
-                body
-            );
-        }
-        tokio::time::sleep(poll).await;
-    }
 }
 
 #[derive(Debug)]
@@ -557,9 +448,6 @@ impl PublishApp {
         ));
         if self.context.ci_workflow_refreshed {
             self.push_log("✔ Workflow updated to latest recommended template");
-        }
-        if let Some(note) = &self.context.registration_note {
-            self.push_log(format!("✔ {}", note));
         }
         self.push_log(format!(
             "✔ GitHub auth token source: {}",
@@ -1116,7 +1004,6 @@ struct GitReleaseState {
     base_head: String,
     commit_sha: Option<String>,
     tag: String,
-    manifest_updated: bool,
     commit_created: bool,
     tag_created: bool,
     main_pushed: bool,
@@ -1137,7 +1024,6 @@ fn execute_git_release_sequence(
             .context("Failed to resolve current HEAD")?,
         commit_sha: None,
         tag: tag.to_string(),
-        manifest_updated: false,
         commit_created: false,
         tag_created: false,
         main_pushed: false,
@@ -1145,7 +1031,6 @@ fn execute_git_release_sequence(
 
     let mut run_steps = || -> Result<()> {
         update_manifest_version(&context.manifest_path, selected_version)?;
-        state.manifest_updated = true;
 
         run_git_checked(&["add", "capsule.toml"])?;
         if context.ci_workflow_refreshed {
@@ -1169,15 +1054,17 @@ fn execute_git_release_sequence(
     };
 
     if let Err(err) = run_steps() {
-        if !state.main_pushed {
-            rollback_before_push_if_needed(&context.manifest_path, &context.manifest_raw, &state)?;
-            return Err(
-                err.context("Release sequence failed before push. Rolled back local tag/commit.")
-            );
+        let cleanup = rollback_after_failure(&state);
+        let mut guidance = if state.main_pushed {
+            "Release sequence failed after push. Local publish changes were discarded, but remote branch/tag may already exist."
+                .to_string()
+        } else {
+            "Release sequence failed before push. Local publish changes were discarded.".to_string()
+        };
+        if let Err(clean_err) = cleanup {
+            guidance.push_str(&format!(" Local cleanup also failed: {}", clean_err));
         }
-        return Err(err.context(
-            "Release sequence failed after push. Automatic rollback was skipped to avoid remote inconsistency.",
-        ));
+        return Err(err.context(guidance));
     }
 
     let commit_sha = state
@@ -1238,26 +1125,12 @@ fn ensure_tag_available(tag: &str) -> Result<()> {
     Ok(())
 }
 
-fn rollback_before_push_if_needed(
-    manifest_path: &Path,
-    original_manifest_raw: &str,
-    state: &GitReleaseState,
-) -> Result<()> {
+fn rollback_after_failure(state: &GitReleaseState) -> Result<()> {
     if state.tag_created {
         let _ = run_git_checked(&["tag", "-d", &state.tag]);
     }
-
-    if state.commit_created {
-        run_git_checked(&["reset", "--mixed", &state.base_head])
-            .context("Failed to reset local release commit during rollback")?;
-    } else if state.manifest_updated {
-        fs::write(manifest_path, original_manifest_raw).with_context(|| {
-            format!(
-                "Failed to restore {} during rollback",
-                manifest_path.display()
-            )
-        })?;
-    }
+    run_git_checked(&["reset", "--hard", &state.base_head])
+        .context("Failed to reset repository to pre-publish HEAD during rollback")?;
 
     Ok(())
 }

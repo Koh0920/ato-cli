@@ -15,7 +15,7 @@
 
 1. `SKILL.md` の `CRITICAL EXECUTION RULES` に従うこと。
 2. 実行前に絶対パスを変数化すること（相対パス禁止）:
-   - `SKILL_DIR="/Users/egamikohsuke/Ekoh/projects/ato/capsuled-dev/apps/ato-cli/skills/data-fetcher"`
+   - `SKILL_DIR="/ABSOLUTE/PATH/TO/apps/ato-cli/skills/data-fetcher"`
    - `cd "$SKILL_DIR"`
    - `pwd` が `$SKILL_DIR` と一致することを確認
 3. 実行は必ず次のコマンドを使うこと:

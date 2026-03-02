@@ -15,7 +15,7 @@
 必須ルール:
 
 1. 実行前に絶対パスを固定する:
-   - SKILL_DIR="/Users/egamikohsuke/Ekoh/projects/ato/capsuled-dev/apps/ato-cli/skills/data-fetcher-fail"
+   - SKILL_DIR="/ABSOLUTE/PATH/TO/apps/ato-cli/skills/data-fetcher-fail"
 2. 次のコマンドのみ使用する:
    - cd "$SKILL_DIR" && (command -v ato >/dev/null 2>&1 && ato run --from-skill ./SKILL.md --yes || ~/.cargo/bin/ato run --from-skill ./SKILL.md --yes)
 3. python / node / curl などの生実行は禁止。

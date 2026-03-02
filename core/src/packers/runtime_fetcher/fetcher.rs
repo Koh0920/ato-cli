@@ -1,5 +1,8 @@
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::Read;
 use std::path::PathBuf;
 use tracing::{debug, info};
 
@@ -239,9 +242,10 @@ impl ToolchainFetcher for DenoFetcher {
             .await?;
 
         let (os, arch) = RuntimeFetcher::detect_platform()?;
+        let filename = deno_artifact_filename(&os, &arch)?;
         let download_url = format!(
-            "https://github.com/denoland/deno/releases/download/v{}/deno-{}-{}.zip",
-            version, os, arch
+            "https://github.com/denoland/deno/releases/download/v{}/{}",
+            version, filename
         );
 
         debug!("Fetching from: {}", download_url);
@@ -252,9 +256,20 @@ impl ToolchainFetcher for DenoFetcher {
             .download_with_progress(&download_url, &archive_path, show_progress)
             .await?;
 
-        let expected_sha256 = provider
-            .fetch_expected_sha256(&(download_url.clone() + ".sha256"), None)
-            .await?;
+        let expected_sha256 = match resolve_deno_sha256(provider, version, &filename).await {
+            Ok(sum) => sum,
+            Err(CapsuleError::NotFound(_)) => {
+                provider
+                    .reporter
+                    .warn(format!(
+                        "⚠️  Deno checksum asset not found for v{}; falling back to TOFU hash",
+                        version
+                    ))
+                    .await?;
+                sha256_of_file(&archive_path)?
+            }
+            Err(err) => return Err(err),
+        };
 
         provider.verify_sha256_of_file(&archive_path, &expected_sha256)?;
 
@@ -285,6 +300,85 @@ impl ToolchainFetcher for DenoFetcher {
             .await?;
         Ok(runtime_dir)
     }
+}
+
+fn deno_artifact_filename(os: &str, arch: &str) -> Result<String> {
+    let target = match (os, arch) {
+        ("macos", "x86_64") => "x86_64-apple-darwin",
+        ("macos", "aarch64") => "aarch64-apple-darwin",
+        ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
+        ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
+        ("windows", "x86_64") => "x86_64-pc-windows-msvc",
+        ("windows", "aarch64") => "aarch64-pc-windows-msvc",
+        _ => {
+            return Err(CapsuleError::Pack(format!(
+                "Unsupported Deno platform: {} {}",
+                os, arch
+            )))
+        }
+    };
+    Ok(format!("deno-{}.zip", target))
+}
+
+async fn resolve_deno_sha256(
+    provider: &RuntimeFetcher,
+    version: &str,
+    filename: &str,
+) -> Result<String> {
+    let candidates = [
+        (
+            format!(
+                "https://github.com/denoland/deno/releases/download/v{}/{}.sha256sum",
+                version, filename
+            ),
+            None,
+        ),
+        (
+            format!(
+                "https://github.com/denoland/deno/releases/download/v{}/{}.sha256",
+                version, filename
+            ),
+            None,
+        ),
+        (
+            format!(
+                "https://github.com/denoland/deno/releases/download/v{}/SHASUMS256.txt",
+                version
+            ),
+            Some(filename),
+        ),
+    ];
+
+    let mut last_not_found = None;
+    for (checksum_url, hint) in candidates {
+        match provider.fetch_expected_sha256(&checksum_url, hint).await {
+            Ok(sum) => return Ok(sum),
+            Err(CapsuleError::NotFound(_)) => {
+                last_not_found = Some(checksum_url);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    let detail = last_not_found.unwrap_or_else(|| "Deno checksum".to_string());
+    Err(CapsuleError::NotFound(detail))
+}
+
+fn sha256_of_file(path: &std::path::Path) -> Result<String> {
+    let mut file = File::open(path)
+        .map_err(|e| CapsuleError::Pack(format!("Failed to open downloaded file: {}", e)))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buf)
+            .map_err(|e| CapsuleError::Pack(format!("Failed to read downloaded file: {}", e)))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 pub(crate) struct BunFetcher;
@@ -367,5 +461,26 @@ impl ToolchainFetcher for BunFetcher {
             ))
             .await?;
         Ok(runtime_dir)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::deno_artifact_filename;
+
+    #[test]
+    fn deno_artifact_filename_uses_release_target_triplets() {
+        assert_eq!(
+            deno_artifact_filename("macos", "aarch64").unwrap(),
+            "deno-aarch64-apple-darwin.zip"
+        );
+        assert_eq!(
+            deno_artifact_filename("linux", "x86_64").unwrap(),
+            "deno-x86_64-unknown-linux-gnu.zip"
+        );
+        assert_eq!(
+            deno_artifact_filename("windows", "x86_64").unwrap(),
+            "deno-x86_64-pc-windows-msvc.zip"
+        );
     }
 }

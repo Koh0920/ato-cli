@@ -264,6 +264,20 @@ pub struct BuildPolicyConfig {
     pub require_did_signature: Option<bool>,
 }
 
+/// Packaging filter configuration
+///
+/// Controls which project files are included in the capsule payload.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PackConfig {
+    /// Strict allowlist patterns. When specified, only matched files are included.
+    #[serde(default)]
+    pub include: Vec<String>,
+
+    /// Exclusion patterns applied after include/default selection.
+    #[serde(default)]
+    pub exclude: Vec<String>,
+}
+
 /// Isolation configuration (runtime-time behavior)
 ///
 /// This section controls what host environment data is allowed to pass into the
@@ -384,6 +398,10 @@ pub struct CapsuleManifestV1 {
     /// Build configuration (packaging-time)
     #[serde(default)]
     pub build: Option<BuildConfig>,
+
+    /// Packaging filter configuration
+    #[serde(default)]
+    pub pack: Option<PackConfig>,
 
     /// Isolation configuration (runtime-time)
     #[serde(default)]
@@ -787,6 +805,17 @@ pub struct NamedTarget {
     #[serde(default)]
     pub language: Option<String>,
 
+    /// Runtime version pinned for deterministic hermetic execution.
+    #[serde(default)]
+    pub runtime_version: Option<String>,
+
+    /// Additional hermetic runtime versions required by orchestrators.
+    ///
+    /// Example:
+    /// runtime_tools = { node = "20.11.0", python = "3.11.7" }
+    #[serde(default)]
+    pub runtime_tools: HashMap<String, String>,
+
     /// Entrypoint path for the target.
     #[serde(default)]
     pub entrypoint: String,
@@ -1086,6 +1115,19 @@ impl CapsuleManifestV1 {
             errors.push(ValidationError::InvalidVersion(self.version.clone()));
         }
 
+        if let Some(pack) = &self.pack {
+            if pack.include.iter().any(|pattern| pattern.trim().is_empty()) {
+                errors.push(ValidationError::InvalidTarget(
+                    "pack.include must not contain empty patterns".to_string(),
+                ));
+            }
+            if pack.exclude.iter().any(|pattern| pattern.trim().is_empty()) {
+                errors.push(ValidationError::InvalidTarget(
+                    "pack.exclude must not contain empty patterns".to_string(),
+                ));
+            }
+        }
+
         // Requirements memory strings must be parseable if present
         if let Some(v) = &self.requirements.vram_min {
             if parse_memory_string(v).is_err() {
@@ -1153,6 +1195,25 @@ impl CapsuleManifestV1 {
                 errors.push(ValidationError::InvalidTarget(label));
                 continue;
             }
+
+            if runtime == "source" {
+                let effective_driver = infer_source_driver(&target, entrypoint);
+                if matches!(
+                    effective_driver.as_deref(),
+                    Some("deno") | Some("node") | Some("python")
+                ) && target
+                    .runtime_version
+                    .as_ref()
+                    .map(|v| v.trim().is_empty())
+                    .unwrap_or(true)
+                {
+                    errors.push(ValidationError::MissingRuntimeVersion(
+                        label.clone(),
+                        effective_driver.unwrap_or_else(|| "unknown".to_string()),
+                    ));
+                }
+            }
+
             if runtime == "web" {
                 if !target.public.is_empty() {
                     errors.push(ValidationError::InvalidWebTarget(
@@ -1339,6 +1400,7 @@ pub enum ValidationError {
     DefaultTargetNotFound(String),
     InvalidTarget(String),
     InvalidTargetDriver(String, String),
+    MissingRuntimeVersion(String, String),
     InvalidWebTarget(String, String),
 }
 
@@ -1405,6 +1467,13 @@ impl std::fmt::Display for ValidationError {
                     label, driver
                 )
             }
+            ValidationError::MissingRuntimeVersion(label, driver) => {
+                write!(
+                    f,
+                    "Invalid target '{}': runtime_version is required for runtime=source driver='{}'",
+                    label, driver
+                )
+            }
             ValidationError::InvalidWebTarget(label, message) => {
                 write!(f, "Invalid web target '{}': {}", label, message)
             }
@@ -1444,6 +1513,17 @@ fn is_semver(s: &str) -> bool {
     }
 
     version_nums.iter().all(|n| n.parse::<u32>().is_ok())
+}
+
+fn infer_source_driver(target: &NamedTarget, entrypoint: &str) -> Option<String> {
+    let _ = entrypoint;
+    if let Some(driver) = target.driver.as_ref() {
+        let normalized = driver.trim().to_ascii_lowercase();
+        if !normalized.is_empty() {
+            return Some(normalized);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1560,6 +1640,19 @@ quantization = "4bit"
         assert!(errors
             .iter()
             .any(|e| matches!(e, ValidationError::InvalidTargetDriver(_, _))));
+    }
+
+    #[test]
+    fn test_validate_source_driver_requires_runtime_version() {
+        let toml = VALID_TOML.replace(
+            "[targets.cli]\nruntime = \"source\"\nentrypoint = \"server.py\"",
+            "[targets.cli]\nruntime = \"source\"\ndriver = \"python\"\nentrypoint = \"server.py\"",
+        );
+        let manifest = CapsuleManifestV1::from_toml(&toml).unwrap();
+        let errors = manifest.validate().unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, ValidationError::MissingRuntimeVersion(_, _))));
     }
 
     #[test]

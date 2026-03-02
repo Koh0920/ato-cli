@@ -4,17 +4,17 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use ed25519_dalek::Signer;
+use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_STORE_API_URL: &str = "https://api.ato.run";
 const ENV_STORE_API_URL: &str = "ATO_STORE_API_URL";
 const OIDC_AUDIENCE: &str = "api.ato.run";
-const ENV_SIGNING_KEY_PATH: &str = "ATO_SIGNING_KEY";
-const ENV_SIGNING_KEY_JSON: &str = "ATO_SIGNING_KEY_JSON";
 
 #[derive(Debug, Clone)]
 pub struct PublishCiArgs {
     pub json_output: bool,
+    pub force_large_payload: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,7 +47,7 @@ struct GitHubContext {
     run_id: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct DidSignaturePayload {
     algorithm: String,
     public_key: String,
@@ -66,8 +66,7 @@ struct CiMetadataPayload {
     workflow_run_id: Option<String>,
     builder_identity: String,
     idempotency_key: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    did_signature: Option<DidSignaturePayload>,
+    did_signature: DidSignaturePayload,
     artifact_sha256: String,
     artifact_blake3: String,
     file_name: String,
@@ -118,13 +117,17 @@ pub async fn execute(args: PublishCiArgs) -> Result<PublishCiResult> {
     }
 
     let artifact_path = build_capsule_artifact(&manifest_path, &manifest.name, &manifest.version)?;
+    crate::payload_guard::ensure_payload_size(
+        &artifact_path,
+        args.force_large_payload,
+        "--force-large-payload",
+    )?;
     let artifact_bytes = fs::read(&artifact_path)
         .with_context(|| format!("Failed to read artifact: {}", artifact_path.display()))?;
     let artifact_sha256 = compute_sha256_hex(&artifact_bytes);
     let artifact_blake3 = compute_blake3_label(&artifact_bytes);
 
-    let did_signature = build_optional_signature(&artifact_blake3)?;
-    let keyless_mode = did_signature.is_none();
+    let did_signature = build_ephemeral_signature(&artifact_blake3);
     let file_name = artifact_path
         .file_name()
         .and_then(|v| v.to_str())
@@ -141,7 +144,7 @@ pub async fn execute(args: PublishCiArgs) -> Result<PublishCiResult> {
         workflow_run_id: github.run_id.clone(),
         builder_identity: format!("github-actions:{}", github.workflow_ref),
         idempotency_key: format!("{}:{}:{}", source_repo, expected_tag, github.sha),
-        did_signature,
+        did_signature: did_signature.clone(),
         artifact_sha256,
         artifact_blake3,
         file_name: file_name.clone(),
@@ -183,9 +186,8 @@ pub async fn execute(args: PublishCiArgs) -> Result<PublishCiResult> {
 
     if !args.json_output {
         eprintln!("CI artifact built: {}", artifact_path.display());
-        if keyless_mode {
-            eprintln!("CI publish mode: keyless (OIDC-backed provenance, no local signing key)");
-        }
+        eprintln!("CI publish mode: keyless ephemeral Ed25519 signature");
+        eprintln!("CI did:key: {}", did_signature.public_key);
     }
 
     Ok(result)
@@ -410,51 +412,18 @@ pub(crate) fn build_capsule_artifact(
     Ok(artifact_path)
 }
 
-fn sign_content_hash_with_stored_key(
-    content_hash: &str,
-    stored: &capsule_core::types::signing::StoredKey,
-) -> Result<DidSignaturePayload> {
-    let did = stored.did()?;
-    let signing_key = stored.to_signing_key()?;
+fn build_ephemeral_signature(content_hash: &str) -> DidSignaturePayload {
+    let signing_key = ed25519_dalek::SigningKey::generate(&mut OsRng);
+    let verify_key = signing_key.verifying_key();
+    let did = capsule_core::types::identity::public_key_to_did(&verify_key.to_bytes());
     let signature = signing_key.sign(content_hash.as_bytes());
-    Ok(DidSignaturePayload {
+    DidSignaturePayload {
         algorithm: "Ed25519".to_string(),
         public_key: did,
         content_hash: content_hash.to_string(),
         signature: BASE64_STANDARD.encode(signature.to_bytes()),
         signed_at: chrono::Utc::now().timestamp(),
-    })
-}
-
-fn build_optional_signature(content_hash: &str) -> Result<Option<DidSignaturePayload>> {
-    if let Some(key_json) = read_env_trimmed(ENV_SIGNING_KEY_JSON) {
-        let stored = serde_json::from_str::<capsule_core::types::signing::StoredKey>(&key_json)
-            .with_context(|| {
-                format!(
-                    "Failed to parse signing key from {} (expected StoredKey JSON)",
-                    ENV_SIGNING_KEY_JSON
-                )
-            })?;
-        return sign_content_hash_with_stored_key(content_hash, &stored).map(Some);
     }
-
-    if let Some(path_raw) = read_env_trimmed(ENV_SIGNING_KEY_PATH) {
-        let key_path = PathBuf::from(path_raw);
-        let stored = capsule_core::types::signing::StoredKey::read(&key_path)
-            .with_context(|| format!("Failed to read signing key: {}", key_path.display()))?;
-        return sign_content_hash_with_stored_key(content_hash, &stored).map(Some);
-    }
-
-    let default_key_path = PathBuf::from("private.key");
-    if default_key_path.exists() {
-        let stored = capsule_core::types::signing::StoredKey::read(&default_key_path)
-            .with_context(|| {
-                format!("Failed to read signing key: {}", default_key_path.display())
-            })?;
-        return sign_content_hash_with_stored_key(content_hash, &stored).map(Some);
-    }
-
-    Ok(None)
 }
 
 fn compute_sha256_hex(data: &[u8]) -> String {

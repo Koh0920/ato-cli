@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use axum::body::Bytes;
-use axum::extract::{Path as AxumPath, Query, State};
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, put};
@@ -13,6 +13,7 @@ use axum::{Json, Router};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
 
 #[derive(Debug, Clone)]
@@ -20,12 +21,14 @@ pub struct RegistryServerConfig {
     pub host: String,
     pub port: u16,
     pub data_dir: String,
+    pub auth_token: Option<String>,
 }
 
 #[derive(Clone)]
 struct AppState {
-    base_url: String,
+    listen_url: String,
     data_dir: PathBuf,
+    auth_token: Option<String>,
     lock: Arc<Mutex<()>>,
 }
 
@@ -174,15 +177,22 @@ struct ArtifactMeta {
 
 pub async fn serve(config: RegistryServerConfig) -> Result<()> {
     let host = config.host;
-    if host != "127.0.0.1" {
-        bail!("Local registry can bind only to 127.0.0.1");
+    let auth_token = config
+        .auth_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string());
+    if host != "127.0.0.1" && auth_token.is_none() {
+        bail!("--auth-token is required when binding local registry to non-loopback host");
     }
     let data_dir = expand_data_dir(&config.data_dir)?;
     initialize_storage(&data_dir)?;
-    let base_url = format!("http://{}:{}", host, config.port);
+    let listen_url = format!("http://{}:{}", host, config.port);
     let state = AppState {
-        base_url: base_url.clone(),
+        listen_url: listen_url.clone(),
         data_dir,
+        auth_token,
         lock: Arc::new(Mutex::new(())),
     };
 
@@ -206,9 +216,10 @@ pub async fn serve(config: RegistryServerConfig) -> Result<()> {
             "/v1/local/capsules/:publisher/:slug/:version",
             put(handle_put_local_capsule),
         )
+        .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
         .with_state(state);
 
-    println!("🚀 Local registry serving at {}", base_url);
+    println!("🚀 Local registry serving at {}", listen_url);
     let addr: SocketAddr = format!("{}:{}", host, config.port)
         .parse()
         .context("Invalid listen address")?;
@@ -226,9 +237,10 @@ async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-async fn handle_well_known(State(state): State<AppState>) -> impl IntoResponse {
+async fn handle_well_known(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let public_base_url = resolve_public_base_url(&headers, &state.listen_url);
     Json(json!({
-        "url": state.base_url,
+        "url": public_base_url,
         "name": "Ato Local Registry",
         "version": "1"
     }))
@@ -355,6 +367,7 @@ async fn handle_distributions(
     State(state): State<AppState>,
     AxumPath((publisher, slug)): AxumPath<(String, String)>,
     Query(query): Query<DistributionQuery>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     if let Err(err) = validate_capsule_segments(&publisher, &slug) {
         return json_error(StatusCode::BAD_REQUEST, "invalid_scope", &err.to_string());
@@ -389,9 +402,10 @@ async fn handle_distributions(
             "Version not found",
         );
     };
+    let public_base_url = resolve_public_base_url(&headers, &state.listen_url);
     let artifact_url = format!(
         "{}/v1/artifacts/{}/{}/{}/{}",
-        state.base_url, capsule.publisher, capsule.slug, release.version, release.file_name
+        public_base_url, capsule.publisher, capsule.slug, release.version, release.file_name
     );
     let response = DistributionResponse {
         version: release.version.clone(),
@@ -409,6 +423,7 @@ async fn handle_download(
     State(state): State<AppState>,
     AxumPath((publisher, slug)): AxumPath<(String, String)>,
     Query(query): Query<DistributionQuery>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     if let Err(err) = validate_capsule_segments(&publisher, &slug) {
         return json_error(StatusCode::BAD_REQUEST, "invalid_scope", &err.to_string());
@@ -444,9 +459,10 @@ async fn handle_download(
         );
     };
 
+    let public_base_url = resolve_public_base_url(&headers, &state.listen_url);
     let artifact_url = format!(
         "{}/v1/artifacts/{}/{}/{}/{}",
-        state.base_url, capsule.publisher, capsule.slug, release.version, release.file_name
+        public_base_url, capsule.publisher, capsule.slug, release.version, release.file_name
     );
     (
         StatusCode::FOUND,
@@ -493,6 +509,10 @@ async fn handle_put_local_capsule(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
+    if let Err(err) = validate_write_auth(&headers, state.auth_token.as_deref()) {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized", &err);
+    }
+
     if let Err(err) = validate_capsule_segments(&publisher, &slug) {
         return json_error(StatusCode::BAD_REQUEST, "invalid_scope", &err.to_string());
     }
@@ -627,9 +647,10 @@ async fn handle_put_local_capsule(
         );
     }
 
+    let public_base_url = resolve_public_base_url(&headers, &state.listen_url);
     let artifact_url = format!(
         "{}/v1/artifacts/{}/{}/{}/{}",
-        state.base_url, publisher, slug, version, file_name
+        public_base_url, publisher, slug, version, file_name
     );
     (
         StatusCode::CREATED,
@@ -644,6 +665,57 @@ async fn handle_put_local_capsule(
         }),
     )
         .into_response()
+}
+
+fn validate_write_auth(headers: &HeaderMap, expected_token: Option<&str>) -> Result<(), String> {
+    let Some(expected) = expected_token.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(());
+    };
+
+    let actual = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+
+    if constant_time_token_eq(expected.as_bytes(), actual.unwrap_or("").as_bytes()) {
+        return Ok(());
+    }
+
+    Err("Bearer token is required for upload".to_string())
+}
+
+fn constant_time_token_eq(expected: &[u8], actual: &[u8]) -> bool {
+    use sha2::{Digest, Sha256};
+
+    let expected_digest = Sha256::digest(expected);
+    let actual_digest = Sha256::digest(actual);
+    expected_digest[..].ct_eq(&actual_digest[..]).into()
+}
+
+fn resolve_public_base_url(headers: &HeaderMap, fallback: &str) -> String {
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| *v == "http" || *v == "https")
+        .unwrap_or("http");
+
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get(header::HOST))
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| v.split(',').next().unwrap_or(v).trim().to_string());
+
+    if let Some(host) = host {
+        return format!("{}://{}", scheme, host);
+    }
+
+    fallback.to_string()
 }
 
 fn publisher_info(handle: &str) -> PublisherInfo {
@@ -964,5 +1036,55 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].publisher.handle, "koh0920");
+    }
+
+    #[test]
+    fn validate_write_auth_allows_when_disabled() {
+        let headers = HeaderMap::new();
+        assert!(validate_write_auth(&headers, None).is_ok());
+    }
+
+    #[test]
+    fn validate_write_auth_requires_matching_bearer_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer secret-token".parse().unwrap(),
+        );
+        assert!(validate_write_auth(&headers, Some("secret-token")).is_ok());
+        assert!(validate_write_auth(&headers, Some("wrong-token")).is_err());
+        let empty = HeaderMap::new();
+        assert!(validate_write_auth(&empty, Some("secret-token")).is_err());
+    }
+
+    #[test]
+    fn constant_time_token_eq_handles_length_mismatch() {
+        assert!(constant_time_token_eq(b"secret-token", b"secret-token"));
+        assert!(!constant_time_token_eq(b"secret-token", b"secret-token-x"));
+        assert!(!constant_time_token_eq(b"secret-token", b"secret"));
+    }
+
+    #[test]
+    fn resolve_public_base_url_uses_host_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "100.64.0.10:8787".parse().unwrap());
+        let url = resolve_public_base_url(&headers, "http://0.0.0.0:8787");
+        assert_eq!(url, "http://100.64.0.10:8787");
+    }
+
+    #[test]
+    fn resolve_public_base_url_uses_forwarded_host_and_proto() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        headers.insert("x-forwarded-host", "store.example.com".parse().unwrap());
+        let url = resolve_public_base_url(&headers, "http://127.0.0.1:8787");
+        assert_eq!(url, "https://store.example.com");
+    }
+
+    #[test]
+    fn resolve_public_base_url_falls_back_when_headers_missing() {
+        let headers = HeaderMap::new();
+        let url = resolve_public_base_url(&headers, "http://127.0.0.1:8787");
+        assert_eq!(url, "http://127.0.0.1:8787");
     }
 }
