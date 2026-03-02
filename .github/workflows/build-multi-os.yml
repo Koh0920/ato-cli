@@ -175,10 +175,12 @@ jobs:
     name: Upload to R2
     needs: build
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.upload_r2 == 'true') }}
+    if: ${{ !github.event.repository.fork && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.upload_r2 == 'true')) && secrets.CLOUDFLARE_API_TOKEN != '' && secrets.CLOUDFLARE_ACCOUNT_ID != '' }}
     env:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      DEFAULT_BUCKET_STAGING: ${{ secrets.R2_BUCKET_STAGING }}
+      DEFAULT_BUCKET_PRODUCTION: ${{ secrets.R2_BUCKET_PRODUCTION }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
