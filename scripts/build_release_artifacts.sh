@@ -67,6 +67,7 @@ ATO_CLI_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 need_cmd cargo
 need_cmd rustup
 need_cmd tar
+need_cmd zip
 need_cmd shasum
 need_cmd mktemp
 
@@ -111,8 +112,13 @@ for target in "${target_list[@]}"; do
     fi
   fi
 
-  binary_path="$ATO_CLI_DIR/target/$target/release/ato"
-  if [[ ! -x "$binary_path" ]]; then
+  binary_name="ato"
+  if [[ "$target" == *"-windows-"* ]]; then
+    binary_name="ato.exe"
+  fi
+
+  binary_path="$ATO_CLI_DIR/target/$target/release/$binary_name"
+  if [[ ! -f "$binary_path" ]]; then
     echo "error: built binary not found: $binary_path" >&2
     exit 1
   fi
@@ -122,26 +128,33 @@ for target in "${target_list[@]}"; do
   fi
 
   staging_dir="$(mktemp -d)"
-  cp "$binary_path" "$staging_dir/ato"
-  chmod 0755 "$staging_dir/ato"
+  cp "$binary_path" "$staging_dir/$binary_name"
+  chmod 0755 "$staging_dir/$binary_name"
 
-  archive_path="$OUT_DIR/ato-$target.tar.gz"
-  tar -C "$staging_dir" -czf "$archive_path" ato
-  rm -rf "$staging_dir"
-
-  entries="$(tar -tzf "$archive_path")"
-  if [[ "$entries" != "ato" ]]; then
-    echo "error: archive must contain only root 'ato': $archive_path" >&2
-    echo "$entries" >&2
-    exit 1
+  if [[ "$target" == *"-windows-"* ]]; then
+    archive_path="$OUT_DIR/ato-$target.zip"
+    (
+      cd "$staging_dir"
+      zip -q "$archive_path" "$binary_name"
+    )
+  else
+    archive_path="$OUT_DIR/ato-$target.tar.gz"
+    tar -C "$staging_dir" -czf "$archive_path" "$binary_name"
   fi
+  rm -rf "$staging_dir"
 
   echo "    packaged: $archive_path"
 done
 
 (
   cd "$OUT_DIR"
-  shasum -a 256 ato-*.tar.gz > SHA256SUMS
+  shopt -s nullglob
+  archives=(ato-*.tar.gz ato-*.zip)
+  if [[ "${#archives[@]}" -eq 0 ]]; then
+    echo "error: no packaged archives found in $OUT_DIR" >&2
+    exit 1
+  fi
+  shasum -a 256 "${archives[@]}" > SHA256SUMS
 )
 
 echo "==> done"
