@@ -1,7 +1,7 @@
+use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::collections::BTreeSet;
 #[cfg(unix)]
 use std::{
     collections::BTreeMap,
@@ -370,9 +370,8 @@ fn is_deno_orchestrator(plan: &ManifestData, entrypoint: &str) -> bool {
     if !runtime.eq_ignore_ascii_case("web") || !driver.eq_ignore_ascii_case("deno") {
         return false;
     }
-    let has_runtime_tools =
-        plan.execution_runtime_tool_version("node").is_some()
-            || plan.execution_runtime_tool_version("python").is_some();
+    let has_runtime_tools = plan.execution_runtime_tool_version("node").is_some()
+        || plan.execution_runtime_tool_version("python").is_some();
     if has_runtime_tools {
         return true;
     }

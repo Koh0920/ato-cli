@@ -1824,10 +1824,13 @@ fn execute_publish_ci_command(
 ) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        let result = publish_ci::execute(publish_ci::PublishCiArgs {
-            json_output,
-            force_large_payload,
-        })
+        let result = publish_ci::execute(
+            publish_ci::PublishCiArgs {
+                json_output,
+                force_large_payload,
+            },
+            reporter.clone(),
+        )
         .await?;
 
         if json_output {
@@ -1926,11 +1929,16 @@ fn execute_publish_private_command(
     json_output: bool,
     reporter: std::sync::Arc<reporters::CliReporter>,
 ) -> Result<()> {
+    let status = publish_private_status_message(artifact_path.is_some());
+    futures::executor::block_on(reporter.progress_start(status.to_string(), None))?;
+
     let result = publish_private::execute(publish_private::PublishPrivateArgs {
         registry_url,
         artifact_path,
         force_large_payload,
-    })?;
+    });
+    futures::executor::block_on(reporter.progress_finish(None))?;
+    let result = result?;
 
     if json_output {
         println!("{}", serde_json::to_string_pretty(&result)?);
@@ -1951,6 +1959,14 @@ fn execute_publish_private_command(
         reporter.notify("Private registry publish completed.".to_string()),
     )?;
     Ok(())
+}
+
+fn publish_private_status_message(has_artifact: bool) -> &'static str {
+    if has_artifact {
+        "📤 Publishing provided artifact to private registry..."
+    } else {
+        "📦 Building capsule artifact for private registry publish..."
+    }
 }
 
 fn resolve_publish_registry_url(cli_registry: Option<String>) -> Result<String> {
@@ -3077,5 +3093,21 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  nacelle-v1.2.3
         assert!(result.is_ok());
 
         std::env::remove_var("CAPSULE_ALLOW_UNSAFE");
+    }
+
+    #[test]
+    fn publish_private_status_message_for_build_path() {
+        assert_eq!(
+            publish_private_status_message(false),
+            "📦 Building capsule artifact for private registry publish..."
+        );
+    }
+
+    #[test]
+    fn publish_private_status_message_for_upload_path() {
+        assert_eq!(
+            publish_private_status_message(true),
+            "📤 Publishing provided artifact to private registry..."
+        );
     }
 }
