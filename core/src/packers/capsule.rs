@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
-use tar::Builder;
+use tar::{Builder, EntryType, Header};
 use tracing::debug;
 use walkdir::WalkDir;
 use zstd::stream::encode_all;
@@ -168,12 +168,12 @@ fn copy_dir_to_tar(
     filter: &PackFilter,
 ) -> Result<()> {
     for entry in WalkDir::new(src_root)
-        .follow_links(true)
+        .follow_links(false)
         .into_iter()
         .flatten()
     {
         let path = entry.path();
-        if !entry.file_type().is_file() {
+        if entry.file_type().is_dir() {
             continue;
         }
         let rel = match path.strip_prefix(src_root) {
@@ -188,7 +188,19 @@ fn copy_dir_to_tar(
         }
         let rel_str = rel.to_string_lossy().replace('\\', "/");
         let target = format!("{}/{}", prefix, rel_str);
-        ar.append_path_with_name(path, &target)?;
+        // Preserve symlink entries instead of dereferencing them.
+        // Next.js standalone output (and Deno/npm node_modules layouts) rely on symlink
+        // topology for correct Node.js module resolution.
+        if entry.file_type().is_symlink() {
+            let link_target = std::fs::read_link(path)?;
+            let mut header = Header::new_gnu();
+            header.set_entry_type(EntryType::Symlink);
+            header.set_size(0);
+            header.set_mode(0o777);
+            ar.append_link(&mut header, &target, link_target)?;
+        } else if entry.file_type().is_file() {
+            ar.append_path_with_name(path, &target)?;
+        }
     }
     Ok(())
 }

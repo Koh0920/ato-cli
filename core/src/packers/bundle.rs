@@ -3,7 +3,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tar::Builder;
+use tar::{Builder, EntryType, Header};
 
 use super::runtime_fetcher::RuntimeFetcher;
 use crate::error::{CapsuleError, Result};
@@ -540,7 +540,7 @@ fn append_dir(
         .git_exclude(false)
         .git_global(false)
         .ignore(false)
-        .follow_links(true)
+        .follow_links(false)
         .build()
     {
         let entry = entry.map_err(|e| CapsuleError::Pack(format!("Walk error: {}", e)))?;
@@ -563,7 +563,9 @@ fn append_dir(
         }
 
         if let Some(filter) = filter {
-            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            let is_file = entry.file_type().map(|t| t.is_file()).unwrap_or(false);
+            let is_symlink = entry.file_type().map(|t| t.is_symlink()).unwrap_or(false);
+            if !(is_file || is_symlink) {
                 continue;
             }
             if !filter.should_include_file(rel) {
@@ -582,6 +584,19 @@ fn append_dir(
                 continue;
             }
             builder.append_dir(target, path)?;
+        } else if entry.file_type().map(|t| t.is_symlink()).unwrap_or(false) {
+            let link_target = fs::read_link(path).map_err(|e| {
+                CapsuleError::Pack(format!(
+                    "Failed to read symlink target {}: {}",
+                    path.display(),
+                    e
+                ))
+            })?;
+            let mut header = Header::new_gnu();
+            header.set_entry_type(EntryType::Symlink);
+            header.set_size(0);
+            header.set_mode(0o777);
+            builder.append_link(&mut header, target, link_target)?;
         } else if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
             builder.append_path_with_name(path, target)?;
         }

@@ -111,6 +111,74 @@ If missing or empty, execution stops fail-closed.
 - `targets.<label>.required_env = ["KEY1", "KEY2"]` (recommended)
 - Backward compatibility: `targets.<label>.env.ATO_ORCH_REQUIRED_ENVS = "KEY1,KEY2"`
 
+## Dynamic App Capsule Recipe (Web + Deno Orchestrator)
+
+For multi-service apps (for example: dashboard + API + worker), use a single `web/deno` target and orchestrate child processes in `ato-entry.ts`.
+
+1. Pre-bundle artifacts before packing (for example: `next build`, worker build, lockfiles).
+2. Include only runtime artifacts via `[pack].include` (do not package raw `node_modules`, `.venv`, caches).
+3. Build once, then publish with `--artifact` to avoid re-packing.
+
+Minimal `capsule.toml` pattern:
+
+```toml
+schema_version = "0.2"
+name = "my-dynamic-app"
+version = "0.1.0"
+default_target = "default"
+
+[pack]
+include = [
+  "ato-entry.ts",
+  "capsule.toml",
+  "capsule.lock",
+  "apps/dashboard/.next/standalone/**",
+  "apps/dashboard/.next/static/**",
+  "apps/control-plane/src/**",
+  "apps/control-plane/pyproject.toml",
+  "apps/control-plane/uv.lock",
+  "apps/worker/src/**",
+  "apps/worker/wrangler.dev.jsonc"
+]
+exclude = [
+  ".deno/**",
+  "node_modules/**",
+  "**/__pycache__/**",
+  "apps/dashboard/.next/cache/**"
+]
+
+[targets.default]
+runtime = "web"
+driver = "deno"
+runtime_version = "1.46.3"
+runtime_tools = { node = "20.11.0", python = "3.11.10" }
+entrypoint = "ato-entry.ts"
+port = 4173
+required_env = ["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID"]
+```
+
+Recommended flow:
+
+```bash
+# 1) pre-bundle app artifacts
+npm run capsule:prepare
+
+# 2) package once
+ato build .
+
+# 3) publish artifact (private/local registry)
+ATO_TOKEN=pwd ato publish --registry http://127.0.0.1:8787 --artifact ./my-dynamic-app.capsule
+
+# 4) install + run
+ato install <publisher>/<slug> --registry http://127.0.0.1:8787
+ato run <publisher>/<slug> --registry http://127.0.0.1:8787
+```
+
+Notes:
+- For Next.js standalone, copy `.next/static` (and `public` if used) into standalone output before `ato build`.
+- `ato run` stops before startup if `required_env` keys are missing.
+- `ato-entry.ts` should fail-fast when one child process exits unexpectedly.
+
 ## Runtime Isolation Policy (Tiers)
 
 - `web/static`: Tier1 (`driver = "static"` + `targets.<label>.port` required; no `capsule.lock` needed)
