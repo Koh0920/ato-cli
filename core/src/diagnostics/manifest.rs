@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::error::CapsuleError;
@@ -22,18 +23,6 @@ pub fn validate_manifest_for_build(
         .and_then(|v| v.as_table())
         .ok_or_else(|| manifest_err(manifest_path, format!("targets.{target_label} is missing")))?;
 
-    let entrypoint = target
-        .get("entrypoint")
-        .and_then(|v| v.as_str())
-        .map(|v| v.trim())
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| {
-            manifest_err(
-                manifest_path,
-                format!("targets.{target_label}.entrypoint is required"),
-            )
-        })?;
-
     let runtime = target
         .get("runtime")
         .and_then(|v| v.as_str())
@@ -44,7 +33,18 @@ pub fn validate_manifest_for_build(
         .and_then(|v| v.as_str())
         .map(|v| v.trim().to_ascii_lowercase());
 
-    let clean_entrypoint = entrypoint.trim_start_matches("./");
+    let entrypoint = target
+        .get("entrypoint")
+        .and_then(|v| v.as_str())
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty());
+    let has_services = raw
+        .get("services")
+        .and_then(|v| v.as_table())
+        .map(|services| !services.is_empty())
+        .unwrap_or(false);
+    let web_services_mode = runtime == "web" && driver.as_deref() == Some("deno") && has_services;
+
     if runtime == "web" {
         let driver = driver.ok_or_else(|| {
             manifest_err(
@@ -79,16 +79,6 @@ pub fn validate_manifest_for_build(
             ));
         }
 
-        if !is_safe_relative_path(clean_entrypoint) {
-            return Err(manifest_err(
-                manifest_path,
-                format!(
-                    "targets.{target_label}.entrypoint='{}' must be a safe relative path",
-                    entrypoint
-                ),
-            ));
-        }
-
         let port_raw = target.get("port").ok_or_else(|| {
             manifest_err(
                 manifest_path,
@@ -108,127 +98,95 @@ pub fn validate_manifest_for_build(
             ));
         }
 
-        let path_in_root = manifest_dir.join(clean_entrypoint);
-        let path_in_source = manifest_dir.join("source").join(clean_entrypoint);
-        match driver.as_str() {
-            "static" => {
-                if !path_in_root.exists() || !path_in_root.is_dir() {
+        let runtime_tools = read_runtime_tools_map(manifest_path, target_label, target)?;
+        if web_services_mode {
+            if let Some(entrypoint) = entrypoint {
+                if is_deprecated_ato_entrypoint(entrypoint) {
                     return Err(manifest_err(
                         manifest_path,
                         format!(
-                            "targets.{target_label}.entrypoint='{}' must be an existing directory under project root ('{}')",
-                            entrypoint,
-                            path_in_root.display()
+                            "targets.{target_label}.entrypoint='ato-entry.ts' is deprecated. Define top-level [services] and remove ato-entry.ts orchestrator."
                         ),
                     ));
                 }
             }
-            "node" | "deno" | "python" => {
-                if entrypoint.split_whitespace().count() > 1 {
-                    return Err(manifest_err(
-                        manifest_path,
-                        format!(
-                            "targets.{target_label}.entrypoint must be a script file path (shell command strings are not allowed)"
-                        ),
-                    ));
-                }
-                if (!path_in_root.exists() || !path_in_root.is_file())
-                    && (!path_in_source.exists() || !path_in_source.is_file())
-                {
-                    return Err(manifest_err(
-                        manifest_path,
-                        format!(
-                            "entrypoint file not found: targets.{target_label}.entrypoint='{}'. Checked '{}' and '{}'",
-                            entrypoint,
-                            path_in_root.display(),
-                            path_in_source.display()
-                        ),
-                    ));
-                }
 
-                if let Some(runtime_tools) = target.get("runtime_tools") {
-                    let tools_table = runtime_tools.as_table().ok_or_else(|| {
-                        manifest_err(
-                            manifest_path,
-                            format!("targets.{target_label}.runtime_tools must be a table"),
-                        )
-                    })?;
-                    for (tool, version) in tools_table {
-                        let version = version.as_str().map(str::trim).ok_or_else(|| {
-                            manifest_err(
-                                manifest_path,
-                                format!(
-                                    "targets.{target_label}.runtime_tools.{tool} must be a non-empty string"
-                                ),
-                            )
-                        })?;
-                        if version.is_empty() {
-                            return Err(manifest_err(
-                                manifest_path,
-                                format!(
-                                    "targets.{target_label}.runtime_tools.{tool} must be a non-empty string"
-                                ),
-                            ));
-                        }
-                    }
-                }
+            validate_web_services_mode(manifest_path, target_label, &raw, &runtime_tools)?;
+        } else {
+            let entrypoint = entrypoint.ok_or_else(|| {
+                manifest_err(
+                    manifest_path,
+                    format!("targets.{target_label}.entrypoint is required"),
+                )
+            })?;
+            let clean_entrypoint = entrypoint.trim_start_matches("./");
+            if !is_safe_relative_path(clean_entrypoint) {
+                return Err(manifest_err(
+                    manifest_path,
+                    format!(
+                        "targets.{target_label}.entrypoint='{}' must be a safe relative path",
+                        entrypoint
+                    ),
+                ));
+            }
+            if driver == "deno" && is_deprecated_ato_entrypoint(entrypoint) {
+                return Err(manifest_err(
+                    manifest_path,
+                    format!(
+                        "targets.{target_label}.entrypoint='ato-entry.ts' is deprecated. Use top-level [services] mode instead."
+                    ),
+                ));
+            }
 
-                // Deno orchestrator targets require explicit runtime pins and tool pins.
-                // We detect orchestrator intent by conventional entrypoint name.
-                if driver == "deno"
-                    && std::path::Path::new(clean_entrypoint)
-                        .file_name()
-                        .and_then(|v| v.to_str())
-                        .map(|v| v.eq_ignore_ascii_case("ato-entry.ts"))
-                        .unwrap_or(false)
-                {
-                    let runtime_version_ok = target
-                        .get("runtime_version")
-                        .and_then(|v| v.as_str())
-                        .map(str::trim)
-                        .filter(|v| !v.is_empty())
-                        .is_some();
-                    if !runtime_version_ok {
+            let path_in_root = manifest_dir.join(clean_entrypoint);
+            let path_in_source = manifest_dir.join("source").join(clean_entrypoint);
+            match driver.as_str() {
+                "static" => {
+                    if !path_in_root.exists() || !path_in_root.is_dir() {
                         return Err(manifest_err(
                             manifest_path,
                             format!(
-                                "targets.{target_label}.runtime_version is required for deno orchestrator targets"
+                                "targets.{target_label}.entrypoint='{}' must be an existing directory under project root ('{}')",
+                                entrypoint,
+                                path_in_root.display()
                             ),
                         ));
                     }
-
-                    let tools_table = target
-                        .get("runtime_tools")
-                        .and_then(|v| v.as_table())
-                        .ok_or_else(|| {
-                            manifest_err(
-                                manifest_path,
-                                format!(
-                                    "targets.{target_label}.runtime_tools is required for deno orchestrator targets"
-                                ),
-                            )
-                        })?;
-                    for required_tool in ["node", "python"] {
-                        let ok = tools_table
-                            .get(required_tool)
-                            .and_then(|v| v.as_str())
-                            .map(str::trim)
-                            .filter(|v| !v.is_empty())
-                            .is_some();
-                        if !ok {
-                            return Err(manifest_err(
-                                manifest_path,
-                                format!(
-                                    "targets.{target_label}.runtime_tools.{required_tool} is required for deno orchestrator targets"
-                                ),
-                            ));
-                        }
+                }
+                "node" | "deno" | "python" => {
+                    if entrypoint.split_whitespace().count() > 1 {
+                        return Err(manifest_err(
+                            manifest_path,
+                            format!(
+                                "targets.{target_label}.entrypoint must be a script file path (shell command strings are not allowed)"
+                            ),
+                        ));
+                    }
+                    if (!path_in_root.exists() || !path_in_root.is_file())
+                        && (!path_in_source.exists() || !path_in_source.is_file())
+                    {
+                        return Err(manifest_err(
+                            manifest_path,
+                            format!(
+                                "entrypoint file not found: targets.{target_label}.entrypoint='{}'. Checked '{}' and '{}'",
+                                entrypoint,
+                                path_in_root.display(),
+                                path_in_source.display()
+                            ),
+                        ));
                     }
                 }
+                _ => unreachable!(),
             }
-            _ => unreachable!(),
         }
     } else {
+        let entrypoint = entrypoint.ok_or_else(|| {
+            manifest_err(
+                manifest_path,
+                format!("targets.{target_label}.entrypoint is required"),
+            )
+        })?;
+        let clean_entrypoint = entrypoint.trim_start_matches("./");
         if clean_entrypoint.contains('/') || clean_entrypoint.contains('\\') {
             let path_in_root = manifest_dir.join(clean_entrypoint);
             let path_in_source = manifest_dir.join("source").join(clean_entrypoint);
@@ -315,6 +273,280 @@ pub fn validate_manifest_for_build(
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct ServiceDiagnosticSpec {
+    depends_on: Vec<String>,
+}
+
+fn read_runtime_tools_map(
+    manifest_path: &Path,
+    target_label: &str,
+    target: &toml::value::Table,
+) -> Result<HashMap<String, String>, CapsuleError> {
+    let mut tools = HashMap::new();
+    let Some(runtime_tools) = target.get("runtime_tools") else {
+        return Ok(tools);
+    };
+    let tools_table = runtime_tools.as_table().ok_or_else(|| {
+        manifest_err(
+            manifest_path,
+            format!("targets.{target_label}.runtime_tools must be a table"),
+        )
+    })?;
+
+    for (tool, version) in tools_table {
+        let version = version.as_str().map(str::trim).ok_or_else(|| {
+            manifest_err(
+                manifest_path,
+                format!("targets.{target_label}.runtime_tools.{tool} must be a non-empty string"),
+            )
+        })?;
+        if version.is_empty() {
+            return Err(manifest_err(
+                manifest_path,
+                format!("targets.{target_label}.runtime_tools.{tool} must be a non-empty string"),
+            ));
+        }
+        tools.insert(tool.to_ascii_lowercase(), version.to_string());
+    }
+    Ok(tools)
+}
+
+fn validate_web_services_mode(
+    manifest_path: &Path,
+    target_label: &str,
+    raw: &toml::Value,
+    runtime_tools: &HashMap<String, String>,
+) -> Result<(), CapsuleError> {
+    let services = raw
+        .get("services")
+        .and_then(|v| v.as_table())
+        .ok_or_else(|| {
+            manifest_err(
+                manifest_path,
+                "top-level [services] is required for web/deno services mode".to_string(),
+            )
+        })?;
+    if services.is_empty() {
+        return Err(manifest_err(
+            manifest_path,
+            "top-level [services] must define at least one service".to_string(),
+        ));
+    }
+    if !services.contains_key("main") {
+        return Err(manifest_err(
+            manifest_path,
+            "services.main is required for web/deno services mode".to_string(),
+        ));
+    }
+
+    let mut parsed: HashMap<String, ServiceDiagnosticSpec> = HashMap::new();
+    let mut referenced_tools: HashSet<String> = HashSet::new();
+
+    for (name, value) in services {
+        let service = value.as_table().ok_or_else(|| {
+            manifest_err(manifest_path, format!("services.{name} must be a table"))
+        })?;
+
+        let entrypoint = service
+            .get("entrypoint")
+            .or_else(|| service.get("command"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| {
+                manifest_err(
+                    manifest_path,
+                    format!("services.{name}.entrypoint is required"),
+                )
+            })?
+            .to_string();
+
+        if let Some(expose) = service.get("expose") {
+            let expose = expose.as_array().ok_or_else(|| {
+                manifest_err(
+                    manifest_path,
+                    format!("services.{name}.expose must be an array"),
+                )
+            })?;
+            if !expose.is_empty() {
+                return Err(manifest_err(
+                    manifest_path,
+                    format!(
+                        "services.{name}.expose is not supported yet in web/deno services mode"
+                    ),
+                ));
+            }
+        }
+
+        if let Some(probe) = service.get("readiness_probe") {
+            let probe = probe.as_table().ok_or_else(|| {
+                manifest_err(
+                    manifest_path,
+                    format!("services.{name}.readiness_probe must be a table"),
+                )
+            })?;
+            let port = probe
+                .get("port")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| {
+                    manifest_err(
+                        manifest_path,
+                        format!("services.{name}.readiness_probe.port must be a non-empty string"),
+                    )
+                })?;
+            let _ = port;
+
+            let has_http_get = probe
+                .get("http_get")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .is_some();
+            let has_tcp_connect = probe
+                .get("tcp_connect")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .is_some();
+            if !has_http_get && !has_tcp_connect {
+                return Err(manifest_err(
+                    manifest_path,
+                    format!("services.{name}.readiness_probe must define http_get or tcp_connect"),
+                ));
+            }
+        }
+
+        let depends_on = if let Some(depends_on) = service.get("depends_on") {
+            let depends_on = depends_on.as_array().ok_or_else(|| {
+                manifest_err(
+                    manifest_path,
+                    format!("services.{name}.depends_on must be an array"),
+                )
+            })?;
+            let mut deps = Vec::new();
+            for (idx, dep) in depends_on.iter().enumerate() {
+                let dep = dep
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| {
+                        manifest_err(
+                            manifest_path,
+                            format!("services.{name}.depends_on[{idx}] must be a non-empty string"),
+                        )
+                    })?;
+                deps.push(dep.to_string());
+            }
+            deps
+        } else {
+            Vec::new()
+        };
+
+        if let Some(head) = parse_command_head(&entrypoint).map_err(|err| {
+            manifest_err(
+                manifest_path,
+                format!("services.{name}.entrypoint is invalid: {err}"),
+            )
+        })? {
+            if matches!(head.as_str(), "node" | "python" | "uv") {
+                referenced_tools.insert(head);
+            }
+        }
+
+        parsed.insert(name.to_string(), ServiceDiagnosticSpec { depends_on });
+    }
+
+    for (name, service) in &parsed {
+        for dep in &service.depends_on {
+            if !parsed.contains_key(dep) {
+                return Err(manifest_err(
+                    manifest_path,
+                    format!("services.{name}.depends_on references unknown service '{dep}'"),
+                ));
+            }
+        }
+    }
+
+    detect_service_cycle(&parsed).map_err(|cycle| {
+        manifest_err(
+            manifest_path,
+            format!("services has circular dependency: {}", cycle),
+        )
+    })?;
+
+    for tool in referenced_tools {
+        if !runtime_tools.contains_key(&tool) {
+            return Err(manifest_err(
+                manifest_path,
+                format!(
+                    "targets.{target_label}.runtime_tools.{tool} is required when services command references '{tool}'"
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn detect_service_cycle(services: &HashMap<String, ServiceDiagnosticSpec>) -> Result<(), String> {
+    fn visit(
+        current: &str,
+        services: &HashMap<String, ServiceDiagnosticSpec>,
+        visiting: &mut HashSet<String>,
+        visited: &mut HashSet<String>,
+        stack: &mut Vec<String>,
+    ) -> Result<(), String> {
+        if visited.contains(current) {
+            return Ok(());
+        }
+        if visiting.contains(current) {
+            stack.push(current.to_string());
+            return Err(stack.join(" -> "));
+        }
+
+        visiting.insert(current.to_string());
+        stack.push(current.to_string());
+        if let Some(service) = services.get(current) {
+            for dep in &service.depends_on {
+                visit(dep, services, visiting, visited, stack)?;
+            }
+        }
+        stack.pop();
+        visiting.remove(current);
+        visited.insert(current.to_string());
+        Ok(())
+    }
+
+    let mut names: Vec<&String> = services.keys().collect();
+    names.sort();
+    let mut visiting = HashSet::new();
+    let mut visited = HashSet::new();
+    for name in names {
+        let mut stack = Vec::new();
+        visit(name, services, &mut visiting, &mut visited, &mut stack)?;
+    }
+    Ok(())
+}
+
+fn parse_command_head(command: &str) -> Result<Option<String>, String> {
+    let tokens = shell_words::split(command).map_err(|err| err.to_string())?;
+    let first = tokens
+        .first()
+        .map(|token| token.trim().to_ascii_lowercase());
+    Ok(first.filter(|token| !token.is_empty()))
+}
+
+fn is_deprecated_ato_entrypoint(entrypoint: &str) -> bool {
+    std::path::Path::new(entrypoint.trim())
+        .file_name()
+        .and_then(|v| v.to_str())
+        .map(|v| v.eq_ignore_ascii_case("ato-entry.ts"))
+        .unwrap_or(false)
 }
 
 fn manifest_err(path: &Path, message: String) -> CapsuleError {
@@ -481,6 +713,113 @@ port = 3000
         assert!(err
             .to_string()
             .contains("entrypoint must be a script file path"));
+    }
+
+    #[test]
+    fn web_deno_services_allows_missing_target_entrypoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("capsule.toml");
+        std::fs::write(
+            &manifest_path,
+            r#"
+schema_version = "0.2"
+name = "web-services"
+version = "0.1.0"
+default_target = "web"
+
+[targets.web]
+runtime = "web"
+driver = "deno"
+port = 4173
+runtime_tools = { node = "20.11.0" }
+
+[services.main]
+entrypoint = "node apps/dashboard/server.js"
+"#,
+        )
+        .unwrap();
+
+        assert!(validate_manifest_for_build(&manifest_path, "web").is_ok());
+    }
+
+    #[test]
+    fn web_deno_services_requires_main() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("capsule.toml");
+        std::fs::write(
+            &manifest_path,
+            r#"
+schema_version = "0.2"
+name = "web-services"
+version = "0.1.0"
+default_target = "web"
+
+[targets.web]
+runtime = "web"
+driver = "deno"
+port = 4173
+
+[services.api]
+entrypoint = "python apps/api/main.py"
+"#,
+        )
+        .unwrap();
+
+        let err = validate_manifest_for_build(&manifest_path, "web").unwrap_err();
+        assert!(err.to_string().contains("services.main is required"));
+    }
+
+    #[test]
+    fn web_deno_services_requires_runtime_tool_for_referenced_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("capsule.toml");
+        std::fs::write(
+            &manifest_path,
+            r#"
+schema_version = "0.2"
+name = "web-services"
+version = "0.1.0"
+default_target = "web"
+
+[targets.web]
+runtime = "web"
+driver = "deno"
+port = 4173
+
+[services.main]
+entrypoint = "node apps/dashboard/server.js"
+"#,
+        )
+        .unwrap();
+
+        let err = validate_manifest_for_build(&manifest_path, "web").unwrap_err();
+        assert!(err.to_string().contains("runtime_tools.node is required"));
+    }
+
+    #[test]
+    fn web_deno_rejects_deprecated_ato_entrypoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest_path = dir.path().join("capsule.toml");
+        std::fs::write(
+            &manifest_path,
+            r#"
+schema_version = "0.2"
+name = "web-deno"
+version = "0.1.0"
+default_target = "web"
+
+[targets.web]
+runtime = "web"
+driver = "deno"
+entrypoint = "ato-entry.ts"
+port = 4173
+"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("ato-entry.ts"), "console.log('ok');").unwrap();
+
+        let err = validate_manifest_for_build(&manifest_path, "web").unwrap_err();
+        assert!(err.to_string().contains("deprecated"));
     }
 
     #[test]
