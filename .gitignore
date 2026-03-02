@@ -24,6 +24,10 @@ target/
 
 # Secrets and envs
 .env
+*.key
+
+# Backup files
+*.bak
 
 # Ignore npm/node_modules if any (not typical for Rust projects)
 node_modules/
