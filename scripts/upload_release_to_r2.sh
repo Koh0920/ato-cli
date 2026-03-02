@@ -14,7 +14,7 @@ set -euo pipefail
 #   BUCKET              optional (if omitted, inferred from DEPLOY_ENV)
 #   DEPLOY_ENV          optional: staging|stg|production|prod
 #   SOURCE_DIR          default: /tmp/ato-release/$VERSION
-#   TARGETS             default: infer from SOURCE_DIR/ato-*.tar.gz
+#   TARGETS             default: infer from SOURCE_DIR/ato-*.tar.gz|ato-*.zip
 #   UPDATE_LATEST       default: 1
 #   PREFIX              default: ato
 #   WRANGLER_CONFIG     optional (if empty, use wrangler default resolution)
@@ -85,6 +85,21 @@ put_object() {
   done
 }
 
+find_archive_for_target() {
+  local target="$1"
+  local tar_file="$SOURCE_DIR/ato-$target.tar.gz"
+  local zip_file="$SOURCE_DIR/ato-$target.zip"
+  if [[ -f "$tar_file" ]]; then
+    echo "$tar_file"
+    return 0
+  fi
+  if [[ -f "$zip_file" ]]; then
+    echo "$zip_file"
+    return 0
+  fi
+  return 1
+}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
@@ -141,14 +156,21 @@ else
     archive_name="$(basename "$archive")"
     target="${archive_name#ato-}"
     target="${target%.tar.gz}"
+    target="${target%.zip}"
     target_list+=("$target")
-  done < <(find "$SOURCE_DIR" -maxdepth 1 -type f -name 'ato-*.tar.gz' | sort)
+  done < <(find "$SOURCE_DIR" -maxdepth 1 -type f \( -name 'ato-*.tar.gz' -o -name 'ato-*.zip' \) | sort)
 fi
 
 if [[ "${#target_list[@]}" -eq 0 ]]; then
-  echo "error: no targets detected. Set TARGETS or place ato-<target>.tar.gz in $SOURCE_DIR" >&2
+  echo "error: no targets detected. Set TARGETS or place ato-<target>.tar.gz / ato-<target>.zip in $SOURCE_DIR" >&2
   exit 1
 fi
+
+deduped_targets=()
+while IFS= read -r target; do
+  deduped_targets+=("$target")
+done < <(printf '%s\n' "${target_list[@]}" | sort -u)
+target_list=("${deduped_targets[@]}")
 
 checksum_file="$SOURCE_DIR/SHA256SUMS"
 if [[ ! -f "$checksum_file" ]]; then
@@ -157,16 +179,16 @@ if [[ ! -f "$checksum_file" ]]; then
 fi
 
 for target in "${target_list[@]}"; do
-  archive_file="$SOURCE_DIR/ato-$target.tar.gz"
-  if [[ ! -f "$archive_file" ]]; then
-    echo "error: archive not found for target '$target': $archive_file" >&2
+  if ! archive_file="$(find_archive_for_target "$target")"; then
+    echo "error: archive not found for target '$target': $SOURCE_DIR/ato-$target.tar.gz|.zip" >&2
     exit 1
   fi
+  archive_name="$(basename "$archive_file")"
 
-  put_object "$PREFIX/releases/$VERSION/ato-$target.tar.gz" "$archive_file" "$RELEASE_CACHE_CONTROL"
+  put_object "$PREFIX/releases/$VERSION/$archive_name" "$archive_file" "$RELEASE_CACHE_CONTROL"
 
   if [[ "$UPDATE_LATEST" == "1" ]]; then
-    put_object "$PREFIX/latest/ato-$target.tar.gz" "$archive_file" "$LATEST_CACHE_CONTROL"
+    put_object "$PREFIX/latest/$archive_name" "$archive_file" "$LATEST_CACHE_CONTROL"
   fi
 done
 

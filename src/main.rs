@@ -1198,8 +1198,8 @@ fn run() -> Result<()> {
         Commands::Setup {
             engine,
             version,
-            skip_verify: _,
-        } => execute_setup_command(engine, version, reporter.clone()),
+            skip_verify,
+        } => execute_setup_command(engine, version, skip_verify, reporter.clone()),
 
         Commands::Open {
             path,
@@ -1501,8 +1501,8 @@ fn run() -> Result<()> {
                 ConfigEngineCommands::Install {
                     engine,
                     version,
-                    skip_verify: _,
-                } => execute_setup_command(engine, version, reporter.clone()),
+                    skip_verify,
+                } => execute_setup_command(engine, version, skip_verify, reporter.clone()),
             },
             ConfigCommands::Registry { command } => {
                 let mapped = match command {
@@ -2069,12 +2069,13 @@ fn execute_publish_tui_command(reporter: std::sync::Arc<reporters::CliReporter>)
 fn execute_setup_command(
     engine: String,
     version: Option<String>,
+    skip_verify: bool,
     reporter: std::sync::Arc<reporters::CliReporter>,
 ) -> Result<()> {
     let em = engine_manager::EngineManager::new()?;
-    let version = version.unwrap_or_else(|| "latest".to_string());
+    let requested_version = version.unwrap_or_else(|| "latest".to_string());
 
-    let (url, sha256) = match engine.as_str() {
+    let (resolved_version, url, sha256) = match engine.as_str() {
         "nacelle" => {
             let os = if cfg!(target_os = "macos") {
                 "darwin"
@@ -2091,21 +2092,21 @@ fn execute_setup_command(
                 anyhow::bail!("Unsupported architecture");
             };
 
-            let ver = if version == "latest" {
-                let resp =
-                    reqwest::blocking::get("https://releases.capsule.dev/nacelle/latest.txt")
-                        .context("Failed to fetch latest version")?
-                        .text()?;
-                resp.trim().to_string()
+            let resolved = if requested_version == "latest" {
+                fetch_latest_nacelle_version()?
             } else {
-                version.clone()
+                requested_version.clone()
             };
 
-            let url = format!(
-                "https://releases.capsule.dev/nacelle/{}/nacelle-{}-{}-{}",
-                ver, ver, os, arch
-            );
-            (url, "".to_string())
+            let binary_name = format!("nacelle-{}-{}-{}", resolved, os, arch);
+            let base_url = format!("https://releases.capsule.dev/nacelle/{}", resolved);
+            let url = format!("{}/{}", base_url, binary_name);
+            let sha256 = if skip_verify {
+                String::new()
+            } else {
+                fetch_release_sha256(&base_url, &binary_name)?
+            };
+            (resolved, url, sha256)
         }
         _ => {
             anyhow::bail!(
@@ -2115,12 +2116,12 @@ fn execute_setup_command(
         }
     };
 
-    let path = em.download_engine(&engine, &version, &url, &sha256, &*reporter)?;
+    let path = em.download_engine(&engine, &resolved_version, &url, &sha256, &*reporter)?;
 
     futures::executor::block_on(reporter.notify(format!(
         "✅ Engine {} v{} installed at {}",
         engine,
-        version,
+        resolved_version,
         path.display()
     )))?;
 
@@ -2139,6 +2140,102 @@ fn execute_setup_command(
     futures::executor::block_on(reporter.notify("✅ Registered as default engine".to_string()))?;
 
     Ok(())
+}
+
+fn fetch_latest_nacelle_version() -> Result<String> {
+    let resp = reqwest::blocking::get("https://releases.capsule.dev/nacelle/latest.txt")
+        .context("Failed to fetch latest nacelle version")?
+        .text()?;
+    let version = resp.trim();
+    if version.is_empty() {
+        anyhow::bail!("Latest nacelle version response was empty");
+    }
+    Ok(version.to_string())
+}
+
+fn fetch_release_sha256(base_url: &str, binary_name: &str) -> Result<String> {
+    let checksum_urls = [
+        format!("{}/SHA256SUMS", base_url),
+        format!("{}/SHA256SUMS.txt", base_url),
+        format!("{}/SHASUMS256.txt", base_url),
+        format!("{}/{}.sha256", base_url, binary_name),
+    ];
+
+    for checksum_url in checksum_urls {
+        let response = match reqwest::blocking::get(&checksum_url) {
+            Ok(resp) => resp,
+            Err(_) => continue,
+        };
+
+        if !response.status().is_success() {
+            continue;
+        }
+
+        let body = response
+            .text()
+            .with_context(|| format!("Failed to read checksum file {}", checksum_url))?;
+
+        if let Some(hash) = parse_sha256_for_artifact(&body, binary_name) {
+            return Ok(hash);
+        }
+
+        if checksum_url.ends_with(".sha256") {
+            if let Some(hash) = extract_first_sha256_hex(&body) {
+                return Ok(hash);
+            }
+        }
+    }
+
+    anyhow::bail!(
+        "Failed to resolve SHA256 for {} from release metadata at {}",
+        binary_name,
+        base_url
+    )
+}
+
+fn parse_sha256_for_artifact(checksum_body: &str, binary_name: &str) -> Option<String> {
+    for raw_line in checksum_body.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        if let Some(stripped) = line
+            .strip_prefix("SHA256 (")
+            .or_else(|| line.strip_prefix("sha256 ("))
+        {
+            if let Some((name, hash_part)) = stripped.split_once(')') {
+                let hash = hash_part.trim().trim_start_matches('=').trim();
+                if name.trim() == binary_name && is_sha256_hex(hash) {
+                    return Some(hash.to_ascii_lowercase());
+                }
+            }
+        }
+
+        let mut parts = line.split_whitespace();
+        let Some(hash) = parts.next() else {
+            continue;
+        };
+        let Some(name) = parts.last() else {
+            continue;
+        };
+        let normalized_name = name.trim_start_matches('*').trim_start_matches("./");
+        if normalized_name == binary_name && is_sha256_hex(hash) {
+            return Some(hash.to_ascii_lowercase());
+        }
+    }
+
+    None
+}
+
+fn extract_first_sha256_hex(raw: &str) -> Option<String> {
+    raw.split_whitespace()
+        .find(|token| is_sha256_hex(token))
+        .map(|token| token.to_ascii_lowercase())
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.as_bytes().iter().all(|b| b.is_ascii_hexdigit())
 }
 
 fn execute_run_like_command(
@@ -2679,6 +2776,8 @@ fn enforce_sandbox_mode_flags(
     dangerously_skip_permissions: bool,
     reporter: std::sync::Arc<reporters::CliReporter>,
 ) -> Result<EnforcementMode> {
+    const ENV_ALLOW_UNSAFE: &str = "CAPSULE_ALLOW_UNSAFE";
+
     if matches!(enforcement, EnforcementMode::BestEffort) {
         anyhow::bail!("--enforcement best-effort is no longer supported; use --enforcement strict");
     }
@@ -2693,6 +2792,12 @@ fn enforce_sandbox_mode_flags(
     }
 
     if dangerously_skip_permissions {
+        if std::env::var(ENV_ALLOW_UNSAFE).ok().as_deref() != Some("1") {
+            anyhow::bail!(
+                "--dangerously-skip-permissions requires {}=1",
+                ENV_ALLOW_UNSAFE
+            );
+        }
         futures::executor::block_on(
             reporter.warn(
                 "⚠️  Dangerous mode enabled: bypassing all Ato runtime permission and sandbox barriers"
@@ -2831,6 +2936,12 @@ fn execute_search_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn explicit_local_path_rules() {
@@ -2908,5 +3019,63 @@ mod tests {
         assert!(!can_prompt_interactively(true, false));
         assert!(!can_prompt_interactively(false, true));
         assert!(!can_prompt_interactively(false, false));
+    }
+
+    #[test]
+    fn parse_sha256_for_artifact_supports_sha256sums_format() {
+        let body = "\
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  nacelle-v1.2.3-darwin-arm64
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  nacelle-v1.2.3-linux-x64
+";
+        let parsed = parse_sha256_for_artifact(body, "nacelle-v1.2.3-linux-x64");
+        assert_eq!(
+            parsed.as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+    }
+
+    #[test]
+    fn parse_sha256_for_artifact_supports_bsd_style_format() {
+        let body = "SHA256 (nacelle-v1.2.3-darwin-arm64) = CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
+        let parsed = parse_sha256_for_artifact(body, "nacelle-v1.2.3-darwin-arm64");
+        assert_eq!(
+            parsed.as_deref(),
+            Some("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+        );
+    }
+
+    #[test]
+    fn extract_first_sha256_hex_reads_single_file_checksum() {
+        let body = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd  nacelle-v1.2.3-darwin-arm64";
+        let parsed = extract_first_sha256_hex(body);
+        assert_eq!(
+            parsed.as_deref(),
+            Some("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd")
+        );
+    }
+
+    #[test]
+    fn dangerous_skip_permissions_requires_explicit_opt_in_env() {
+        let _guard = env_lock().lock().expect("env lock");
+        std::env::remove_var("CAPSULE_ALLOW_UNSAFE");
+
+        let reporter = std::sync::Arc::new(reporters::CliReporter::new(true));
+        let err = enforce_sandbox_mode_flags(EnforcementMode::Strict, false, true, reporter)
+            .expect_err("must fail closed without env opt-in");
+        assert!(err
+            .to_string()
+            .contains("--dangerously-skip-permissions requires CAPSULE_ALLOW_UNSAFE=1"));
+    }
+
+    #[test]
+    fn dangerous_skip_permissions_allows_with_explicit_opt_in_env() {
+        let _guard = env_lock().lock().expect("env lock");
+        std::env::set_var("CAPSULE_ALLOW_UNSAFE", "1");
+
+        let reporter = std::sync::Arc::new(reporters::CliReporter::new(true));
+        let result = enforce_sandbox_mode_flags(EnforcementMode::Strict, false, true, reporter);
+        assert!(result.is_ok());
+
+        std::env::remove_var("CAPSULE_ALLOW_UNSAFE");
     }
 }
