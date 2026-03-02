@@ -172,6 +172,7 @@ fn run_runtime(
     } else {
         if orchestrator_mode {
             let mut allow_run = Vec::new();
+            allow_run.push(deno_bin.to_string_lossy().to_string());
             if let Some(node) = node_bin {
                 allow_run.push(node.to_string_lossy().to_string());
             }
