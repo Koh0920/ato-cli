@@ -111,9 +111,9 @@ If missing or empty, execution stops fail-closed.
 - `targets.<label>.required_env = ["KEY1", "KEY2"]` (recommended)
 - Backward compatibility: `targets.<label>.env.ATO_ORCH_REQUIRED_ENVS = "KEY1,KEY2"`
 
-## Dynamic App Capsule Recipe (Web + Deno Orchestrator)
+## Dynamic App Capsule Recipe (Web + Services Supervisor)
 
-For multi-service apps (for example: dashboard + API + worker), use a single `web/deno` target and orchestrate child processes in `ato-entry.ts`.
+For multi-service apps (for example: dashboard + API + worker), use a single `web/deno` target with top-level `[services]`. `ato run` starts services in DAG order, waits on readiness probes, prefixes logs, and fail-fast stops all services when one exits.
 
 1. Pre-bundle artifacts before packing (for example: `next build`, worker build, lockfiles).
 2. Include only runtime artifacts via `[pack].include` (do not package raw `node_modules`, `.venv`, caches).
@@ -129,7 +129,6 @@ default_target = "default"
 
 [pack]
 include = [
-  "ato-entry.ts",
   "capsule.toml",
   "capsule.lock",
   "apps/dashboard/.next/standalone/**",
@@ -151,10 +150,19 @@ exclude = [
 runtime = "web"
 driver = "deno"
 runtime_version = "1.46.3"
-runtime_tools = { node = "20.11.0", python = "3.11.10" }
-entrypoint = "ato-entry.ts"
+runtime_tools = { node = "20.11.0", python = "3.11.10", uv = "0.4.30" }
 port = 4173
 required_env = ["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID"]
+
+[services.main]
+entrypoint = "node apps/dashboard/.next/standalone/server.js"
+depends_on = ["api"]
+readiness_probe = { http_get = "/health", port = "PORT" }
+
+[services.api]
+entrypoint = "python apps/control-plane/src/main.py"
+env = { API_PORT = "8000" }
+readiness_probe = { http_get = "/health", port = "API_PORT" }
 ```
 
 Recommended flow:
@@ -177,7 +185,9 @@ ato run <publisher>/<slug> --registry http://127.0.0.1:8787
 Notes:
 - For Next.js standalone, copy `.next/static` (and `public` if used) into standalone output before `ato build`.
 - `ato run` stops before startup if `required_env` keys are missing.
-- `ato-entry.ts` should fail-fast when one child process exits unexpectedly.
+- `services.main` is required in services mode and receives `PORT=<targets.<label>.port`.
+- `targets.<label>.entrypoint = "ato-entry.ts"` is deprecated and rejected.
+- If a service command starts with `node`, `python`, or `uv`, pin the matching version in `runtime_tools`.
 
 ## Runtime Isolation Policy (Tiers)
 

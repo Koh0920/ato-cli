@@ -11,6 +11,37 @@ use crate::runtime_manager;
 const STATIC_SERVER_SCRIPT: &str = include_str!("../assets/static_file_server.ts");
 
 pub fn execute(plan: &ManifestData, _reporter: std::sync::Arc<CliReporter>) -> Result<()> {
+    let (deno_bin, args) = build_static_server_command(plan)?;
+    let status = Command::new(deno_bin)
+        .args(&args)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .context("Failed to launch deno file server for runtime=web static target")?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "deno file server exited with status {}",
+            status
+        ))
+    }
+}
+
+pub fn spawn_background(plan: &ManifestData) -> Result<std::process::Child> {
+    let (deno_bin, args) = build_static_server_command(plan)?;
+    Command::new(deno_bin)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("Failed to launch deno file server for runtime=web static target in background")
+}
+
+fn build_static_server_command(plan: &ManifestData) -> Result<(PathBuf, Vec<String>)> {
     let driver = plan
         .execution_driver()
         .map(|v| v.trim().to_ascii_lowercase())
@@ -38,23 +69,7 @@ pub fn execute(plan: &ManifestData, _reporter: std::sync::Arc<CliReporter>) -> R
     let serve_dir = resolve_static_serve_dir(&plan.manifest_dir, &entrypoint)?;
     let script_path = ensure_static_server_script()?;
     let args = build_deno_file_server_args(&script_path, &serve_dir, port);
-
-    let status = Command::new(deno_bin)
-        .args(&args)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .context("Failed to launch deno file server for runtime=web static target")?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!(
-            "deno file server exited with status {}",
-            status
-        ))
-    }
+    Ok((deno_bin, args))
 }
 
 fn resolve_static_serve_dir(manifest_dir: &Path, entrypoint: &str) -> Result<PathBuf> {
