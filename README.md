@@ -1,13 +1,15 @@
 # ato-cli
 
-`ato` は `capsule.toml` を解釈して、実行・配布・インストールを行うメタCLIです。  
-Zero-Trust / fail-closed を前提に、通常実行時は静かに動作し、同意や違反時のみ明示的に出力します。
+English | [日本語](README_JA.md)
 
-## 主要コマンド
+`ato` is a meta-CLI that interprets `capsule.toml` to execute, distribute, and install capsules.
+It is designed around a Zero-Trust / fail-closed model: normal runs stay quiet, while consent prompts and policy violations are surfaced explicitly.
+
+## Key Commands
 
 ```bash
 ato run [path|publisher/slug] [--registry <url>]
-ato open [path] [--watch]                 # 互換コマンド（非推奨; run を推奨）
+ato open [path] [--watch]                 # compatibility command (deprecated; prefer run)
 ato ps
 ato close --id <capsule-id> | --name <name> [--all] [--force]
 ato logs --id <capsule-id> [--follow]
@@ -18,153 +20,154 @@ ato publish --dry-run
 ato publish --ci
 ato search [query]
 ato config engine install --engine nacelle [--version <ver>]
-ato setup --engine nacelle [--version <ver>] # 互換コマンド（非推奨）
+ato setup --engine nacelle [--version <ver>] # compatibility command (deprecated)
 ato registry serve --host 127.0.0.1 --port 8787 [--auth-token <token>]
 ```
 
-## クイックスタート（ローカル）
+## Quick Start (Local)
 
 ```bash
 # build
 cargo build -p ato-cli
 
-# nacelle エンジンを未導入の場合（推奨）
+# install nacelle engine if not installed (recommended)
 ./target/debug/ato config engine install --engine nacelle
 
-# 互換: setup サブコマンド
+# compatibility: setup subcommand
 ./target/debug/ato setup --engine nacelle
 
-# 実行
+# run
 ./target/debug/ato run .
 
-# 開発時ホットリロード
+# hot reload during development
 ./target/debug/ato open . --watch
 
-# バックグラウンド管理
+# background process management
 ./target/debug/ato run . --background
 ./target/debug/ato ps
 ./target/debug/ato logs --id <capsule-id> --follow
 ./target/debug/ato close --id <capsule-id>
 ```
 
-## 公開モデル（公式 / ローカル）
+## Publish Model (Official / Local)
 
-- 公式レジストリ（`https://api.ato.run`, `https://staging.api.ato.run`）:
-  `ato publish` は CI-first（OIDC）で公開します。ローカルからの直接アップロードは行いません。
-- ローカル/私設レジストリ（上記以外の `--registry`）:
-  `ato publish --registry ...` で直接アップロードします。`--artifact` 指定を推奨します（再パッキング回避）。
+- Official registries (`https://api.ato.run`, `https://staging.api.ato.run`):
+  `ato publish` is CI-first (OIDC). Direct local uploads are not allowed.
+- Local/private registries (any other `--registry`):
+  `ato publish --registry ...` performs direct uploads. `--artifact` is recommended to avoid re-packing.
 
 ```bash
-# 事前ビルド + private registry へ直接 publish（推奨）
+# pre-build + direct publish to a private registry (recommended)
 ato build .
 ATO_TOKEN=pwd ato publish --registry http://127.0.0.1:8787 --artifact ./<name>.capsule
 ```
 
-## Proto 再生成（メンテナンス時のみ）
+## Proto Regeneration (Maintenance Only)
 
-通常ビルドでは `protoc` は不要です。  
-`core/proto/tsnet/v1/tsnet.proto` を変更したときだけ、次を実行してください。
+`protoc` is not required for normal builds.
+Run this only when `core/proto/tsnet/v1/tsnet.proto` changes.
 
 ```bash
 ./core/scripts/gen_tsnet_proto.sh
 ```
 
-## ローカルレジストリ E2E
+## Local Registry E2E
 
 ```bash
-# ターミナル1: ローカルHTTPレジストリ起動
+# Terminal 1: start local HTTP registry
 ato registry serve --host 127.0.0.1 --port 8787
 
-# ターミナル2: build -> publish(artifact) -> install -> run
+# Terminal 2: build -> publish(artifact) -> install -> run
 ato build .
 ATO_TOKEN=pwd ato publish --artifact ./<name>.capsule --registry http://127.0.0.1:8787
 ato install <publisher>/<slug> --registry http://127.0.0.1:8787
 ato run <publisher>/<slug> --registry http://127.0.0.1:8787 --yes
 ```
 
-補足:
-- 書き込み（publish）は `ATO_TOKEN` が必要です（`registry serve --auth-token` 設定時）。
-- 読み取り（search/install/download）は無認証のまま利用できます。
-- `publish --artifact` はローカル用途向けの推奨経路です。
+Notes:
+- Write operations (`publish`) require `ATO_TOKEN` when `registry serve --auth-token` is enabled.
+- Read operations (search/install/download) can remain unauthenticated.
+- `publish --artifact` is the recommended path for local/private workflows.
 
-## 別デバイス公開（VPN / Tailscale 想定）
+## Cross-Device Publish (VPN / Tailscale)
 
 ```bash
-# サーバー側: 非loopback公開時は --auth-token 必須
+# Server side: non-loopback exposure requires --auth-token
 ato registry serve --host 0.0.0.0 --port 8787 --auth-token pwd
 
-# クライアント側: install/run は token 不要（読み取りAPI）
+# Client side: install/run do not require token (read APIs)
 ato install <publisher>/<slug> --registry http://100.x.y.z:8787
 ato run <publisher>/<slug> --registry http://100.x.y.z:8787
 
-# パブリッシュ時のみ token 必須
+# Token required only for publish
 ATO_TOKEN=pwd ato publish --registry http://100.x.y.z:8787 --artifact ./<name>.capsule
 ```
 
-## 実行前の環境変数チェック
+## Required Environment Variable Checks (Pre-Run)
 
-`ato run` は起動前に必須環境変数を検証します。未設定または空文字なら fail-closed で停止します。
+`ato run` validates required environment variables before startup.
+If missing or empty, execution stops fail-closed.
 
-- `targets.<label>.required_env = ["KEY1", "KEY2"]`（推奨）
-- 既存互換: `targets.<label>.env.ATO_ORCH_REQUIRED_ENVS = "KEY1,KEY2"`
+- `targets.<label>.required_env = ["KEY1", "KEY2"]` (recommended)
+- Backward compatibility: `targets.<label>.env.ATO_ORCH_REQUIRED_ENVS = "KEY1,KEY2"`
 
-## ランタイム隔離ポリシー（Tier）
+## Runtime Isolation Policy (Tiers)
 
-- `web/static`: Tier1（`driver = "static"` + `targets.<label>.port` 必須。`capsule.lock` 不要）
-- `web/deno`: Tier1（`capsule.lock` + `deno.lock` または `package-lock.json`）
-- `web/node`: Tier1（Deno compat 実行。`capsule.lock` + `package-lock.json` 必須）
-- `web/python`: Tier2（`uv.lock` 必須、`--sandbox` 推奨）
-- `source/deno`: Tier1（`capsule.lock` + `deno.lock` または `package-lock.json`）
-- `source/node`: Tier1（Deno compat 実行。`capsule.lock` + `package-lock.json` 必須）
-- `source/python`: Tier2（`uv.lock` 必須、`--sandbox` 推奨）
-- `source/native`: Tier2（`--sandbox` 推奨）
+- `web/static`: Tier1 (`driver = "static"` + `targets.<label>.port` required; no `capsule.lock` needed)
+- `web/deno`: Tier1 (`capsule.lock` + `deno.lock` or `package-lock.json`)
+- `web/node`: Tier1 (Deno compat execution; requires `capsule.lock` + `package-lock.json`)
+- `web/python`: Tier2 (requires `uv.lock`; `--sandbox` recommended)
+- `source/deno`: Tier1 (`capsule.lock` + `deno.lock` or `package-lock.json`)
+- `source/node`: Tier1 (Deno compat execution; requires `capsule.lock` + `package-lock.json`)
+- `source/python`: Tier2 (requires `uv.lock`; `--sandbox` recommended)
+- `source/native`: Tier2 (`--sandbox` recommended)
 
-補足:
-- Node は Tier1 として `--unsafe` 不要です。
-- Tier2（`source/native|python`, `web/python`）は `nacelle` エンジンが必須です。
-  未登録時は fail-closed で停止するため、事前に `ato engine register` か `--nacelle` / `NACELLE_PATH` で設定してください。
-- Legacy 互換で `--unsafe` / `--unsafe-bypass-sandbox` は残っていますが、利用は非推奨です。
-- Node/Python で非対応・逸脱が発生した場合は自動フォールバックせず fail-closed で停止します。
-- `runtime=web` は `driver` が必須です（`static|node|deno|python`）。
-- `runtime=web` では `public` は廃止されました。
-- `runtime=web` 実行時、CLI は URL を表示します（ブラウザ自動起動はしません）。
+Notes:
+- Node is Tier1 and does not require `--unsafe`.
+- Tier2 (`source/native|python`, `web/python`) requires the `nacelle` engine.
+  If not configured, execution stops fail-closed. Configure via `ato engine register`, `--nacelle`, or `NACELLE_PATH`.
+- Legacy compatibility flags (`--unsafe`, `--unsafe-bypass-sandbox`) remain but are discouraged.
+- Unsupported or out-of-policy Node/Python behavior does not auto-fallback; it stops fail-closed.
+- `runtime=web` requires `driver` (`static|node|deno|python`).
+- `public` is deprecated for `runtime=web`.
+- For `runtime=web`, CLI prints the URL and does not auto-open a browser.
 
-## SKILL 実行
+## SKILL Execution
 
 ```bash
-# 名前解決して実行（標準探索パス）
+# Resolve by skill name (default search paths)
 ato run --skill <skill-name>
 
-# SKILL.md を直接指定
+# Point to a specific SKILL.md
 ato run --from-skill /path/to/SKILL.md
 ```
 
-`--skill` と `--from-skill` は排他的です。
+`--skill` and `--from-skill` are mutually exclusive.
 
-## UX方針（Silent Runner）
+## UX Policy (Silent Runner)
 
-- 正常時は最小出力（ツールの標準出力中心）
-- 同意が必要なときのみプロンプト表示
-- 非対話環境では `-y/--yes` で同意を自動承認できます
-- ポリシー違反や未充足は `ATO_ERR_*` JSONL を `stderr` に出力
+- Minimal output on success (tool stdout-first)
+- Prompt only when explicit consent is required
+- In non-interactive environments, `-y/--yes` auto-approves consent
+- Policy violations and unmet requirements are emitted as `ATO_ERR_*` JSONL to `stderr`
 
-## セキュリティと実行ポリシー（Zero-Trust / Fail-closed）
+## Security and Execution Policy (Zero-Trust / Fail-closed)
 
-- 必須環境変数検証: `targets.<label>.required_env`（または `ATO_ORCH_REQUIRED_ENVS`）が未設定/空文字なら起動前に停止
-- 危険フラグ制御: `--dangerously-skip-permissions` は `CAPSULE_ALLOW_UNSAFE=1` がない限り拒否
-- ローカルレジストリ書き込み認証: `registry serve --auth-token` 利用時、publish は `ATO_TOKEN` 必須
-- エンジン自動取得: チェックサム取得/検証に失敗した場合は fail-closed で停止
+- Required env validation: startup fails if `targets.<label>.required_env` (or `ATO_ORCH_REQUIRED_ENVS`) is missing/empty
+- Dangerous flag guard: `--dangerously-skip-permissions` is rejected unless `CAPSULE_ALLOW_UNSAFE=1`
+- Local registry write auth: when `registry serve --auth-token` is enabled, `publish` requires `ATO_TOKEN`
+- Engine auto-install: checksum retrieval/verification failures stop execution fail-closed
 
-## 環境変数リファレンス（主要）
+## Environment Variable Reference (Core)
 
-- `CAPSULE_WATCH_DEBOUNCE_MS`: `open --watch` のデバウンス間隔（ms, default: `300`）
-- `CAPSULE_ALLOW_UNSAFE`: `--dangerously-skip-permissions` の明示許可（`1` のみ有効）
-- `ATO_TOKEN`: ローカル/私設レジストリへの publish 認証トークン
-- `ATO_STORE_API_URL`: `ato search` / install 系で使う API ベースURL（default: `https://api.ato.run`）
-- `ATO_STORE_SITE_URL`: ストアWebのベースURL（default: `https://store.ato.run`）
-- `ATO_SESSION_TOKEN`: セッション認証トークン（`CAPSULE_SESSION_TOKEN` は互換）
+- `CAPSULE_WATCH_DEBOUNCE_MS`: debounce interval for `open --watch` (ms, default: `300`)
+- `CAPSULE_ALLOW_UNSAFE`: explicit allow for `--dangerously-skip-permissions` (only `1` is valid)
+- `ATO_TOKEN`: auth token for local/private registry publish
+- `ATO_STORE_API_URL`: API base URL for `ato search` / install flows (default: `https://api.ato.run`)
+- `ATO_STORE_SITE_URL`: store web base URL (default: `https://store.ato.run`)
+- `ATO_SESSION_TOKEN`: session token (`CAPSULE_SESSION_TOKEN` is supported for compatibility)
 
-## 検索・認証
+## Search and Auth
 
 ```bash
 ato search ai
@@ -172,12 +175,12 @@ ato login
 ato whoami
 ```
 
-既定API:
+Default endpoints:
 - `ATO_STORE_API_URL` (default: `https://api.ato.run`)
 - `ATO_STORE_SITE_URL` (default: `https://store.ato.run`)
-- `ATO_SESSION_TOKEN` (`CAPSULE_SESSION_TOKEN` は互換)
+- `ATO_SESSION_TOKEN` (`CAPSULE_SESSION_TOKEN` is compatibility alias)
 
-## 開発用テスト
+## Development Tests
 
 ```bash
 cargo test -p capsule-core execution_plan:: --lib
