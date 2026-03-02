@@ -271,7 +271,12 @@ fn run_runtime(
         let secrets = collect_runtime_secrets(execution_plan);
         if !secrets.is_empty() {
             _secret_fd_guard = Some(inject_secrets_via_fd3(&mut cmd, &secrets)?);
-            cmd.arg("--allow-env");
+            let has_allow_env = cmd
+                .get_args()
+                .any(|arg| arg.to_string_lossy().starts_with("--allow-env"));
+            if !has_allow_env {
+                cmd.arg("--allow-env");
+            }
         }
     }
 
