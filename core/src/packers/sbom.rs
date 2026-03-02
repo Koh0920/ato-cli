@@ -188,7 +188,7 @@ fn sha256_hex_file(path: &Path) -> Result<String> {
     let file = fs::File::open(path).map_err(CapsuleError::Io)?;
     let mut reader = BufReader::new(file);
     let mut hasher = Sha256::new();
-    let mut buf = [0u8; 16 * 1024];
+    let mut buf = [0u8; 64 * 1024];
     loop {
         let read = reader.read(&mut buf).map_err(CapsuleError::Io)?;
         if read == 0 {
@@ -202,6 +202,7 @@ fn sha256_hex_file(path: &Path) -> Result<String> {
 fn collect_lockfile_packages(files: &[(String, PathBuf)]) -> Vec<SpdxPackage> {
     let mut packages = BTreeMap::<String, SpdxPackage>::new();
     for (archive_path, disk_path) in files {
+        // Lockfile names are normalized by packers into archive paths.
         let file_name = archive_path
             .rsplit('/')
             .next()
@@ -280,7 +281,9 @@ fn parse_uv_lock(path: &Path, packages: &mut BTreeMap<String, SpdxPackage>) {
 }
 
 fn insert_package(packages: &mut BTreeMap<String, SpdxPackage>, name: &str, version: &str) {
-    if name.trim().is_empty() || version.trim().is_empty() {
+    let name = name.trim();
+    let version = version.trim();
+    if name.is_empty() || version.is_empty() {
         return;
     }
     let key = format!("{name}@{version}");

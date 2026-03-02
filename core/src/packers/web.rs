@@ -10,7 +10,7 @@ use zstd::stream::encode_all;
 use crate::error::{CapsuleError, Result};
 use crate::lockfile;
 use crate::manifest;
-use crate::packers::sbom::{generate_embedded_sbom_async, SBOM_PATH};
+use crate::packers::sbom::{generate_embedded_sbom, SBOM_PATH};
 use crate::router::ManifestData;
 
 #[derive(Debug, Clone)]
@@ -102,7 +102,7 @@ pub fn pack(
         .append_path_with_name(&lockfile_path, "capsule.lock")
         .map_err(CapsuleError::Io)?;
 
-    let sbom = generate_sbom_for_sync_context(loaded.model.name.clone(), sbom_files)?;
+    let sbom = generate_embedded_sbom(&loaded.model.name, &sbom_files)?;
     let sbom_tmp = temp_dir.path().join(SBOM_PATH);
     fs::write(&sbom_tmp, sbom.document).map_err(CapsuleError::Io)?;
     outer
@@ -166,19 +166,6 @@ fn ensure_lockfile(
         manifest_text,
         reporter,
     ))
-}
-
-fn generate_sbom_for_sync_context(
-    capsule_name: String,
-    sbom_files: Vec<(String, PathBuf)>,
-) -> Result<crate::packers::sbom::EmbeddedSbom> {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        return tokio::task::block_in_place(|| {
-            handle.block_on(generate_embedded_sbom_async(capsule_name, sbom_files))
-        });
-    }
-    let rt = tokio::runtime::Runtime::new().map_err(CapsuleError::Io)?;
-    rt.block_on(generate_embedded_sbom_async(capsule_name, sbom_files))
 }
 
 fn resolve_static_entrypoint(manifest_dir: &Path, entrypoint: &str) -> Result<(PathBuf, PathBuf)> {
