@@ -1,5 +1,6 @@
+use std::collections::BTreeMap;
 use std::fs;
-use std::io::Read;
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
@@ -54,6 +55,27 @@ struct SpdxDocument {
     #[serde(rename = "creationInfo")]
     creation_info: SpdxCreationInfo,
     files: Vec<SpdxFile>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    packages: Vec<SpdxPackage>,
+}
+
+#[derive(Serialize, Clone)]
+struct SpdxPackage {
+    #[serde(rename = "SPDXID")]
+    spdx_id: String,
+    name: String,
+    #[serde(rename = "versionInfo", skip_serializing_if = "Option::is_none")]
+    version_info: Option<String>,
+    #[serde(rename = "downloadLocation")]
+    download_location: String,
+    #[serde(rename = "filesAnalyzed")]
+    files_analyzed: bool,
+    #[serde(rename = "licenseConcluded")]
+    license_concluded: String,
+    #[serde(rename = "licenseDeclared")]
+    license_declared: String,
+    #[serde(rename = "copyrightText")]
+    copyright_text: String,
 }
 
 pub fn generate_embedded_sbom(
@@ -62,17 +84,18 @@ pub fn generate_embedded_sbom(
 ) -> Result<EmbeddedSbom> {
     let mut sbom_files = Vec::new();
     for (archive_path, disk_path) in files {
-        let data = fs::read(disk_path).map_err(CapsuleError::Io)?;
+        let file_hash = sha256_hex_file(disk_path)?;
         sbom_files.push(SpdxFile {
             spdx_id: format!("SPDXRef-File-{}", sanitize_spdx_id(archive_path)),
             file_name: archive_path.clone(),
             checksums: vec![SpdxChecksum {
                 algorithm: "SHA256".to_string(),
-                checksum_value: sha256_hex(&data),
+                checksum_value: file_hash,
             }],
         });
     }
     sbom_files.sort_by(|a, b| a.file_name.cmp(&b.file_name));
+    let sbom_packages = collect_lockfile_packages(files);
 
     let document = SpdxDocument {
         spdx_version: "SPDX-2.3".to_string(),
@@ -89,12 +112,22 @@ pub fn generate_embedded_sbom(
             creators: vec!["Tool: ato-cli".to_string()],
         },
         files: sbom_files,
+        packages: sbom_packages,
     };
     let document = serde_json::to_string_pretty(&document)
         .map_err(|e| CapsuleError::Pack(format!("Failed to serialize SBOM: {e}")))?;
     let sha256 = sha256_hex(document.as_bytes());
 
     Ok(EmbeddedSbom { document, sha256 })
+}
+
+pub async fn generate_embedded_sbom_async(
+    capsule_name: String,
+    files: Vec<(String, PathBuf)>,
+) -> Result<EmbeddedSbom> {
+    tokio::task::spawn_blocking(move || generate_embedded_sbom(&capsule_name, &files))
+        .await
+        .map_err(|e| CapsuleError::Pack(format!("SBOM generation task failed: {e}")))?
 }
 
 pub fn extract_and_verify_embedded_sbom(capsule_path: &Path) -> Result<String> {
@@ -149,6 +182,152 @@ fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     format!("{:x}", hasher.finalize())
+}
+
+fn sha256_hex_file(path: &Path) -> Result<String> {
+    let file = fs::File::open(path).map_err(CapsuleError::Io)?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        let read = reader.read(&mut buf).map_err(CapsuleError::Io)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn collect_lockfile_packages(files: &[(String, PathBuf)]) -> Vec<SpdxPackage> {
+    let mut packages = BTreeMap::<String, SpdxPackage>::new();
+    for (archive_path, disk_path) in files {
+        let file_name = archive_path
+            .rsplit('/')
+            .next()
+            .unwrap_or(archive_path.as_str());
+        match file_name {
+            "package-lock.json" => parse_package_lock(disk_path, &mut packages),
+            "deno.lock" => parse_deno_lock(disk_path, &mut packages),
+            "uv.lock" => parse_uv_lock(disk_path, &mut packages),
+            _ => {}
+        }
+    }
+    packages.into_values().collect()
+}
+
+fn parse_package_lock(path: &Path, packages: &mut BTreeMap<String, SpdxPackage>) {
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return;
+    };
+
+    if let Some(obj) = json.get("packages").and_then(|v| v.as_object()) {
+        for (lock_path, value) in obj {
+            let version = value.get("version").and_then(|v| v.as_str());
+            let explicit_name = value.get("name").and_then(|v| v.as_str());
+            let inferred_name = package_name_from_lock_path(lock_path);
+            if let (Some(name), Some(version)) =
+                (explicit_name.or(inferred_name.as_deref()), version)
+            {
+                insert_package(packages, name, version);
+            }
+        }
+    }
+}
+
+fn parse_deno_lock(path: &Path, packages: &mut BTreeMap<String, SpdxPackage>) {
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return;
+    };
+    let Some(lock_packages) = json.get("packages").and_then(|v| v.as_object()) else {
+        return;
+    };
+    for key in ["npm", "jsr"] {
+        let Some(ecosystem) = lock_packages.get(key).and_then(|v| v.as_object()) else {
+            continue;
+        };
+        for package_key in ecosystem.keys() {
+            if let Some((name, version)) = parse_name_version_from_lock_key(package_key) {
+                insert_package(packages, &name, &version);
+            }
+        }
+    }
+}
+
+fn parse_uv_lock(path: &Path, packages: &mut BTreeMap<String, SpdxPackage>) {
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(doc) = text.parse::<toml::Value>() else {
+        return;
+    };
+    let Some(entries) = doc.get("package").and_then(|v| v.as_array()) else {
+        return;
+    };
+    for entry in entries {
+        let name = entry.get("name").and_then(|v| v.as_str());
+        let version = entry.get("version").and_then(|v| v.as_str());
+        if let (Some(name), Some(version)) = (name, version) {
+            insert_package(packages, name, version);
+        }
+    }
+}
+
+fn insert_package(packages: &mut BTreeMap<String, SpdxPackage>, name: &str, version: &str) {
+    if name.trim().is_empty() || version.trim().is_empty() {
+        return;
+    }
+    let key = format!("{name}@{version}");
+    packages.entry(key).or_insert_with(|| SpdxPackage {
+        spdx_id: format!(
+            "SPDXRef-Package-{}",
+            sanitize_spdx_id(&format!("{name}-{version}"))
+        ),
+        name: name.to_string(),
+        version_info: Some(version.to_string()),
+        download_location: "NOASSERTION".to_string(),
+        files_analyzed: false,
+        license_concluded: "NOASSERTION".to_string(),
+        license_declared: "NOASSERTION".to_string(),
+        copyright_text: "NOASSERTION".to_string(),
+    });
+}
+
+fn package_name_from_lock_path(lock_path: &str) -> Option<String> {
+    if lock_path.is_empty() {
+        return None;
+    }
+    let segment = lock_path.rsplit("node_modules/").next()?;
+    let mut parts = segment.split('/');
+    let first = parts.next()?;
+    if first.starts_with('@') {
+        let second = parts.next()?;
+        Some(format!("{first}/{second}"))
+    } else {
+        Some(first.to_string())
+    }
+}
+
+fn parse_name_version_from_lock_key(raw_key: &str) -> Option<(String, String)> {
+    let key = raw_key
+        .trim_start_matches("npm:")
+        .trim_start_matches("jsr:")
+        .trim();
+    let split = key.rfind('@')?;
+    if split == 0 || split + 1 >= key.len() {
+        return None;
+    }
+    let (name, version) = key.split_at(split);
+    Some((
+        name.to_string(),
+        version.trim_start_matches('@').to_string(),
+    ))
 }
 
 fn sanitize_spdx_id(path: &str) -> String {
@@ -227,5 +406,53 @@ mod tests {
         let extracted = extract_and_verify_embedded_sbom(&capsule_path).expect("extract");
         let parsed: serde_json::Value = serde_json::from_str(&extracted).expect("json");
         assert_eq!(parsed["spdxVersion"], "SPDX-2.3");
+    }
+
+    #[test]
+    fn sbom_includes_lockfile_packages_when_present() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pkg_lock = tmp.path().join("package-lock.json");
+        let deno_lock = tmp.path().join("deno.lock");
+        let uv_lock = tmp.path().join("uv.lock");
+        fs::write(
+            &pkg_lock,
+            r#"{"packages":{"":{"name":"demo","version":"0.1.0"},"node_modules/lodash":{"version":"4.17.21"}}}"#,
+        )
+        .expect("write package-lock");
+        fs::write(
+            &deno_lock,
+            r#"{"version":"5","packages":{"npm":{"chalk@5.3.0":{"integrity":"x"}}}}"#,
+        )
+        .expect("write deno.lock");
+        fs::write(
+            &uv_lock,
+            r#"[[package]]
+name = "requests"
+version = "2.32.3"
+"#,
+        )
+        .expect("write uv.lock");
+
+        let sbom = generate_embedded_sbom(
+            "demo",
+            &[
+                ("source/package-lock.json".to_string(), pkg_lock),
+                ("source/deno.lock".to_string(), deno_lock),
+                ("source/uv.lock".to_string(), uv_lock),
+            ],
+        )
+        .expect("sbom");
+        let parsed: serde_json::Value = serde_json::from_str(&sbom.document).expect("json");
+        let packages = parsed
+            .get("packages")
+            .and_then(|v| v.as_array())
+            .expect("packages");
+        let names: Vec<_> = packages
+            .iter()
+            .filter_map(|v| v.get("name").and_then(|n| n.as_str()))
+            .collect();
+        assert!(names.contains(&"lodash"));
+        assert!(names.contains(&"chalk"));
+        assert!(names.contains(&"requests"));
     }
 }

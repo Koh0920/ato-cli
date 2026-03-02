@@ -11,7 +11,7 @@ use zstd::stream::encode_all;
 
 use crate::error::Result as CapsuleResult;
 use crate::packers::pack_filter::PackFilter;
-use crate::packers::sbom::{generate_embedded_sbom, SBOM_PATH};
+use crate::packers::sbom::{generate_embedded_sbom_async, SBOM_PATH};
 use crate::r3_config;
 
 /// Capsule Format v2 PAX TAR Archive Structure:
@@ -150,7 +150,7 @@ pub async fn pack(
     fs::write(&manifest_temp_path, &manifest_content)?;
     outer_ar.append_path_with_name(&manifest_temp_path, "capsule.toml")?;
 
-    let sbom = generate_embedded_sbom(&loaded.model.name, &sbom_files)?;
+    let sbom = generate_embedded_sbom_async(loaded.model.name.clone(), sbom_files).await?;
     let sbom_temp_path = temp_dir.join(SBOM_PATH);
     fs::write(&sbom_temp_path, &sbom.document)?;
     outer_ar.append_path_with_name(&sbom_temp_path, SBOM_PATH)?;
@@ -166,8 +166,10 @@ pub async fn pack(
             "format": "spdx-json",
         }
     });
-    let signature_bytes = serde_json::to_vec_pretty(&signature).map_err(|e| {
-        crate::error::CapsuleError::Pack(format!("Failed to serialize signature metadata: {e}"))
+    let signature_bytes = serde_jcs::to_vec(&signature).map_err(|e| {
+        crate::error::CapsuleError::Pack(format!(
+            "Failed to serialize signature metadata (JCS): {e}"
+        ))
     })?;
     fs::write(&sig_temp_path, signature_bytes)?;
     outer_ar.append_path_with_name(&sig_temp_path, "signature.json")?;
