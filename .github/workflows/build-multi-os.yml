@@ -1,40 +1,12 @@
 name: Build (Multi OS)
 
 on:
-  pull_request:
-    branches:
-      - main
   push:
+    branches:
+      - dev
+      - main
     tags:
       - "v*.*.*"
-  workflow_dispatch:
-    inputs:
-      upload_r2:
-        description: "Upload packaged artifacts to R2"
-        required: false
-        default: true
-        type: boolean
-      deploy_env:
-        description: "R2 deployment environment"
-        required: false
-        default: "staging"
-        type: choice
-        options:
-          - staging
-          - production
-      version:
-        description: "Release version (optional; empty uses Cargo.toml version)"
-        required: false
-        type: string
-      update_latest:
-        description: "Update ato/latest/* in addition to versioned path"
-        required: false
-        default: true
-        type: boolean
-      bucket:
-        description: "R2 bucket override (optional)"
-        required: false
-        type: string
 
 permissions:
   contents: read
@@ -175,7 +147,7 @@ jobs:
     name: Upload to R2
     needs: build
     runs-on: ubuntu-latest
-    if: ${{ !github.event.repository.fork && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.upload_r2 == 'true')) }}
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
     env:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -184,9 +156,27 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check tag commit is on main
+        id: tag_main_check
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git fetch --no-tags origin main:refs/remotes/origin/main
+
+          if git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "on_main=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "on_main=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping R2 upload because tag commit is not contained in origin/main."
+          fi
 
       - name: Check Cloudflare secrets
         id: secrets_check
+        if: ${{ steps.tag_main_check.outputs.on_main == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -199,7 +189,7 @@ jobs:
           fi
 
       - name: Download packaged artifacts
-        if: ${{ steps.secrets_check.outputs.available == 'true' }}
+        if: ${{ steps.tag_main_check.outputs.on_main == 'true' && steps.secrets_check.outputs.available == 'true' }}
         uses: actions/download-artifact@v4
         with:
           pattern: release-*
@@ -207,18 +197,18 @@ jobs:
           merge-multiple: true
 
       - name: Set up Node.js
-        if: ${{ steps.secrets_check.outputs.available == 'true' }}
+        if: ${{ steps.tag_main_check.outputs.on_main == 'true' && steps.secrets_check.outputs.available == 'true' }}
         uses: actions/setup-node@v4
         with:
           node-version: "22"
 
       - name: Install Wrangler CLI
-        if: ${{ steps.secrets_check.outputs.available == 'true' }}
+        if: ${{ steps.tag_main_check.outputs.on_main == 'true' && steps.secrets_check.outputs.available == 'true' }}
         run: npm install -g wrangler@4
 
       - name: Prepare upload bundle
         id: prepare
-        if: ${{ steps.secrets_check.outputs.available == 'true' }}
+        if: ${{ steps.tag_main_check.outputs.on_main == 'true' && steps.secrets_check.outputs.available == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -234,37 +224,20 @@ jobs:
             exit 1
           fi
 
-          version_input="${{ github.event.inputs.version }}"
+          version_input=""
           if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
             release_version="${GITHUB_REF#refs/tags/}"
-          elif [[ -n "$version_input" ]]; then
-            version_input="${version_input#v}"
-            if [[ "$version_input" != "$cargo_version" ]]; then
-              echo "workflow_dispatch version ($version_input) must match Cargo.toml version ($cargo_version)" >&2
-              exit 1
-            fi
-            release_version="$version_input"
           elif [[ "${{ github.event_name }}" == "push" ]]; then
             release_version="${cargo_version}-${GITHUB_SHA::7}"
           else
             release_version="$cargo_version"
           fi
 
-          deploy_env_input="${{ github.event.inputs.deploy_env }}"
-          if [[ "${{ github.event_name }}" == "push" || -z "$deploy_env_input" ]]; then
-            deploy_env="staging"
-          else
-            deploy_env="$deploy_env_input"
-          fi
+          deploy_env="staging"
 
-          update_latest_input="${{ github.event.inputs.update_latest }}"
-          if [[ "$update_latest_input" == "false" ]]; then
-            update_latest="0"
-          else
-            update_latest="1"
-          fi
+          update_latest="1"
 
-          bucket_input="${{ github.event.inputs.bucket }}"
+          bucket_input=""
           source_dir="/tmp/ato-release/${release_version}"
           mkdir -p "$source_dir"
 
@@ -293,7 +266,7 @@ jobs:
           echo "source_dir=$source_dir" >> "$GITHUB_OUTPUT"
 
       - name: Upload archives to R2
-        if: ${{ steps.secrets_check.outputs.available == 'true' }}
+        if: ${{ steps.tag_main_check.outputs.on_main == 'true' && steps.secrets_check.outputs.available == 'true' }}
         shell: bash
         env:
           VERSION: ${{ steps.prepare.outputs.release_version }}
@@ -304,8 +277,8 @@ jobs:
           WRANGLER_CONFIG: ""
         run: ./scripts/upload_release_to_r2.sh
 
-      - name: Upload archives to R2 (production mirror for main push)
-        if: ${{ steps.secrets_check.outputs.available == 'true' && github.event_name == 'push' }}
+      - name: Upload archives to R2 (production mirror for main tag push)
+        if: ${{ steps.tag_main_check.outputs.on_main == 'true' && steps.secrets_check.outputs.available == 'true' }}
         shell: bash
         env:
           VERSION: ${{ steps.prepare.outputs.release_version }}
@@ -315,8 +288,8 @@ jobs:
           WRANGLER_CONFIG: ""
         run: ./scripts/upload_release_to_r2.sh
 
-      - name: Upload archives to R2 (semver alias for main push)
-        if: ${{ steps.secrets_check.outputs.available == 'true' && github.event_name == 'push' }}
+      - name: Upload archives to R2 (semver alias for main tag push)
+        if: ${{ steps.tag_main_check.outputs.on_main == 'true' && steps.secrets_check.outputs.available == 'true' }}
         shell: bash
         env:
           VERSION: ${{ steps.prepare.outputs.cargo_version }}
@@ -327,8 +300,8 @@ jobs:
           WRANGLER_CONFIG: ""
         run: ./scripts/upload_release_to_r2.sh
 
-      - name: Upload archives to R2 (production semver alias for main push)
-        if: ${{ steps.secrets_check.outputs.available == 'true' && github.event_name == 'push' }}
+      - name: Upload archives to R2 (production semver alias for main tag push)
+        if: ${{ steps.tag_main_check.outputs.on_main == 'true' && steps.secrets_check.outputs.available == 'true' }}
         shell: bash
         env:
           VERSION: ${{ steps.prepare.outputs.cargo_version }}
