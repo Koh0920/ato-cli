@@ -354,6 +354,7 @@ async fn execute_normal_mode(args: OpenArgs) -> Result<()> {
     let decision = compiled.runtime_decision;
     let tier = compiled.tier;
 
+    preflight_required_environment_variables(&decision.plan)?;
     preflight_deno_orchestrator_requirements(&decision.plan)?;
 
     let lockfile_path = manifest_path.parent().map(|p| p.join("capsule.lock"));
@@ -682,33 +683,36 @@ fn preflight_deno_orchestrator_requirements(
         }
     }
 
-    let required_envs = plan
-        .execution_env()
-        .get("ATO_ORCH_REQUIRED_ENVS")
-        .cloned()
-        .unwrap_or_default();
-    if required_envs.trim().is_empty() {
+    Ok(())
+}
+
+fn preflight_required_environment_variables(
+    plan: &capsule_core::router::ManifestData,
+) -> Result<()> {
+    let required = plan.execution_required_envs();
+    if required.is_empty() {
         return Ok(());
     }
 
-    let missing: Vec<String> = required_envs
-        .split(',')
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .filter(|name| std::env::var_os(name).is_none())
-        .map(|name| name.to_string())
+    let missing: Vec<String> = required
+        .into_iter()
+        .filter(|name| {
+            std::env::var(name)
+                .map(|v| v.trim().is_empty())
+                .unwrap_or(true)
+        })
         .collect();
 
-    if !missing.is_empty() {
-        return Err(AtoExecutionError::policy_violation(format!(
-            "missing required environment variables for orchestrator target '{}': {}",
-            plan.selected_target_label(),
-            missing.join(", ")
-        ))
-        .into());
+    if missing.is_empty() {
+        return Ok(());
     }
 
-    Ok(())
+    Err(AtoExecutionError::policy_violation(format!(
+        "missing required environment variables for target '{}': {} (set them before `ato run`)",
+        plan.selected_target_label(),
+        missing.join(", ")
+    ))
+    .into())
 }
 
 fn preflight_macos_compat(plan: &capsule_core::router::ManifestData) -> Result<()> {
