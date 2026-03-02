@@ -32,3 +32,5 @@ target/
 # Ignore npm/node_modules if any (not typical for Rust projects)
 node_modules/
 session-*.md
+*.key
+*.bak

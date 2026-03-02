@@ -14,7 +14,7 @@
 必須ルール:
 
 1. 実行前に絶対パスを固定する:
-   - `SKILL_DIR="/Users/egamikohsuke/Ekoh/projects/ato/capsuled-dev/apps/ato-cli/skills/ato-deploy-staging"`
+   - `SKILL_DIR="/ABSOLUTE/PATH/TO/apps/ato-cli/skills/ato-deploy-staging"`
 2. 最初にユーザーへ次を確認する:
    - 対象プロジェクト
    - `REPO_URL`

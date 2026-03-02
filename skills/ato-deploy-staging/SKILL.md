@@ -2,7 +2,7 @@
 name: ato-deploy-staging
 description: GitHubリポジトリをAto staging環境へデプロイし、同期・実行確認まで行う運用スキル
 permissions:
-  egress_allow: ["staging.api.ato.run", "api.github.com", "github.com"]
+  egress_allow: ["<STAGING_API_DOMAIN>", "api.github.com", "github.com"]
 ---
 
 # Ato Deploy Staging Skill
@@ -42,7 +42,7 @@ permissions:
 
 - `REPO_URL` 例: `https://github.com/koh0920/byok-dynamic-http`
 - `SCOPED_ID` 例: `koh0920/byok-dynamic-http`
-- `REGISTRY_URL` 固定: `https://staging.api.ato.run`
+- `REGISTRY_URL` 固定: `https://<STAGING_API_DOMAIN>`
 - `TARGET_ATO_VERSION` 固定: `0.3.0`
 
 ## Procedure
@@ -68,7 +68,7 @@ permissions:
    - `ato --version`（インストール済み時のみ）
 2. 状態サマリをユーザーに提示し、**「この状態で次へ進むか」** を確認する。
 3. `ato` 未インストール時、または `ato --version` が `0.3.0` 以下の場合は、次の staging 専用コマンドで再ダウンロードさせる:
-   - `curl -fsSL https://staging.store.ato.run/install.sh | ATO_RELEASE_BASE_URL=https://stg-dl.ato.run sh`
+  - `curl -fsSL https://<STAGING_STORE_DOMAIN>/install.sh | ATO_RELEASE_BASE_URL=https://<STAGING_DOWNLOAD_DOMAIN> sh`
 4. 再ダウンロード後は `ato --version` を再確認し、`TARGET_ATO_VERSION(0.3.0)` 未満ならエラーとして停止する。
 
 ### Phase 2: カプセル化（必須）
@@ -108,9 +108,9 @@ permissions:
 
 5. デプロイが完了しない場合の原因分類と通知
    - `ato` コマンド自体が見つからない:
-     - 通知: 「Ato CLI が未インストールです。次を実行してインストールしてください: `curl -fsSL https://staging.store.ato.run/install.sh | ATO_RELEASE_BASE_URL=https://stg-dl.ato.run sh`」
+    - 通知: 「Ato CLI が未インストールです。次を実行してインストールしてください: `curl -fsSL https://<STAGING_STORE_DOMAIN>/install.sh | ATO_RELEASE_BASE_URL=https://<STAGING_DOWNLOAD_DOMAIN> sh`」
    - `ato` バージョンが `0.3.0` 以下:
-     - 通知: 「Ato CLI が古いため再ダウンロードします。`curl -fsSL https://staging.store.ato.run/install.sh | ATO_RELEASE_BASE_URL=https://stg-dl.ato.run sh` を実行後、`ato --version` を確認してください。」
+    - 通知: 「Ato CLI が古いため再ダウンロードします。`curl -fsSL https://<STAGING_STORE_DOMAIN>/install.sh | ATO_RELEASE_BASE_URL=https://<STAGING_DOWNLOAD_DOMAIN> sh` を実行後、`ato --version` を確認してください。」
    - `ato whoami` で未ログイン:
      - 通知: 「Ato にログインされていません。`ato login` を実行してください。」
    - publisher / アカウント未作成で publish 拒否:
@@ -137,7 +137,7 @@ permissions:
 成功時は次のURLをユーザーに返す:
 
 1. Store URL（必須）  
-   - `https://staging.store.ato.run/capsules/<publisher>/<slug>`
+  - `https://<STAGING_STORE_DOMAIN>/capsules/<publisher>/<slug>`
 2. Playground URL（取得できた場合）  
    - API応答の `playground_url` または `playground_theater_url` を優先して返す。
 
