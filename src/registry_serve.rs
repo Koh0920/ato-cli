@@ -13,6 +13,7 @@ use axum::{Json, Router};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
 
 #[derive(Debug, Clone)]
@@ -679,11 +680,19 @@ fn validate_write_auth(headers: &HeaderMap, expected_token: Option<&str>) -> Res
         .map(str::trim)
         .filter(|v| !v.is_empty());
 
-    if actual == Some(expected) {
+    if constant_time_token_eq(expected.as_bytes(), actual.unwrap_or("").as_bytes()) {
         return Ok(());
     }
 
     Err("Bearer token is required for upload".to_string())
+}
+
+fn constant_time_token_eq(expected: &[u8], actual: &[u8]) -> bool {
+    use sha2::{Digest, Sha256};
+
+    let expected_digest = Sha256::digest(expected);
+    let actual_digest = Sha256::digest(actual);
+    expected_digest[..].ct_eq(&actual_digest[..]).into()
 }
 
 fn resolve_public_base_url(headers: &HeaderMap, fallback: &str) -> String {
@@ -1046,6 +1055,13 @@ mod tests {
         assert!(validate_write_auth(&headers, Some("wrong-token")).is_err());
         let empty = HeaderMap::new();
         assert!(validate_write_auth(&empty, Some("secret-token")).is_err());
+    }
+
+    #[test]
+    fn constant_time_token_eq_handles_length_mismatch() {
+        assert!(constant_time_token_eq(b"secret-token", b"secret-token"));
+        assert!(!constant_time_token_eq(b"secret-token", b"secret-token-x"));
+        assert!(!constant_time_token_eq(b"secret-token", b"secret"));
     }
 
     #[test]
