@@ -105,7 +105,7 @@ fn run_provisioning(
             cmd.arg("--lock").arg(lock_path).arg("--frozen");
         }
         DependencyLock::PackageJson(_) => {
-            cmd.arg("--node-modules-dir=auto");
+            cmd.arg("--node-modules-dir");
         }
     }
     cmd.arg(entrypoint)
@@ -162,7 +162,7 @@ fn run_runtime(
             cmd.arg("--lock").arg(lock_path).arg("--frozen");
         }
         DependencyLock::PackageJson(_) => {
-            cmd.arg("--node-modules-dir=auto");
+            cmd.arg("--node-modules-dir");
         }
     }
 
