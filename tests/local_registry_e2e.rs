@@ -484,6 +484,137 @@ port = {static_port}
 }
 
 #[test]
+fn e2e_local_registry_v3_sync_endpoints_roundtrip() -> Result<()> {
+    let ato = assert_cmd::cargo::cargo_bin("ato");
+    let tmp = TempDir::new().context("create temp dir")?;
+    let home_dir = tmp.path().join("home");
+    std::fs::create_dir_all(&home_dir)?;
+    let data_dir = tmp.path().join("registry-data");
+    let project_dir = tmp.path().join("project-v3-sync");
+    let local_cas_dir = tmp.path().join("local-cas");
+    std::fs::create_dir_all(&project_dir)?;
+    std::fs::create_dir_all(&local_cas_dir)?;
+
+    std::fs::write(
+        project_dir.join("capsule.toml"),
+        r#"schema_version = "0.2"
+name = "test-v3-sync"
+version = "1.0.0"
+type = "app"
+default_target = "cli"
+
+[targets.cli]
+runtime = "source"
+driver = "deno"
+runtime_version = "1.46.3"
+entrypoint = "main.ts"
+"#,
+    )?;
+    std::fs::write(
+        project_dir.join("main.ts"),
+        r#"console.log("hello v3 sync");"#,
+    )?;
+    std::fs::write(
+        project_dir.join("deno.lock"),
+        r#"{"version":"5","specifiers":{},"packages":{}}"#,
+    )?;
+
+    let build = Command::new(&ato)
+        .args(["build", "."])
+        .current_dir(&project_dir)
+        .env("HOME", &home_dir)
+        .env("ATO_EXPERIMENTAL_V3_PACK", "1")
+        .env("ATO_CAS_ROOT", &local_cas_dir)
+        .output()
+        .context("run build with v3")?;
+    assert!(
+        build.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let artifact = project_dir.join("test-v3-sync.capsule");
+    assert!(
+        artifact.exists(),
+        "artifact missing: {}",
+        artifact.display()
+    );
+
+    let Some((_guard, base_url)) = start_local_registry_or_skip(
+        &ato,
+        &data_dir,
+        "e2e_local_registry_v3_sync_endpoints_roundtrip",
+    )?
+    else {
+        return Ok(());
+    };
+
+    let publish = Command::new(&ato)
+        .args([
+            "publish",
+            "--deploy",
+            "--registry",
+            &base_url,
+            "--artifact",
+            artifact.to_string_lossy().as_ref(),
+            "--scoped-id",
+            "local/test-v3-sync",
+            "--json",
+        ])
+        .current_dir(&project_dir)
+        .env("HOME", &home_dir)
+        .env("ATO_CAS_ROOT", &local_cas_dir)
+        .output()
+        .context("publish artifact with v3 sync")?;
+    assert!(
+        publish.status.success(),
+        "publish failed: {}",
+        String::from_utf8_lossy(&publish.stderr)
+    );
+
+    let manifest_resp = reqwest::blocking::get(format!(
+        "{}/v1/releases/local/test-v3-sync/1.0.0/manifest",
+        base_url
+    ))
+    .context("fetch v3 manifest")?;
+    assert_eq!(
+        manifest_resp.status(),
+        reqwest::StatusCode::OK,
+        "manifest endpoint failed"
+    );
+    let manifest_json: serde_json::Value = manifest_resp.json().context("manifest json")?;
+    let first_chunk = manifest_json
+        .get("chunks")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|v| v.get("raw_hash"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .context("missing first chunk hash in manifest")?;
+
+    let chunk_resp = reqwest::blocking::get(format!(
+        "{}/v1/chunks/{}",
+        base_url,
+        urlencoding::encode(&first_chunk)
+    ))
+    .context("fetch chunk")?;
+    assert_eq!(chunk_resp.status(), reqwest::StatusCode::OK);
+    let cache_control = chunk_resp
+        .headers()
+        .get("cache-control")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        cache_control.contains("immutable"),
+        "chunk response should be immutable cacheable: {}",
+        cache_control
+    );
+
+    Ok(())
+}
+
+#[test]
 fn e2e_local_registry_node_python_run_fail_closed() -> Result<()> {
     let ato = assert_cmd::cargo::cargo_bin("ato");
     let tmp = TempDir::new().context("create temp dir")?;

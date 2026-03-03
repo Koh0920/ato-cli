@@ -5,10 +5,14 @@
 //! Legacy fallback: `/v1/capsules/by/:publisher/:slug/download`
 
 use anyhow::{bail, Context, Result};
+use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::{Arc, Once};
+use std::time::Duration;
+use tokio::sync::Semaphore;
 
 use crate::registry::RegistryResolver;
 
@@ -150,6 +154,19 @@ struct SuggestionCapsuleRow {
 #[derive(Debug, Deserialize)]
 struct SuggestionPublisher {
     handle: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum V3SyncOutcome {
+    Synced,
+    SkippedUnsupportedRegistry,
+    SkippedDisabledCas(capsule_core::capsule_v3::CasDisableReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChunkDownloadOutcome {
+    Stored,
+    UnsupportedRegistry,
 }
 
 fn is_valid_segment(value: &str) -> bool {
@@ -372,6 +389,23 @@ pub async fn install_app(
         }
     }
 
+    if let Some(v3_manifest) = extract_payload_v3_manifest_from_capsule(&bytes)? {
+        let sync_result = sync_v3_chunks_from_manifest(&client, &registry, &v3_manifest).await?;
+        match sync_result {
+            V3SyncOutcome::Synced => {}
+            V3SyncOutcome::SkippedUnsupportedRegistry => {
+                if !json_output {
+                    eprintln!(
+                        "ℹ️  Registry does not expose v3 chunk sync endpoint; falling back to embedded payload"
+                    );
+                }
+            }
+            V3SyncOutcome::SkippedDisabledCas(reason) => {
+                emit_cas_disabled_performance_warning_once(&reason, json_output);
+            }
+        }
+    }
+
     let store_root = output_dir.unwrap_or_else(|| {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -413,6 +447,264 @@ pub async fn install_app(
         path: output_path,
         content_hash: computed_blake3,
     })
+}
+
+fn extract_payload_v3_manifest_from_capsule(
+    bytes: &[u8],
+) -> Result<Option<capsule_core::capsule_v3::CapsuleManifestV3>> {
+    let mut archive = tar::Archive::new(std::io::Cursor::new(bytes));
+    let mut entries = archive
+        .entries()
+        .context("Failed to read .capsule archive entries")?;
+
+    while let Some(entry) = entries.next() {
+        let mut entry = entry.context("Invalid .capsule entry")?;
+        let entry_path = entry
+            .path()
+            .context("Failed to read archive entry path")?
+            .to_string_lossy()
+            .to_string();
+        if entry_path != capsule_core::capsule_v3::V3_PAYLOAD_MANIFEST_PATH {
+            continue;
+        }
+
+        let mut manifest_bytes = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut manifest_bytes)
+            .context("Failed to read payload.v3.manifest.json from artifact")?;
+        let manifest: capsule_core::capsule_v3::CapsuleManifestV3 =
+            serde_json::from_slice(&manifest_bytes)
+                .context("Failed to parse payload.v3.manifest.json from artifact")?;
+        capsule_core::capsule_v3::verify_artifact_hash(&manifest)
+            .context("Invalid payload.v3.manifest.json artifact_hash")?;
+        return Ok(Some(manifest));
+    }
+
+    Ok(None)
+}
+
+async fn sync_v3_chunks_from_manifest(
+    client: &reqwest::Client,
+    registry: &str,
+    manifest: &capsule_core::capsule_v3::CapsuleManifestV3,
+) -> Result<V3SyncOutcome> {
+    let cas = match capsule_core::capsule_v3::CasProvider::from_env() {
+        capsule_core::capsule_v3::CasProvider::Enabled(store) => store,
+        capsule_core::capsule_v3::CasProvider::Disabled(reason) => {
+            capsule_core::capsule_v3::CasProvider::log_disabled_once(
+                "install_v3_chunk_sync",
+                &reason,
+            );
+            return Ok(V3SyncOutcome::SkippedDisabledCas(reason));
+        }
+    };
+    let token = read_ato_token();
+    let concurrency = sync_concurrency_limit();
+    sync_v3_chunks_from_manifest_with_options(client, registry, manifest, cas, token, concurrency)
+        .await
+}
+
+fn emit_cas_disabled_performance_warning_once(
+    reason: &capsule_core::capsule_v3::CasDisableReason,
+    json_output: bool,
+) {
+    if json_output {
+        return;
+    }
+    static STDERR_WARN_ONCE: Once = Once::new();
+    STDERR_WARN_ONCE.call_once(|| {
+        eprintln!(
+            "⚠️  Performance warning: CAS is disabled (reason: {}). Falling back to v2 legacy mode.",
+            reason
+        );
+    });
+}
+
+async fn sync_v3_chunks_from_manifest_with_options(
+    client: &reqwest::Client,
+    registry: &str,
+    manifest: &capsule_core::capsule_v3::CapsuleManifestV3,
+    cas: capsule_core::capsule_v3::CasStore,
+    token: Option<String>,
+    concurrency: usize,
+) -> Result<V3SyncOutcome> {
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let mut downloads = FuturesUnordered::new();
+
+    for chunk in &manifest.chunks {
+        if cas
+            .has_chunk(&chunk.raw_hash)
+            .with_context(|| format!("Failed to check local CAS chunk {}", chunk.raw_hash))?
+        {
+            continue;
+        }
+        let client = client.clone();
+        let cas = cas.clone();
+        let registry = registry.to_string();
+        let token = token.clone();
+        let raw_hash = chunk.raw_hash.clone();
+        let raw_size = chunk.raw_size;
+        let semaphore = Arc::clone(&semaphore);
+
+        downloads.push(async move {
+            let _permit = semaphore
+                .acquire_owned()
+                .await
+                .map_err(|_| anyhow::anyhow!("v3 pull semaphore was closed"))?;
+            download_chunk_to_cas_with_retry(
+                &client,
+                &registry,
+                &cas,
+                &raw_hash,
+                raw_size,
+                token.as_deref(),
+            )
+            .await
+        });
+    }
+
+    while let Some(result) = downloads.next().await {
+        match result? {
+            ChunkDownloadOutcome::Stored => {}
+            ChunkDownloadOutcome::UnsupportedRegistry => {
+                return Ok(V3SyncOutcome::SkippedUnsupportedRegistry);
+            }
+        }
+    }
+
+    Ok(V3SyncOutcome::Synced)
+}
+
+async fn download_chunk_to_cas_with_retry(
+    client: &reqwest::Client,
+    registry: &str,
+    cas: &capsule_core::capsule_v3::CasStore,
+    raw_hash: &str,
+    raw_size: u32,
+    token: Option<&str>,
+) -> Result<ChunkDownloadOutcome> {
+    let endpoint = format!("{}/v1/chunks/{}", registry, urlencoding::encode(raw_hash));
+    const MAX_RETRIES: usize = 4;
+
+    for attempt in 0..=MAX_RETRIES {
+        let mut req = client.get(&endpoint);
+        if let Some(token) = token {
+            req = req.bearer_auth(token);
+        }
+
+        match req.send().await {
+            Ok(resp) if resp.status().is_success() => {
+                let bytes = resp.bytes().await.with_context(|| {
+                    format!("Failed to read downloaded chunk body {}", raw_hash)
+                })?;
+                verify_downloaded_chunk(raw_hash, raw_size, bytes.as_ref())?;
+                cas.put_chunk_zstd(raw_hash, bytes.as_ref())
+                    .with_context(|| format!("Failed to store downloaded chunk {}", raw_hash))?;
+                return Ok(ChunkDownloadOutcome::Stored);
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                if is_sync_not_supported_status(status) {
+                    return Ok(ChunkDownloadOutcome::UnsupportedRegistry);
+                }
+                if is_transient_status(status) && attempt < MAX_RETRIES {
+                    tokio::time::sleep(backoff_duration(attempt)).await;
+                    continue;
+                }
+                bail!(
+                    "v3 chunk download failed for {} ({}): {}",
+                    raw_hash,
+                    status.as_u16(),
+                    body.trim()
+                );
+            }
+            Err(err) => {
+                if is_transient_reqwest_error(&err) && attempt < MAX_RETRIES {
+                    tokio::time::sleep(backoff_duration(attempt)).await;
+                    continue;
+                }
+                return Err(err).with_context(|| {
+                    format!(
+                        "v3 chunk download request failed for {} via {}",
+                        raw_hash, endpoint
+                    )
+                });
+            }
+        }
+    }
+
+    bail!("v3 chunk download exhausted retries for {}", raw_hash)
+}
+
+fn verify_downloaded_chunk(raw_hash: &str, raw_size: u32, zstd_bytes: &[u8]) -> Result<()> {
+    let cursor = std::io::Cursor::new(zstd_bytes);
+    let mut decoder = zstd::Decoder::new(cursor)
+        .with_context(|| format!("Failed to decode downloaded chunk {}", raw_hash))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut total: u64 = 0;
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        let n = std::io::Read::read(&mut decoder, &mut buf)
+            .with_context(|| format!("Failed to read decoded bytes for {}", raw_hash))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        total = total.saturating_add(n as u64);
+    }
+
+    if total != raw_size as u64 {
+        bail!(
+            "downloaded chunk raw_size mismatch for {}: expected {} got {}",
+            raw_hash,
+            raw_size,
+            total
+        );
+    }
+
+    let got = format!("blake3:{}", hex::encode(hasher.finalize().as_bytes()));
+    if !equals_hash(raw_hash, &got) {
+        bail!(
+            "downloaded chunk hash mismatch for {}: expected {} got {}",
+            raw_hash,
+            raw_hash,
+            got
+        );
+    }
+
+    Ok(())
+}
+
+fn sync_concurrency_limit() -> usize {
+    std::env::var("ATO_SYNC_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|v| v.clamp(1, 128))
+        .unwrap_or(8)
+}
+
+fn is_sync_not_supported_status(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::NOT_FOUND
+            | reqwest::StatusCode::METHOD_NOT_ALLOWED
+            | reqwest::StatusCode::NOT_IMPLEMENTED
+    )
+}
+
+fn is_transient_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+fn is_transient_reqwest_error(err: &reqwest::Error) -> bool {
+    err.is_timeout() || err.is_connect() || err.is_request()
+}
+
+fn backoff_duration(attempt: usize) -> Duration {
+    let base_ms = 200u64.saturating_mul(1u64 << attempt.min(4));
+    Duration::from_millis(base_ms.min(2_000))
 }
 
 pub async fn fetch_capsule_detail(
@@ -589,6 +881,13 @@ fn equals_hash(expected: &str, got_raw: &str) -> bool {
     normalized_expected == normalized_got
 }
 
+fn read_ato_token() -> Option<String> {
+    std::env::var("ATO_TOKEN")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 fn ensure_signature_verified(signature_status: &str, allow_unverified: bool) -> Result<()> {
     if signature_status == "verified" || (allow_unverified && signature_status == "unverified") {
         return Ok(());
@@ -661,6 +960,16 @@ pub async fn suggest_scoped_capsules(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::{Path as AxumPath, State};
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use axum::routing::get;
+    use axum::Router;
+    use capsule_core::capsule_v3::{set_artifact_hash, CapsuleManifestV3, ChunkMeta};
+    use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::sync::Mutex as AsyncMutex;
 
     #[test]
     fn test_compute_blake3() {
@@ -745,5 +1054,286 @@ mod tests {
     fn test_parse_capsule_ref_rejects_slug_only() {
         assert!(parse_capsule_ref("sample-capsule").is_err());
         assert!(is_slug_only_ref("sample-capsule"));
+    }
+
+    #[derive(Clone)]
+    struct PullMockState {
+        zstd_by_hash: Arc<HashMap<String, Vec<u8>>>,
+        calls_by_hash: Arc<AsyncMutex<HashMap<String, usize>>>,
+        fail_once_hashes: Arc<AsyncMutex<HashSet<String>>>,
+        fail_n_times_by_hash: Arc<AsyncMutex<HashMap<String, usize>>>,
+        corrupt_hashes: Arc<HashSet<String>>,
+        total_gets: Arc<AtomicUsize>,
+    }
+
+    impl PullMockState {
+        fn new(zstd_by_hash: HashMap<String, Vec<u8>>) -> Self {
+            Self {
+                zstd_by_hash: Arc::new(zstd_by_hash),
+                calls_by_hash: Arc::new(AsyncMutex::new(HashMap::new())),
+                fail_once_hashes: Arc::new(AsyncMutex::new(HashSet::new())),
+                fail_n_times_by_hash: Arc::new(AsyncMutex::new(HashMap::new())),
+                corrupt_hashes: Arc::new(HashSet::new()),
+                total_gets: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    async fn pull_chunk_handler(
+        State(state): State<PullMockState>,
+        AxumPath(raw_hash): AxumPath<String>,
+    ) -> impl IntoResponse {
+        state.total_gets.fetch_add(1, Ordering::SeqCst);
+        {
+            let mut calls = state.calls_by_hash.lock().await;
+            let entry = calls.entry(raw_hash.clone()).or_insert(0);
+            *entry += 1;
+        }
+
+        {
+            let mut fail_once = state.fail_once_hashes.lock().await;
+            if fail_once.remove(&raw_hash) {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    axum::body::Bytes::from_static(b"transient"),
+                )
+                    .into_response();
+            }
+        }
+        {
+            let mut fail_n = state.fail_n_times_by_hash.lock().await;
+            if let Some(remaining) = fail_n.get_mut(&raw_hash) {
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        axum::body::Bytes::from_static(b"transient"),
+                    )
+                        .into_response();
+                }
+            }
+        }
+
+        let Some(mut bytes) = state.zstd_by_hash.get(&raw_hash).cloned() else {
+            return (StatusCode::NOT_FOUND, axum::body::Bytes::new()).into_response();
+        };
+        if state.corrupt_hashes.contains(&raw_hash) && !bytes.is_empty() {
+            bytes[0] = bytes[0].wrapping_add(1);
+        }
+        (
+            StatusCode::OK,
+            [("cache-control", "public, max-age=31536000, immutable")],
+            axum::body::Bytes::from(bytes),
+        )
+            .into_response()
+    }
+
+    async fn start_pull_mock_server(state: PullMockState) -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route("/v1/chunks/:raw_hash", get(pull_chunk_handler))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        (format!("http://{}", addr), handle)
+    }
+
+    fn compress_zstd(raw: &[u8]) -> Vec<u8> {
+        let mut encoder = zstd::Encoder::new(Vec::new(), 3).expect("encoder");
+        encoder.write_all(raw).expect("write");
+        encoder.finish().expect("finish")
+    }
+
+    fn build_manifest_and_chunks(
+        count: usize,
+    ) -> (
+        CapsuleManifestV3,
+        HashMap<String, Vec<u8>>,
+        Vec<(String, Vec<u8>)>,
+    ) {
+        let mut chunks = Vec::new();
+        let mut map = HashMap::new();
+        let mut ordered_raw = Vec::new();
+        for i in 0..count {
+            let raw = vec![(i % 251) as u8; 1024 + (i * 17)];
+            let raw_hash = capsule_core::capsule_v3::manifest::blake3_digest(&raw);
+            let zstd = compress_zstd(&raw);
+            chunks.push(ChunkMeta {
+                raw_hash: raw_hash.clone(),
+                raw_size: raw.len() as u32,
+                zstd_size_hint: Some(zstd.len() as u32),
+            });
+            map.insert(raw_hash.clone(), zstd);
+            ordered_raw.push((raw_hash, raw));
+        }
+        let mut manifest = CapsuleManifestV3::new(chunks);
+        set_artifact_hash(&mut manifest).expect("artifact hash");
+        (manifest, map, ordered_raw)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_v3_sync_discards_corrupted_download() {
+        let (manifest, zstd_by_hash, ordered_raw) = build_manifest_and_chunks(1);
+        let corrupted_hash = ordered_raw[0].0.clone();
+        let mut state = PullMockState::new(zstd_by_hash);
+        state.corrupt_hashes = Arc::new(HashSet::from([corrupted_hash.clone()]));
+        let (base_url, handle) = start_pull_mock_server(state.clone()).await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cas = capsule_core::capsule_v3::CasStore::new(tmp.path()).expect("cas");
+        let client = reqwest::Client::new();
+
+        let err = sync_v3_chunks_from_manifest_with_options(
+            &client,
+            &base_url,
+            &manifest,
+            cas.clone(),
+            None,
+            1,
+        )
+        .await
+        .expect_err("must fail on corruption");
+        assert!(
+            err.to_string().contains("hash mismatch")
+                || err.to_string().contains("decode")
+                || err.to_string().contains("raw_size mismatch")
+        );
+        assert!(!cas.has_chunk(&corrupted_hash).expect("has_chunk"));
+
+        // Ensure no temporary artifacts remain after failure.
+        let mut stack = vec![cas.root().to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read_dir") {
+                let entry = entry.expect("entry");
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                assert!(
+                    !name.starts_with(".tmp-"),
+                    "temporary file leaked: {}",
+                    path.display()
+                );
+            }
+        }
+
+        handle.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_v3_sync_pull_resume_after_interruption() {
+        let (manifest, zstd_by_hash, ordered_raw) = build_manifest_and_chunks(2);
+        let first_hash = ordered_raw[0].0.clone();
+        let second_hash = ordered_raw[1].0.clone();
+
+        let state = PullMockState::new(zstd_by_hash);
+        {
+            let mut fail_n = state.fail_n_times_by_hash.lock().await;
+            // Exceed MAX_RETRIES (=4) so first sync fails; second sync resumes and succeeds.
+            fail_n.insert(second_hash.clone(), 5);
+        }
+        let (base_url, handle) = start_pull_mock_server(state.clone()).await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cas = capsule_core::capsule_v3::CasStore::new(tmp.path()).expect("cas");
+        let client = reqwest::Client::new();
+
+        let first_attempt = sync_v3_chunks_from_manifest_with_options(
+            &client,
+            &base_url,
+            &manifest,
+            cas.clone(),
+            None,
+            1,
+        )
+        .await;
+        assert!(first_attempt.is_err(), "first attempt should fail");
+        assert!(cas.has_chunk(&first_hash).expect("has first"));
+        assert!(!cas.has_chunk(&second_hash).expect("has second"));
+
+        let second_outcome = sync_v3_chunks_from_manifest_with_options(
+            &client,
+            &base_url,
+            &manifest,
+            cas.clone(),
+            None,
+            1,
+        )
+        .await
+        .expect("second attempt should succeed");
+        assert_eq!(second_outcome, V3SyncOutcome::Synced);
+        assert!(cas.has_chunk(&first_hash).expect("has first"));
+        assert!(cas.has_chunk(&second_hash).expect("has second"));
+
+        let calls = state.calls_by_hash.lock().await;
+        // first chunk should be fetched only once (then skipped on resume).
+        assert_eq!(calls.get(&first_hash).copied().unwrap_or(0), 1);
+        // second chunk should have at least one failed attempt before succeeding on resume.
+        assert!(calls.get(&second_hash).copied().unwrap_or(0) >= 2);
+
+        handle.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_v3_sync_zero_transfer_on_full_hit() {
+        let (manifest, zstd_by_hash, ordered_raw) = build_manifest_and_chunks(3);
+        let expected_chunk_gets = ordered_raw.len();
+        let state = PullMockState::new(zstd_by_hash);
+        let (base_url, handle) = start_pull_mock_server(state.clone()).await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cas = capsule_core::capsule_v3::CasStore::new(tmp.path()).expect("cas");
+        let client = reqwest::Client::new();
+
+        let first_outcome = sync_v3_chunks_from_manifest_with_options(
+            &client,
+            &base_url,
+            &manifest,
+            cas.clone(),
+            None,
+            3,
+        )
+        .await
+        .expect("first sync should succeed");
+        assert_eq!(first_outcome, V3SyncOutcome::Synced);
+        let gets_after_first = state.total_gets.load(Ordering::SeqCst);
+        assert_eq!(
+            gets_after_first, expected_chunk_gets,
+            "first sync should fetch each chunk exactly once"
+        );
+
+        let second_outcome =
+            sync_v3_chunks_from_manifest_with_options(&client, &base_url, &manifest, cas, None, 3)
+                .await
+                .expect("second sync should succeed");
+        assert_eq!(second_outcome, V3SyncOutcome::Synced);
+        let gets_after_second = state.total_gets.load(Ordering::SeqCst);
+        assert_eq!(
+            gets_after_second, gets_after_first,
+            "second sync should not download any chunk on full local hit"
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_v3_sync_falls_back_when_registry_lacks_chunk_endpoint() {
+        let (manifest, _zstd_by_hash, _ordered_raw) = build_manifest_and_chunks(1);
+        let state = PullMockState::new(HashMap::new());
+        let (base_url, handle) = start_pull_mock_server(state).await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cas = capsule_core::capsule_v3::CasStore::new(tmp.path()).expect("cas");
+        let client = reqwest::Client::new();
+
+        let outcome =
+            sync_v3_chunks_from_manifest_with_options(&client, &base_url, &manifest, cas, None, 1)
+                .await
+                .expect("must skip unsupported chunk endpoint");
+        assert_eq!(outcome, V3SyncOutcome::SkippedUnsupportedRegistry);
+
+        handle.abort();
     }
 }

@@ -251,6 +251,7 @@ dependencies = [
  "reqwest 0.12.28",
  "semver",
  "serde",
+ "serde_jcs",
  "serde_json",
  "serde_yaml",
  "sha2",

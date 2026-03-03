@@ -34,6 +34,7 @@ const SMART_DEFAULT_EXCLUDES: &[&str] = &[
     "config.json",
     "capsule.lock",
     "signature.json",
+    "payload.v3.manifest.json",
     "payload.tar",
     "payload.tar.zst",
 ];
@@ -88,6 +89,11 @@ impl PackFilter {
             }
         }
 
+        // Allow Next.js standalone runtime dependencies when explicitly opted into include mode.
+        if self.include.is_some() && is_next_standalone_node_modules_path(&rel) {
+            return true;
+        }
+
         !self.exclude.is_match(&rel)
     }
 }
@@ -127,6 +133,11 @@ fn normalize_rel_path(path: &Path) -> String {
         .map(|c| c.as_os_str().to_string_lossy().to_string())
         .collect::<Vec<_>>()
         .join("/")
+}
+
+fn is_next_standalone_node_modules_path(rel: &str) -> bool {
+    (rel.starts_with(".next/standalone/") || rel.contains("/.next/standalone/"))
+        && rel.contains("/node_modules/")
 }
 
 #[cfg(test)]
@@ -232,5 +243,52 @@ mod tests {
 
         let filter = PackFilter::from_manifest(&manifest).expect("filter");
         assert!(!filter.should_include_file(Path::new("apps/web/node_modules/react/index.js")));
+    }
+
+    #[test]
+    fn include_mode_allows_next_standalone_node_modules() {
+        let mut manifest = CapsuleManifestV1 {
+            schema_version: "0.2".to_string(),
+            name: "test".to_string(),
+            version: "0.1.0".to_string(),
+            capsule_type: crate::types::capsule_v1::CapsuleType::App,
+            default_target: "cli".to_string(),
+            metadata: Default::default(),
+            capabilities: None,
+            requirements: Default::default(),
+            execution: Default::default(),
+            storage: Default::default(),
+            routing: Default::default(),
+            network: None,
+            model: None,
+            transparency: None,
+            pool: None,
+            build: None,
+            pack: None,
+            isolation: None,
+            polymorphism: None,
+            targets: None,
+            services: None,
+        };
+        manifest.pack = Some(PackConfig {
+            include: vec![
+                "apps/dashboard/.next/standalone/**".to_string(),
+                ".next/standalone/**".to_string(),
+            ],
+            exclude: vec![],
+        });
+
+        let filter = PackFilter::from_manifest(&manifest).expect("filter");
+        assert!(filter
+            .should_include_file(Path::new(".next/standalone/node_modules/next/package.json")));
+        assert!(filter.should_include_file(Path::new(
+            "apps/dashboard/.next/standalone/node_modules/next/package.json"
+        )));
+        assert!(filter.should_include_file(Path::new(
+            "apps/dashboard/.next/standalone/apps/web/node_modules/react/index.js"
+        )));
+        assert!(
+            !filter.should_include_file(Path::new("apps/dashboard/node_modules/react/index.js"))
+        );
     }
 }
