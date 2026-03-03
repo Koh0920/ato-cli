@@ -1,6 +1,7 @@
 name: Build (Multi OS)
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - dev

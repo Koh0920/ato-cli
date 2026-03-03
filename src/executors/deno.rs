@@ -183,6 +183,10 @@ fn run_runtime(
         if execution_plan.target.runtime == ExecutionRuntime::Web {
             let mut allow_env = BTreeSet::new();
             allow_env.insert("PORT".to_string());
+            allow_env.insert("ATO_RUNTIME_DENO_BIN".to_string());
+            allow_env.insert("ATO_RUNTIME_NODE_BIN".to_string());
+            allow_env.insert("ATO_RUNTIME_PYTHON_BIN".to_string());
+            allow_env.insert("ATO_RUNTIME_UV_BIN".to_string());
             allow_env.extend(execution_env.keys().cloned());
             cmd.arg(format!(
                 "--allow-env={}",

@@ -10,11 +10,19 @@ use sha2::{Digest, Sha256};
 use crate::error::{CapsuleError, Result};
 
 pub const SBOM_PATH: &str = "sbom.spdx.json";
+const DEFAULT_REPRO_EPOCH: i64 = 0;
 
 #[derive(Debug, Clone)]
 pub struct EmbeddedSbom {
     pub document: String,
     pub sha256: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SbomFileInput {
+    pub archive_path: String,
+    pub sha256: String,
+    pub disk_path: Option<PathBuf>,
 }
 
 #[derive(Serialize)]
@@ -82,20 +90,36 @@ pub fn generate_embedded_sbom(
     capsule_name: &str,
     files: &[(String, PathBuf)],
 ) -> Result<EmbeddedSbom> {
-    let mut sbom_files = Vec::new();
+    let mut inputs = Vec::with_capacity(files.len());
     for (archive_path, disk_path) in files {
-        let file_hash = sha256_hex_file(disk_path)?;
+        inputs.push(SbomFileInput {
+            archive_path: archive_path.clone(),
+            sha256: sha256_hex_file(disk_path)?,
+            disk_path: Some(disk_path.clone()),
+        });
+    }
+    generate_embedded_sbom_from_inputs(capsule_name, &inputs)
+}
+
+pub fn generate_embedded_sbom_from_inputs(
+    capsule_name: &str,
+    files: &[SbomFileInput],
+) -> Result<EmbeddedSbom> {
+    let created_at = reproducible_created_at();
+    let namespace_suffix = created_at.format("%Y%m%d%H%M%S").to_string();
+    let mut sbom_files = Vec::new();
+    for file in files {
         sbom_files.push(SpdxFile {
-            spdx_id: format!("SPDXRef-File-{}", sanitize_spdx_id(archive_path)),
-            file_name: archive_path.clone(),
+            spdx_id: format!("SPDXRef-File-{}", sanitize_spdx_id(&file.archive_path)),
+            file_name: file.archive_path.clone(),
             checksums: vec![SpdxChecksum {
                 algorithm: "SHA256".to_string(),
-                checksum_value: file_hash,
+                checksum_value: file.sha256.clone(),
             }],
         });
     }
     sbom_files.sort_by(|a, b| a.file_name.cmp(&b.file_name));
-    let sbom_packages = collect_lockfile_packages(files);
+    let sbom_packages = collect_lockfile_packages_from_inputs(files);
 
     let document = SpdxDocument {
         spdx_version: "SPDX-2.3".to_string(),
@@ -105,10 +129,10 @@ pub fn generate_embedded_sbom(
         document_namespace: format!(
             "https://ato.run/sbom/{}/{}",
             url::form_urlencoded::byte_serialize(capsule_name.as_bytes()).collect::<String>(),
-            Utc::now().format("%Y%m%d%H%M%S")
+            namespace_suffix
         ),
         creation_info: SpdxCreationInfo {
-            created: Utc::now().to_rfc3339(),
+            created: created_at.to_rfc3339(),
             creators: vec!["Tool: ato-cli".to_string()],
         },
         files: sbom_files,
@@ -126,6 +150,15 @@ pub async fn generate_embedded_sbom_async(
     files: Vec<(String, PathBuf)>,
 ) -> Result<EmbeddedSbom> {
     tokio::task::spawn_blocking(move || generate_embedded_sbom(&capsule_name, &files))
+        .await
+        .map_err(|e| CapsuleError::Pack(format!("SBOM generation task failed: {e}")))?
+}
+
+pub async fn generate_embedded_sbom_from_inputs_async(
+    capsule_name: String,
+    files: Vec<SbomFileInput>,
+) -> Result<EmbeddedSbom> {
+    tokio::task::spawn_blocking(move || generate_embedded_sbom_from_inputs(&capsule_name, &files))
         .await
         .map_err(|e| CapsuleError::Pack(format!("SBOM generation task failed: {e}")))?
 }
@@ -199,6 +232,15 @@ fn sha256_hex_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn reproducible_created_at() -> chrono::DateTime<Utc> {
+    let epoch = std::env::var("SOURCE_DATE_EPOCH")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(DEFAULT_REPRO_EPOCH);
+    chrono::DateTime::<Utc>::from_timestamp(epoch, 0)
+        .unwrap_or_else(|| chrono::DateTime::<Utc>::from_timestamp(0, 0).expect("unix epoch"))
+}
+
 fn collect_lockfile_packages(files: &[(String, PathBuf)]) -> Vec<SpdxPackage> {
     let mut packages = BTreeMap::<String, SpdxPackage>::new();
     for (archive_path, disk_path) in files {
@@ -207,6 +249,27 @@ fn collect_lockfile_packages(files: &[(String, PathBuf)]) -> Vec<SpdxPackage> {
             .rsplit('/')
             .next()
             .unwrap_or(archive_path.as_str());
+        match file_name {
+            "package-lock.json" => parse_package_lock(disk_path, &mut packages),
+            "deno.lock" => parse_deno_lock(disk_path, &mut packages),
+            "uv.lock" => parse_uv_lock(disk_path, &mut packages),
+            _ => {}
+        }
+    }
+    packages.into_values().collect()
+}
+
+fn collect_lockfile_packages_from_inputs(files: &[SbomFileInput]) -> Vec<SpdxPackage> {
+    let mut packages = BTreeMap::<String, SpdxPackage>::new();
+    for file in files {
+        let Some(disk_path) = file.disk_path.as_deref() else {
+            continue;
+        };
+        let file_name = file
+            .archive_path
+            .rsplit('/')
+            .next()
+            .unwrap_or(file.archive_path.as_str());
         match file_name {
             "package-lock.json" => parse_package_lock(disk_path, &mut packages),
             "deno.lock" => parse_deno_lock(disk_path, &mut packages),
@@ -370,6 +433,25 @@ mod tests {
             )],
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn sbom_from_inputs_uses_prehashed_checksum_without_reread() {
+        let sbom = generate_embedded_sbom_from_inputs(
+            "demo",
+            &[SbomFileInput {
+                archive_path: "source/a.txt".to_string(),
+                sha256: "deadbeef".to_string(),
+                disk_path: None,
+            }],
+        )
+        .expect("sbom");
+
+        let parsed: serde_json::Value = serde_json::from_str(&sbom.document).expect("json");
+        let checksum = parsed["files"][0]["checksums"][0]["checksumValue"]
+            .as_str()
+            .expect("checksum");
+        assert_eq!(checksum, "deadbeef");
     }
 
     #[test]

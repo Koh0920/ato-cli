@@ -374,16 +374,22 @@ pub(crate) fn build_capsule_artifact(
 
     match decision.kind {
         capsule_core::router::RuntimeKind::Source => {
+            let prepared_config = capsule_core::packers::source::prepare_source_config(
+                &decision.plan.manifest_path,
+                "strict".to_string(),
+                false,
+            )?;
             capsule_core::packers::source::pack(
                 &decision.plan,
                 capsule_core::packers::source::SourcePackOptions {
                     manifest_path: decision.plan.manifest_path.clone(),
                     manifest_dir: decision.plan.manifest_dir.clone(),
+                    config_json: prepared_config.config_json.clone(),
+                    config_path: prepared_config.config_path.clone(),
                     output: Some(artifact_path.clone()),
                     runtime: None,
                     skip_l1: false,
                     skip_validation: false,
-                    enforcement: "strict".to_string(),
                     nacelle_override: None,
                     standalone: false,
                 },
@@ -407,16 +413,22 @@ pub(crate) fn build_capsule_artifact(
                     reporter,
                 )?;
             } else {
+                let prepared_config = capsule_core::packers::source::prepare_source_config(
+                    &decision.plan.manifest_path,
+                    "strict".to_string(),
+                    false,
+                )?;
                 capsule_core::packers::source::pack(
                     &decision.plan,
                     capsule_core::packers::source::SourcePackOptions {
                         manifest_path: decision.plan.manifest_path.clone(),
                         manifest_dir: decision.plan.manifest_dir.clone(),
+                        config_json: prepared_config.config_json.clone(),
+                        config_path: prepared_config.config_path.clone(),
                         output: Some(artifact_path.clone()),
                         runtime: None,
                         skip_l1: false,
                         skip_validation: false,
-                        enforcement: "strict".to_string(),
                         nacelle_override: None,
                         standalone: false,
                     },
