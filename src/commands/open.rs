@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use tracing::debug;
 
 use crate::executors::source::ExecuteMode;
@@ -108,27 +108,26 @@ async fn execute_capsule_file(args: &OpenArgs, capsule_path: &PathBuf) -> Result
 
     debug!(extract_dir = %extract_dir.display(), "Capsule extracted");
 
-    let payload_zst = extract_dir.join("payload.tar.zst");
-
-    if payload_zst.exists() {
-        debug!("Extracting payload bundle");
-
-        let payload_tar = extract_dir.join("payload.tar");
-        let decoder = zstd::stream::Decoder::new(
-            fs::File::open(&payload_zst).with_context(|| "Failed to open payload.tar.zst")?,
-        )
-        .with_context(|| "Failed to create zstd decoder")?;
-
-        let mut tar_reader = tar::Archive::new(decoder);
-        tar_reader
-            .unpack(&extract_dir)
-            .with_context(|| "Failed to extract payload.tar.zst")?;
-
-        fs::remove_file(&payload_zst).ok();
-        fs::remove_file(&payload_tar).ok();
-
-        debug!("Payload extracted");
+    let cas_provider = capsule_core::capsule_v3::CasProvider::from_env();
+    let payload_outcome = capsule_core::capsule_v3::unpack_payload_from_capsule_root_with_provider(
+        &extract_dir,
+        &extract_dir,
+        &cas_provider,
+    )
+    .with_context(|| "Failed to extract payload from capsule root (v2/v3)")?;
+    match payload_outcome {
+        capsule_core::capsule_v3::PayloadUnpackOutcome::RestoredFromV3
+        | capsule_core::capsule_v3::PayloadUnpackOutcome::RestoredFromV2 => {}
+        capsule_core::capsule_v3::PayloadUnpackOutcome::RestoredFromV2DueToCasDisabled(reason) => {
+            emit_open_cas_disabled_warning_once(&reason);
+        }
+        capsule_core::capsule_v3::PayloadUnpackOutcome::RestoredFromV2DueToV3Error(err) => {
+            emit_open_v3_fallback_warning_once(&err);
+        }
     }
+    fs::remove_file(extract_dir.join("payload.tar.zst")).ok();
+    fs::remove_file(extract_dir.join("payload.tar")).ok();
+    debug!("Payload extracted");
 
     let manifest_path = extract_dir.join("capsule.toml");
     if !manifest_path.exists() {
@@ -173,6 +172,26 @@ async fn execute_capsule_file(args: &OpenArgs, capsule_path: &PathBuf) -> Result
     };
 
     execute_normal_mode(open_args).await
+}
+
+fn emit_open_cas_disabled_warning_once(reason: &capsule_core::capsule_v3::CasDisableReason) {
+    static STDERR_WARN_ONCE: Once = Once::new();
+    STDERR_WARN_ONCE.call_once(|| {
+        eprintln!(
+            "⚠️  Performance warning: CAS is disabled (reason: {}). Falling back to v2 legacy mode.",
+            reason
+        );
+    });
+}
+
+fn emit_open_v3_fallback_warning_once(error_message: &str) {
+    static STDERR_WARN_ONCE: Once = Once::new();
+    STDERR_WARN_ONCE.call_once(|| {
+        eprintln!(
+            "⚠️  Performance warning: v3 payload reconstruction failed ({}). Falling back to v2 legacy mode.",
+            error_message
+        );
+    });
 }
 
 async fn copy_source_files(
@@ -355,7 +374,7 @@ async fn execute_normal_mode(args: OpenArgs) -> Result<()> {
     let tier = compiled.tier;
 
     preflight_required_environment_variables(&decision.plan)?;
-    preflight_deno_orchestrator_requirements(&decision.plan)?;
+    preflight_web_services_requirements(&decision.plan)?;
 
     let lockfile_path = manifest_path.parent().map(|p| p.join("capsule.lock"));
     if let Some(lock_path) = lockfile_path {
@@ -521,6 +540,39 @@ async fn execute_normal_mode(args: OpenArgs) -> Result<()> {
             }
         }
         ExecutorKind::WebStatic => {
+            if args.background {
+                let child = crate::executors::open_web::spawn_background(&decision.plan)?;
+                let pid = child.id();
+                let id = format!("capsule-{}", pid);
+
+                let info = crate::process_manager::ProcessInfo {
+                    id: id.clone(),
+                    name: decision
+                        .plan
+                        .manifest_path
+                        .file_stem()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    pid: pid as i32,
+                    status: crate::process_manager::ProcessStatus::Running,
+                    runtime: "web-static".to_string(),
+                    start_time: std::time::SystemTime::now(),
+                    manifest_path: Some(decision.plan.manifest_path.clone()),
+                };
+
+                let pm = crate::process_manager::ProcessManager::new()?;
+                pm.write_pid(&info)?;
+
+                args.reporter
+                    .notify(format!("🚀 Capsule started in background (ID: {})", id))
+                    .await?;
+
+                drop(child);
+                sidecar_cleanup.stop_now();
+                return Ok(());
+            }
+
             crate::executors::open_web::execute(&decision.plan, args.reporter.clone())?;
             sidecar_cleanup.stop_now();
         }
@@ -657,30 +709,17 @@ fn preflight_native_sandbox(
     Ok(())
 }
 
-fn preflight_deno_orchestrator_requirements(
-    plan: &capsule_core::router::ManifestData,
-) -> Result<()> {
-    if !is_deno_orchestrator_target(plan) {
+fn preflight_web_services_requirements(plan: &capsule_core::router::ManifestData) -> Result<()> {
+    if !plan.is_web_services_mode() {
         return Ok(());
     }
 
-    let is_default_target = plan.selected_target_label().eq_ignore_ascii_case("default");
-    if is_default_target {
-        let build_markers = [
-            plan.manifest_dir.join("apps/dashboard/.next/BUILD_ID"),
-            plan.manifest_dir
-                .join("apps/dashboard/.next/standalone/server.js"),
-            plan.manifest_dir
-                .join("source/apps/dashboard/.next/BUILD_ID"),
-            plan.manifest_dir
-                .join("source/apps/dashboard/.next/standalone/server.js"),
-        ];
-        if !build_markers.iter().any(|p| p.exists()) {
-            return Err(AtoExecutionError::policy_violation(
-                "default target requires dashboard build artifacts (.next). Run `npm run -w apps/dashboard build` before publish/run.",
-            )
-            .into());
-        }
+    let services = plan.services();
+    if !services.contains_key("main") {
+        return Err(AtoExecutionError::policy_violation(
+            "web/deno services mode requires top-level [services.main]",
+        )
+        .into());
     }
 
     Ok(())
@@ -817,23 +856,6 @@ fn is_python_source_target(plan: &capsule_core::router::ManifestData) -> bool {
 
     plan.execution_entrypoint()
         .map(|entry| entry.trim().to_ascii_lowercase().ends_with(".py"))
-        .unwrap_or(false)
-}
-
-fn is_deno_orchestrator_target(plan: &capsule_core::router::ManifestData) -> bool {
-    let runtime = plan.execution_runtime().unwrap_or_default();
-    let driver = plan.execution_driver().unwrap_or_default();
-    if !runtime.eq_ignore_ascii_case("web") || !driver.eq_ignore_ascii_case("deno") {
-        return false;
-    }
-    plan.execution_entrypoint()
-        .map(|entry| {
-            std::path::Path::new(entry.trim())
-                .file_name()
-                .and_then(|v| v.to_str())
-                .map(|v| v.eq_ignore_ascii_case("ato-entry.ts"))
-                .unwrap_or(false)
-        })
         .unwrap_or(false)
 }
 

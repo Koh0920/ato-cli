@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use colored::Colorize;
+use serde::Serialize;
 use serde_json::json;
 use std::cmp::Ordering;
 use std::io::{self, IsTerminal, Write};
@@ -102,7 +103,9 @@ mod profile;
 mod publish_artifact;
 mod publish_ci;
 mod publish_dry_run;
+mod publish_official;
 mod publish_preflight;
+mod publish_prepare;
 mod publish_private;
 mod publish_tui;
 mod registry;
@@ -470,9 +473,42 @@ enum Commands {
         #[arg(long, value_name = "PATH", conflicts_with_all = ["ci", "dry_run"])]
         artifact: Option<PathBuf>,
 
+        /// Explicit scoped ID for artifact publish (publisher/slug)
+        #[arg(
+            long,
+            value_name = "PUBLISHER/SLUG",
+            conflicts_with_all = ["ci", "dry_run"],
+            requires = "artifact"
+        )]
+        scoped_id: Option<String>,
+
+        /// Allow idempotent success when same version already exists with identical sha256
+        #[arg(long, default_value_t = false, conflicts_with_all = ["ci", "dry_run"])]
+        allow_existing: bool,
+
+        /// Run prepare phase
+        #[arg(long, default_value_t = false, conflicts_with_all = ["ci", "dry_run"])]
+        prepare: bool,
+
+        /// Run build phase
+        #[arg(long, default_value_t = false, conflicts_with_all = ["ci", "dry_run"])]
+        build: bool,
+
+        /// Run deploy phase
+        #[arg(long, default_value_t = false, conflicts_with_all = ["ci", "dry_run"])]
+        deploy: bool,
+
+        /// Use legacy default phases (prepare/build/deploy) for official registry publish
+        #[arg(long, default_value_t = false, conflicts_with_all = ["ci", "dry_run"])]
+        legacy_full_publish: bool,
+
         /// Allow publishing payloads larger than 200MB
         #[arg(long, default_value_t = false)]
         force_large_payload: bool,
+
+        /// Auto-fix official CI workflow once, then rerun diagnostics exactly once
+        #[arg(long, default_value_t = false, conflicts_with_all = ["ci", "dry_run"])]
+        fix: bool,
 
         /// Publish from GitHub Actions with OIDC token (CI-only mode)
         #[arg(long, conflicts_with = "dry_run")]
@@ -1519,7 +1555,14 @@ fn run() -> Result<()> {
         Commands::Publish {
             registry,
             artifact,
+            scoped_id,
+            allow_existing,
+            prepare,
+            build,
+            deploy,
+            legacy_full_publish,
             force_large_payload,
+            fix,
             ci,
             dry_run,
             no_tui,
@@ -1530,22 +1573,23 @@ fn run() -> Result<()> {
             } else if dry_run {
                 execute_publish_dry_run_command(json, reporter.clone())
             } else {
-                let resolved_registry = resolve_publish_registry_url(registry)?;
-                if is_official_publish_registry(&resolved_registry) {
-                    if std::io::stdout().is_terminal() && !json && !no_tui {
-                        execute_publish_tui_command(reporter.clone())
-                    } else {
-                        execute_publish_guidance_command(json, &resolved_registry)
-                    }
-                } else {
-                    execute_publish_private_command(
-                        resolved_registry,
+                execute_publish_command(
+                    PublishCommandArgs {
+                        registry,
                         artifact,
+                        scoped_id,
+                        allow_existing,
+                        prepare,
+                        build,
+                        deploy,
+                        legacy_full_publish,
                         force_large_payload,
+                        fix,
+                        no_tui,
                         json,
-                        reporter.clone(),
-                    )
-                }
+                    },
+                    reporter.clone(),
+                )
             }
         }
 
@@ -1824,10 +1868,13 @@ fn execute_publish_ci_command(
 ) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
-        let result = publish_ci::execute(publish_ci::PublishCiArgs {
-            json_output,
-            force_large_payload,
-        })
+        let result = publish_ci::execute(
+            publish_ci::PublishCiArgs {
+                json_output,
+                force_large_payload,
+            },
+            reporter.clone(),
+        )
         .await?;
 
         if json_output {
@@ -1919,22 +1966,327 @@ fn execute_publish_guidance_command(json_output: bool, registry_url: &str) -> Re
     Ok(())
 }
 
-fn execute_publish_private_command(
-    registry_url: String,
-    artifact_path: Option<PathBuf>,
+#[derive(Debug, Clone)]
+struct PublishCommandArgs {
+    registry: Option<String>,
+    artifact: Option<PathBuf>,
+    scoped_id: Option<String>,
+    allow_existing: bool,
+    prepare: bool,
+    build: bool,
+    deploy: bool,
+    legacy_full_publish: bool,
     force_large_payload: bool,
-    json_output: bool,
+    fix: bool,
+    no_tui: bool,
+    json: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PublishPhaseSelection {
+    prepare: bool,
+    build: bool,
+    deploy: bool,
+    explicit_filter: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PublishPhaseResult {
+    name: &'static str,
+    selected: bool,
+    ok: bool,
+    status: &'static str,
+    elapsed_ms: u64,
+    actionable_fix: Option<String>,
+    message: String,
+    result_kind: Option<String>,
+    skipped_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct OfficialDeployOutcome {
+    route: publish_official::PublishRoutePlan,
+    fix_result: publish_official::WorkflowFixResult,
+    diagnosis: publish_official::OfficialPublishDiagnosis,
+}
+
+fn execute_publish_command(
+    args: PublishCommandArgs,
     reporter: std::sync::Arc<reporters::CliReporter>,
 ) -> Result<()> {
-    let result = publish_private::execute(publish_private::PublishPrivateArgs {
-        registry_url,
-        artifact_path,
-        force_large_payload,
-    })?;
+    let resolved_registry = resolve_publish_registry_url(args.registry.clone())?;
+    let is_official = is_official_publish_registry(&resolved_registry);
+    let selection = select_publish_phases(
+        args.prepare,
+        args.build,
+        args.deploy,
+        is_official,
+        args.legacy_full_publish,
+    );
+    validate_publish_phase_options(&args, selection, is_official)?;
+    maybe_warn_legacy_full_publish(&args, selection, is_official);
+    let _ = args.no_tui;
 
-    if json_output {
-        println!("{}", serde_json::to_string_pretty(&result)?);
+    let mut phases = vec![
+        new_phase_result("prepare", selection.prepare),
+        new_phase_result("build", selection.build),
+        new_phase_result("deploy", selection.deploy),
+    ];
+
+    let cwd = std::env::current_dir().context("Failed to resolve current directory")?;
+    let mut built_artifact_path: Option<PathBuf> = None;
+    let mut private_result: Option<publish_private::PublishPrivateResult> = None;
+    let mut official_result: Option<OfficialDeployOutcome> = None;
+
+    let private_preview = if selection.deploy && !is_official {
+        Some(publish_private::summarize(
+            &publish_private::PublishPrivateArgs {
+                registry_url: resolved_registry.clone(),
+                artifact_path: args.artifact.clone(),
+                force_large_payload: args.force_large_payload,
+                scoped_id: args.scoped_id.clone(),
+                allow_existing: args.allow_existing,
+            },
+        )?)
     } else {
+        None
+    };
+
+    if selection.prepare {
+        print_phase_line(args.json, "prepare", "RUN", "prepare command detection");
+        let started = std::time::Instant::now();
+        let prepare_spec = publish_prepare::detect_prepare_command(&cwd)?;
+        match prepare_spec {
+            Some(spec) => {
+                let message = format!("running {}", spec.source.as_label());
+                publish_prepare::run_prepare_command(&spec, &cwd, args.json)
+                    .context("Failed to run publish prepare command")?;
+                phase_mark_ok(
+                    &mut phases[0],
+                    started.elapsed().as_millis() as u64,
+                    message.clone(),
+                    None,
+                );
+                print_phase_line(args.json, "prepare", "OK", &message);
+            }
+            None => {
+                let skipped_reason = "no prepare command configured".to_string();
+                if selection.explicit_filter {
+                    let fix = "capsule.toml に [build.lifecycle].prepare を設定するか package.json scripts[\"capsule:prepare\"] を追加して再実行してください。".to_string();
+                    phase_mark_failed(
+                        &mut phases[0],
+                        started.elapsed().as_millis() as u64,
+                        "--prepare was selected but no prepare command was found".to_string(),
+                        Some(fix.clone()),
+                    );
+                    print_phase_line(args.json, "prepare", "FAIL", "prepare command not found");
+                    if !args.json {
+                        println!("👉 次に打つコマンド: {}", fix);
+                    }
+                    anyhow::bail!(
+                        "--prepare was selected but no prepare command was found. Set `build.lifecycle.prepare` in capsule.toml or add package.json scripts[\"capsule:prepare\"]."
+                    );
+                }
+                phase_mark_skipped(
+                    &mut phases[0],
+                    started.elapsed().as_millis() as u64,
+                    skipped_reason.clone(),
+                    skipped_reason.clone(),
+                );
+                print_phase_line(args.json, "prepare", "SKIP", &skipped_reason);
+            }
+        }
+    } else {
+        phase_mark_skipped(
+            &mut phases[0],
+            0,
+            "prepare phase not selected".to_string(),
+            "not selected".to_string(),
+        );
+        print_phase_line(args.json, "prepare", "SKIP", "not selected");
+    }
+
+    if selection.build {
+        print_phase_line(args.json, "build", "RUN", "artifact build");
+        let started = std::time::Instant::now();
+        if args.artifact.is_some() {
+            let skipped_reason = "--artifact provided".to_string();
+            phase_mark_skipped(
+                &mut phases[1],
+                started.elapsed().as_millis() as u64,
+                "build is skipped when --artifact is provided".to_string(),
+                skipped_reason.clone(),
+            );
+            print_phase_line(args.json, "build", "SKIP", &skipped_reason);
+        } else {
+            let artifact_path = build_capsule_artifact_for_publish(&cwd)?;
+            let elapsed = started.elapsed().as_millis() as u64;
+            let message = format!("artifact built: {}", artifact_path.display());
+            phase_mark_ok(&mut phases[1], elapsed, message.clone(), None);
+            built_artifact_path = Some(artifact_path);
+            print_phase_line(args.json, "build", "OK", &message);
+        }
+    } else {
+        phase_mark_skipped(
+            &mut phases[1],
+            0,
+            "build phase not selected".to_string(),
+            "not selected".to_string(),
+        );
+        print_phase_line(args.json, "build", "SKIP", "not selected");
+    }
+
+    if selection.deploy {
+        print_phase_line(args.json, "deploy", "RUN", "deploy execution");
+        let started = std::time::Instant::now();
+        if is_official {
+            let outcome = run_official_deploy(resolved_registry.clone(), args.fix)?;
+
+            if !args.json {
+                println!(
+                    "🔎 official publish route registry={} route={:?}",
+                    outcome.route.registry_url, outcome.route.route
+                );
+                for stage in &outcome.diagnosis.stages {
+                    let icon = if stage.ok { "✅" } else { "❌" };
+                    println!("{} {:<14} {}", icon, stage.key, stage.message);
+                }
+                if outcome.fix_result.attempted {
+                    if outcome.fix_result.applied {
+                        let label = if outcome.fix_result.created {
+                            "created"
+                        } else {
+                            "updated"
+                        };
+                        println!("🛠️  workflow {} via --fix", label);
+                    } else {
+                        println!("🛠️  --fix requested, but workflow was already up-to-date");
+                    }
+                }
+            }
+
+            if !outcome.diagnosis.can_handoff {
+                let actions = publish_official::collect_issue_actions(&outcome.diagnosis.issues);
+                let fix_line = actions.first().cloned().unwrap_or_else(|| {
+                    "ato publish --deploy --registry https://api.ato.run".to_string()
+                });
+                phase_mark_failed(
+                    &mut phases[2],
+                    started.elapsed().as_millis() as u64,
+                    "official publish diagnostics failed".to_string(),
+                    Some(fix_line.clone()),
+                );
+                print_phase_line(args.json, "deploy", "FAIL", "official diagnostics failed");
+                if !args.json {
+                    println!("👉 次に打つコマンド: {}", fix_line);
+                    if !actions.is_empty() {
+                        println!();
+                        println!("詳細:");
+                        for issue in &outcome.diagnosis.issues {
+                            println!(" - [{}] {}", issue.stage, issue.message);
+                        }
+                    }
+                    anyhow::bail!("official publish diagnostics failed");
+                }
+                official_result = Some(outcome);
+            } else {
+                let success_message = "official CI handoff is ready".to_string();
+                phase_mark_ok(
+                    &mut phases[2],
+                    started.elapsed().as_millis() as u64,
+                    success_message.clone(),
+                    Some("handoff".to_string()),
+                );
+                print_phase_line(args.json, "deploy", "OK", &success_message);
+                official_result = Some(outcome);
+            }
+        } else {
+            let source_is_artifact = args.artifact.is_some();
+            let deploy_artifact = if let Some(path) = args.artifact.clone() {
+                path
+            } else if let Some(path) = built_artifact_path.clone() {
+                path
+            } else {
+                let fix_line =
+                    "ato publish --deploy --artifact <file.capsule> --registry <url> もしくは ato publish --build --deploy --registry <url>"
+                        .to_string();
+                phase_mark_failed(
+                    &mut phases[2],
+                    started.elapsed().as_millis() as u64,
+                    "deploy phase requires artifact input".to_string(),
+                    Some(fix_line.clone()),
+                );
+                print_phase_line(args.json, "deploy", "FAIL", "artifact input is missing");
+                if !args.json {
+                    println!("👉 次に打つコマンド: {}", fix_line);
+                }
+                anyhow::bail!(
+                    "--deploy requires artifact input for private registry. Use --artifact or include --build."
+                );
+            };
+
+            let preview = private_preview
+                .as_ref()
+                .context("missing private publish preview")?;
+            if !args.json {
+                println!(
+                    "{}",
+                    publish_private_start_summary_line(
+                        &resolved_registry,
+                        preview.source,
+                        &preview.scoped_id,
+                        &preview.version,
+                        preview.allow_existing,
+                    )
+                );
+            }
+
+            let status = publish_private_status_message(source_is_artifact);
+            futures::executor::block_on(reporter.progress_start(status.to_string(), None))?;
+            let scoped_override = if source_is_artifact {
+                args.scoped_id.clone()
+            } else {
+                Some(preview.scoped_id.clone())
+            };
+            let upload_result = publish_private::execute(publish_private::PublishPrivateArgs {
+                registry_url: resolved_registry.clone(),
+                artifact_path: Some(deploy_artifact),
+                force_large_payload: args.force_large_payload,
+                scoped_id: scoped_override,
+                allow_existing: args.allow_existing,
+            });
+            futures::executor::block_on(reporter.progress_finish(None))?;
+            let result = upload_result?;
+
+            let success_message = format!("uploaded {}", result.file_name);
+            phase_mark_ok(
+                &mut phases[2],
+                started.elapsed().as_millis() as u64,
+                success_message.clone(),
+                Some("upload".to_string()),
+            );
+            print_phase_line(args.json, "deploy", "OK", &success_message);
+            private_result = Some(result);
+        }
+    } else {
+        phase_mark_skipped(
+            &mut phases[2],
+            0,
+            "deploy phase not selected".to_string(),
+            "not selected".to_string(),
+        );
+        print_phase_line(args.json, "deploy", "SKIP", "not selected");
+    }
+
+    if args.json {
+        emit_publish_json_output(
+            &resolved_registry,
+            is_official,
+            &phases,
+            private_result.as_ref(),
+            official_result.as_ref(),
+        )?;
+    } else if let Some(result) = private_result {
         println!("✅ Successfully published to private registry!");
         println!();
         println!("📦 Capsule:   {} v{}", result.scoped_id, result.version);
@@ -1942,15 +2294,290 @@ fn execute_publish_private_command(
         println!();
         println!("🌐 Artifact URL: {}", result.artifact_url);
         println!();
+        if result.already_existed {
+            println!("ℹ️  Existing release reused (same sha256, no new upload).");
+            println!();
+        }
         println!(
             "👉 Next step: ato install {} --registry {}",
             result.scoped_id, result.registry_url
         );
+    } else if let Some(outcome) = official_result {
+        println!();
+        println!("✅ CI handoff ready. 次の順で実行してください:");
+        for command in &outcome.diagnosis.next_commands {
+            println!("  {}", command);
+        }
+        if let Some(repo) = &outcome.diagnosis.repository {
+            println!(
+                "  https://github.com/{}/actions/workflows/ato-publish.yml",
+                repo
+            );
+        }
+    } else {
+        println!("✅ Selected publish phases completed.");
     }
-    futures::executor::block_on(
-        reporter.notify("Private registry publish completed.".to_string()),
-    )?;
+
+    if !args.json {
+        if selection.deploy && phases[2].ok {
+            let notice = if is_official {
+                "Official publish handoff prepared (CI-first: local upload is not executed)."
+            } else {
+                "Private registry publish completed."
+            };
+            futures::executor::block_on(reporter.notify(notice.to_string()))?;
+        } else {
+            futures::executor::block_on(
+                reporter.notify("Selected publish phases completed.".to_string()),
+            )?;
+        }
+    }
+
     Ok(())
+}
+
+fn run_official_deploy(registry_url: String, fix: bool) -> Result<OfficialDeployOutcome> {
+    let cwd = std::env::current_dir().context("Failed to resolve current directory")?;
+    let route = publish_official::build_route_plan(&registry_url);
+
+    let mut fix_result = publish_official::WorkflowFixResult::default();
+    let mut diagnosis = publish_official::diagnose_official(&cwd, &registry_url);
+    if fix && diagnosis.needs_workflow_fix {
+        fix_result = publish_official::apply_workflow_fix_once(&cwd)?;
+        diagnosis = publish_official::diagnose_official(&cwd, &registry_url);
+    }
+
+    Ok(OfficialDeployOutcome {
+        route,
+        fix_result,
+        diagnosis,
+    })
+}
+
+fn publish_private_status_message(has_artifact: bool) -> &'static str {
+    if has_artifact {
+        "📤 Publishing provided artifact to private registry..."
+    } else {
+        "📦 Building capsule artifact for private registry publish..."
+    }
+}
+
+fn publish_private_start_summary_line(
+    registry_url: &str,
+    source: &str,
+    scoped_id: &str,
+    version: &str,
+    allow_existing: bool,
+) -> String {
+    format!(
+        "🔎 private publish target registry={} source={} scoped_id={} version={} allow_existing={}",
+        registry_url, source, scoped_id, version, allow_existing
+    )
+}
+
+fn select_publish_phases(
+    prepare: bool,
+    build: bool,
+    deploy: bool,
+    is_official: bool,
+    legacy_full_publish: bool,
+) -> PublishPhaseSelection {
+    let explicit_filter = prepare || build || deploy;
+    if explicit_filter {
+        PublishPhaseSelection {
+            prepare,
+            build,
+            deploy,
+            explicit_filter,
+        }
+    } else if is_official && !legacy_full_publish {
+        PublishPhaseSelection {
+            prepare: false,
+            build: false,
+            deploy: true,
+            explicit_filter: false,
+        }
+    } else {
+        PublishPhaseSelection {
+            prepare: true,
+            build: true,
+            deploy: true,
+            explicit_filter: false,
+        }
+    }
+}
+
+fn maybe_warn_legacy_full_publish(
+    args: &PublishCommandArgs,
+    selection: PublishPhaseSelection,
+    is_official: bool,
+) {
+    if args.legacy_full_publish && is_official && !selection.explicit_filter {
+        eprintln!(
+            "⚠️  --legacy-full-publish is deprecated and will be removed in a future release. Use explicit --prepare/--build/--deploy flags instead."
+        );
+    }
+}
+
+fn validate_publish_phase_options(
+    args: &PublishCommandArgs,
+    selection: PublishPhaseSelection,
+    is_official: bool,
+) -> Result<()> {
+    if args.fix && !(is_official && selection.deploy) {
+        anyhow::bail!("--fix is only available when deploying to official registry");
+    }
+
+    if args.legacy_full_publish && !is_official {
+        anyhow::bail!("--legacy-full-publish is only available for official registry publish");
+    }
+
+    if args.legacy_full_publish && selection.explicit_filter {
+        anyhow::bail!("--legacy-full-publish cannot be combined with --prepare/--build/--deploy");
+    }
+
+    if args.allow_existing && (is_official || !selection.deploy) {
+        anyhow::bail!("--allow-existing is only available for private registry deploy phase");
+    }
+
+    if !is_official && selection.deploy && !selection.build && args.artifact.is_none() {
+        anyhow::bail!(
+            "--deploy requires --artifact for private registry publish (or include --build)"
+        );
+    }
+
+    Ok(())
+}
+
+fn build_capsule_artifact_for_publish(cwd: &std::path::Path) -> Result<PathBuf> {
+    let manifest_path = cwd.join("capsule.toml");
+    let manifest_raw = std::fs::read_to_string(&manifest_path)
+        .with_context(|| format!("Failed to read {}", manifest_path.display()))?;
+    let manifest = capsule_core::types::capsule_v1::CapsuleManifestV1::from_toml(&manifest_raw)
+        .map_err(|err| anyhow::anyhow!("Failed to parse capsule.toml: {}", err))?;
+    crate::publish_ci::build_capsule_artifact(&manifest_path, &manifest.name, &manifest.version)
+        .with_context(|| "Failed to build artifact for publish")
+}
+
+fn emit_publish_json_output(
+    registry_url: &str,
+    is_official: bool,
+    phases: &[PublishPhaseResult],
+    private_result: Option<&publish_private::PublishPrivateResult>,
+    official_result: Option<&OfficialDeployOutcome>,
+) -> Result<()> {
+    if let Some(outcome) = official_result {
+        let payload = serde_json::json!({
+            "ok": outcome.diagnosis.can_handoff,
+            "code": if outcome.diagnosis.can_handoff { "CI_HANDOFF_READY" } else { "CI_ONLY_PUBLISH" },
+            "message": if outcome.diagnosis.can_handoff {
+                "Official registry publishing is CI-first. Handoff is ready."
+            } else {
+                "Official registry publishing is CI-first. Run the suggested local fixes, then push tag to trigger CI."
+            },
+            "route": outcome.route.route,
+            "registry": outcome.route.registry_url,
+            "fix": outcome.fix_result,
+            "diagnosis": outcome.diagnosis,
+            "phases": phases,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
+
+    if let Some(result) = private_result {
+        let mut payload = serde_json::to_value(result)?;
+        if let serde_json::Value::Object(map) = &mut payload {
+            map.insert("phases".to_string(), serde_json::to_value(phases)?);
+        }
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
+
+    let payload = serde_json::json!({
+        "ok": true,
+        "code": "PUBLISH_PHASES_COMPLETED",
+        "message": "Selected publish phases completed.",
+        "registry": registry_url,
+        "route": if is_official { "official" } else { "private" },
+        "phases": phases,
+    });
+    println!("{}", serde_json::to_string_pretty(&payload)?);
+    Ok(())
+}
+
+fn new_phase_result(name: &'static str, selected: bool) -> PublishPhaseResult {
+    PublishPhaseResult {
+        name,
+        selected,
+        ok: !selected,
+        status: "skipped",
+        elapsed_ms: 0,
+        actionable_fix: None,
+        message: if selected {
+            "pending".to_string()
+        } else {
+            "not selected".to_string()
+        },
+        result_kind: None,
+        skipped_reason: if selected {
+            None
+        } else {
+            Some("not selected".to_string())
+        },
+    }
+}
+
+fn phase_mark_ok(
+    phase: &mut PublishPhaseResult,
+    elapsed_ms: u64,
+    message: String,
+    result_kind: Option<String>,
+) {
+    phase.ok = true;
+    phase.status = "ok";
+    phase.elapsed_ms = elapsed_ms;
+    phase.actionable_fix = None;
+    phase.message = message;
+    phase.result_kind = result_kind;
+    phase.skipped_reason = None;
+}
+
+fn phase_mark_skipped(
+    phase: &mut PublishPhaseResult,
+    elapsed_ms: u64,
+    message: String,
+    skipped_reason: String,
+) {
+    phase.ok = true;
+    phase.status = "skipped";
+    phase.elapsed_ms = elapsed_ms;
+    phase.actionable_fix = None;
+    phase.message = message;
+    phase.result_kind = None;
+    phase.skipped_reason = Some(skipped_reason);
+}
+
+fn phase_mark_failed(
+    phase: &mut PublishPhaseResult,
+    elapsed_ms: u64,
+    message: String,
+    actionable_fix: Option<String>,
+) {
+    phase.ok = false;
+    phase.status = "failed";
+    phase.elapsed_ms = elapsed_ms;
+    phase.actionable_fix = actionable_fix;
+    phase.message = message;
+    phase.result_kind = None;
+    phase.skipped_reason = None;
+}
+
+fn print_phase_line(json_output: bool, phase: &str, state: &str, detail: &str) {
+    if json_output {
+        return;
+    }
+    println!("PHASE {:<7} {:<4} {}", phase, state, detail);
 }
 
 fn resolve_publish_registry_url(cli_registry: Option<String>) -> Result<String> {
@@ -3077,5 +3704,132 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  nacelle-v1.2.3
         assert!(result.is_ok());
 
         std::env::remove_var("CAPSULE_ALLOW_UNSAFE");
+    }
+
+    #[test]
+    fn publish_private_status_message_for_build_path() {
+        assert_eq!(
+            publish_private_status_message(false),
+            "📦 Building capsule artifact for private registry publish..."
+        );
+    }
+
+    #[test]
+    fn publish_private_status_message_for_upload_path() {
+        assert_eq!(
+            publish_private_status_message(true),
+            "📤 Publishing provided artifact to private registry..."
+        );
+    }
+
+    #[test]
+    fn publish_private_start_summary_line_build_path() {
+        let line = publish_private_start_summary_line(
+            "http://127.0.0.1:8787",
+            "build",
+            "local/demo-app",
+            "1.2.3",
+            false,
+        );
+        assert!(line.contains("registry=http://127.0.0.1:8787"));
+        assert!(line.contains("source=build"));
+        assert!(line.contains("scoped_id=local/demo-app"));
+        assert!(line.contains("version=1.2.3"));
+        assert!(line.contains("allow_existing=false"));
+    }
+
+    #[test]
+    fn publish_private_start_summary_line_artifact_path() {
+        let line = publish_private_start_summary_line(
+            "http://127.0.0.1:8787",
+            "artifact",
+            "team-x/demo-app",
+            "1.2.3",
+            true,
+        );
+        assert!(line.contains("source=artifact"));
+        assert!(line.contains("allow_existing=true"));
+    }
+
+    fn test_publish_args() -> PublishCommandArgs {
+        PublishCommandArgs {
+            registry: Some("http://127.0.0.1:8787".to_string()),
+            artifact: None,
+            scoped_id: None,
+            allow_existing: false,
+            prepare: false,
+            build: false,
+            deploy: false,
+            legacy_full_publish: false,
+            force_large_payload: false,
+            fix: false,
+            no_tui: false,
+            json: true,
+        }
+    }
+
+    #[test]
+    fn publish_phase_selection_defaults_to_all_for_private() {
+        let selected = select_publish_phases(false, false, false, false, false);
+        assert!(selected.prepare);
+        assert!(selected.build);
+        assert!(selected.deploy);
+        assert!(!selected.explicit_filter);
+    }
+
+    #[test]
+    fn publish_phase_selection_respects_filter_flags() {
+        let selected = select_publish_phases(true, false, true, true, false);
+        assert!(selected.prepare);
+        assert!(!selected.build);
+        assert!(selected.deploy);
+        assert!(selected.explicit_filter);
+    }
+
+    #[test]
+    fn publish_phase_selection_defaults_to_deploy_for_official() {
+        let selected = select_publish_phases(false, false, false, true, false);
+        assert!(!selected.prepare);
+        assert!(!selected.build);
+        assert!(selected.deploy);
+        assert!(!selected.explicit_filter);
+    }
+
+    #[test]
+    fn publish_phase_selection_legacy_full_publish_keeps_all_for_official() {
+        let selected = select_publish_phases(false, false, false, true, true);
+        assert!(selected.prepare);
+        assert!(selected.build);
+        assert!(selected.deploy);
+        assert!(!selected.explicit_filter);
+    }
+
+    #[test]
+    fn publish_validate_rejects_allow_existing_without_deploy() {
+        let mut args = test_publish_args();
+        args.allow_existing = true;
+        let selected = select_publish_phases(false, true, false, false, false);
+        let err =
+            validate_publish_phase_options(&args, selected, false).expect_err("must fail closed");
+        assert!(err.to_string().contains("--allow-existing"));
+    }
+
+    #[test]
+    fn publish_validate_rejects_fix_for_private_registry() {
+        let mut args = test_publish_args();
+        args.fix = true;
+        let selected = select_publish_phases(false, false, true, false, false);
+        let err =
+            validate_publish_phase_options(&args, selected, false).expect_err("must fail closed");
+        assert!(err.to_string().contains("--fix"));
+    }
+
+    #[test]
+    fn publish_validate_requires_artifact_or_build_for_private_deploy_only() {
+        let args = test_publish_args();
+        let selected = select_publish_phases(false, false, true, false, false);
+        let err =
+            validate_publish_phase_options(&args, selected, false).expect_err("must fail closed");
+        assert!(err.to_string().contains("--deploy requires --artifact"));
     }
 }

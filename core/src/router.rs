@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use tracing::debug;
 
 use crate::manifest;
+use crate::types::ServiceSpec;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeKind {
@@ -125,7 +126,8 @@ impl ManifestData {
         let mut ordered = Vec::new();
         let mut seen = HashSet::new();
 
-        if let Some(required) = self.get_array(&["targets", &self.selected_target, "required_env"]) {
+        if let Some(required) = self.get_array(&["targets", &self.selected_target, "required_env"])
+        {
             for value in required {
                 if let Some(name) = value.as_str() {
                     let trimmed = name.trim();
@@ -149,6 +151,31 @@ impl ManifestData {
         }
 
         ordered
+    }
+
+    pub fn services(&self) -> HashMap<String, ServiceSpec> {
+        self.get_table(&["services"])
+            .map(|services| {
+                services
+                    .iter()
+                    .filter_map(|(name, raw)| {
+                        let spec: ServiceSpec = raw.clone().try_into().ok()?;
+                        Some((name.to_string(), spec))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn is_web_services_mode(&self) -> bool {
+        self.execution_runtime()
+            .map(|runtime| runtime.eq_ignore_ascii_case("web"))
+            .unwrap_or(false)
+            && self
+                .execution_driver()
+                .map(|driver| driver.eq_ignore_ascii_case("deno"))
+                .unwrap_or(false)
+            && !self.services().is_empty()
     }
 
     pub fn manifest_name(&self) -> Option<String> {

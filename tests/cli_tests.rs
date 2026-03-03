@@ -175,6 +175,9 @@ fn test_publish_command_exists() {
         .success()
         .stdout(predicate::str::contains("Publish capsule"))
         .stdout(predicate::str::contains("--registry <REGISTRY>"))
+        .stdout(predicate::str::contains("--prepare"))
+        .stdout(predicate::str::contains("--build"))
+        .stdout(predicate::str::contains("--deploy"))
         .stdout(predicate::str::contains("--ci"))
         .stdout(predicate::str::contains("--dry-run"))
         .stdout(predicate::str::contains("--no-tui"));
@@ -265,7 +268,7 @@ fn test_build_invalid_manifest_outputs_single_json_error() {
 fn test_publish_json_error_uses_diagnostic_envelope() {
     let output = Command::cargo_bin("ato")
         .unwrap()
-        .args(["publish", "--json"])
+        .args(["publish", "--json", "--deploy"])
         .output()
         .unwrap();
 
@@ -274,6 +277,71 @@ fn test_publish_json_error_uses_diagnostic_envelope() {
     let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     assert_eq!(value["ok"], false);
     assert_eq!(value["code"], "CI_ONLY_PUBLISH");
+    assert!(value["phases"].is_array());
+}
+
+#[test]
+fn test_publish_default_for_official_selects_deploy_only() {
+    let output = Command::cargo_bin("ato")
+        .unwrap()
+        .args(["publish", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let phases = value["phases"].as_array().expect("phases must be array");
+
+    let prepare = phases
+        .iter()
+        .find(|p| p["name"] == "prepare")
+        .expect("prepare phase");
+    let build = phases
+        .iter()
+        .find(|p| p["name"] == "build")
+        .expect("build phase");
+    let deploy = phases
+        .iter()
+        .find(|p| p["name"] == "deploy")
+        .expect("deploy phase");
+
+    assert_eq!(prepare["selected"], false);
+    assert_eq!(build["selected"], false);
+    assert_eq!(deploy["selected"], true);
+}
+
+#[test]
+fn test_publish_legacy_full_publish_rejected_for_private_registry() {
+    let output = Command::cargo_bin("ato")
+        .unwrap()
+        .args([
+            "publish",
+            "--json",
+            "--legacy-full-publish",
+            "--registry",
+            "http://127.0.0.1:8787",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(value["code"], "E999");
+    assert!(value["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("--legacy-full-publish is only available for official registry publish"));
+}
+
+#[test]
+fn test_publish_phase_flags_conflict_with_ci_mode() {
+    let mut cmd = Command::cargo_bin("ato").unwrap();
+    cmd.args(["publish", "--ci", "--deploy"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
 }
 
 #[test]
@@ -301,7 +369,8 @@ fn test_source_rebuild_accepts_reference_alias() {
     .assert()
     .failure()
     .stderr(
-        predicate::str::contains("Failed to preflight source operation")
-            .or(predicate::str::contains("Source operation requires authentication")),
+        predicate::str::contains("Failed to preflight source operation").or(
+            predicate::str::contains("Source operation requires authentication"),
+        ),
     );
 }

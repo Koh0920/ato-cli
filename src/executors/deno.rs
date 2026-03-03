@@ -1,7 +1,7 @@
+use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::collections::BTreeSet;
 #[cfg(unix)]
 use std::{
     collections::BTreeMap,
@@ -36,9 +36,12 @@ pub fn execute(
     ipc_env: Option<&IpcEnvVars>,
     dangerously_skip_permissions: bool,
 ) -> Result<i32> {
-    let deno_bin = runtime_manager::ensure_deno_binary(plan)?;
-
     verify_execution_plan_hashes(execution_plan)?;
+    if plan.is_web_services_mode() {
+        return super::web_services::execute(plan, ipc_env);
+    }
+
+    let deno_bin = runtime_manager::ensure_deno_binary(plan)?;
 
     let entrypoint = plan
         .execution_entrypoint()
@@ -57,23 +60,6 @@ pub fn execute(
         .into());
     };
 
-    let is_orchestrator = is_deno_orchestrator(plan, &entrypoint);
-    let node_bin = if is_orchestrator {
-        Some(runtime_manager::ensure_node_binary(plan)?)
-    } else {
-        None
-    };
-    let python_bin = if is_orchestrator {
-        Some(runtime_manager::ensure_python_binary(plan)?)
-    } else {
-        None
-    };
-    let uv_bin = if is_orchestrator {
-        Some(runtime_manager::ensure_uv_binary(plan)?)
-    } else {
-        None
-    };
-
     run_provisioning(&deno_bin, plan, &runtime_dir, &entrypoint, &lock, ipc_env)?;
     run_runtime(
         &deno_bin,
@@ -84,9 +70,6 @@ pub fn execute(
         &lock,
         ipc_env,
         dangerously_skip_permissions,
-        node_bin.as_deref(),
-        python_bin.as_deref(),
-        uv_bin.as_deref(),
     )
 }
 
@@ -146,9 +129,6 @@ fn run_runtime(
     lock: &DependencyLock,
     ipc_env: Option<&IpcEnvVars>,
     dangerously_skip_permissions: bool,
-    node_bin: Option<&Path>,
-    python_bin: Option<&Path>,
-    uv_bin: Option<&Path>,
 ) -> Result<i32> {
     let mut cmd = Command::new(deno_bin);
     let execution_env = plan.execution_env();
@@ -166,81 +146,52 @@ fn run_runtime(
         }
     }
 
-    let orchestrator_mode = node_bin.is_some() && python_bin.is_some();
     if dangerously_skip_permissions {
         cmd.arg("-A");
     } else {
-        if orchestrator_mode {
-            let mut allow_run = Vec::new();
-            allow_run.push(deno_bin.to_string_lossy().to_string());
-            if let Some(node) = node_bin {
-                allow_run.push(node.to_string_lossy().to_string());
-            }
-            if let Some(python) = python_bin {
-                allow_run.push(python.to_string_lossy().to_string());
-            }
-            if let Some(uv) = uv_bin {
-                allow_run.push(uv.to_string_lossy().to_string());
-            }
-            // Allow orchestrator-created venv Python path for control-plane startup.
-            for rel in [
-                "apps/control-plane/.venv/bin/python",
-                "source/apps/control-plane/.venv/bin/python",
-                "apps/control-plane/.venv/Scripts/python.exe",
-                "source/apps/control-plane/.venv/Scripts/python.exe",
-            ] {
-                allow_run.push(runtime_dir.join(rel).to_string_lossy().to_string());
-            }
-            cmd.arg(format!("--allow-run={}", allow_run.join(",")));
-            cmd.arg("--allow-env");
-            cmd.arg("--allow-read");
-            cmd.arg("--allow-net");
-            cmd.arg(format!("--allow-write={}", runtime_dir.to_string_lossy()));
-        } else {
-            if !execution_plan.runtime.policy.network.allow_hosts.is_empty() {
-                cmd.arg(format!(
-                    "--allow-net={}",
-                    execution_plan.runtime.policy.network.allow_hosts.join(",")
-                ));
-            }
+        if !execution_plan.runtime.policy.network.allow_hosts.is_empty() {
+            cmd.arg(format!(
+                "--allow-net={}",
+                execution_plan.runtime.policy.network.allow_hosts.join(",")
+            ));
+        }
 
-            let mut allow_read = execution_plan.runtime.policy.filesystem.read_only.clone();
-            allow_read.extend(execution_plan.runtime.policy.filesystem.read_write.clone());
-            if !allow_read.is_empty() {
-                cmd.arg(format!("--allow-read={}", allow_read.join(",")));
-            }
+        let mut allow_read = execution_plan.runtime.policy.filesystem.read_only.clone();
+        allow_read.extend(execution_plan.runtime.policy.filesystem.read_write.clone());
+        if !allow_read.is_empty() {
+            cmd.arg(format!("--allow-read={}", allow_read.join(",")));
+        }
 
-            if !execution_plan
-                .runtime
-                .policy
-                .filesystem
-                .read_write
-                .is_empty()
-            {
-                cmd.arg(format!(
-                    "--allow-write={}",
-                    execution_plan
-                        .runtime
-                        .policy
-                        .filesystem
-                        .read_write
-                        .join(",")
-                ));
-            }
+        if !execution_plan
+            .runtime
+            .policy
+            .filesystem
+            .read_write
+            .is_empty()
+        {
+            cmd.arg(format!(
+                "--allow-write={}",
+                execution_plan
+                    .runtime
+                    .policy
+                    .filesystem
+                    .read_write
+                    .join(",")
+            ));
+        }
 
-            if execution_plan.target.runtime == ExecutionRuntime::Web {
-                let mut allow_env = BTreeSet::new();
-                allow_env.insert("PORT".to_string());
-                allow_env.insert("ATO_RUNTIME_DENO_BIN".to_string());
-                allow_env.insert("ATO_RUNTIME_NODE_BIN".to_string());
-                allow_env.insert("ATO_RUNTIME_PYTHON_BIN".to_string());
-                allow_env.insert("ATO_RUNTIME_UV_BIN".to_string());
-                allow_env.extend(execution_env.keys().cloned());
-                cmd.arg(format!(
-                    "--allow-env={}",
-                    allow_env.into_iter().collect::<Vec<_>>().join(",")
-                ));
-            }
+        if execution_plan.target.runtime == ExecutionRuntime::Web {
+            let mut allow_env = BTreeSet::new();
+            allow_env.insert("PORT".to_string());
+            allow_env.insert("ATO_RUNTIME_DENO_BIN".to_string());
+            allow_env.insert("ATO_RUNTIME_NODE_BIN".to_string());
+            allow_env.insert("ATO_RUNTIME_PYTHON_BIN".to_string());
+            allow_env.insert("ATO_RUNTIME_UV_BIN".to_string());
+            allow_env.extend(execution_env.keys().cloned());
+            cmd.arg(format!(
+                "--allow-env={}",
+                allow_env.into_iter().collect::<Vec<_>>().join(",")
+            ));
         }
     }
 
@@ -248,15 +199,6 @@ fn run_runtime(
         cmd.env(key, value);
     }
     cmd.env("ATO_RUNTIME_DENO_BIN", deno_bin);
-    if let Some(node) = node_bin {
-        cmd.env("ATO_RUNTIME_NODE_BIN", node);
-    }
-    if let Some(python) = python_bin {
-        cmd.env("ATO_RUNTIME_PYTHON_BIN", python);
-    }
-    if let Some(uv) = uv_bin {
-        cmd.env("ATO_RUNTIME_UV_BIN", uv);
-    }
     if execution_plan.target.runtime == ExecutionRuntime::Web {
         if let Some(port) = plan.execution_port() {
             cmd.env("PORT", port.to_string());
@@ -362,25 +304,6 @@ fn run_and_stream_child(cmd: &mut Command) -> Result<(i32, Vec<u8>)> {
 
     let exit_code = status.code().unwrap_or(1);
     Ok((exit_code, stderr))
-}
-
-fn is_deno_orchestrator(plan: &ManifestData, entrypoint: &str) -> bool {
-    let runtime = plan.execution_runtime().unwrap_or_default();
-    let driver = plan.execution_driver().unwrap_or_default();
-    if !runtime.eq_ignore_ascii_case("web") || !driver.eq_ignore_ascii_case("deno") {
-        return false;
-    }
-    let has_runtime_tools =
-        plan.execution_runtime_tool_version("node").is_some()
-            || plan.execution_runtime_tool_version("python").is_some();
-    if has_runtime_tools {
-        return true;
-    }
-    std::path::Path::new(entrypoint)
-        .file_name()
-        .and_then(|v| v.to_str())
-        .map(|v| v.eq_ignore_ascii_case("ato-entry.ts"))
-        .unwrap_or(false)
 }
 
 fn resolve_deno_runtime_dir(manifest_dir: &Path, entrypoint: &str) -> PathBuf {

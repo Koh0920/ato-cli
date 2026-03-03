@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use capsule_core::CapsuleReporter;
 use ed25519_dalek::Signer;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
@@ -76,7 +77,10 @@ struct CiMetadataPayload {
     request_playground: bool,
 }
 
-pub async fn execute(args: PublishCiArgs) -> Result<PublishCiResult> {
+pub async fn execute(
+    args: PublishCiArgs,
+    reporter: std::sync::Arc<crate::reporters::CliReporter>,
+) -> Result<PublishCiResult> {
     let github = load_github_context()?;
     if github.ref_type != "tag" {
         anyhow::bail!(
@@ -116,7 +120,22 @@ pub async fn execute(args: PublishCiArgs) -> Result<PublishCiResult> {
         );
     }
 
-    let artifact_path = build_capsule_artifact(&manifest_path, &manifest.name, &manifest.version)?;
+    if !args.json_output {
+        reporter
+            .progress_start(
+                "📦 [publish] Building capsule artifact for CI publish...".to_string(),
+                None,
+            )
+            .await?;
+    }
+    let artifact_path = build_capsule_artifact(&manifest_path, &manifest.name, &manifest.version);
+    if !args.json_output {
+        reporter.progress_finish(None).await?;
+    }
+    let artifact_path = artifact_path?;
+    if !args.json_output {
+        println!("✅ CI artifact built: {}", artifact_path.display());
+    }
     crate::payload_guard::ensure_payload_size(
         &artifact_path,
         args.force_large_payload,
@@ -167,13 +186,25 @@ pub async fn execute(args: PublishCiArgs) -> Result<PublishCiResult> {
                 .mime_str("application/octet-stream")?,
         );
 
+    if !args.json_output {
+        reporter
+            .progress_start(
+                "📤 [publish] Uploading artifact to Store API...".to_string(),
+                None,
+            )
+            .await?;
+    }
     let response = reqwest::Client::new()
         .post(&endpoint)
         .header("Authorization", format!("Bearer {}", oidc_token))
         .multipart(form)
         .send()
         .await
-        .with_context(|| format!("Failed to upload CI artifact to {}", endpoint))?;
+        .with_context(|| format!("Failed to upload CI artifact to {}", endpoint));
+    if !args.json_output {
+        reporter.progress_finish(None).await?;
+    }
+    let response = response?;
 
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
@@ -185,9 +216,8 @@ pub async fn execute(args: PublishCiArgs) -> Result<PublishCiResult> {
         .context("Invalid /v1/publish/ci response payload")?;
 
     if !args.json_output {
-        eprintln!("CI artifact built: {}", artifact_path.display());
-        eprintln!("CI publish mode: keyless ephemeral Ed25519 signature");
-        eprintln!("CI did:key: {}", did_signature.public_key);
+        println!("CI publish mode: keyless ephemeral Ed25519 signature");
+        println!("CI did:key: {}", did_signature.public_key);
     }
 
     Ok(result)
@@ -344,16 +374,22 @@ pub(crate) fn build_capsule_artifact(
 
     match decision.kind {
         capsule_core::router::RuntimeKind::Source => {
+            let prepared_config = capsule_core::packers::source::prepare_source_config(
+                &decision.plan.manifest_path,
+                "strict".to_string(),
+                false,
+            )?;
             capsule_core::packers::source::pack(
                 &decision.plan,
                 capsule_core::packers::source::SourcePackOptions {
                     manifest_path: decision.plan.manifest_path.clone(),
                     manifest_dir: decision.plan.manifest_dir.clone(),
+                    config_json: prepared_config.config_json.clone(),
+                    config_path: prepared_config.config_path.clone(),
                     output: Some(artifact_path.clone()),
                     runtime: None,
                     skip_l1: false,
                     skip_validation: false,
-                    enforcement: "strict".to_string(),
                     nacelle_override: None,
                     standalone: false,
                 },
@@ -377,16 +413,22 @@ pub(crate) fn build_capsule_artifact(
                     reporter,
                 )?;
             } else {
+                let prepared_config = capsule_core::packers::source::prepare_source_config(
+                    &decision.plan.manifest_path,
+                    "strict".to_string(),
+                    false,
+                )?;
                 capsule_core::packers::source::pack(
                     &decision.plan,
                     capsule_core::packers::source::SourcePackOptions {
                         manifest_path: decision.plan.manifest_path.clone(),
                         manifest_dir: decision.plan.manifest_dir.clone(),
+                        config_json: prepared_config.config_json.clone(),
+                        config_path: prepared_config.config_path.clone(),
                         output: Some(artifact_path.clone()),
                         runtime: None,
                         skip_l1: false,
                         skip_validation: false,
-                        enforcement: "strict".to_string(),
                         nacelle_override: None,
                         standalone: false,
                     },

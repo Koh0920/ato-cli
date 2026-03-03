@@ -15,13 +15,13 @@ ato close --id <capsule-id> | --name <name> [--all] [--force]
 ato logs --id <capsule-id> [--follow]
 ato install <publisher/slug> [--registry <url>]
 ato build [dir] [--force-large-payload]
-ato publish [--registry <url>] [--artifact <file.capsule>] [--force-large-payload]
+ato publish [--registry <url>] [--artifact <file.capsule>] [--scoped-id <publisher/slug>] [--allow-existing] [--prepare] [--build] [--deploy] [--legacy-full-publish] [--force-large-payload]
 ato publish --dry-run
 ato publish --ci
 ato search [query]
 ato config engine install --engine nacelle [--version <ver>]
 ato setup --engine nacelle [--version <ver>] # compatibility command (deprecated)
-ato registry serve --host 127.0.0.1 --port 8787 [--auth-token <token>]
+ato registry serve --host 127.0.0.1 --port 18787 [--auth-token <token>]
 ```
 
 ## Quick Start (Local)
@@ -53,13 +53,40 @@ cargo build -p ato-cli
 
 - Official registries (`https://api.ato.run`, `https://staging.api.ato.run`):
   `ato publish` is CI-first (OIDC). Direct local uploads are not allowed.
+  Default phase selection is `deploy` only (handoff/diagnostics). If you need local build checks, explicitly add `--build` (or `--prepare --build`) before `--deploy`.
 - Local/private registries (any other `--registry`):
   `ato publish --registry ...` performs direct uploads. `--artifact` is recommended to avoid re-packing.
+  `--artifact` supports standalone artifact flow (no local `capsule.toml` required).
+  `--allow-existing` is available only on deploy phase (`--deploy`) for private/local registries.
+
+`ato publish` runs 3 internal phases in fixed order: `prepare -> build -> deploy`.
+
+- Default (official registries): run `deploy` only.
+- Default (private/local registries): run all phases.
+- If any of `--prepare/--build/--deploy` is specified: run only selected phases.
+- `--artifact` always skips build phase.
+- `official + deploy` returns handoff only (no local upload).
+- `--legacy-full-publish` (official only) temporarily restores legacy default (`prepare -> build -> deploy`), is deprecated, and is scheduled for removal in the next major release.
+- `--ci` / `--dry-run` cannot be combined with phase flags.
 
 ```bash
 # pre-build + direct publish to a private registry (recommended)
 ato build .
-ATO_TOKEN=pwd ato publish --registry http://127.0.0.1:8787 --artifact ./<name>.capsule
+ATO_TOKEN=pwd ato publish --registry http://127.0.0.1:18787 --artifact ./<name>.capsule
+
+# phase-filtered execution examples
+ato publish --prepare
+ato publish --build
+ATO_TOKEN=pwd ato publish --deploy --artifact ./<name>.capsule --registry http://127.0.0.1:18787
+ato publish --registry https://api.ato.run           # default: deploy only
+ato publish --registry https://api.ato.run --build   # explicit local build + official handoff
+ato publish --deploy --registry https://api.ato.run
+
+# temporary compatibility flag (official only; deprecated and will be removed in next major)
+ato publish --registry https://api.ato.run --legacy-full-publish
+
+# idempotent retry for the same version/content (CI retry best practice)
+ATO_TOKEN=pwd ato publish --registry http://127.0.0.1:18787 --artifact ./<name>.capsule --allow-existing
 ```
 
 ## Proto Regeneration (Maintenance Only)
@@ -75,32 +102,37 @@ Run this only when `core/proto/tsnet/v1/tsnet.proto` changes.
 
 ```bash
 # Terminal 1: start local HTTP registry
-ato registry serve --host 127.0.0.1 --port 8787
+ato registry serve --host 127.0.0.1 --port 18787
 
 # Terminal 2: build -> publish(artifact) -> install -> run
 ato build .
-ATO_TOKEN=pwd ato publish --artifact ./<name>.capsule --registry http://127.0.0.1:8787
-ato install <publisher>/<slug> --registry http://127.0.0.1:8787
-ato run <publisher>/<slug> --registry http://127.0.0.1:8787 --yes
+ATO_TOKEN=pwd ato publish --artifact ./<name>.capsule --registry http://127.0.0.1:18787
+ato install <publisher>/<slug> --registry http://127.0.0.1:18787
+ato run <publisher>/<slug> --registry http://127.0.0.1:18787 --yes
 ```
 
 Notes:
 - Write operations (`publish`) require `ATO_TOKEN` when `registry serve --auth-token` is enabled.
 - Read operations (search/install/download) can remain unauthenticated.
+- Use `18787` in local verification to avoid collision with app services that also use `8787` (for example, worker HTTP ports).
 - `publish --artifact` is the recommended path for local/private workflows.
+- `--scoped-id` can override publisher/slug for artifact upload.
+- `--allow-existing` is not a blind conflict ignore; it is an idempotent operation gated by artifact hash/manifest consistency checks.
+- In enterprise CI, attach `--allow-existing` to retry paths to make reruns deterministic and safe.
+- Version conflict is reported as `E202` with next actions (`bump version`, `--allow-existing`, or reset local registry).
 
 ## Cross-Device Publish (VPN / Tailscale)
 
 ```bash
 # Server side: non-loopback exposure requires --auth-token
-ato registry serve --host 0.0.0.0 --port 8787 --auth-token pwd
+ato registry serve --host 0.0.0.0 --port 18787 --auth-token pwd
 
 # Client side: install/run do not require token (read APIs)
-ato install <publisher>/<slug> --registry http://100.x.y.z:8787
-ato run <publisher>/<slug> --registry http://100.x.y.z:8787
+ato install <publisher>/<slug> --registry http://100.x.y.z:18787
+ato run <publisher>/<slug> --registry http://100.x.y.z:18787
 
 # Token required only for publish
-ATO_TOKEN=pwd ato publish --registry http://100.x.y.z:8787 --artifact ./<name>.capsule
+ATO_TOKEN=pwd ato publish --registry http://100.x.y.z:18787 --artifact ./<name>.capsule
 ```
 
 ## Required Environment Variable Checks (Pre-Run)
@@ -111,9 +143,9 @@ If missing or empty, execution stops fail-closed.
 - `targets.<label>.required_env = ["KEY1", "KEY2"]` (recommended)
 - Backward compatibility: `targets.<label>.env.ATO_ORCH_REQUIRED_ENVS = "KEY1,KEY2"`
 
-## Dynamic App Capsule Recipe (Web + Deno Orchestrator)
+## Dynamic App Capsule Recipe (Web + Services Supervisor)
 
-For multi-service apps (for example: dashboard + API + worker), use a single `web/deno` target and orchestrate child processes in `ato-entry.ts`.
+For multi-service apps (for example: dashboard + API + worker), use a single `web/deno` target with top-level `[services]`. `ato run` starts services in DAG order, waits on readiness probes, prefixes logs, and fail-fast stops all services when one exits.
 
 1. Pre-bundle artifacts before packing (for example: `next build`, worker build, lockfiles).
 2. Include only runtime artifacts via `[pack].include` (do not package raw `node_modules`, `.venv`, caches).
@@ -129,7 +161,6 @@ default_target = "default"
 
 [pack]
 include = [
-  "ato-entry.ts",
   "capsule.toml",
   "capsule.lock",
   "apps/dashboard/.next/standalone/**",
@@ -151,10 +182,19 @@ exclude = [
 runtime = "web"
 driver = "deno"
 runtime_version = "1.46.3"
-runtime_tools = { node = "20.11.0", python = "3.11.10" }
-entrypoint = "ato-entry.ts"
+runtime_tools = { node = "20.11.0", python = "3.11.10", uv = "0.4.30" }
 port = 4173
 required_env = ["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID"]
+
+[services.main]
+entrypoint = "node apps/dashboard/.next/standalone/server.js"
+depends_on = ["api"]
+readiness_probe = { http_get = "/health", port = "PORT" }
+
+[services.api]
+entrypoint = "python apps/control-plane/src/main.py"
+env = { API_PORT = "8000" }
+readiness_probe = { http_get = "/health", port = "API_PORT" }
 ```
 
 Recommended flow:
@@ -167,17 +207,19 @@ npm run capsule:prepare
 ato build .
 
 # 3) publish artifact (private/local registry)
-ATO_TOKEN=pwd ato publish --registry http://127.0.0.1:8787 --artifact ./my-dynamic-app.capsule
+ATO_TOKEN=pwd ato publish --registry http://127.0.0.1:18787 --artifact ./my-dynamic-app.capsule
 
 # 4) install + run
-ato install <publisher>/<slug> --registry http://127.0.0.1:8787
-ato run <publisher>/<slug> --registry http://127.0.0.1:8787
+ato install <publisher>/<slug> --registry http://127.0.0.1:18787
+ato run <publisher>/<slug> --registry http://127.0.0.1:18787
 ```
 
 Notes:
 - For Next.js standalone, copy `.next/static` (and `public` if used) into standalone output before `ato build`.
 - `ato run` stops before startup if `required_env` keys are missing.
-- `ato-entry.ts` should fail-fast when one child process exits unexpectedly.
+- `services.main` is required in services mode and receives `PORT=<targets.<label>.port`.
+- `targets.<label>.entrypoint = "ato-entry.ts"` is deprecated and rejected.
+- If a service command starts with `node`, `python`, or `uv`, pin the matching version in `runtime_tools`.
 
 ## Runtime Isolation Policy (Tiers)
 
