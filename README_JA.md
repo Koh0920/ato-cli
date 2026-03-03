@@ -15,13 +15,13 @@ ato close --id <capsule-id> | --name <name> [--all] [--force]
 ato logs --id <capsule-id> [--follow]
 ato install <publisher/slug> [--registry <url>]
 ato build [dir] [--force-large-payload]
-ato publish [--registry <url>] [--artifact <file.capsule>] [--force-large-payload]
+ato publish [--registry <url>] [--artifact <file.capsule>] [--scoped-id <publisher/slug>] [--allow-existing] [--prepare] [--build] [--deploy] [--legacy-full-publish] [--force-large-payload]
 ato publish --dry-run
 ato publish --ci
 ato search [query]
 ato config engine install --engine nacelle [--version <ver>]
 ato setup --engine nacelle [--version <ver>] # 互換コマンド（非推奨）
-ato registry serve --host 127.0.0.1 --port 8787 [--auth-token <token>]
+ato registry serve --host 127.0.0.1 --port 18787 [--auth-token <token>]
 ```
 
 ## クイックスタート（ローカル）
@@ -53,13 +53,40 @@ cargo build -p ato-cli
 
 - 公式レジストリ（`https://api.ato.run`, `https://staging.api.ato.run`）:
   `ato publish` は CI-first（OIDC）で公開します。ローカルからの直接アップロードは行いません。
+  既定フェーズは `deploy` のみ（handoff/diagnostics）です。ローカルで build 検証が必要な場合は `--build`（必要なら `--prepare --build`）を明示してください。
 - ローカル/私設レジストリ（上記以外の `--registry`）:
   `ato publish --registry ...` で直接アップロードします。`--artifact` 指定を推奨します（再パッキング回避）。
+  `--artifact` はローカル `capsule.toml` がなくても単体で publish できます。
+  `--allow-existing` は private/local の deploy フェーズ（`--deploy`）でのみ利用できます。
+
+`ato publish` は固定順 `prepare -> build -> deploy` の3フェーズで実行されます。
+
+- フェーズ指定なし（official）: `deploy` のみ実行
+- フェーズ指定なし（private/local）: 3フェーズすべて実行
+- `--prepare/--build/--deploy` のいずれか指定時: 指定フェーズのみ実行
+- `--artifact` 指定時: build フェーズは常に skip
+- `official + deploy` は handoff のみ（ローカル upload はしない）
+- `--legacy-full-publish`（official専用）は旧既定（`prepare -> build -> deploy`）へ一時的に戻す互換フラグです。非推奨で、次回メジャーリリースで削除予定です。
+- `--ci` / `--dry-run` とフェーズ指定は併用不可
 
 ```bash
 # 事前ビルド + private registry へ直接 publish（推奨）
 ato build .
-ATO_TOKEN=pwd ato publish --registry http://127.0.0.1:8787 --artifact ./<name>.capsule
+ATO_TOKEN=pwd ato publish --registry http://127.0.0.1:18787 --artifact ./<name>.capsule
+
+# フェーズ指定の実行例
+ato publish --prepare
+ato publish --build
+ATO_TOKEN=pwd ato publish --deploy --artifact ./<name>.capsule --registry http://127.0.0.1:18787
+ato publish --registry https://api.ato.run           # 既定: deployのみ
+ato publish --registry https://api.ato.run --build   # 明示的にローカルbuild + official handoff
+ato publish --deploy --registry https://api.ato.run
+
+# 一時互換フラグ（official専用・非推奨・次回メジャーで削除予定）
+ato publish --registry https://api.ato.run --legacy-full-publish
+
+# 同一 version/同一内容の再実行を成功扱いにする（idempotent / CI再試行の推奨）
+ATO_TOKEN=pwd ato publish --registry http://127.0.0.1:18787 --artifact ./<name>.capsule --allow-existing
 ```
 
 ## Proto 再生成（メンテナンス時のみ）
@@ -75,32 +102,37 @@ ATO_TOKEN=pwd ato publish --registry http://127.0.0.1:8787 --artifact ./<name>.c
 
 ```bash
 # ターミナル1: ローカルHTTPレジストリ起動
-ato registry serve --host 127.0.0.1 --port 8787
+ato registry serve --host 127.0.0.1 --port 18787
 
 # ターミナル2: build -> publish(artifact) -> install -> run
 ato build .
-ATO_TOKEN=pwd ato publish --artifact ./<name>.capsule --registry http://127.0.0.1:8787
-ato install <publisher>/<slug> --registry http://127.0.0.1:8787
-ato run <publisher>/<slug> --registry http://127.0.0.1:8787 --yes
+ATO_TOKEN=pwd ato publish --artifact ./<name>.capsule --registry http://127.0.0.1:18787
+ato install <publisher>/<slug> --registry http://127.0.0.1:18787
+ato run <publisher>/<slug> --registry http://127.0.0.1:18787 --yes
 ```
 
 補足:
 - 書き込み（publish）は `ATO_TOKEN` が必要です（`registry serve --auth-token` 設定時）。
 - 読み取り（search/install/download）は無認証のまま利用できます。
+- ローカル検証では `18787` を使うと、worker 等が `8787` を使うアプリとのポート衝突を避けられます。
 - `publish --artifact` はローカル用途向けの推奨経路です。
+- `--scoped-id` で artifact upload 時の publisher/slug を明示指定できます。
+- `--allow-existing` は単なる競合無視ではなく、artifact hash / manifest 整合性チェック付きの冪等操作です。
+- エンタープライズCIの再試行経路では、`--allow-existing` を付与して再実行を安全に決定論化することを推奨します。
+- version 競合は `E202` で返り、次アクション（version更新 / `--allow-existing` / ローカルレジストリ初期化）を表示します。
 
 ## 別デバイス公開（VPN / Tailscale 想定）
 
 ```bash
 # サーバー側: 非loopback公開時は --auth-token 必須
-ato registry serve --host 0.0.0.0 --port 8787 --auth-token pwd
+ato registry serve --host 0.0.0.0 --port 18787 --auth-token pwd
 
 # クライアント側: install/run は token 不要（読み取りAPI）
-ato install <publisher>/<slug> --registry http://100.x.y.z:8787
-ato run <publisher>/<slug> --registry http://100.x.y.z:8787
+ato install <publisher>/<slug> --registry http://100.x.y.z:18787
+ato run <publisher>/<slug> --registry http://100.x.y.z:18787
 
 # パブリッシュ時のみ token 必須
-ATO_TOKEN=pwd ato publish --registry http://100.x.y.z:8787 --artifact ./<name>.capsule
+ATO_TOKEN=pwd ato publish --registry http://100.x.y.z:18787 --artifact ./<name>.capsule
 ```
 
 ## 実行前の環境変数チェック
@@ -166,11 +198,11 @@ npm run capsule:prepare
 ato build .
 
 # 3) 成果物をpublish（private/local registry）
-ATO_TOKEN=pwd ato publish --registry http://127.0.0.1:8787 --artifact ./my-dynamic-app.capsule
+ATO_TOKEN=pwd ato publish --registry http://127.0.0.1:18787 --artifact ./my-dynamic-app.capsule
 
 # 4) install + run
-ato install <publisher>/<slug> --registry http://127.0.0.1:8787
-ato run <publisher>/<slug> --registry http://127.0.0.1:8787
+ato install <publisher>/<slug> --registry http://127.0.0.1:18787
+ato run <publisher>/<slug> --registry http://127.0.0.1:18787
 ```
 
 補足:
