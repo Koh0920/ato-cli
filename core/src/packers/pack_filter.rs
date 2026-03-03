@@ -69,9 +69,7 @@ impl PackFilter {
         };
 
         let mut excludes = Vec::<String>::new();
-        if include.is_none() {
-            excludes.extend(SMART_DEFAULT_EXCLUDES.iter().map(|v| v.to_string()));
-        }
+        excludes.extend(SMART_DEFAULT_EXCLUDES.iter().map(|v| v.to_string()));
         excludes.extend(exclude_patterns);
 
         let exclude = build_glob_set(&excludes)?;
@@ -200,5 +198,39 @@ mod tests {
         assert!(filter.should_include_file(Path::new("apps/a.ts")));
         assert!(!filter.should_include_file(Path::new("apps/a.test.ts")));
         assert!(!filter.should_include_file(Path::new("node_modules/x.js")));
+    }
+
+    #[test]
+    fn include_mode_cannot_force_include_hard_default_excludes() {
+        let mut manifest = CapsuleManifestV1 {
+            schema_version: "0.2".to_string(),
+            name: "test".to_string(),
+            version: "0.1.0".to_string(),
+            capsule_type: crate::types::capsule_v1::CapsuleType::App,
+            default_target: "cli".to_string(),
+            metadata: Default::default(),
+            capabilities: None,
+            requirements: Default::default(),
+            execution: Default::default(),
+            storage: Default::default(),
+            routing: Default::default(),
+            network: None,
+            model: None,
+            transparency: None,
+            pool: None,
+            build: None,
+            pack: None,
+            isolation: None,
+            polymorphism: None,
+            targets: None,
+            services: None,
+        };
+        manifest.pack = Some(PackConfig {
+            include: vec!["**/node_modules/**".to_string()],
+            exclude: vec![],
+        });
+
+        let filter = PackFilter::from_manifest(&manifest).expect("filter");
+        assert!(!filter.should_include_file(Path::new("apps/web/node_modules/react/index.js")));
     }
 }

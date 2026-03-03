@@ -49,7 +49,7 @@ fs2 = "0.4"
 tar = "0.4"
 flate2 = "1.0"
 zip = "2.1"
-zstd = "0.13"
+zstd = { version = "0.13", features = ["zstdmt"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "net", "signal"] }
 tempfile = "3.8"
 wasmtime = "16.0"

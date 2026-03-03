@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::engine;
 use crate::error::{CapsuleError, Result};
@@ -16,13 +17,38 @@ use tracing::debug;
 pub struct SourcePackOptions {
     pub manifest_path: PathBuf,
     pub manifest_dir: PathBuf,
+    pub config_json: Arc<r3_config::ConfigJson>,
+    pub config_path: PathBuf,
     pub output: Option<PathBuf>,
     pub runtime: Option<PathBuf>,
     pub skip_l1: bool,
     pub skip_validation: bool,
-    pub enforcement: String,
     pub nacelle_override: Option<PathBuf>,
     pub standalone: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedSourceConfig {
+    pub config_json: Arc<r3_config::ConfigJson>,
+    pub config_path: PathBuf,
+}
+
+pub fn prepare_source_config(
+    manifest_path: &Path,
+    enforcement: String,
+    standalone: bool,
+) -> Result<PreparedSourceConfig> {
+    let config_json = Arc::new(r3_config::generate_config(
+        manifest_path,
+        Some(enforcement),
+        standalone,
+    )?);
+    let config_path = r3_config::write_config(manifest_path, config_json.as_ref())?;
+
+    Ok(PreparedSourceConfig {
+        config_json,
+        config_path,
+    })
 }
 
 pub fn pack(
@@ -84,19 +110,17 @@ pub fn pack(
         debug!("Entrypoint validation passed");
     }
 
-    debug!("Phase 2: generating R3 config.json");
-    let enforcement = opts.enforcement.clone();
-    let config_path = r3_config::generate_and_write_config(
-        &opts.manifest_path,
-        Some(enforcement.clone()),
-        opts.standalone,
-    )?;
-
+    debug!("Phase 2: using pre-generated R3 config.json");
     let config_reporter = reporter.clone();
+    if !opts.config_path.exists() {
+        return Err(CapsuleError::Pack(format!(
+            "config.json is missing: {}",
+            opts.config_path.display()
+        )));
+    }
+    debug!("config.json ready: {}", opts.config_path.display());
 
-    debug!("config.json generated: {}", config_path.display());
-
-    let lockfile_path = rt.block_on(lockfile::generate_and_write_lockfile(
+    let lockfile_path = rt.block_on(lockfile::ensure_lockfile(
         &opts.manifest_path,
         &loaded.raw,
         &loaded.raw_text,
@@ -133,8 +157,9 @@ pub fn pack(
                 manifest_path: opts.manifest_path.clone(),
                 manifest_dir: opts.manifest_dir.clone(),
                 output: opts.output.clone(),
-                enforcement: enforcement.clone(),
-                standalone: false,
+                config_json: opts.config_json,
+                config_path: opts.config_path,
+                lockfile_path,
             },
             reporter.clone(),
         ))?;

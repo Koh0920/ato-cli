@@ -1,9 +1,13 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::UNIX_EPOCH;
 
 use chrono::Utc;
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -15,6 +19,8 @@ use crate::reporter::CapsuleReporter;
 
 const UV_VERSION: &str = "0.4.19";
 const PNPM_VERSION: &str = "9.9.0";
+const LOCKFILE_INPUT_SNAPSHOT_VERSION: u32 = 1;
+const LOCKFILE_INPUT_SNAPSHOT_NAME: &str = ".capsule.lock.inputs.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapsuleLock {
@@ -127,6 +133,28 @@ pub struct ArtifactEntry {
     pub artifact_type: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LockfileInputSnapshot {
+    version: u32,
+    manifest_hash: String,
+    files: Vec<LockfileInputState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LockfileInputState {
+    path: String,
+    size: u64,
+    modified_ns: u128,
+    inode: Option<u64>,
+}
+
+struct OpenLockfileInput {
+    path: PathBuf,
+    state: LockfileInputState,
+    #[allow(dead_code)]
+    file: fs::File,
+}
+
 pub async fn generate_and_write_lockfile(
     manifest_path: &Path,
     manifest_raw: &toml::Value,
@@ -141,24 +169,64 @@ pub async fn generate_and_write_lockfile(
     let output_path = manifest_dir.join("capsule.lock");
     let content = toml::to_string_pretty(&lockfile)
         .map_err(|e| CapsuleError::Pack(format!("Failed to serialize capsule.lock: {}", e)))?;
-    std::fs::write(&output_path, content)
-        .map_err(|e| CapsuleError::Pack(format!("Failed to write capsule.lock: {}", e)))?;
+    write_atomic_bytes_with_os_lock(
+        &output_path,
+        content.as_bytes(),
+        "capsule.lock",
+        capsule_error_pack,
+    )?;
     Ok(output_path)
 }
 
-pub fn verify_lockfile_manifest(manifest_path: &Path, lockfile_path: &Path) -> Result<()> {
-    let manifest_text = fs::read_to_string(manifest_path)
-        .map_err(|e| CapsuleError::Config(format!("Failed to read manifest: {}", e)))?;
-    let lockfile = read_lockfile(lockfile_path)?;
-    let expected_hash = format!("sha256:{}", sha256_hex(manifest_text.as_bytes()));
+pub async fn ensure_lockfile(
+    manifest_path: &Path,
+    manifest_raw: &toml::Value,
+    manifest_text: &str,
+    reporter: Arc<dyn CapsuleReporter + 'static>,
+) -> Result<PathBuf> {
+    let manifest_dir = manifest_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let lock_path = manifest_dir.join("capsule.lock");
+    let mut inputs = open_lockfile_inputs(manifest_path, &manifest_dir, manifest_raw)?;
+    let manifest_hash = manifest_hash_from_open_inputs(&mut inputs, manifest_path)?;
 
+    if lock_path.exists()
+        && verify_lockfile_manifest_hash(&lock_path, &manifest_hash).is_ok()
+        && lockfile_inputs_snapshot_matches(&manifest_dir, &manifest_hash, &inputs)?
+    {
+        return Ok(lock_path);
+    }
+
+    let generated =
+        generate_and_write_lockfile(manifest_path, manifest_raw, manifest_text, reporter).await?;
+    write_lockfile_inputs_snapshot(&manifest_dir, &manifest_hash, &inputs)?;
+    Ok(generated)
+}
+
+pub fn verify_lockfile_manifest(manifest_path: &Path, lockfile_path: &Path) -> Result<()> {
+    let mut manifest_file = fs::File::open(manifest_path)
+        .map_err(|e| CapsuleError::Config(format!("Failed to read manifest: {}", e)))?;
+    verify_lockfile_manifest_with_open_manifest(&mut manifest_file, lockfile_path)
+}
+
+fn verify_lockfile_manifest_with_open_manifest(
+    manifest_file: &mut fs::File,
+    lockfile_path: &Path,
+) -> Result<()> {
+    let expected_hash = manifest_hash_from_open_file(manifest_file)?;
+    verify_lockfile_manifest_hash(lockfile_path, &expected_hash)
+}
+
+fn verify_lockfile_manifest_hash(lockfile_path: &Path, expected_hash: &str) -> Result<()> {
+    let lockfile = read_lockfile(lockfile_path)?;
     if lockfile.meta.manifest_hash != expected_hash {
         return Err(CapsuleError::Config(format!(
             "capsule.lock manifest hash mismatch (expected {}, got {})",
             expected_hash, lockfile.meta.manifest_hash
         )));
     }
-
     Ok(())
 }
 
@@ -167,6 +235,187 @@ fn read_lockfile(path: &Path) -> Result<CapsuleLock> {
         .map_err(|e| CapsuleError::Config(format!("Failed to read capsule.lock: {}", e)))?;
     toml::from_str(&raw)
         .map_err(|e| CapsuleError::Config(format!("Failed to parse capsule.lock: {}", e)))
+}
+
+fn manifest_hash_from_open_inputs(
+    inputs: &mut [OpenLockfileInput],
+    manifest_path: &Path,
+) -> Result<String> {
+    let manifest = inputs
+        .iter_mut()
+        .find(|input| input.path == manifest_path)
+        .ok_or_else(|| {
+            CapsuleError::Config(format!(
+                "Failed to locate opened manifest input: {}",
+                manifest_path.display()
+            ))
+        })?;
+    manifest_hash_from_open_file(&mut manifest.file)
+}
+
+fn manifest_hash_from_open_file(file: &mut fs::File) -> Result<String> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| CapsuleError::Config(format!("Failed to seek manifest: {}", e)))?;
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .map_err(|e| CapsuleError::Config(format!("Failed to read manifest: {}", e)))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| CapsuleError::Config(format!("Failed to rewind manifest: {}", e)))?;
+    Ok(format!("sha256:{}", sha256_hex(text.as_bytes())))
+}
+
+fn lockfile_inputs_snapshot_path(manifest_dir: &Path) -> PathBuf {
+    manifest_dir.join(LOCKFILE_INPUT_SNAPSHOT_NAME)
+}
+
+fn write_lockfile_inputs_snapshot(
+    manifest_dir: &Path,
+    manifest_hash: &str,
+    inputs: &[OpenLockfileInput],
+) -> Result<()> {
+    let snapshot = LockfileInputSnapshot {
+        version: LOCKFILE_INPUT_SNAPSHOT_VERSION,
+        manifest_hash: manifest_hash.to_string(),
+        files: inputs.iter().map(|i| i.state.clone()).collect(),
+    };
+    let raw = serde_json::to_vec_pretty(&snapshot).map_err(|e| {
+        CapsuleError::Config(format!("Failed to serialize lockfile input snapshot: {e}"))
+    })?;
+    let snapshot_path = lockfile_inputs_snapshot_path(manifest_dir);
+    write_atomic_bytes_with_os_lock(
+        &snapshot_path,
+        &raw,
+        "lockfile input snapshot",
+        capsule_error_config,
+    )?;
+    Ok(())
+}
+
+fn lockfile_inputs_snapshot_matches(
+    manifest_dir: &Path,
+    manifest_hash: &str,
+    inputs: &[OpenLockfileInput],
+) -> Result<bool> {
+    let snapshot_path = lockfile_inputs_snapshot_path(manifest_dir);
+    if !snapshot_path.exists() {
+        return Ok(false);
+    }
+    let raw = fs::read_to_string(&snapshot_path).map_err(|e| {
+        CapsuleError::Config(format!("Failed to read lockfile input snapshot: {}", e))
+    })?;
+    let snapshot: LockfileInputSnapshot = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return Ok(false),
+    };
+
+    if snapshot.version != LOCKFILE_INPUT_SNAPSHOT_VERSION {
+        return Ok(false);
+    }
+    if snapshot.manifest_hash != manifest_hash {
+        return Ok(false);
+    }
+
+    let current: Vec<LockfileInputState> = inputs.iter().map(|i| i.state.clone()).collect();
+    Ok(snapshot.files == current)
+}
+
+fn open_lockfile_inputs(
+    manifest_path: &Path,
+    manifest_dir: &Path,
+    manifest_raw: &toml::Value,
+) -> Result<Vec<OpenLockfileInput>> {
+    let mut paths = collect_lockfile_input_paths(manifest_path, manifest_dir, manifest_raw);
+    paths.sort();
+    paths.dedup();
+
+    let mut inputs = Vec::new();
+    for path in paths {
+        if !path.exists() || !path.is_file() {
+            continue;
+        }
+        let file = fs::File::open(&path).map_err(|e| {
+            CapsuleError::Config(format!(
+                "Failed to open lockfile input {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
+        let metadata = file.metadata().map_err(|e| {
+            CapsuleError::Config(format!(
+                "Failed to read metadata for {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
+        let state = lockfile_input_state(manifest_dir, &path, &metadata)?;
+        inputs.push(OpenLockfileInput { path, state, file });
+    }
+    inputs.sort_by(|a, b| a.state.path.cmp(&b.state.path));
+    Ok(inputs)
+}
+
+fn collect_lockfile_input_paths(
+    manifest_path: &Path,
+    manifest_dir: &Path,
+    manifest_raw: &toml::Value,
+) -> Vec<PathBuf> {
+    let mut paths = vec![manifest_path.to_path_buf()];
+    for name in [
+        "package.json",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "pyproject.toml",
+        "requirements.txt",
+        "deno.json",
+        "deno.jsonc",
+        "uv.lock",
+    ] {
+        paths.push(manifest_dir.join(name));
+    }
+
+    for language in ["python", "node"] {
+        if let Some(path) = read_dependencies_path(manifest_raw, language, manifest_dir) {
+            paths.push(path);
+        }
+    }
+
+    paths
+}
+
+fn lockfile_input_state(
+    manifest_dir: &Path,
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<LockfileInputState> {
+    let rel = path
+        .strip_prefix(manifest_dir)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let modified_ns = metadata
+        .modified()
+        .ok()
+        .and_then(|ts| ts.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+
+    Ok(LockfileInputState {
+        path: rel,
+        size: metadata.len(),
+        modified_ns,
+        inode: metadata_inode(metadata),
+    })
+}
+
+#[cfg(unix)]
+fn metadata_inode(metadata: &fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Some(metadata.ino())
+}
+
+#[cfg(not(unix))]
+fn metadata_inode(_: &fs::Metadata) -> Option<u64> {
+    None
 }
 
 async fn generate_lockfile(
@@ -393,6 +642,7 @@ async fn generate_uv_lock(
             &uv_path,
             &["lock"],
             deps_path.parent().unwrap_or(manifest_dir),
+            Some(manifest),
         )
         .await?
     } else if deps_path.extension().and_then(|e| e.to_str()) == Some("txt") {
@@ -401,10 +651,11 @@ async fn generate_uv_lock(
             &uv_path,
             &["pip", "compile", dep_string.as_str(), "-o", "uv.lock"],
             manifest_dir,
+            Some(manifest),
         )
         .await?
     } else {
-        run_command(&uv_path, &["lock"], manifest_dir).await?
+        run_command(&uv_path, &["lock"], manifest_dir, Some(manifest)).await?
     };
 
     if !status.success() {
@@ -460,7 +711,7 @@ async fn generate_pnpm_lock(
     cmd.args(&pnpm_cmd.args_prefix)
         .args(["install", "--lockfile-only", "--ignore-scripts", "--silent"])
         .current_dir(manifest_dir);
-    let status = run_command_inner(cmd).await?;
+    let status = run_command_inner_with_manifest_env(cmd, Some(manifest)).await?;
     if !status.success() {
         return Err(CapsuleError::Pack(
             "pnpm lock generation failed".to_string(),
@@ -521,7 +772,7 @@ async fn generate_deno_lock(
     ])
     .current_dir(manifest_dir);
 
-    let status = run_command_inner(cmd).await?;
+    let status = run_command_inner_with_manifest_env(cmd, Some(manifest)).await?;
     if !status.success() {
         return Err(CapsuleError::Pack(
             "deno lock generation failed".to_string(),
@@ -537,7 +788,7 @@ async fn generate_deno_lock(
 }
 
 async fn prepare_python_artifacts(
-    _manifest: &toml::Value,
+    manifest: &toml::Value,
     manifest_dir: &Path,
     target_key: &str,
     python_version: &str,
@@ -574,7 +825,7 @@ async fn prepare_python_artifacts(
     ])
     .current_dir(manifest_dir);
 
-    let status = run_command_inner(cmd).await?;
+    let status = run_command_inner_with_manifest_env(cmd, Some(manifest)).await?;
     if !status.success() {
         return Err(CapsuleError::Pack("uv pip sync failed".to_string()));
     }
@@ -646,7 +897,7 @@ async fn prepare_node_artifacts(
             store_dir.to_string_lossy().as_ref(),
         ])
         .current_dir(temp_path);
-    let status = run_command_inner(cmd).await?;
+    let status = run_command_inner_with_manifest_env(cmd, Some(manifest)).await?;
     if !status.success() {
         return Err(CapsuleError::Pack("pnpm fetch failed".to_string()));
     }
@@ -767,8 +1018,254 @@ async fn download_file(url: &str, dest: &Path) -> Result<()> {
         ));
     }
     let bytes = response.bytes().await.map_err(CapsuleError::Network)?;
-    std::fs::write(dest, &bytes)
-        .map_err(|e| CapsuleError::Pack(format!("Failed to write {}: {}", url, e)))?;
+    write_atomic_bytes_with_os_lock(
+        dest,
+        &bytes,
+        &format!("download cache for {url}"),
+        capsule_error_pack,
+    )?;
+    Ok(())
+}
+
+fn capsule_error_pack(message: String) -> CapsuleError {
+    CapsuleError::Pack(message)
+}
+
+fn capsule_error_config(message: String) -> CapsuleError {
+    CapsuleError::Config(message)
+}
+
+fn write_atomic_bytes_with_os_lock<E>(
+    path: &Path,
+    bytes: &[u8],
+    label: &str,
+    to_error: E,
+) -> Result<()>
+where
+    E: Fn(String) -> CapsuleError,
+{
+    let parent = path.parent().ok_or_else(|| {
+        to_error(format!(
+            "Failed to resolve parent directory for {} ({})",
+            path.display(),
+            label
+        ))
+    })?;
+    fs::create_dir_all(parent).map_err(|e| {
+        to_error(format!(
+            "Failed to create parent directory {} for {}: {}",
+            parent.display(),
+            label,
+            e
+        ))
+    })?;
+
+    with_path_lock(path, label, &to_error, || {
+        atomic_write_in_place(path, bytes, label, &to_error)
+    })
+}
+
+fn with_path_lock<T, E, F>(path: &Path, label: &str, to_error: &E, op: F) -> Result<T>
+where
+    E: Fn(String) -> CapsuleError,
+    F: FnOnce() -> Result<T>,
+{
+    #[cfg(unix)]
+    let lock_target = path.parent().ok_or_else(|| {
+        to_error(format!(
+            "Failed to locate lock parent for {}",
+            path.display()
+        ))
+    })?;
+    #[cfg(not(unix))]
+    let lock_target = path;
+
+    #[cfg(unix)]
+    let lock_file = fs::OpenOptions::new()
+        .read(true)
+        .open(lock_target)
+        .map_err(|e| {
+            to_error(format!(
+                "Failed to open lock directory {} for {}: {}",
+                lock_target.display(),
+                label,
+                e
+            ))
+        })?;
+    #[cfg(not(unix))]
+    let lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_target)
+        .map_err(|e| {
+            to_error(format!(
+                "Failed to open lock target {} for {}: {}",
+                lock_target.display(),
+                label,
+                e
+            ))
+        })?;
+
+    lock_file.lock_exclusive().map_err(|e| {
+        to_error(format!(
+            "Failed to acquire exclusive lock on {} for {}: {}",
+            lock_target.display(),
+            label,
+            e
+        ))
+    })?;
+
+    let op_result = op();
+    let unlock_result = lock_file.unlock();
+    match (op_result, unlock_result) {
+        (Ok(v), Ok(())) => Ok(v),
+        (Err(err), Ok(())) => Err(err),
+        (Ok(_), Err(e)) => Err(to_error(format!(
+            "Failed to release lock on {} for {}: {}",
+            lock_target.display(),
+            label,
+            e
+        ))),
+        (Err(err), Err(_)) => Err(err),
+    }
+}
+
+fn atomic_write_in_place<E>(path: &Path, bytes: &[u8], label: &str, to_error: &E) -> Result<()>
+where
+    E: Fn(String) -> CapsuleError,
+{
+    let parent = path.parent().ok_or_else(|| {
+        to_error(format!(
+            "Failed to resolve parent directory for {} ({})",
+            path.display(),
+            label
+        ))
+    })?;
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "tmp".to_string());
+
+    let tmp_path = create_atomic_temp_file(parent, &file_name, label, to_error)?;
+    let write_result = (|| -> Result<()> {
+        let mut tmp_file = fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .map_err(|e| {
+                to_error(format!(
+                    "Failed to reopen temp file {} for {}: {}",
+                    tmp_path.display(),
+                    label,
+                    e
+                ))
+            })?;
+        tmp_file.write_all(bytes).map_err(|e| {
+            to_error(format!(
+                "Failed to write temp file {} for {}: {}",
+                tmp_path.display(),
+                label,
+                e
+            ))
+        })?;
+        tmp_file.sync_all().map_err(|e| {
+            to_error(format!(
+                "Failed to sync temp file {} for {}: {}",
+                tmp_path.display(),
+                label,
+                e
+            ))
+        })?;
+        drop(tmp_file);
+
+        fs::rename(&tmp_path, path).map_err(|e| {
+            to_error(format!(
+                "Failed to atomically rename {} -> {} for {}: {}",
+                tmp_path.display(),
+                path.display(),
+                label,
+                e
+            ))
+        })?;
+        sync_parent_directory(parent, label, to_error)?;
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    write_result
+}
+
+fn create_atomic_temp_file<E>(
+    parent: &Path,
+    file_name: &str,
+    label: &str,
+    to_error: &E,
+) -> Result<PathBuf>
+where
+    E: Fn(String) -> CapsuleError,
+{
+    let pid = std::process::id();
+    for attempt in 0..256u32 {
+        let tmp_name = format!(".{}.tmp-{}-{}", file_name, pid, attempt);
+        let tmp_path = parent.join(tmp_name);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+        {
+            Ok(file) => {
+                drop(file);
+                return Ok(tmp_path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(to_error(format!(
+                    "Failed to create temp file in {} for {}: {}",
+                    parent.display(),
+                    label,
+                    e
+                )));
+            }
+        }
+    }
+    Err(to_error(format!(
+        "Failed to allocate unique temp file in {} for {}",
+        parent.display(),
+        label
+    )))
+}
+
+fn sync_parent_directory<E>(parent: &Path, label: &str, to_error: &E) -> Result<()>
+where
+    E: Fn(String) -> CapsuleError,
+{
+    #[cfg(unix)]
+    {
+        let dir = fs::File::open(parent).map_err(|e| {
+            to_error(format!(
+                "Failed to open parent directory {} for {} sync: {}",
+                parent.display(),
+                label,
+                e
+            ))
+        })?;
+        dir.sync_all().map_err(|e| {
+            to_error(format!(
+                "Failed to sync parent directory {} for {}: {}",
+                parent.display(),
+                label,
+                e
+            ))
+        })?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (parent, label, to_error);
+    }
     Ok(())
 }
 
@@ -803,17 +1300,129 @@ async fn run_command(
     program: &Path,
     args: &[&str],
     cwd: &Path,
+    manifest: Option<&toml::Value>,
 ) -> Result<std::process::ExitStatus> {
     let mut cmd = std::process::Command::new(program);
     cmd.args(args).current_dir(cwd);
-    run_command_inner(cmd).await
+    run_command_inner_with_manifest_env(cmd, manifest).await
 }
 
-async fn run_command_inner(mut cmd: std::process::Command) -> Result<std::process::ExitStatus> {
+async fn run_command_inner(cmd: std::process::Command) -> Result<std::process::ExitStatus> {
+    run_command_inner_with_manifest_env(cmd, None).await
+}
+
+async fn run_command_inner_with_manifest_env(
+    mut cmd: std::process::Command,
+    manifest: Option<&toml::Value>,
+) -> Result<std::process::ExitStatus> {
+    let program = Path::new(cmd.get_program());
+    if !program.is_absolute() {
+        return Err(CapsuleError::Pack(format!(
+            "Refusing to execute non-absolute command path: {}",
+            program.to_string_lossy()
+        )));
+    }
+    let required_env = manifest
+        .map(read_required_env_pairs)
+        .transpose()?
+        .unwrap_or_default();
+    apply_sanitized_command_env(&mut cmd, &required_env);
     tokio::task::spawn_blocking(move || cmd.status())
         .await
         .map_err(|e| CapsuleError::Pack(format!("Failed to run command: {}", e)))?
         .map_err(|e| CapsuleError::Pack(format!("Failed to run command: {}", e)))
+}
+
+fn apply_sanitized_command_env(
+    cmd: &mut std::process::Command,
+    required_env: &[(OsString, OsString)],
+) {
+    const ALLOWED_ENV_KEYS: &[&str] = &[
+        "PATH",
+        "HOME",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "SYSTEMROOT",
+        "WINDIR",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+    ];
+
+    let mut allowed_envs: HashMap<OsString, OsString> = HashMap::new();
+    for key in ALLOWED_ENV_KEYS {
+        if let Some(value) = std::env::var_os(key) {
+            allowed_envs.insert(OsString::from(key), value);
+        }
+    }
+
+    for (key, value) in std::env::vars_os() {
+        let key_text = key.to_string_lossy();
+        if key_text.starts_with("ATO_") || key_text.starts_with("CAPSULE_") {
+            allowed_envs.insert(key, value);
+        }
+    }
+    for (key, value) in required_env {
+        allowed_envs.insert(key.clone(), value.clone());
+    }
+
+    cmd.env_clear();
+    for (key, value) in allowed_envs.into_iter() {
+        cmd.env(key, value);
+    }
+}
+
+fn read_required_env_pairs(manifest: &toml::Value) -> Result<Vec<(OsString, OsString)>> {
+    let keys = required_env_keys_from_manifest(manifest);
+    let mut required_env = Vec::new();
+    for key in keys {
+        if let Some(value) = std::env::var_os(&key) {
+            required_env.push((OsString::from(key), value));
+        }
+    }
+
+    Ok(required_env)
+}
+
+fn required_env_keys_from_manifest(manifest: &toml::Value) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    if let Some(targets) = manifest.get("targets").and_then(|v| v.as_table()) {
+        for target in targets.values() {
+            if let Some(required_env) = target.get("required_env").and_then(|v| v.as_array()) {
+                for value in required_env {
+                    if let Some(key) = value.as_str() {
+                        let trimmed = key.trim();
+                        if !trimmed.is_empty() {
+                            keys.push(trimmed.to_string());
+                        }
+                    }
+                }
+            }
+
+            if let Some(legacy_required) = target
+                .get("env")
+                .and_then(|v| v.as_table())
+                .and_then(|env| env.get("ATO_ORCH_REQUIRED_ENVS"))
+                .and_then(|v| v.as_str())
+            {
+                for item in legacy_required.split(',') {
+                    let trimmed = item.trim();
+                    if !trimmed.is_empty() {
+                        keys.push(trimmed.to_string());
+                    }
+                }
+            }
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    keys
 }
 
 async fn resolve_python_runtime(
@@ -1078,10 +1687,10 @@ async fn resolve_url_sha256(
 
 fn detect_tool(cmd: &str) -> Option<String> {
     let exe = which::which(cmd).ok()?;
-    let output = std::process::Command::new(exe)
-        .arg("--version")
-        .output()
-        .ok()?;
+    let mut command = std::process::Command::new(exe);
+    command.arg("--version");
+    apply_sanitized_command_env(&mut command, &[]);
+    let output = command.output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1397,6 +2006,7 @@ fn reset_dir(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn serialize_lockfile_with_allowlist() {
@@ -1492,5 +2102,125 @@ runtime_version = "1.46.3"
 
         let version = required_runtime_version(&manifest).unwrap();
         assert_eq!(version.as_deref(), Some("1.46.3"));
+    }
+
+    #[test]
+    fn required_env_keys_from_manifest_collects_modern_and_legacy() {
+        let manifest: toml::Value = toml::from_str(
+            r#"
+[targets.default]
+runtime = "web"
+driver = "deno"
+required_env = ["API_TOKEN", " ACCOUNT_ID ", ""]
+env = { ATO_ORCH_REQUIRED_ENVS = "LEGACY_ONE, LEGACY_TWO,API_TOKEN" }
+"#,
+        )
+        .unwrap();
+
+        let keys = required_env_keys_from_manifest(&manifest);
+        assert_eq!(
+            keys,
+            vec![
+                "ACCOUNT_ID".to_string(),
+                "API_TOKEN".to_string(),
+                "LEGACY_ONE".to_string(),
+                "LEGACY_TWO".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn atomic_write_replaces_file_without_temp_leaks() {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("capsule.lock");
+
+        write_atomic_bytes_with_os_lock(&target, b"first", "test lockfile", capsule_error_pack)
+            .unwrap();
+        write_atomic_bytes_with_os_lock(&target, b"second", "test lockfile", capsule_error_pack)
+            .unwrap();
+
+        let written = fs::read_to_string(&target).unwrap();
+        assert_eq!(written, "second");
+
+        let leftovers = fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with(".capsule.lock.tmp-"))
+            .collect::<Vec<_>>();
+        assert!(leftovers.is_empty(), "temp files leaked: {:?}", leftovers);
+    }
+
+    #[test]
+    fn atomic_temp_file_is_created_in_target_directory() {
+        let temp = TempDir::new().unwrap();
+        let tmp_path = create_atomic_temp_file(
+            temp.path(),
+            "capsule.lock",
+            "test temp file",
+            &capsule_error_pack,
+        )
+        .unwrap();
+
+        assert_eq!(tmp_path.parent(), Some(temp.path()));
+        assert!(tmp_path.exists());
+        let _ = fs::remove_file(tmp_path);
+    }
+
+    #[test]
+    fn ensure_lockfile_reuses_when_inputs_unchanged() {
+        let temp = TempDir::new().unwrap();
+        let manifest_path = temp.path().join("capsule.toml");
+        let manifest_text = r#"
+schema_version = "0.2"
+name = "demo"
+version = "0.1.0"
+default_target = "default"
+[targets.default]
+runtime = "source"
+driver = "native"
+entrypoint = "source/main.sh"
+"#;
+        fs::write(&manifest_path, manifest_text).unwrap();
+        fs::create_dir_all(temp.path().join("source")).unwrap();
+        fs::write(temp.path().join("source/main.sh"), "echo demo").unwrap();
+
+        let manifest_raw: toml::Value = toml::from_str(manifest_text).unwrap();
+        let reporter: Arc<dyn CapsuleReporter + 'static> = Arc::new(crate::reporter::NoOpReporter);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let first = rt
+            .block_on(ensure_lockfile(
+                &manifest_path,
+                &manifest_raw,
+                manifest_text,
+                reporter.clone(),
+            ))
+            .unwrap();
+        let first_lock = read_lockfile(&first).unwrap();
+
+        std::thread::sleep(Duration::from_millis(20));
+
+        let second = rt
+            .block_on(ensure_lockfile(
+                &manifest_path,
+                &manifest_raw,
+                manifest_text,
+                reporter,
+            ))
+            .unwrap();
+        let second_lock = read_lockfile(&second).unwrap();
+
+        assert_eq!(first_lock.meta.created_at, second_lock.meta.created_at);
+        assert!(temp.path().join(LOCKFILE_INPUT_SNAPSHOT_NAME).exists());
+    }
+
+    #[tokio::test]
+    async fn run_command_inner_rejects_relative_program() {
+        let cmd = std::process::Command::new("echo");
+        let err = run_command_inner(cmd).await.expect_err("must fail closed");
+        assert!(err
+            .to_string()
+            .contains("Refusing to execute non-absolute command path"));
     }
 }
