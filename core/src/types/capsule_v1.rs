@@ -4,7 +4,7 @@
 //! Supports both TOML (human-authored) and JSON (machine-generated) formats.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -1184,12 +1184,18 @@ impl CapsuleManifestV1 {
             ));
         }
 
+        let has_services = self
+            .services
+            .as_ref()
+            .map(|services| !services.is_empty())
+            .unwrap_or(false);
+        let mut requires_web_services_validation = false;
+
         for (label, target) in named_targets {
             let runtime = target.runtime.trim().to_ascii_lowercase();
             let entrypoint = target.entrypoint.trim();
             if label.trim().is_empty()
                 || runtime.is_empty()
-                || entrypoint.is_empty()
                 || !matches!(runtime.as_str(), "source" | "wasm" | "oci" | "web")
             {
                 errors.push(ValidationError::InvalidTarget(label));
@@ -1197,6 +1203,10 @@ impl CapsuleManifestV1 {
             }
 
             if runtime == "source" {
+                if entrypoint.is_empty() {
+                    errors.push(ValidationError::InvalidTarget(label));
+                    continue;
+                }
                 let effective_driver = infer_source_driver(&target, entrypoint);
                 if matches!(
                     effective_driver.as_deref(),
@@ -1262,17 +1272,44 @@ impl CapsuleManifestV1 {
                     }
                 }
 
-                if matches!(
-                    normalized_driver.as_deref(),
-                    Some("node") | Some("deno") | Some("python")
-                ) && entrypoint.split_whitespace().count() > 1
-                {
-                    errors.push(ValidationError::InvalidWebTarget(
-                        label.clone(),
-                        "entrypoint must be a script file path (shell command strings are not allowed)"
-                            .to_string(),
-                    ));
+                let web_services_mode =
+                    matches!(normalized_driver.as_deref(), Some("deno")) && has_services;
+                if web_services_mode {
+                    requires_web_services_validation = true;
+                    if std::path::Path::new(entrypoint)
+                        .file_name()
+                        .and_then(|v| v.to_str())
+                        .map(|v| v.eq_ignore_ascii_case("ato-entry.ts"))
+                        .unwrap_or(false)
+                    {
+                        errors.push(ValidationError::InvalidWebTarget(
+                            label.clone(),
+                            "entrypoint='ato-entry.ts' is deprecated. Define top-level [services] and remove ato-entry.ts orchestrator."
+                                .to_string(),
+                        ));
+                    }
+                } else {
+                    if entrypoint.is_empty() {
+                        errors.push(ValidationError::InvalidTarget(label));
+                        continue;
+                    }
+                    if matches!(
+                        normalized_driver.as_deref(),
+                        Some("node") | Some("deno") | Some("python")
+                    ) && entrypoint.split_whitespace().count() > 1
+                    {
+                        errors.push(ValidationError::InvalidWebTarget(
+                            label.clone(),
+                            "entrypoint must be a script file path (shell command strings are not allowed)"
+                                .to_string(),
+                        ));
+                    }
                 }
+                continue;
+            }
+
+            if entrypoint.is_empty() {
+                errors.push(ValidationError::InvalidTarget(label));
                 continue;
             }
 
@@ -1294,6 +1331,89 @@ impl CapsuleManifestV1 {
                         driver.clone(),
                     ));
                     continue;
+                }
+            }
+        }
+
+        if requires_web_services_validation {
+            let services = self.services.as_ref().cloned().unwrap_or_default();
+            if services.is_empty() {
+                errors.push(ValidationError::InvalidService(
+                    "main".to_string(),
+                    "top-level [services] must define at least one service for web/deno services mode".to_string(),
+                ));
+            } else {
+                if !services.contains_key("main") {
+                    errors.push(ValidationError::InvalidService(
+                        "main".to_string(),
+                        "services.main is required for web/deno services mode".to_string(),
+                    ));
+                }
+
+                for (name, service) in &services {
+                    if service.entrypoint.trim().is_empty() {
+                        errors.push(ValidationError::InvalidService(
+                            name.to_string(),
+                            "entrypoint is required".to_string(),
+                        ));
+                    }
+
+                    if service
+                        .expose
+                        .as_ref()
+                        .is_some_and(|ports| !ports.is_empty())
+                    {
+                        errors.push(ValidationError::InvalidService(
+                            name.to_string(),
+                            "expose is not supported yet in web/deno services mode".to_string(),
+                        ));
+                    }
+
+                    if let Some(probe) = service.readiness_probe.as_ref() {
+                        if probe.port.trim().is_empty() {
+                            errors.push(ValidationError::InvalidService(
+                                name.to_string(),
+                                "readiness_probe.port must be a non-empty placeholder name"
+                                    .to_string(),
+                            ));
+                        }
+                        let has_http_get = probe
+                            .http_get
+                            .as_ref()
+                            .map(|v| !v.trim().is_empty())
+                            .unwrap_or(false);
+                        let has_tcp_connect = probe
+                            .tcp_connect
+                            .as_ref()
+                            .map(|v| !v.trim().is_empty())
+                            .unwrap_or(false);
+                        if !has_http_get && !has_tcp_connect {
+                            errors.push(ValidationError::InvalidService(
+                                name.to_string(),
+                                "readiness_probe must define http_get or tcp_connect".to_string(),
+                            ));
+                        }
+                    }
+                }
+
+                for (name, service) in &services {
+                    if let Some(deps) = service.depends_on.as_ref() {
+                        for dep in deps {
+                            if !services.contains_key(dep) {
+                                errors.push(ValidationError::InvalidService(
+                                    name.to_string(),
+                                    format!("depends_on references unknown service '{}'", dep),
+                                ));
+                            }
+                        }
+                    }
+                }
+
+                if let Err(cycle) = detect_service_cycle(&services) {
+                    errors.push(ValidationError::InvalidService(
+                        "services".to_string(),
+                        format!("circular dependency detected: {}", cycle),
+                    ));
                 }
             }
         }
@@ -1402,6 +1522,7 @@ pub enum ValidationError {
     InvalidTargetDriver(String, String),
     MissingRuntimeVersion(String, String),
     InvalidWebTarget(String, String),
+    InvalidService(String, String),
 }
 
 impl std::fmt::Display for ValidationError {
@@ -1477,6 +1598,9 @@ impl std::fmt::Display for ValidationError {
             ValidationError::InvalidWebTarget(label, message) => {
                 write!(f, "Invalid web target '{}': {}", label, message)
             }
+            ValidationError::InvalidService(name, message) => {
+                write!(f, "Invalid service '{}': {}", name, message)
+            }
         }
     }
 }
@@ -1524,6 +1648,50 @@ fn infer_source_driver(target: &NamedTarget, entrypoint: &str) -> Option<String>
         }
     }
     None
+}
+
+fn detect_service_cycle(services: &HashMap<String, ServiceSpec>) -> Result<(), String> {
+    fn visit(
+        current: &str,
+        services: &HashMap<String, ServiceSpec>,
+        visiting: &mut HashSet<String>,
+        visited: &mut HashSet<String>,
+        stack: &mut Vec<String>,
+    ) -> Result<(), String> {
+        if visited.contains(current) {
+            return Ok(());
+        }
+        if visiting.contains(current) {
+            stack.push(current.to_string());
+            return Err(stack.join(" -> "));
+        }
+
+        visiting.insert(current.to_string());
+        stack.push(current.to_string());
+        if let Some(spec) = services.get(current) {
+            if let Some(deps) = spec.depends_on.as_ref() {
+                for dep in deps {
+                    if services.contains_key(dep) {
+                        visit(dep, services, visiting, visited, stack)?;
+                    }
+                }
+            }
+        }
+        stack.pop();
+        visiting.remove(current);
+        visited.insert(current.to_string());
+        Ok(())
+    }
+
+    let mut names: Vec<&String> = services.keys().collect();
+    names.sort();
+    let mut visiting = HashSet::new();
+    let mut visited = HashSet::new();
+    for name in names {
+        let mut stack = Vec::new();
+        visit(name, services, &mut visiting, &mut visited, &mut stack)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1743,6 +1911,168 @@ port = 3000
         assert!(errors.iter().any(|e| matches!(
             e,
             ValidationError::InvalidWebTarget(_, msg) if msg.contains("shell command strings are not allowed")
+        )));
+    }
+
+    #[test]
+    fn test_validate_web_deno_services_allows_empty_target_entrypoint() {
+        let toml = r#"
+schema_version = "0.2"
+name = "web-services-app"
+version = "0.1.0"
+type = "app"
+default_target = "web"
+
+[targets.web]
+runtime = "web"
+driver = "deno"
+port = 4173
+
+[services.main]
+entrypoint = "node apps/dashboard/server.js"
+"#;
+        let manifest = CapsuleManifestV1::from_toml(toml).unwrap();
+        assert!(manifest.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_web_deno_services_requires_main_service() {
+        let toml = r#"
+schema_version = "0.2"
+name = "web-services-app"
+version = "0.1.0"
+type = "app"
+default_target = "web"
+
+[targets.web]
+runtime = "web"
+driver = "deno"
+port = 4173
+
+[services.api]
+entrypoint = "python apps/api/main.py"
+"#;
+        let manifest = CapsuleManifestV1::from_toml(toml).unwrap();
+        let errors = manifest.validate().unwrap_err();
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            ValidationError::InvalidService(name, msg)
+                if name == "main" && msg.contains("services.main is required")
+        )));
+    }
+
+    #[test]
+    fn test_validate_web_deno_services_rejects_unknown_dependency() {
+        let toml = r#"
+schema_version = "0.2"
+name = "web-services-app"
+version = "0.1.0"
+type = "app"
+default_target = "web"
+
+[targets.web]
+runtime = "web"
+driver = "deno"
+port = 4173
+
+[services.main]
+entrypoint = "node apps/dashboard/server.js"
+depends_on = ["api"]
+"#;
+        let manifest = CapsuleManifestV1::from_toml(toml).unwrap();
+        let errors = manifest.validate().unwrap_err();
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            ValidationError::InvalidService(name, msg)
+                if name == "main" && msg.contains("unknown service 'api'")
+        )));
+    }
+
+    #[test]
+    fn test_validate_web_deno_services_rejects_circular_dependencies() {
+        let toml = r#"
+schema_version = "0.2"
+name = "web-services-app"
+version = "0.1.0"
+type = "app"
+default_target = "web"
+
+[targets.web]
+runtime = "web"
+driver = "deno"
+port = 4173
+
+[services.main]
+entrypoint = "node apps/dashboard/server.js"
+depends_on = ["api"]
+
+[services.api]
+entrypoint = "python apps/api/main.py"
+depends_on = ["main"]
+"#;
+        let manifest = CapsuleManifestV1::from_toml(toml).unwrap();
+        let errors = manifest.validate().unwrap_err();
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            ValidationError::InvalidService(name, msg)
+                if name == "services" && msg.contains("circular dependency detected")
+        )));
+    }
+
+    #[test]
+    fn test_validate_web_deno_services_rejects_invalid_readiness_probe() {
+        let toml = r#"
+schema_version = "0.2"
+name = "web-services-app"
+version = "0.1.0"
+type = "app"
+default_target = "web"
+
+[targets.web]
+runtime = "web"
+driver = "deno"
+port = 4173
+
+[services.main]
+entrypoint = "node apps/dashboard/server.js"
+
+[services.api]
+entrypoint = "python apps/api/main.py"
+readiness_probe = { port = "API_PORT" }
+"#;
+        let manifest = CapsuleManifestV1::from_toml(toml).unwrap();
+        let errors = manifest.validate().unwrap_err();
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            ValidationError::InvalidService(name, msg)
+                if name == "api" && msg.contains("http_get or tcp_connect")
+        )));
+    }
+
+    #[test]
+    fn test_validate_web_deno_services_rejects_expose() {
+        let toml = r#"
+schema_version = "0.2"
+name = "web-services-app"
+version = "0.1.0"
+type = "app"
+default_target = "web"
+
+[targets.web]
+runtime = "web"
+driver = "deno"
+port = 4173
+
+[services.main]
+entrypoint = "node apps/dashboard/server.js"
+expose = ["API_PORT"]
+"#;
+        let manifest = CapsuleManifestV1::from_toml(toml).unwrap();
+        let errors = manifest.validate().unwrap_err();
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            ValidationError::InvalidService(name, msg)
+                if name == "main" && msg.contains("expose is not supported")
         )));
     }
 

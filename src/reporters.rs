@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use std::io::{IsTerminal, Write};
 
 use capsule_core::{CapsuleReporter, UnifiedMetrics, UsageReporter};
 
@@ -104,10 +105,19 @@ impl CapsuleReporter for StdoutReporter {
     }
 
     async fn progress_start(&self, label: String, total: Option<u64>) -> anyhow::Result<()> {
-        if let Some(total) = total {
-            println!("{} ({} bytes)", label, total);
+        if std::io::stdout().is_terminal() {
+            if let Some(total) = total {
+                print!("\r{} ({} bytes)", label, total);
+            } else {
+                print!("\r{}", label);
+            }
+            std::io::stdout().flush()?;
         } else {
-            println!("{}", label);
+            if let Some(total) = total {
+                println!("{} ({} bytes)", label, total);
+            } else {
+                println!("{}", label);
+            }
         }
         Ok(())
     }
@@ -117,7 +127,14 @@ impl CapsuleReporter for StdoutReporter {
     }
 
     async fn progress_finish(&self, message: Option<String>) -> anyhow::Result<()> {
-        if let Some(message) = message {
+        if std::io::stdout().is_terminal() {
+            print!("\r\x1B[2K");
+            if let Some(message) = message {
+                println!("{}", message);
+            } else {
+                std::io::stdout().flush()?;
+            }
+        } else if let Some(message) = message {
             println!("{}", message);
         }
         Ok(())

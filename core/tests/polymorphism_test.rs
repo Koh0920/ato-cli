@@ -10,14 +10,19 @@ fn implements_schema_resolves_aliases() {
 
     let mut manifest = CapsuleManifestV1::from_json(
         r#"{
-        "schema_version":"1.0",
+        "schema_version":"0.2",
         "name":"todo-app",
         "version":"0.1.0",
         "type":"app",
-        "execution":{"runtime":"source","entrypoint":"main.py","env":{},"startup_timeout":30},
-        "requirements":{"platform":[],"dependencies":[]},
-        "routing":{"weight":"light","fallback_to_cloud":false},
-        "storage":{"volumes":[],"use_thin_provisioning":false},
+        "default_target":"cli",
+        "targets":{
+          "cli":{
+            "runtime":"source",
+            "driver":"deno",
+            "runtime_version":"1.46.3",
+            "entrypoint":"main.ts"
+          }
+        },
         "polymorphism":{"implements":["std.todo.v1"]}
         }"#,
     )

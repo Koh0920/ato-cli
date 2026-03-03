@@ -173,6 +173,15 @@ pub fn generate_and_write_config(
     enforcement_override: Option<String>,
     standalone: bool,
 ) -> Result<PathBuf> {
+    let config = generate_config(manifest_path, enforcement_override, standalone)?;
+    write_config(manifest_path, &config)
+}
+
+pub fn generate_config(
+    manifest_path: &Path,
+    enforcement_override: Option<String>,
+    standalone: bool,
+) -> Result<ConfigJson> {
     let loaded = manifest::load_manifest(manifest_path)?;
     let manifest_content = loaded.raw_text;
     let manifest = loaded.raw;
@@ -184,18 +193,51 @@ pub fn generate_and_write_config(
         standalone,
     )?;
     validate_config_json(&config)?;
+    Ok(config)
+}
 
+pub fn write_config(manifest_path: &Path, config: &ConfigJson) -> Result<PathBuf> {
     let manifest_dir = manifest_path
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
     let output_path = manifest_dir.join("config.json");
 
-    let json = serde_json::to_string_pretty(&config).context("Failed to serialize config.json")?;
+    let json = to_stable_json_pretty(config)?;
     std::fs::write(&output_path, json)
         .with_context(|| format!("Failed to write config.json: {}", output_path.display()))?;
 
     Ok(output_path)
+}
+
+fn to_stable_json_pretty<T: Serialize>(value: &T) -> Result<String> {
+    let mut json = serde_json::to_value(value).context("Failed to serialize config.json")?;
+    sort_json_object_keys(&mut json);
+    serde_json::to_string_pretty(&json).context("Failed to serialize config.json")
+}
+
+fn sort_json_object_keys(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<(String, serde_json::Value)> = std::mem::take(map)
+                .into_iter()
+                .map(|(k, mut v)| {
+                    sort_json_object_keys(&mut v);
+                    (k, v)
+                })
+                .collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            for (key, value) in entries {
+                map.insert(key, value);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                sort_json_object_keys(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn build_config_json(
@@ -948,6 +990,7 @@ fn sha256_hex(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use tempfile::tempdir;
 
     #[test]
@@ -1281,5 +1324,101 @@ egress_allow = ["1.1.1.1"]
         let config: ConfigJson = serde_json::from_str(&config_raw).unwrap();
 
         assert_eq!(config.services["main"].executable, "my-app");
+    }
+
+    #[test]
+    fn stable_json_serialization_sorts_hashmap_keys() {
+        let mut left = HashMap::new();
+        left.insert("z".to_string(), "last".to_string());
+        left.insert("a".to_string(), "first".to_string());
+
+        let mut right = HashMap::new();
+        right.insert("a".to_string(), "first".to_string());
+        right.insert("z".to_string(), "last".to_string());
+
+        let mut left_services = HashMap::new();
+        left_services.insert(
+            "main".to_string(),
+            ServiceSpec {
+                executable: "echo".to_string(),
+                args: vec!["ok".to_string()],
+                cwd: Some("source".to_string()),
+                env: Some(left),
+                user: None,
+                signals: None,
+                depends_on: None,
+                health_check: None,
+                ports: None,
+            },
+        );
+
+        let mut right_services = HashMap::new();
+        right_services.insert(
+            "main".to_string(),
+            ServiceSpec {
+                executable: "echo".to_string(),
+                args: vec!["ok".to_string()],
+                cwd: Some("source".to_string()),
+                env: Some(right),
+                user: None,
+                signals: None,
+                depends_on: None,
+                health_check: None,
+                ports: None,
+            },
+        );
+
+        let left_config = ConfigJson {
+            version: CONFIG_VERSION.to_string(),
+            services: left_services,
+            sandbox: SandboxConfig {
+                enabled: true,
+                filesystem: None,
+                network: NetworkConfig {
+                    enabled: true,
+                    enforcement: "best_effort".to_string(),
+                    egress: None,
+                },
+                development_mode: None,
+            },
+            metadata: Some(MetadataConfig {
+                name: Some("demo".to_string()),
+                version: Some("0.1.0".to_string()),
+                generated_at: None,
+                generated_by: Some("ato-cli".to_string()),
+                source_manifest: Some("sha256:abc".to_string()),
+            }),
+            annotations: None,
+            sidecar: None,
+        };
+
+        let right_config = ConfigJson {
+            version: CONFIG_VERSION.to_string(),
+            services: right_services,
+            sandbox: SandboxConfig {
+                enabled: true,
+                filesystem: None,
+                network: NetworkConfig {
+                    enabled: true,
+                    enforcement: "best_effort".to_string(),
+                    egress: None,
+                },
+                development_mode: None,
+            },
+            metadata: Some(MetadataConfig {
+                name: Some("demo".to_string()),
+                version: Some("0.1.0".to_string()),
+                generated_at: None,
+                generated_by: Some("ato-cli".to_string()),
+                source_manifest: Some("sha256:abc".to_string()),
+            }),
+            annotations: None,
+            sidecar: None,
+        };
+
+        let left_json = to_stable_json_pretty(&left_config).expect("left json");
+        let right_json = to_stable_json_pretty(&right_config).expect("right json");
+
+        assert_eq!(left_json, right_json);
     }
 }
