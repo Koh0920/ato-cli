@@ -2,7 +2,9 @@ use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 #[derive(Debug, Clone)]
 pub struct PublishArtifactArgs {
@@ -10,6 +12,7 @@ pub struct PublishArtifactArgs {
     pub scoped_id: String,
     pub registry_url: String,
     pub force_large_payload: bool,
+    pub allow_existing: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,6 +24,8 @@ pub struct PublishArtifactResult {
     pub sha256: String,
     pub blake3: String,
     pub size_bytes: u64,
+    #[serde(default)]
+    pub already_existed: bool,
 }
 
 #[derive(Debug)]
@@ -34,6 +39,29 @@ struct ArtifactPayload {
     blake3: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ArtifactManifestInfo {
+    pub name: String,
+    pub version: String,
+    pub repository_owner: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegistryErrorPayload {
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+#[derive(Debug, Error)]
+pub enum PublishArtifactError {
+    #[error("Artifact upload conflict (409 version_exists): {message}")]
+    VersionExists { message: String },
+    #[error("Artifact upload failed ({status}): {message}")]
+    UploadFailed { status: u16, message: String },
+}
+
 pub fn publish_artifact(args: PublishArtifactArgs) -> Result<PublishArtifactResult> {
     let base_url = normalize_registry_url(&args.registry_url)?;
     crate::payload_guard::ensure_payload_size(
@@ -42,13 +70,13 @@ pub fn publish_artifact(args: PublishArtifactArgs) -> Result<PublishArtifactResu
         "--force-large-payload",
     )?;
     let payload = load_artifact_payload(&args.artifact_path, &args.scoped_id)?;
-    let endpoint = format!(
-        "{}/v1/local/capsules/{}/{}/{}?file_name={}",
-        base_url,
-        urlencoding::encode(&payload.publisher),
-        urlencoding::encode(&payload.slug),
-        urlencoding::encode(&payload.version),
-        urlencoding::encode(&payload.file_name),
+    let endpoint = build_upload_endpoint(
+        &base_url,
+        &payload.publisher,
+        &payload.slug,
+        &payload.version,
+        &payload.file_name,
+        args.allow_existing,
     );
 
     let request = reqwest::blocking::Client::new()
@@ -71,13 +99,62 @@ pub fn publish_artifact(args: PublishArtifactArgs) -> Result<PublishArtifactResu
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().unwrap_or_default();
-        bail!("Artifact upload failed ({}): {}", status, body);
+        let error = classify_upload_failure(status, &body);
+        return Err(error.into());
     }
 
     let result = response
         .json::<PublishArtifactResult>()
         .context("Invalid local registry upload response")?;
     Ok(result)
+}
+
+pub fn inspect_artifact_manifest(path: &Path) -> Result<ArtifactManifestInfo> {
+    if !path.exists() {
+        bail!("Artifact not found: {}", path.display());
+    }
+    if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| !ext.eq_ignore_ascii_case("capsule"))
+        .unwrap_or(true)
+    {
+        bail!("--artifact must point to a .capsule file");
+    }
+
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("Failed to read artifact: {}", path.display()))?;
+    let manifest = extract_manifest_from_capsule(&bytes)?;
+    let parsed = capsule_core::types::capsule_v1::CapsuleManifestV1::from_toml(&manifest)
+        .map_err(|err| anyhow::anyhow!("Failed to parse capsule.toml from artifact: {}", err))?;
+
+    Ok(ArtifactManifestInfo {
+        name: parsed.name,
+        version: parsed.version,
+        repository_owner: extract_repository_owner(&manifest),
+    })
+}
+
+fn build_upload_endpoint(
+    base_url: &str,
+    publisher: &str,
+    slug: &str,
+    version: &str,
+    file_name: &str,
+    allow_existing: bool,
+) -> String {
+    let mut endpoint = format!(
+        "{}/v1/local/capsules/{}/{}/{}?file_name={}",
+        base_url,
+        urlencoding::encode(publisher),
+        urlencoding::encode(slug),
+        urlencoding::encode(version),
+        urlencoding::encode(file_name)
+    );
+    if allow_existing {
+        endpoint.push_str("&allow_existing=true");
+    }
+    endpoint
 }
 
 fn load_artifact_payload(path: &Path, scoped_id: &str) -> Result<ArtifactPayload> {
@@ -108,11 +185,7 @@ fn load_artifact_payload(path: &Path, scoped_id: &str) -> Result<ArtifactPayload
         );
     }
 
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| anyhow::anyhow!("Failed to derive artifact file name"))?;
+    let file_name = format!("{}-{}.capsule", scoped.slug, parsed.version);
 
     Ok(ArtifactPayload {
         publisher: scoped.publisher,
@@ -161,6 +234,90 @@ fn normalize_registry_url(raw: &str) -> Result<String> {
         );
     }
     Ok(raw.trim().trim_end_matches('/').to_string())
+}
+
+fn classify_upload_failure(status: StatusCode, body: &str) -> PublishArtifactError {
+    let parsed = serde_json::from_str::<RegistryErrorPayload>(body).ok();
+    if is_version_exists_conflict(status, parsed.as_ref(), body) {
+        let message = parsed
+            .as_ref()
+            .and_then(|v| v.message.as_deref())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .unwrap_or("same version is already published")
+            .to_string();
+        return PublishArtifactError::VersionExists { message };
+    }
+
+    let message = parsed
+        .as_ref()
+        .and_then(|v| v.message.as_deref())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| body.trim())
+        .to_string();
+
+    PublishArtifactError::UploadFailed {
+        status: status.as_u16(),
+        message,
+    }
+}
+
+fn is_version_exists_conflict(
+    status: StatusCode,
+    parsed: Option<&RegistryErrorPayload>,
+    raw_body: &str,
+) -> bool {
+    if status != StatusCode::CONFLICT {
+        return false;
+    }
+
+    if parsed
+        .and_then(|v| v.error.as_deref())
+        .map(|v| v.eq_ignore_ascii_case("version_exists"))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    let message = parsed
+        .and_then(|v| v.message.as_deref())
+        .unwrap_or(raw_body)
+        .to_ascii_lowercase();
+    message.contains("same version is already published")
+        || message.contains("version_exists")
+        || message.contains("sha256 mismatch")
+}
+
+fn extract_repository_owner(manifest_raw: &str) -> Option<String> {
+    let raw = crate::publish_preflight::find_manifest_repository(manifest_raw)?;
+    let normalized = crate::publish_preflight::normalize_repository_value(&raw).ok()?;
+    let (owner, _) = normalized.split_once('/')?;
+    let owner = normalize_segment(owner);
+    if owner.is_empty() {
+        None
+    } else {
+        Some(owner)
+    }
+}
+
+fn normalize_segment(input: &str) -> String {
+    let mut out = String::new();
+    let mut prev_dash = false;
+
+    for ch in input.trim().to_ascii_lowercase().chars() {
+        if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
+            out.push(ch);
+            prev_dash = false;
+            continue;
+        }
+        if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+
+    out.trim_matches('-').to_string()
 }
 
 fn read_ato_token() -> Option<String> {
@@ -260,5 +417,41 @@ entrypoint = "main.ts"
         assert_eq!(b1, b2);
         assert!(s1.starts_with("sha256:"));
         assert!(b1.starts_with("blake3:"));
+    }
+
+    #[test]
+    fn build_upload_endpoint_appends_allow_existing() {
+        let endpoint = build_upload_endpoint(
+            "http://127.0.0.1:8787",
+            "local",
+            "demo-app",
+            "1.0.0",
+            "demo-app-1.0.0.capsule",
+            true,
+        );
+        assert!(endpoint.contains("allow_existing=true"));
+        assert!(endpoint.contains("file_name=demo-app-1.0.0.capsule"));
+    }
+
+    #[test]
+    fn build_upload_endpoint_omits_allow_existing_by_default() {
+        let endpoint = build_upload_endpoint(
+            "http://127.0.0.1:8787",
+            "local",
+            "demo-app",
+            "1.0.0",
+            "demo-app-1.0.0.capsule",
+            false,
+        );
+        assert!(!endpoint.contains("allow_existing="));
+    }
+
+    #[test]
+    fn classify_upload_failure_detects_version_exists_from_status_and_message() {
+        let err = classify_upload_failure(
+            StatusCode::CONFLICT,
+            r#"{"error":"other","message":"same version is already published"}"#,
+        );
+        assert!(matches!(err, PublishArtifactError::VersionExists { .. }));
     }
 }

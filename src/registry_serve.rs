@@ -84,6 +84,7 @@ struct DistributionQuery {
 #[derive(Debug, Deserialize)]
 struct UploadQuery {
     file_name: Option<String>,
+    allow_existing: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -95,6 +96,7 @@ struct UploadResponse {
     sha256: String,
     blake3: String,
     size_bytes: u64,
+    already_existed: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -522,6 +524,7 @@ async fn handle_put_local_capsule(
     let file_name = query
         .file_name
         .unwrap_or_else(|| format!("{}-{}.capsule", slug, version));
+    let allow_existing = query.allow_existing.unwrap_or(false);
     if let Err(err) = validate_file_name(&file_name) {
         return json_error(
             StatusCode::BAD_REQUEST,
@@ -593,12 +596,33 @@ async fn handle_put_local_capsule(
         }
     };
 
-    if has_release_version(&index, &publisher, &slug, &version) {
-        return json_error(
-            StatusCode::CONFLICT,
-            "version_exists",
-            "same version is already published",
-        );
+    if let Some(existing_release) = find_release_by_version(&index, &publisher, &slug, &version) {
+        match existing_release_outcome(existing_release, allow_existing, &actual_sha) {
+            ExistingReleaseOutcome::Reuse => {
+                let public_base_url = resolve_public_base_url(&headers, &state.listen_url);
+                let artifact_url = format!(
+                    "{}/v1/artifacts/{}/{}/{}/{}",
+                    public_base_url, publisher, slug, version, existing_release.file_name
+                );
+                return (
+                    StatusCode::OK,
+                    Json(UploadResponse {
+                        scoped_id: format!("{}/{}", publisher, slug),
+                        version,
+                        artifact_url,
+                        file_name: existing_release.file_name.clone(),
+                        sha256: existing_release.sha256.clone(),
+                        blake3: existing_release.blake3.clone(),
+                        size_bytes: existing_release.size_bytes,
+                        already_existed: true,
+                    }),
+                )
+                    .into_response();
+            }
+            ExistingReleaseOutcome::Conflict(message) => {
+                return json_error(StatusCode::CONFLICT, "version_exists", message);
+            }
+        }
     }
 
     let artifact_path = artifact_path(&state.data_dir, &publisher, &slug, &version, &file_name);
@@ -662,6 +686,7 @@ async fn handle_put_local_capsule(
             sha256: actual_sha,
             blake3: actual_blake3,
             size_bytes: body.len() as u64,
+            already_existed: false,
         }),
     )
         .into_response()
@@ -785,18 +810,49 @@ fn upsert_capsule(
     });
 }
 
+#[cfg(test)]
 fn has_release_version(index: &RegistryIndex, publisher: &str, slug: &str, version: &str) -> bool {
+    find_release_by_version(index, publisher, slug, version).is_some()
+}
+
+fn find_release_by_version<'a>(
+    index: &'a RegistryIndex,
+    publisher: &str,
+    slug: &str,
+    version: &str,
+) -> Option<&'a StoredRelease> {
     index
         .capsules
         .iter()
         .find(|capsule| capsule.publisher == publisher && capsule.slug == slug)
-        .map(|capsule| {
+        .and_then(|capsule| {
             capsule
                 .releases
                 .iter()
-                .any(|release| release.version == version)
+                .find(|release| release.version == version)
         })
-        .unwrap_or(false)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingReleaseOutcome {
+    Reuse,
+    Conflict(&'static str),
+}
+
+fn existing_release_outcome(
+    existing_release: &StoredRelease,
+    allow_existing: bool,
+    actual_sha: &str,
+) -> ExistingReleaseOutcome {
+    if !allow_existing {
+        return ExistingReleaseOutcome::Conflict("same version is already published");
+    }
+
+    if equals_hash(&existing_release.sha256, actual_sha) {
+        return ExistingReleaseOutcome::Reuse;
+    }
+
+    ExistingReleaseOutcome::Conflict("same version is already published (sha256 mismatch)")
 }
 
 fn get_required_header(headers: &HeaderMap, key: &str) -> Result<String> {
@@ -1004,6 +1060,60 @@ mod tests {
             "sample-capsule",
             "1.0.0"
         ));
+    }
+
+    #[test]
+    fn existing_release_outcome_requires_opt_in() {
+        let release = StoredRelease {
+            version: "1.0.0".to_string(),
+            file_name: "sample.capsule".to_string(),
+            sha256: "sha256:abc".to_string(),
+            blake3: "blake3:def".to_string(),
+            size_bytes: 1,
+            signature_status: "verified".to_string(),
+            created_at: Utc::now().to_rfc3339(),
+        };
+
+        let outcome = existing_release_outcome(&release, false, "sha256:abc");
+        assert_eq!(
+            outcome,
+            ExistingReleaseOutcome::Conflict("same version is already published")
+        );
+    }
+
+    #[test]
+    fn existing_release_outcome_reuses_when_sha256_matches() {
+        let release = StoredRelease {
+            version: "1.0.0".to_string(),
+            file_name: "sample.capsule".to_string(),
+            sha256: "sha256:abc".to_string(),
+            blake3: "blake3:def".to_string(),
+            size_bytes: 1,
+            signature_status: "verified".to_string(),
+            created_at: Utc::now().to_rfc3339(),
+        };
+
+        let outcome = existing_release_outcome(&release, true, "sha256:abc");
+        assert_eq!(outcome, ExistingReleaseOutcome::Reuse);
+    }
+
+    #[test]
+    fn existing_release_outcome_conflicts_when_sha256_differs() {
+        let release = StoredRelease {
+            version: "1.0.0".to_string(),
+            file_name: "sample.capsule".to_string(),
+            sha256: "sha256:abc".to_string(),
+            blake3: "blake3:def".to_string(),
+            size_bytes: 1,
+            signature_status: "verified".to_string(),
+            created_at: Utc::now().to_rfc3339(),
+        };
+
+        let outcome = existing_release_outcome(&release, true, "sha256:xyz");
+        assert_eq!(
+            outcome,
+            ExistingReleaseOutcome::Conflict("same version is already published (sha256 mismatch)")
+        );
     }
 
     #[test]
