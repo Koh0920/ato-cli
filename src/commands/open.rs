@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use tracing::debug;
 
 use crate::executors::source::ExecuteMode;
@@ -108,27 +108,26 @@ async fn execute_capsule_file(args: &OpenArgs, capsule_path: &PathBuf) -> Result
 
     debug!(extract_dir = %extract_dir.display(), "Capsule extracted");
 
-    let payload_zst = extract_dir.join("payload.tar.zst");
-
-    if payload_zst.exists() {
-        debug!("Extracting payload bundle");
-
-        let payload_tar = extract_dir.join("payload.tar");
-        let decoder = zstd::stream::Decoder::new(
-            fs::File::open(&payload_zst).with_context(|| "Failed to open payload.tar.zst")?,
-        )
-        .with_context(|| "Failed to create zstd decoder")?;
-
-        let mut tar_reader = tar::Archive::new(decoder);
-        tar_reader
-            .unpack(&extract_dir)
-            .with_context(|| "Failed to extract payload.tar.zst")?;
-
-        fs::remove_file(&payload_zst).ok();
-        fs::remove_file(&payload_tar).ok();
-
-        debug!("Payload extracted");
+    let cas_provider = capsule_core::capsule_v3::CasProvider::from_env();
+    let payload_outcome = capsule_core::capsule_v3::unpack_payload_from_capsule_root_with_provider(
+        &extract_dir,
+        &extract_dir,
+        &cas_provider,
+    )
+    .with_context(|| "Failed to extract payload from capsule root (v2/v3)")?;
+    match payload_outcome {
+        capsule_core::capsule_v3::PayloadUnpackOutcome::RestoredFromV3
+        | capsule_core::capsule_v3::PayloadUnpackOutcome::RestoredFromV2 => {}
+        capsule_core::capsule_v3::PayloadUnpackOutcome::RestoredFromV2DueToCasDisabled(reason) => {
+            emit_open_cas_disabled_warning_once(&reason);
+        }
+        capsule_core::capsule_v3::PayloadUnpackOutcome::RestoredFromV2DueToV3Error(err) => {
+            emit_open_v3_fallback_warning_once(&err);
+        }
     }
+    fs::remove_file(extract_dir.join("payload.tar.zst")).ok();
+    fs::remove_file(extract_dir.join("payload.tar")).ok();
+    debug!("Payload extracted");
 
     let manifest_path = extract_dir.join("capsule.toml");
     if !manifest_path.exists() {
@@ -173,6 +172,26 @@ async fn execute_capsule_file(args: &OpenArgs, capsule_path: &PathBuf) -> Result
     };
 
     execute_normal_mode(open_args).await
+}
+
+fn emit_open_cas_disabled_warning_once(reason: &capsule_core::capsule_v3::CasDisableReason) {
+    static STDERR_WARN_ONCE: Once = Once::new();
+    STDERR_WARN_ONCE.call_once(|| {
+        eprintln!(
+            "⚠️  Performance warning: CAS is disabled (reason: {}). Falling back to v2 legacy mode.",
+            reason
+        );
+    });
+}
+
+fn emit_open_v3_fallback_warning_once(error_message: &str) {
+    static STDERR_WARN_ONCE: Once = Once::new();
+    STDERR_WARN_ONCE.call_once(|| {
+        eprintln!(
+            "⚠️  Performance warning: v3 payload reconstruction failed ({}). Falling back to v2 legacy mode.",
+            error_message
+        );
+    });
 }
 
 async fn copy_source_files(

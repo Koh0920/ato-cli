@@ -51,10 +51,11 @@ tokio-util = "0.7"
 tracing = "0.1"
 which = "6.0"
 ctrlc = "3.4"
-zstd = "0.13"
+zstd = { version = "0.13", features = ["zstdmt"] }
 tempfile = "3"
 
 [dev-dependencies]
+dhat = "0.3"
 
 [features]
 default = []

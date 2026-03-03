@@ -92,6 +92,11 @@ pub fn execute_pack_command(
 
     match decision.kind {
         capsule_core::router::RuntimeKind::Source => {
+            let prepared_config = capsule_core::packers::source::prepare_source_config(
+                &manifest,
+                enforcement.clone(),
+                standalone,
+            )?;
             futures::executor::block_on(reporter.progress_start(
                 "⏳ [build] Preparing source runtime bundle...".to_string(),
                 None,
@@ -101,11 +106,12 @@ pub fn execute_pack_command(
                 capsule_core::packers::source::SourcePackOptions {
                     manifest_path: manifest.clone(),
                     manifest_dir: manifest_dir.clone(),
+                    config_json: prepared_config.config_json.clone(),
+                    config_path: prepared_config.config_path.clone(),
                     output: None,
                     runtime: None,
                     skip_l1: false,
                     skip_validation: false,
-                    enforcement: enforcement.clone(),
                     nacelle_override,
                     standalone,
                 },
@@ -228,6 +234,11 @@ pub fn execute_pack_command(
                     reporter.clone(),
                 )?
             } else {
+                let prepared_config = capsule_core::packers::source::prepare_source_config(
+                    &manifest,
+                    enforcement.clone(),
+                    standalone,
+                )?;
                 futures::executor::block_on(reporter.progress_start(
                     "⏳ [build] Preparing web runtime bundle...".to_string(),
                     None,
@@ -237,11 +248,12 @@ pub fn execute_pack_command(
                     capsule_core::packers::source::SourcePackOptions {
                         manifest_path: manifest.clone(),
                         manifest_dir: manifest_dir.clone(),
+                        config_json: prepared_config.config_json.clone(),
+                        config_path: prepared_config.config_path.clone(),
                         output: None,
                         runtime: None,
                         skip_l1: false,
                         skip_validation: false,
-                        enforcement: enforcement.clone(),
                         nacelle_override,
                         standalone,
                     },

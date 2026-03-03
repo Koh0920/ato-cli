@@ -45,9 +45,7 @@ fn start_local_registry_or_skip(
     test_name: &str,
 ) -> Result<Option<(ServerGuard, String)>> {
     if !local_tcp_bind_available() {
-        eprintln!(
-            "skipping {test_name}: local TCP bind is not permitted in this environment"
-        );
+        eprintln!("skipping {test_name}: local TCP bind is not permitted in this environment");
         return Ok(None);
     }
 
@@ -170,6 +168,143 @@ fn build_publish_install(
 }
 
 #[test]
+fn e2e_publish_artifact_without_cwd_manifest() -> Result<()> {
+    let ato = assert_cmd::cargo::cargo_bin("ato");
+    let tmp = TempDir::new().context("create temp dir")?;
+    let home_dir = tmp.path().join("home");
+    std::fs::create_dir_all(&home_dir)?;
+    let data_dir = tmp.path().join("registry-data");
+    let build_dir = tmp.path().join("build-project");
+    let publish_cwd = tmp.path().join("publish-cwd");
+    std::fs::create_dir_all(&build_dir)?;
+    std::fs::create_dir_all(&publish_cwd)?;
+
+    std::fs::write(
+        build_dir.join("capsule.toml"),
+        r#"schema_version = "0.2"
+name = "test-artifact-cwdless"
+version = "1.0.0"
+type = "app"
+default_target = "cli"
+
+[targets.cli]
+runtime = "source"
+driver = "deno"
+runtime_version = "1.46.3"
+entrypoint = "main.ts"
+"#,
+    )?;
+    std::fs::write(
+        build_dir.join("main.ts"),
+        r#"console.log("cwdless publish")"#,
+    )?;
+    std::fs::write(
+        build_dir.join("deno.lock"),
+        r#"{"version":"5","specifiers":{},"packages":{}}"#,
+    )?;
+
+    let build = run_ato_with_home(&ato, &["build", "."], &build_dir, &home_dir)?;
+    assert!(
+        build.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let artifact_path = build_dir.join("test-artifact-cwdless.capsule");
+    assert!(artifact_path.exists(), "artifact not found");
+
+    let Some((_guard, base_url)) =
+        start_local_registry_or_skip(&ato, &data_dir, "e2e_publish_artifact_without_cwd_manifest")?
+    else {
+        return Ok(());
+    };
+
+    let artifact_str = artifact_path.to_string_lossy().to_string();
+    let scoped_id = "team-x/test-artifact-cwdless";
+
+    let first_publish = run_ato_with_home(
+        &ato,
+        &[
+            "publish",
+            "--deploy",
+            "--registry",
+            &base_url,
+            "--artifact",
+            &artifact_str,
+            "--scoped-id",
+            scoped_id,
+            "--json",
+        ],
+        &publish_cwd,
+        &home_dir,
+    )?;
+    assert!(
+        first_publish.status.success(),
+        "first publish failed: {}",
+        String::from_utf8_lossy(&first_publish.stderr)
+    );
+
+    let second_publish = run_ato_with_home(
+        &ato,
+        &[
+            "publish",
+            "--deploy",
+            "--registry",
+            &base_url,
+            "--artifact",
+            &artifact_str,
+            "--scoped-id",
+            scoped_id,
+            "--json",
+        ],
+        &publish_cwd,
+        &home_dir,
+    )?;
+    assert!(
+        !second_publish.status.success(),
+        "second publish without --allow-existing must fail"
+    );
+    let second_stdout = String::from_utf8_lossy(&second_publish.stdout);
+    let second_stderr = String::from_utf8_lossy(&second_publish.stderr);
+    assert!(
+        second_stderr.contains("E202") || second_stdout.contains("\"code\":\"E202\""),
+        "expected E202 for version conflict; stdout={} stderr={}",
+        second_stdout,
+        second_stderr
+    );
+
+    let third_publish = run_ato_with_home(
+        &ato,
+        &[
+            "publish",
+            "--deploy",
+            "--registry",
+            &base_url,
+            "--artifact",
+            &artifact_str,
+            "--scoped-id",
+            scoped_id,
+            "--allow-existing",
+        ],
+        &publish_cwd,
+        &home_dir,
+    )?;
+    assert!(
+        third_publish.status.success(),
+        "third publish with --allow-existing failed: {}",
+        String::from_utf8_lossy(&third_publish.stderr)
+    );
+    let third_stdout = String::from_utf8_lossy(&third_publish.stdout);
+    assert_eq!(
+        third_stdout.contains("Existing release reused (same sha256, no new upload)."),
+        true,
+        "expected reused-release message in allow-existing path; stdout={}",
+        third_stdout
+    );
+
+    Ok(())
+}
+
+#[test]
 fn e2e_local_registry_build_publish_install_search_download() -> Result<()> {
     let ato = assert_cmd::cargo::cargo_bin("ato");
     let tmp = TempDir::new().context("create temp dir")?;
@@ -203,8 +338,11 @@ entrypoint = "main.ts"
         r#"{"version":"5","specifiers":{},"packages":{}}"#,
     )?;
 
-    let Some((_guard, base_url)) =
-        start_local_registry_or_skip(&ato, &data_dir, "e2e_local_registry_build_publish_install_search_download")?
+    let Some((_guard, base_url)) = start_local_registry_or_skip(
+        &ato,
+        &data_dir,
+        "e2e_local_registry_build_publish_install_search_download",
+    )?
     else {
         return Ok(());
     };
@@ -302,8 +440,11 @@ port = {static_port}
         r#"<!doctype html><title>web static</title>"#,
     )?;
 
-    let Some((_guard, base_url)) =
-        start_local_registry_or_skip(&ato, &data_dir, "e2e_local_registry_web_static_build_publish_install")?
+    let Some((_guard, base_url)) = start_local_registry_or_skip(
+        &ato,
+        &data_dir,
+        "e2e_local_registry_web_static_build_publish_install",
+    )?
     else {
         return Ok(());
     };
@@ -337,11 +478,137 @@ port = {static_port}
     );
 
     // Best-effort cleanup in case background process was started.
-    let _ = run_ato_with_home(
+    let _ = run_ato_with_home(&ato, &["close", "--all", "--force"], tmp.path(), &home_dir);
+
+    Ok(())
+}
+
+#[test]
+fn e2e_local_registry_v3_sync_endpoints_roundtrip() -> Result<()> {
+    let ato = assert_cmd::cargo::cargo_bin("ato");
+    let tmp = TempDir::new().context("create temp dir")?;
+    let home_dir = tmp.path().join("home");
+    std::fs::create_dir_all(&home_dir)?;
+    let data_dir = tmp.path().join("registry-data");
+    let project_dir = tmp.path().join("project-v3-sync");
+    let local_cas_dir = tmp.path().join("local-cas");
+    std::fs::create_dir_all(&project_dir)?;
+    std::fs::create_dir_all(&local_cas_dir)?;
+
+    std::fs::write(
+        project_dir.join("capsule.toml"),
+        r#"schema_version = "0.2"
+name = "test-v3-sync"
+version = "1.0.0"
+type = "app"
+default_target = "cli"
+
+[targets.cli]
+runtime = "source"
+driver = "deno"
+runtime_version = "1.46.3"
+entrypoint = "main.ts"
+"#,
+    )?;
+    std::fs::write(
+        project_dir.join("main.ts"),
+        r#"console.log("hello v3 sync");"#,
+    )?;
+    std::fs::write(
+        project_dir.join("deno.lock"),
+        r#"{"version":"5","specifiers":{},"packages":{}}"#,
+    )?;
+
+    let build = Command::new(&ato)
+        .args(["build", "."])
+        .current_dir(&project_dir)
+        .env("HOME", &home_dir)
+        .env("ATO_EXPERIMENTAL_V3_PACK", "1")
+        .env("ATO_CAS_ROOT", &local_cas_dir)
+        .output()
+        .context("run build with v3")?;
+    assert!(
+        build.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    let artifact = project_dir.join("test-v3-sync.capsule");
+    assert!(
+        artifact.exists(),
+        "artifact missing: {}",
+        artifact.display()
+    );
+
+    let Some((_guard, base_url)) = start_local_registry_or_skip(
         &ato,
-        &["close", "--all", "--force"],
-        tmp.path(),
-        &home_dir,
+        &data_dir,
+        "e2e_local_registry_v3_sync_endpoints_roundtrip",
+    )?
+    else {
+        return Ok(());
+    };
+
+    let publish = Command::new(&ato)
+        .args([
+            "publish",
+            "--deploy",
+            "--registry",
+            &base_url,
+            "--artifact",
+            artifact.to_string_lossy().as_ref(),
+            "--scoped-id",
+            "local/test-v3-sync",
+            "--json",
+        ])
+        .current_dir(&project_dir)
+        .env("HOME", &home_dir)
+        .env("ATO_CAS_ROOT", &local_cas_dir)
+        .output()
+        .context("publish artifact with v3 sync")?;
+    assert!(
+        publish.status.success(),
+        "publish failed: {}",
+        String::from_utf8_lossy(&publish.stderr)
+    );
+
+    let manifest_resp = reqwest::blocking::get(format!(
+        "{}/v1/releases/local/test-v3-sync/1.0.0/manifest",
+        base_url
+    ))
+    .context("fetch v3 manifest")?;
+    assert_eq!(
+        manifest_resp.status(),
+        reqwest::StatusCode::OK,
+        "manifest endpoint failed"
+    );
+    let manifest_json: serde_json::Value = manifest_resp.json().context("manifest json")?;
+    let first_chunk = manifest_json
+        .get("chunks")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|v| v.get("raw_hash"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .context("missing first chunk hash in manifest")?;
+
+    let chunk_resp = reqwest::blocking::get(format!(
+        "{}/v1/chunks/{}",
+        base_url,
+        urlencoding::encode(&first_chunk)
+    ))
+    .context("fetch chunk")?;
+    assert_eq!(chunk_resp.status(), reqwest::StatusCode::OK);
+    let cache_control = chunk_resp
+        .headers()
+        .get("cache-control")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        cache_control.contains("immutable"),
+        "chunk response should be immutable cacheable: {}",
+        cache_control
     );
 
     Ok(())
@@ -465,8 +732,11 @@ entrypoint = "main.py"
     )?;
     std::fs::write(python_with_lock.join("uv.lock"), "# uv lock")?;
 
-    let Some((_guard, base_url)) =
-        start_local_registry_or_skip(&ato, &data_dir, "e2e_local_registry_node_python_run_fail_closed")?
+    let Some((_guard, base_url)) = start_local_registry_or_skip(
+        &ato,
+        &data_dir,
+        "e2e_local_registry_node_python_run_fail_closed",
+    )?
     else {
         return Ok(());
     };

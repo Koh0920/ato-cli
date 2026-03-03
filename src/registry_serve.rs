@@ -1,4 +1,4 @@
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -8,8 +8,10 @@ use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::{get, put};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use capsule_core::capsule_v3::manifest::{validate_blake3_digest, V3_PAYLOAD_MANIFEST_PATH};
+use capsule_core::capsule_v3::{verify_artifact_hash, CapsuleManifestV3, CasStore};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -66,6 +68,16 @@ struct StoredRelease {
     size_bytes: u64,
     signature_status: String,
     created_at: String,
+    #[serde(default)]
+    payload_v3: Option<StoredPayloadV3>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredPayloadV3 {
+    artifact_hash: String,
+    chunk_count: usize,
+    total_raw_size: u64,
+    manifest_rel_path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,6 +96,7 @@ struct DistributionQuery {
 #[derive(Debug, Deserialize)]
 struct UploadQuery {
     file_name: Option<String>,
+    allow_existing: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -95,6 +108,50 @@ struct UploadResponse {
     sha256: String,
     blake3: String,
     size_bytes: u64,
+    already_existed: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct SyncChunkDescriptor {
+    raw_hash: String,
+    raw_size: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct SyncNegotiateRequest {
+    artifact_hash: String,
+    schema_version: u32,
+    chunks: Vec<SyncChunkDescriptor>,
+}
+
+#[derive(Debug, Serialize)]
+struct SyncNegotiateResponse {
+    missing_chunks: Vec<String>,
+    total_chunks: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct ChunkUploadResponse {
+    raw_hash: String,
+    inserted: bool,
+    zstd_size: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct SyncCommitRequest {
+    publisher: String,
+    slug: String,
+    version: String,
+    manifest: CapsuleManifestV3,
+}
+
+#[derive(Debug, Serialize)]
+struct SyncCommitResponse {
+    scoped_id: String,
+    version: String,
+    artifact_hash: String,
+    chunk_count: usize,
+    total_raw_size: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -211,6 +268,14 @@ pub async fn serve(config: RegistryServerConfig) -> Result<()> {
         .route(
             "/v1/artifacts/:publisher/:slug/:version/:file_name",
             get(handle_get_artifact),
+        )
+        .route("/v1/sync/negotiate", post(handle_sync_negotiate))
+        .route("/v1/sync/commit", post(handle_sync_commit))
+        .route("/v1/chunks/:raw_hash", put(handle_put_chunk))
+        .route("/v1/chunks/:raw_hash", get(handle_get_chunk))
+        .route(
+            "/v1/releases/:publisher/:slug/:version/manifest",
+            get(handle_get_release_manifest),
         )
         .route(
             "/v1/local/capsules/:publisher/:slug/:version",
@@ -502,6 +567,390 @@ async fn handle_get_artifact(
         .into_response()
 }
 
+async fn handle_sync_negotiate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<SyncNegotiateRequest>,
+) -> impl IntoResponse {
+    if let Err(err) = validate_write_auth(&headers, state.auth_token.as_deref()) {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized", &err);
+    }
+
+    if request.schema_version != 3 {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_schema_version",
+            "schema_version must be 3",
+        );
+    }
+    if let Err(err) = validate_blake3_digest("artifact_hash", &request.artifact_hash) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_artifact_hash",
+            &err.to_string(),
+        );
+    }
+
+    let cas = match registry_cas_store(&state.data_dir) {
+        Ok(cas) => cas,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "cas_init_failed",
+                &err.to_string(),
+            );
+        }
+    };
+
+    let mut missing_chunks = Vec::new();
+    for chunk in &request.chunks {
+        if let Err(err) = validate_blake3_digest("chunk.raw_hash", &chunk.raw_hash) {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_chunk_hash",
+                &err.to_string(),
+            );
+        }
+        if chunk.raw_size == 0 {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_chunk_size",
+                "chunk.raw_size must be greater than zero",
+            );
+        }
+
+        match cas.has_chunk(&chunk.raw_hash) {
+            Ok(true) => {}
+            Ok(false) => missing_chunks.push(chunk.raw_hash.clone()),
+            Err(err) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "cas_lookup_failed",
+                    &err.to_string(),
+                );
+            }
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(SyncNegotiateResponse {
+            missing_chunks,
+            total_chunks: request.chunks.len(),
+        }),
+    )
+        .into_response()
+}
+
+async fn handle_put_chunk(
+    State(state): State<AppState>,
+    AxumPath(raw_hash): AxumPath<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    if let Err(err) = validate_write_auth(&headers, state.auth_token.as_deref()) {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized", &err);
+    }
+    if let Err(err) = validate_blake3_digest("raw_hash", &raw_hash) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_chunk_hash",
+            &err.to_string(),
+        );
+    }
+
+    let raw_size = match parse_required_u32_header(&headers, "x-raw-size") {
+        Ok(v) if v > 0 => v,
+        Ok(_) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_chunk_size",
+                "x-raw-size must be greater than zero",
+            );
+        }
+        Err(err) => {
+            return json_error(StatusCode::BAD_REQUEST, "missing_header", &err.to_string());
+        }
+    };
+
+    if let Err(err) = verify_uploaded_chunk(&raw_hash, raw_size, &body) {
+        return json_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "chunk_validation_failed",
+            &err,
+        );
+    }
+
+    let cas = match registry_cas_store(&state.data_dir) {
+        Ok(cas) => cas,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "cas_init_failed",
+                &err.to_string(),
+            );
+        }
+    };
+    let put = match cas.put_chunk_zstd(&raw_hash, &body) {
+        Ok(result) => result,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "chunk_store_failed",
+                &err.to_string(),
+            );
+        }
+    };
+
+    let status = if put.inserted {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    (
+        status,
+        Json(ChunkUploadResponse {
+            raw_hash,
+            inserted: put.inserted,
+            zstd_size: put.zstd_size,
+        }),
+    )
+        .into_response()
+}
+
+async fn handle_get_chunk(
+    State(state): State<AppState>,
+    AxumPath(raw_hash): AxumPath<String>,
+) -> impl IntoResponse {
+    if let Err(err) = validate_blake3_digest("raw_hash", &raw_hash) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_chunk_hash",
+            &err.to_string(),
+        );
+    }
+
+    let cas = match registry_cas_store(&state.data_dir) {
+        Ok(cas) => cas,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "cas_init_failed",
+                &err.to_string(),
+            );
+        }
+    };
+    let path = match cas.chunk_path(&raw_hash) {
+        Ok(path) => path,
+        Err(err) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_chunk_hash",
+                &err.to_string(),
+            );
+        }
+    };
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(_) => return json_error(StatusCode::NOT_FOUND, "not_found", "Chunk not found"),
+    };
+
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/zstd"),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+async fn handle_sync_commit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<SyncCommitRequest>,
+) -> impl IntoResponse {
+    if let Err(err) = validate_write_auth(&headers, state.auth_token.as_deref()) {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized", &err);
+    }
+    if let Err(err) = validate_capsule_segments(&request.publisher, &request.slug) {
+        return json_error(StatusCode::BAD_REQUEST, "invalid_scope", &err.to_string());
+    }
+    if let Err(err) = validate_version(&request.version) {
+        return json_error(StatusCode::BAD_REQUEST, "invalid_version", &err.to_string());
+    }
+    if let Err(err) = request.manifest.validate() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_manifest",
+            &err.to_string(),
+        );
+    }
+    if let Err(err) = verify_artifact_hash(&request.manifest) {
+        return json_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "hash_mismatch",
+            &err.to_string(),
+        );
+    }
+
+    let cas = match registry_cas_store(&state.data_dir) {
+        Ok(cas) => cas,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "cas_init_failed",
+                &err.to_string(),
+            );
+        }
+    };
+    let fsck = match cas.fsck_manifest(&request.manifest) {
+        Ok(report) => report,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "fsck_failed",
+                &err.to_string(),
+            );
+        }
+    };
+    if !fsck.is_ok() {
+        let message = if fsck.hard_errors.is_empty() {
+            "manifest references invalid chunks".to_string()
+        } else {
+            fsck.hard_errors.join("; ")
+        };
+        return json_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "manifest_chunks_invalid",
+            &message,
+        );
+    }
+
+    let canonical_manifest = match serde_jcs::to_vec(&request.manifest) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "manifest_serialize_failed",
+                &err.to_string(),
+            );
+        }
+    };
+    let rel_path = release_manifest_rel_path(&request.publisher, &request.slug, &request.version);
+    let abs_path = state.data_dir.join(&rel_path);
+    if let Err(err) = atomic_write_bytes(&abs_path, &canonical_manifest) {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "manifest_write_failed",
+            &err.to_string(),
+        );
+    }
+
+    let _guard = state.lock.lock().await;
+    let mut index = match load_index(&state.data_dir) {
+        Ok(index) => index,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "index_read_failed",
+                &err.to_string(),
+            );
+        }
+    };
+    let mut changed = false;
+    if let Some(capsule) = index
+        .capsules
+        .iter_mut()
+        .find(|c| c.publisher == request.publisher && c.slug == request.slug)
+    {
+        if let Some(release) = capsule
+            .releases
+            .iter_mut()
+            .find(|r| r.version == request.version)
+        {
+            release.payload_v3 = Some(StoredPayloadV3 {
+                artifact_hash: request.manifest.artifact_hash.clone(),
+                chunk_count: request.manifest.chunks.len(),
+                total_raw_size: request.manifest.total_raw_size,
+                manifest_rel_path: rel_path.clone(),
+            });
+            changed = true;
+        }
+    }
+    if changed {
+        if let Err(err) = write_index(&state.data_dir, &index) {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "index_write_failed",
+                &err.to_string(),
+            );
+        }
+    }
+
+    (
+        StatusCode::CREATED,
+        Json(SyncCommitResponse {
+            scoped_id: format!("{}/{}", request.publisher, request.slug),
+            version: request.version,
+            artifact_hash: request.manifest.artifact_hash,
+            chunk_count: request.manifest.chunks.len(),
+            total_raw_size: request.manifest.total_raw_size,
+        }),
+    )
+        .into_response()
+}
+
+async fn handle_get_release_manifest(
+    State(state): State<AppState>,
+    AxumPath((publisher, slug, version)): AxumPath<(String, String, String)>,
+) -> impl IntoResponse {
+    if let Err(err) = validate_capsule_segments(&publisher, &slug) {
+        return json_error(StatusCode::BAD_REQUEST, "invalid_scope", &err.to_string());
+    }
+    if let Err(err) = validate_version(&version) {
+        return json_error(StatusCode::BAD_REQUEST, "invalid_version", &err.to_string());
+    }
+
+    let _guard = state.lock.lock().await;
+    let mut manifest_path = state
+        .data_dir
+        .join(release_manifest_rel_path(&publisher, &slug, &version));
+    if let Ok(index) = load_index(&state.data_dir) {
+        if let Some(rel_path) = index
+            .capsules
+            .iter()
+            .find(|c| c.publisher == publisher && c.slug == slug)
+            .and_then(|c| c.releases.iter().find(|r| r.version == version))
+            .and_then(|r| r.payload_v3.as_ref())
+            .map(|v| v.manifest_rel_path.clone())
+        {
+            manifest_path = state.data_dir.join(rel_path);
+        }
+    }
+    let bytes = match std::fs::read(&manifest_path) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return json_error(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "payload v3 manifest not found",
+            )
+        }
+    };
+
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
 async fn handle_put_local_capsule(
     State(state): State<AppState>,
     AxumPath((publisher, slug, version)): AxumPath<(String, String, String)>,
@@ -522,6 +971,7 @@ async fn handle_put_local_capsule(
     let file_name = query
         .file_name
         .unwrap_or_else(|| format!("{}-{}.capsule", slug, version));
+    let allow_existing = query.allow_existing.unwrap_or(false);
     if let Err(err) = validate_file_name(&file_name) {
         return json_error(
             StatusCode::BAD_REQUEST,
@@ -593,12 +1043,33 @@ async fn handle_put_local_capsule(
         }
     };
 
-    if has_release_version(&index, &publisher, &slug, &version) {
-        return json_error(
-            StatusCode::CONFLICT,
-            "version_exists",
-            "same version is already published",
-        );
+    if let Some(existing_release) = find_release_by_version(&index, &publisher, &slug, &version) {
+        match existing_release_outcome(existing_release, allow_existing, &actual_sha) {
+            ExistingReleaseOutcome::Reuse => {
+                let public_base_url = resolve_public_base_url(&headers, &state.listen_url);
+                let artifact_url = format!(
+                    "{}/v1/artifacts/{}/{}/{}/{}",
+                    public_base_url, publisher, slug, version, existing_release.file_name
+                );
+                return (
+                    StatusCode::OK,
+                    Json(UploadResponse {
+                        scoped_id: format!("{}/{}", publisher, slug),
+                        version,
+                        artifact_url,
+                        file_name: existing_release.file_name.clone(),
+                        sha256: existing_release.sha256.clone(),
+                        blake3: existing_release.blake3.clone(),
+                        size_bytes: existing_release.size_bytes,
+                        already_existed: true,
+                    }),
+                )
+                    .into_response();
+            }
+            ExistingReleaseOutcome::Conflict(message) => {
+                return json_error(StatusCode::CONFLICT, "version_exists", message);
+            }
+        }
     }
 
     let artifact_path = artifact_path(&state.data_dir, &publisher, &slug, &version, &file_name);
@@ -628,6 +1099,7 @@ async fn handle_put_local_capsule(
         size_bytes: body.len() as u64,
         signature_status: "verified".to_string(),
         created_at: now.clone(),
+        payload_v3: None,
     };
     upsert_capsule(
         &mut index,
@@ -662,6 +1134,7 @@ async fn handle_put_local_capsule(
             sha256: actual_sha,
             blake3: actual_blake3,
             size_bytes: body.len() as u64,
+            already_existed: false,
         }),
     )
         .into_response()
@@ -785,18 +1258,49 @@ fn upsert_capsule(
     });
 }
 
+#[cfg(test)]
 fn has_release_version(index: &RegistryIndex, publisher: &str, slug: &str, version: &str) -> bool {
+    find_release_by_version(index, publisher, slug, version).is_some()
+}
+
+fn find_release_by_version<'a>(
+    index: &'a RegistryIndex,
+    publisher: &str,
+    slug: &str,
+    version: &str,
+) -> Option<&'a StoredRelease> {
     index
         .capsules
         .iter()
         .find(|capsule| capsule.publisher == publisher && capsule.slug == slug)
-        .map(|capsule| {
+        .and_then(|capsule| {
             capsule
                 .releases
                 .iter()
-                .any(|release| release.version == version)
+                .find(|release| release.version == version)
         })
-        .unwrap_or(false)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingReleaseOutcome {
+    Reuse,
+    Conflict(&'static str),
+}
+
+fn existing_release_outcome(
+    existing_release: &StoredRelease,
+    allow_existing: bool,
+    actual_sha: &str,
+) -> ExistingReleaseOutcome {
+    if !allow_existing {
+        return ExistingReleaseOutcome::Conflict("same version is already published");
+    }
+
+    if equals_hash(&existing_release.sha256, actual_sha) {
+        return ExistingReleaseOutcome::Reuse;
+    }
+
+    ExistingReleaseOutcome::Conflict("same version is already published (sha256 mismatch)")
 }
 
 fn get_required_header(headers: &HeaderMap, key: &str) -> Result<String> {
@@ -805,6 +1309,57 @@ fn get_required_header(headers: &HeaderMap, key: &str) -> Result<String> {
         .and_then(|value| value.to_str().ok())
         .map(|v| v.to_string())
         .ok_or_else(|| anyhow::anyhow!("required header '{}' is missing", key))
+}
+
+fn parse_required_u32_header(headers: &HeaderMap, key: &str) -> Result<u32> {
+    let value = get_required_header(headers, key)?;
+    value
+        .trim()
+        .parse::<u32>()
+        .with_context(|| format!("invalid '{}' header value: {}", key, value))
+}
+
+fn verify_uploaded_chunk(
+    raw_hash: &str,
+    raw_size: u32,
+    zstd_bytes: &[u8],
+) -> std::result::Result<(), String> {
+    let mut decoder = zstd::stream::Decoder::new(Cursor::new(zstd_bytes))
+        .map_err(|e| format!("failed to initialize zstd decoder: {}", e))?;
+
+    let mut hasher = blake3::Hasher::new();
+    let mut total = 0u64;
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        let n = decoder
+            .read(&mut buf)
+            .map_err(|e| format!("failed to decode zstd chunk: {}", e))?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        hasher.update(&buf[..n]);
+    }
+
+    if total != raw_size as u64 {
+        return Err(format!(
+            "raw size mismatch: expected {} got {}",
+            raw_size, total
+        ));
+    }
+
+    let computed = format!("blake3:{}", hasher.finalize().to_hex());
+    if computed != raw_hash {
+        return Err(format!(
+            "raw hash mismatch: expected {} got {}",
+            raw_hash, computed
+        ));
+    }
+    Ok(())
+}
+
+fn registry_cas_store(data_dir: &Path) -> Result<CasStore> {
+    CasStore::new(data_dir.join("cas")).map_err(|e| anyhow::anyhow!("{}", e))
 }
 
 fn parse_artifact_manifest(bytes: &[u8]) -> Result<ArtifactMeta> {
@@ -895,6 +1450,64 @@ fn artifact_path(
         .join(file_name)
 }
 
+fn release_manifest_rel_path(publisher: &str, slug: &str, version: &str) -> String {
+    format!(
+        "manifests/{}/{}/{}/{}",
+        publisher, slug, version, V3_PAYLOAD_MANIFEST_PATH
+    )
+}
+
+fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("invalid path"))?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create parent directory {}", parent.display()))?;
+
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".tmp-manifest-")
+        .tempfile_in(parent)
+        .with_context(|| format!("failed to create temp file in {}", parent.display()))?;
+    tmp.write_all(bytes)
+        .with_context(|| format!("failed to write temp file in {}", parent.display()))?;
+    tmp.as_file_mut()
+        .sync_all()
+        .with_context(|| format!("failed to sync temp file in {}", parent.display()))?;
+
+    let persisted = tmp.persist(path).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to persist {} from {}: {}",
+            path.display(),
+            e.file.path().display(),
+            e.error
+        )
+    })?;
+    persisted
+        .sync_all()
+        .with_context(|| format!("failed to sync {}", path.display()))?;
+    sync_parent_directory(parent)?;
+    Ok(())
+}
+
+fn sync_parent_directory(parent: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let dir = std::fs::File::open(parent)
+            .with_context(|| format!("failed to open directory {}", parent.display()))?;
+        dir.sync_all()
+            .with_context(|| format!("failed to sync directory {}", parent.display()))?;
+    }
+
+    #[cfg(windows)]
+    {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+
+    Ok(())
+}
+
 fn validate_capsule_segments(publisher: &str, slug: &str) -> Result<()> {
     let scoped = format!("{}/{}", publisher, slug);
     let _ = crate::install::parse_capsule_ref(&scoped)?;
@@ -968,6 +1581,12 @@ impl Default for RegistryIndex {
 mod tests {
     use super::*;
 
+    fn compress(data: &[u8]) -> Vec<u8> {
+        let mut encoder = zstd::Encoder::new(Vec::new(), 3).expect("encoder");
+        encoder.write_all(data).expect("write");
+        encoder.finish().expect("finish")
+    }
+
     #[test]
     fn initialize_storage_creates_index() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -995,6 +1614,7 @@ mod tests {
                 size_bytes: 1,
                 signature_status: "verified".to_string(),
                 created_at: now.clone(),
+                payload_v3: None,
             },
             &now,
         );
@@ -1004,6 +1624,63 @@ mod tests {
             "sample-capsule",
             "1.0.0"
         ));
+    }
+
+    #[test]
+    fn existing_release_outcome_requires_opt_in() {
+        let release = StoredRelease {
+            version: "1.0.0".to_string(),
+            file_name: "sample.capsule".to_string(),
+            sha256: "sha256:abc".to_string(),
+            blake3: "blake3:def".to_string(),
+            size_bytes: 1,
+            signature_status: "verified".to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            payload_v3: None,
+        };
+
+        let outcome = existing_release_outcome(&release, false, "sha256:abc");
+        assert_eq!(
+            outcome,
+            ExistingReleaseOutcome::Conflict("same version is already published")
+        );
+    }
+
+    #[test]
+    fn existing_release_outcome_reuses_when_sha256_matches() {
+        let release = StoredRelease {
+            version: "1.0.0".to_string(),
+            file_name: "sample.capsule".to_string(),
+            sha256: "sha256:abc".to_string(),
+            blake3: "blake3:def".to_string(),
+            size_bytes: 1,
+            signature_status: "verified".to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            payload_v3: None,
+        };
+
+        let outcome = existing_release_outcome(&release, true, "sha256:abc");
+        assert_eq!(outcome, ExistingReleaseOutcome::Reuse);
+    }
+
+    #[test]
+    fn existing_release_outcome_conflicts_when_sha256_differs() {
+        let release = StoredRelease {
+            version: "1.0.0".to_string(),
+            file_name: "sample.capsule".to_string(),
+            sha256: "sha256:abc".to_string(),
+            blake3: "blake3:def".to_string(),
+            size_bytes: 1,
+            signature_status: "verified".to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            payload_v3: None,
+        };
+
+        let outcome = existing_release_outcome(&release, true, "sha256:xyz");
+        assert_eq!(
+            outcome,
+            ExistingReleaseOutcome::Conflict("same version is already published (sha256 mismatch)")
+        );
     }
 
     #[test]
@@ -1025,6 +1702,7 @@ mod tests {
                     size_bytes: 1,
                     signature_status: "verified".to_string(),
                     created_at: now.clone(),
+                    payload_v3: None,
                 },
                 &now,
             );
@@ -1086,5 +1764,27 @@ mod tests {
         let headers = HeaderMap::new();
         let url = resolve_public_base_url(&headers, "http://127.0.0.1:8787");
         assert_eq!(url, "http://127.0.0.1:8787");
+    }
+
+    #[test]
+    fn verify_uploaded_chunk_accepts_valid_payload() {
+        let raw = b"chunk-data";
+        let hash = compute_blake3(raw);
+        let zstd = compress(raw);
+        assert!(verify_uploaded_chunk(&hash, raw.len() as u32, &zstd).is_ok());
+    }
+
+    #[test]
+    fn verify_uploaded_chunk_rejects_hash_mismatch() {
+        let raw = b"chunk-data";
+        let zstd = compress(raw);
+        let wrong_hash = compute_blake3(b"other");
+        assert!(verify_uploaded_chunk(&wrong_hash, raw.len() as u32, &zstd).is_err());
+    }
+
+    #[test]
+    fn release_manifest_rel_path_matches_expected_layout() {
+        let rel = release_manifest_rel_path("local", "demo", "1.2.3");
+        assert_eq!(rel, "manifests/local/demo/1.2.3/payload.v3.manifest.json");
     }
 }

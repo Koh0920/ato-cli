@@ -26,6 +26,7 @@ pub enum CliDiagnosticCode {
     E101,
     E102,
     E201,
+    E202,
     E999,
 }
 
@@ -38,6 +39,7 @@ impl CliDiagnosticCode {
             Self::E101 => "E101",
             Self::E102 => "E102",
             Self::E201 => "E201",
+            Self::E202 => "E202",
             Self::E999 => "E999",
         }
     }
@@ -235,6 +237,40 @@ pub fn from_anyhow(err: &AnyhowError, command_context: CommandContext) -> CliDia
         );
     }
 
+    if matches!(command_context, CommandContext::Publish) {
+        if let Some(upload_error) =
+            err.downcast_ref::<crate::publish_artifact::PublishArtifactError>()
+        {
+            if let crate::publish_artifact::PublishArtifactError::VersionExists { message } =
+                upload_error
+            {
+                return CliDiagnostic::new(
+                    CliDiagnosticCode::E202,
+                    message.clone(),
+                    Some(
+                        "同じ version が既に存在します。version を上げるか、同一内容なら --allow-existing を使用してください。必要に応じてローカル registry を初期化してください。",
+                    ),
+                    None,
+                    None,
+                    causes,
+                );
+            }
+        }
+
+        if is_publish_version_exists_conflict(&message) {
+            return CliDiagnostic::new(
+                CliDiagnosticCode::E202,
+                message,
+                Some(
+                    "同じ version が既に存在します。version を上げるか、同一内容なら --allow-existing を使用してください。必要に応じてローカル registry を初期化してください。",
+                ),
+                None,
+                None,
+                causes,
+            );
+        }
+    }
+
     CliDiagnostic::new(
         CliDiagnosticCode::E999,
         message,
@@ -390,6 +426,14 @@ fn is_source_registration_issue(message: &str) -> bool {
         || lower.contains("source register")
 }
 
+fn is_publish_version_exists_conflict(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    (lower.contains("artifact upload") && lower.contains("(409"))
+        && (lower.contains("version_exists")
+            || lower.contains("same version is already published")
+            || lower.contains("sha256 mismatch"))
+}
+
 fn detect_field(message: &str) -> Option<&'static str> {
     if message.contains("default_target") {
         Some("default_target")
@@ -439,6 +483,25 @@ mod tests {
         ));
         let diagnostic = from_anyhow(&err, CommandContext::Build);
         assert_eq!(diagnostic.code, CliDiagnosticCode::E101);
+    }
+
+    #[test]
+    fn maps_publish_version_exists_from_error_type_to_e202() {
+        let err = anyhow!(
+            crate::publish_artifact::PublishArtifactError::VersionExists {
+                message: "same version is already published".to_string(),
+            }
+        );
+        let diagnostic = from_anyhow(&err, CommandContext::Publish);
+        assert_eq!(diagnostic.code, CliDiagnosticCode::E202);
+    }
+
+    #[test]
+    fn maps_publish_version_exists_from_409_message_to_e202() {
+        let err =
+            anyhow!("Artifact upload failed (409 Conflict): same version is already published");
+        let diagnostic = from_anyhow(&err, CommandContext::Publish);
+        assert_eq!(diagnostic.code, CliDiagnosticCode::E202);
     }
 
     #[test]
