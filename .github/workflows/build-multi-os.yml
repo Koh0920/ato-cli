@@ -167,23 +167,23 @@ jobs:
           fi
 
           "$py_cmd" - <<'PY'
-from pathlib import Path
-import hashlib
+            from pathlib import Path
+            import hashlib
 
-dist = Path("dist")
-archive = next(dist.glob("ato-*.tar.gz"), None)
-if archive is None:
-    archive = next(dist.glob("ato-*.zip"), None)
-if archive is None:
-    raise SystemExit("archive not found in dist")
+            dist = Path("dist")
+            archive = next(dist.glob("ato-*.tar.gz"), None)
+            if archive is None:
+              archive = next(dist.glob("ato-*.zip"), None)
+            if archive is None:
+              raise SystemExit("archive not found in dist")
 
-h = hashlib.sha256()
-with archive.open("rb") as f:
-    for chunk in iter(lambda: f.read(1024 * 1024), b""):
-        h.update(chunk)
+            h = hashlib.sha256()
+            with archive.open("rb") as f:
+              for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
 
-(dist / "SHA256SUMS").write_text(f"{h.hexdigest()}  {archive.name}\n", encoding="utf-8")
-PY
+            (dist / "SHA256SUMS").write_text(f"{h.hexdigest()}  {archive.name}\n", encoding="utf-8")
+            PY
 
           echo "$resolved_target" > "dist/target-triple.txt"
           echo "target_triple=$resolved_target" >> "$GITHUB_OUTPUT"
