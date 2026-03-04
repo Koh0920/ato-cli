@@ -157,33 +157,21 @@ jobs:
             tar -C dist/payload -czf "dist/${archive_name}" "${{ matrix.binary_name }}"
           fi
 
-          if command -v python3 >/dev/null 2>&1; then
-            py_cmd=python3
-          elif command -v python >/dev/null 2>&1; then
-            py_cmd=python
-          else
-            echo "python3/python is required to generate SHA256SUMS" >&2
+          archive_path="dist/${archive_name}"
+          if [[ ! -f "$archive_path" ]]; then
+            echo "archive not found for checksum generation: $archive_path" >&2
             exit 1
           fi
 
-          "$py_cmd" - <<'PY'
-            from pathlib import Path
-            import hashlib
-
-            dist = Path("dist")
-            archive = next(dist.glob("ato-*.tar.gz"), None)
-            if archive is None:
-              archive = next(dist.glob("ato-*.zip"), None)
-            if archive is None:
-              raise SystemExit("archive not found in dist")
-
-            h = hashlib.sha256()
-            with archive.open("rb") as f:
-              for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                h.update(chunk)
-
-            (dist / "SHA256SUMS").write_text(f"{h.hexdigest()}  {archive.name}\n", encoding="utf-8")
-            PY
+          if command -v sha256sum >/dev/null 2>&1; then
+            checksum="$(sha256sum "$archive_path" | awk '{print $1}')"
+          elif command -v shasum >/dev/null 2>&1; then
+            checksum="$(shasum -a 256 "$archive_path" | awk '{print $1}')"
+          else
+            echo "No SHA-256 tool found (need sha256sum or shasum)" >&2
+            exit 1
+          fi
+          printf '%s  %s\n' "$checksum" "$archive_name" > dist/SHA256SUMS
 
           echo "$resolved_target" > "dist/target-triple.txt"
           echo "target_triple=$resolved_target" >> "$GITHUB_OUTPUT"
