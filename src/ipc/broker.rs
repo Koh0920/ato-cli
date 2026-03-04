@@ -79,7 +79,7 @@ impl IpcBroker {
     ///
     /// Resolution order:
     /// 1. Local Registry (already running)
-    /// 2. Local Store (`~/.capsule/store/`)
+    /// 2. Local Store (`~/.ato/store/`)
     /// 3. Error (suggest `ato install`)
     pub fn resolve(&self, from: &str) -> ResolvedService {
         // 1. Check if already running
@@ -201,15 +201,15 @@ impl IpcBroker {
     /// Compute the local store path for a service.
     fn local_store_path(&self, from: &str) -> PathBuf {
         // Handle different `from` formats:
-        // - "greeter-service" → ~/.capsule/store/greeter-service/
-        // - "@scope/name:1.0" → ~/.capsule/store/@scope/name/
+        // - "greeter-service" → ~/.ato/store/greeter-service/
+        // - "@scope/name:1.0" → ~/.ato/store/@scope/name/
         // - "./relative/path" → relative path as-is
         if from.starts_with("./") || from.starts_with("../") {
             return PathBuf::from(from);
         }
 
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-        let store_dir = home.join(".capsule").join("store");
+        let store_dir = home.join(".ato").join("store");
 
         if from.starts_with('@') {
             // @scope/name:version → scope/name
@@ -394,7 +394,7 @@ mod tests {
         assert!(path
             .to_str()
             .unwrap()
-            .contains(".capsule/store/greeter-service"));
+            .contains(".ato/store/greeter-service"));
     }
 
     #[test]
@@ -404,7 +404,7 @@ mod tests {
         assert!(path
             .to_str()
             .unwrap()
-            .contains(".capsule/store/@ato/llm-service"));
+            .contains(".ato/store/@ato/llm-service"));
     }
 
     #[test]

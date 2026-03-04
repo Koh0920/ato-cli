@@ -4,7 +4,7 @@ use sha2::Digest;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const ENGINES_DIR: &str = ".capsule/engines";
+const ENGINES_DIR: &str = ".ato/engines";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineInfo {
@@ -254,7 +254,7 @@ mod tests {
         let path = em.engine_path("nacelle", "v1.2.3");
         let path_str = path.to_string_lossy();
         assert!(path_str.contains("nacelle-v1.2.3"));
-        assert!(path_str.contains(".capsule/engines"));
+        assert!(path_str.contains(".ato/engines"));
     }
 
     #[test]

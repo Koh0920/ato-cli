@@ -65,7 +65,7 @@ pub fn execute(args: LogsArgs, reporter: Arc<CliReporter>) -> Result<()> {
 
 fn get_log_path(id: &str) -> PathBuf {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-    home.join(".capsule")
+    home.join(".ato")
         .join("logs")
         .join(format!("{}{}", id, LOG_FILE_EXT))
 }
@@ -190,7 +190,7 @@ mod tests {
         let path = get_log_path("test-capsule");
         let path_str = path.to_string_lossy();
         assert!(path_str.contains("test-capsule.log"));
-        assert!(path_str.contains(".capsule/logs"));
+        assert!(path_str.contains(".ato/logs"));
     }
 
     #[test]

@@ -72,7 +72,7 @@ impl ConsentStore {
         let home = dirs::home_dir().ok_or_else(|| {
             AtoExecutionError::internal("failed to resolve home directory for consent store")
         })?;
-        let consent_dir = home.join(".capsule").join("consent");
+        let consent_dir = home.join(".ato").join("consent");
 
         fs::create_dir_all(&consent_dir).map_err(|err| {
             AtoExecutionError::internal(format!("failed to create consent directory: {err}"))

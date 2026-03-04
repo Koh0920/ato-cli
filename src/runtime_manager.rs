@@ -348,7 +348,7 @@ fn select_tool_artifact<'a>(
 fn runtime_cache_root() -> Result<PathBuf> {
     let home =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Failed to determine home directory"))?;
-    Ok(home.join(".capsule").join("runtimes"))
+    Ok(home.join(".ato").join("runtimes"))
 }
 
 fn current_platform_keys() -> Result<(String, String)> {

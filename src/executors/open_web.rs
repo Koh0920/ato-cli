@@ -102,7 +102,7 @@ fn ensure_static_server_script() -> Result<PathBuf> {
     let home =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Failed to resolve home directory"))?;
     let script_path = home
-        .join(".capsule")
+        .join(".ato")
         .join("cache")
         .join("scripts")
         .join("static_file_server.ts");

@@ -25,7 +25,7 @@ pub struct DiscoveryRegistry {
 
 /// Local discovery PoC implementation.
 ///
-/// Reads static peers from ~/.capsule/discovery_peers.json and merges results
+/// Reads static peers from ~/.ato/discovery_peers.json and merges results
 /// across mDNS/DHT/GossipSub/Relay backends.
 pub fn discover_peers() -> Result<DiscoveryResult> {
     let mut peers = Vec::new();

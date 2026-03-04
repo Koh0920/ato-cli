@@ -94,7 +94,13 @@ fn extract_capsule(capsule_path: &Path, out_dir: &Path) -> Result<(), CapsuleErr
     let mut outer = tar::Archive::new(&mut archive);
     outer.unpack(out_dir).map_err(CapsuleError::Io)?;
 
-    crate::capsule_v3::unpack_payload_from_capsule_root(out_dir, out_dir)?;
+    let payload_zst = out_dir.join("payload.tar.zst");
+    if payload_zst.exists() {
+        let file = std::fs::File::open(&payload_zst).map_err(CapsuleError::Io)?;
+        let decoder = zstd::stream::Decoder::new(file).map_err(CapsuleError::Io)?;
+        let mut payload = tar::Archive::new(decoder);
+        payload.unpack(out_dir).map_err(CapsuleError::Io)?;
+    }
 
     Ok(())
 }

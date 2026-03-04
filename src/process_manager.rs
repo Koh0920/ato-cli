@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 
-const RUN_DIR: &str = ".capsule/run";
+const RUN_DIR: &str = ".ato/run";
 const PID_FILE_EXT: &str = ".pid";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

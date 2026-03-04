@@ -754,7 +754,7 @@ impl RuntimeFetcher {
 fn toolchain_cache_dir() -> Result<PathBuf> {
     let home = dirs::home_dir()
         .ok_or_else(|| CapsuleError::Config("Failed to determine home directory".to_string()))?;
-    Ok(home.join(".capsule").join("toolchains"))
+    Ok(home.join(".ato").join("toolchains"))
 }
 
 #[cfg(test)]

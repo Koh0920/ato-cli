@@ -149,7 +149,7 @@ fn write_mock_elf_with_dt_verneed(path: &Path, required_glibc: &str) {
 
 fn prepare_consent_home(fixture_root: &Path) -> TempDir {
     let home = TempDir::new().expect("failed to create temporary HOME");
-    let consent_dir = home.path().join(".capsule").join("consent");
+    let consent_dir = home.path().join(".ato").join("consent");
     fs::create_dir_all(&consent_dir).expect("failed to create consent dir");
 
     let manifest_path = fixture_root.join("capsule.toml");
@@ -229,11 +229,11 @@ fn run_without_seeded_consent(
 fn find_built_capsule_path(workspace_root: &Path) -> PathBuf {
     let mut found: Vec<PathBuf> = Vec::new();
 
-    let capsule_dir = workspace_root.join(".capsule");
+    let capsule_dir = workspace_root.join(".ato");
     if capsule_dir.is_dir() {
         found.extend(
             fs::read_dir(&capsule_dir)
-                .expect("failed to read .capsule directory")
+                .expect("failed to read .ato directory")
                 .filter_map(|entry| entry.ok().map(|v| v.path()))
                 .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("capsule")),
         );
@@ -979,7 +979,7 @@ fn test_8_consent_store_permissions_are_hardened() {
         "run is expected to fail due to missing consent in non-interactive mode"
     );
 
-    let consent_dir = home.path().join(".capsule").join("consent");
+    let consent_dir = home.path().join(".ato").join("consent");
     let consent_file = consent_dir.join("executionplan_v1.jsonl");
     assert!(consent_dir.exists(), "consent directory must be created");
     assert!(consent_file.exists(), "consent file must be created");
