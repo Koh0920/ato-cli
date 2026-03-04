@@ -72,11 +72,11 @@ run_zero_config_build_case() {
 }
 
 resolve_session_token() {
-  if [ -n "${ATO_SESSION_TOKEN:-}" ]; then
+  if [ -n "${ATO_TOKEN:-}" ]; then
     return 0
   fi
 
-  local creds_file="${HOME}/.capsule/credentials.json"
+  local creds_file="${HOME}/.ato/credentials.json"
   if [ ! -f "${creds_file}" ]; then
     return 1
   fi
@@ -84,7 +84,7 @@ resolve_session_token() {
   local token
   token="$(python3 - <<'PY'
 import json, os, pathlib
-p = pathlib.Path(os.path.expanduser('~/.capsule/credentials.json'))
+p = pathlib.Path(os.path.expanduser('~/.ato/credentials.json'))
 try:
     data = json.loads(p.read_text())
 except Exception:
@@ -94,7 +94,7 @@ print((data.get('session_token') or '').strip())
 PY
 )"
   if [ -n "${token}" ]; then
-    export ATO_SESSION_TOKEN="${token}"
+    export ATO_TOKEN="${token}"
     return 0
   fi
 
