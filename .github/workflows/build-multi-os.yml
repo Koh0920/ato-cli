@@ -103,6 +103,46 @@ jobs:
             cargo build --release --locked --bin ato
           fi
 
+      - name: Verify strict-v3 fail-fast behavior
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tmp_dir="$(mktemp -d)"
+          mkdir -p "${tmp_dir}/source"
+          cat >"${tmp_dir}/capsule.toml" <<'EOF'
+          schema_version = "0.2"
+          name = "strict-v3-ci-check"
+          version = "0.1.0"
+          type = "app"
+          default_target = "cli"
+
+          [targets.cli]
+          runtime = "source"
+          driver = "native"
+          entrypoint = "source/main.py"
+          EOF
+          cat >"${tmp_dir}/source/main.py" <<'EOF'
+          print("strict v3 check")
+          EOF
+
+          set +e
+          target/release/ato build "${tmp_dir}" --strict-v3 >"${tmp_dir}/stdout.log" 2>"${tmp_dir}/stderr.log"
+          status=$?
+          set -e
+          if [[ ${status} -eq 0 ]]; then
+            echo "strict-v3 check unexpectedly succeeded" >&2
+            cat "${tmp_dir}/stdout.log" >&2 || true
+            cat "${tmp_dir}/stderr.log" >&2 || true
+            exit 1
+          fi
+          if ! grep -qiE "strict-v3|Strict v3 fallback is not allowed" "${tmp_dir}/stderr.log"; then
+            echo "strict-v3 failure message not found in stderr" >&2
+            cat "${tmp_dir}/stderr.log" >&2 || true
+            exit 1
+          fi
+
       - name: Package target archive
         id: package
         shell: bash
@@ -141,6 +181,38 @@ jobs:
             dist/ato-*.tar.gz
             dist/ato-*.zip
             dist/target-triple.txt
+          if-no-files-found: error
+
+  tar_pack_benchmark:
+    name: Tar pack benchmark
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Benchmark (10k files)
+        shell: bash
+        run: |
+          set -euo pipefail
+          FILES=10000 scripts/ci/tar_pack_benchmark.sh
+
+      - name: Benchmark (100k files)
+        shell: bash
+        run: |
+          set -euo pipefail
+          FILES=100000 scripts/ci/tar_pack_benchmark.sh
+
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tar-pack-benchmark
+          path: /tmp/tar-pack-benchmark
           if-no-files-found: error
 
   upload_r2:
