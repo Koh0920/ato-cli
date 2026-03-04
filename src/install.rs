@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use crate::registry::RegistryResolver;
 
-const DEFAULT_STORE_DIR: &str = ".capsule/store";
+const DEFAULT_STORE_DIR: &str = ".ato/store";
 const SEGMENT_MAX_LEN: usize = 63;
 
 #[derive(Debug, Serialize)]
