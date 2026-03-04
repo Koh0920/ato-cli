@@ -150,6 +150,10 @@ struct CapsuleDetailResponse {
     latest_version: String,
     releases: Vec<CapsuleReleaseRow>,
     publisher: PublisherInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manifest: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repository: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -342,6 +346,7 @@ async fn handle_get_capsule(
         return json_error(StatusCode::NOT_FOUND, "not_found", "Capsule not found");
     };
 
+    let (manifest, repository) = load_capsule_detail_manifest(&state.data_dir, capsule);
     let detail = CapsuleDetailResponse {
         id: capsule.id.clone(),
         scoped_id: format!("{}/{}", capsule.publisher, capsule.slug),
@@ -361,6 +366,8 @@ async fn handle_get_capsule(
             })
             .collect(),
         publisher: publisher_info(&capsule.publisher),
+        manifest,
+        repository,
     };
     (StatusCode::OK, Json(detail)).into_response()
 }
@@ -864,6 +871,17 @@ fn get_required_header(headers: &HeaderMap, key: &str) -> Result<String> {
 }
 
 fn parse_artifact_manifest(bytes: &[u8]) -> Result<ArtifactMeta> {
+    let manifest = extract_manifest_from_capsule(bytes)?;
+    let parsed = capsule_core::types::capsule_v1::CapsuleManifestV1::from_toml(&manifest)
+        .map_err(|err| anyhow::anyhow!("{}", err))?;
+    Ok(ArtifactMeta {
+        name: parsed.name,
+        version: parsed.version,
+        description: parsed.metadata.description.unwrap_or_default(),
+    })
+}
+
+fn extract_manifest_from_capsule(bytes: &[u8]) -> Result<String> {
     let mut archive = tar::Archive::new(Cursor::new(bytes));
     let mut entries = archive
         .entries()
@@ -876,17 +894,97 @@ fn parse_artifact_manifest(bytes: &[u8]) -> Result<ArtifactMeta> {
             entry
                 .read_to_string(&mut manifest)
                 .context("Failed to read capsule.toml")?;
-            let parsed = capsule_core::types::capsule_v1::CapsuleManifestV1::from_toml(&manifest)
-                .map_err(|err| anyhow::anyhow!("{}", err))?;
-            return Ok(ArtifactMeta {
-                name: parsed.name,
-                version: parsed.version,
-                description: parsed.metadata.description.unwrap_or_default(),
-            });
+            return Ok(manifest);
         }
     }
 
     bail!("capsule.toml not found in artifact")
+}
+
+fn load_capsule_detail_manifest(
+    data_dir: &Path,
+    capsule: &StoredCapsule,
+) -> (Option<serde_json::Value>, Option<String>) {
+    let Some(release) = capsule
+        .releases
+        .iter()
+        .find(|release| release.version == capsule.latest_version)
+        .or_else(|| capsule.releases.last())
+    else {
+        return (None, None);
+    };
+    let path = artifact_path(
+        data_dir,
+        &capsule.publisher,
+        &capsule.slug,
+        &release.version,
+        &release.file_name,
+    );
+
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(
+                "local registry failed to read artifact for detail manifest path={} error={}",
+                path.display(),
+                err
+            );
+            return (None, None);
+        }
+    };
+    let manifest_raw = match extract_manifest_from_capsule(&bytes) {
+        Ok(raw) => raw,
+        Err(err) => {
+            tracing::warn!(
+                "local registry failed to extract capsule.toml for {}/{}@{}: {}",
+                capsule.publisher,
+                capsule.slug,
+                release.version,
+                err
+            );
+            return (None, None);
+        }
+    };
+
+    let parsed = match toml::from_str::<toml::Value>(&manifest_raw) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            tracing::warn!(
+                "local registry failed to parse capsule.toml for {}/{}@{}: {}",
+                capsule.publisher,
+                capsule.slug,
+                release.version,
+                err
+            );
+            return (None, None);
+        }
+    };
+    let repository = extract_repository_from_manifest(&parsed);
+    let manifest = match serde_json::to_value(parsed) {
+        Ok(value) => Some(value),
+        Err(err) => {
+            tracing::warn!(
+                "local registry failed to serialize manifest JSON for {}/{}@{}: {}",
+                capsule.publisher,
+                capsule.slug,
+                release.version,
+                err
+            );
+            None
+        }
+    };
+    (manifest, repository)
+}
+
+fn extract_repository_from_manifest(parsed: &toml::Value) -> Option<String> {
+    parsed
+        .get("metadata")
+        .and_then(|v| v.get("repository"))
+        .and_then(toml::Value::as_str)
+        .or_else(|| parsed.get("repository").and_then(toml::Value::as_str))
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
 }
 
 fn expand_data_dir(raw: &str) -> Result<PathBuf> {
@@ -1023,6 +1121,35 @@ impl Default for RegistryIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    fn build_capsule_bytes(manifest: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut out);
+            let mut header = tar::Header::new_gnu();
+            header.set_path("capsule.toml").expect("set path");
+            header.set_mode(0o644);
+            header.set_size(manifest.len() as u64);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "capsule.toml", manifest.as_bytes())
+                .expect("append manifest");
+
+            let mut extra_header = tar::Header::new_gnu();
+            extra_header.set_path("README.md").expect("set path");
+            extra_header.set_mode(0o644);
+            let extra = b"dummy";
+            extra_header.set_size(extra.len() as u64);
+            extra_header.set_cksum();
+            builder
+                .append_data(&mut extra_header, "README.md", &extra[..])
+                .expect("append extra");
+            builder.finish().expect("finish archive");
+        }
+        out.flush().expect("flush vec");
+        out
+    }
 
     #[test]
     fn initialize_storage_creates_index() {
@@ -1196,5 +1323,94 @@ mod tests {
         let headers = HeaderMap::new();
         let url = resolve_public_base_url(&headers, "http://127.0.0.1:8787");
         assert_eq!(url, "http://127.0.0.1:8787");
+    }
+
+    #[test]
+    fn extract_manifest_from_capsule_returns_text() {
+        let manifest = r#"schema_version = "0.2"
+name = "sample"
+version = "1.0.0"
+type = "app"
+default_target = "cli"
+"#;
+        let bytes = build_capsule_bytes(manifest);
+        let extracted = extract_manifest_from_capsule(&bytes).expect("extract");
+        assert!(extracted.contains("name = \"sample\""));
+    }
+
+    #[test]
+    fn extract_repository_from_manifest_prefers_metadata_then_root() {
+        let parsed: toml::Value = toml::from_str(
+            r#"
+repository = "root/repo"
+[metadata]
+repository = "meta/repo"
+"#,
+        )
+        .expect("parse");
+        assert_eq!(
+            extract_repository_from_manifest(&parsed).as_deref(),
+            Some("meta/repo")
+        );
+
+        let parsed_root: toml::Value =
+            toml::from_str(r#"repository = "root-only/repo""#).expect("parse");
+        assert_eq!(
+            extract_repository_from_manifest(&parsed_root).as_deref(),
+            Some("root-only/repo")
+        );
+    }
+
+    #[test]
+    fn load_capsule_detail_manifest_reads_latest_release_artifact() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manifest = r#"schema_version = "0.2"
+name = "sample"
+version = "1.0.0"
+type = "app"
+default_target = "cli"
+
+[metadata]
+repository = "koh0920/sample"
+"#;
+        let file_name = "sample-1.0.0.capsule";
+        let artifact = artifact_path(tmp.path(), "local", "sample", "1.0.0", file_name);
+        std::fs::create_dir_all(artifact.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&artifact, build_capsule_bytes(manifest)).expect("write artifact");
+
+        let capsule = StoredCapsule {
+            id: "id-1".to_string(),
+            publisher: "local".to_string(),
+            slug: "sample".to_string(),
+            name: "sample".to_string(),
+            description: "".to_string(),
+            category: "tools".to_string(),
+            capsule_type: "app".to_string(),
+            price: 0,
+            currency: "usd".to_string(),
+            latest_version: "1.0.0".to_string(),
+            releases: vec![StoredRelease {
+                version: "1.0.0".to_string(),
+                file_name: file_name.to_string(),
+                sha256: "sha256:x".to_string(),
+                blake3: "blake3:y".to_string(),
+                size_bytes: 1,
+                signature_status: "verified".to_string(),
+                created_at: Utc::now().to_rfc3339(),
+            }],
+            downloads: 0,
+            created_at: Utc::now().to_rfc3339(),
+            updated_at: Utc::now().to_rfc3339(),
+        };
+
+        let (manifest_json, repository) = load_capsule_detail_manifest(tmp.path(), &capsule);
+        let manifest_json = manifest_json.expect("manifest json");
+        assert_eq!(
+            manifest_json
+                .get("name")
+                .and_then(serde_json::Value::as_str),
+            Some("sample")
+        );
+        assert_eq!(repository.as_deref(), Some("koh0920/sample"));
     }
 }

@@ -4,6 +4,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::io::{Cursor, Read};
 
 const DEFAULT_STORE_API_URL: &str = "https://api.ato.run";
 const ENV_STORE_API_URL: &str = "ATO_STORE_API_URL";
@@ -47,6 +48,12 @@ struct RawCapsuleDetailForManifest {
     manifest: Option<serde_json::Value>,
     #[serde(default)]
     repository: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawDistributionForManifest {
+    #[serde(rename = "artifact_url", alias = "artifactUrl")]
+    artifact_url: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -284,6 +291,12 @@ pub async fn fetch_capsule_manifest(scoped_id: &str, registry_url: Option<&str>)
         }
     }
 
+    if let Some(manifest) =
+        fetch_manifest_from_distribution_artifact(&client, &registry, &publisher, &slug).await?
+    {
+        return Ok(manifest);
+    }
+
     anyhow::bail!("capsule.toml is not available from this capsule source")
 }
 
@@ -375,6 +388,76 @@ async fn fetch_manifest_from_github(
     Ok(None)
 }
 
+async fn fetch_manifest_from_distribution_artifact(
+    client: &reqwest::Client,
+    registry: &str,
+    publisher: &str,
+    slug: &str,
+) -> Result<Option<String>> {
+    let distribution_url = format!(
+        "{}/v1/capsules/by/{}/{}/distributions",
+        registry,
+        urlencoding::encode(publisher),
+        urlencoding::encode(slug)
+    );
+    let distribution_response = match client.get(&distribution_url).send().await {
+        Ok(response) => response,
+        Err(_) => return Ok(None),
+    };
+    if !distribution_response.status().is_success() {
+        return Ok(None);
+    }
+    let distribution = match distribution_response
+        .json::<RawDistributionForManifest>()
+        .await
+    {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+
+    let artifact_response = match client.get(&distribution.artifact_url).send().await {
+        Ok(response) => response,
+        Err(_) => return Ok(None),
+    };
+    if !artifact_response.status().is_success() {
+        return Ok(None);
+    }
+    let bytes = match artifact_response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(None),
+    };
+    let manifest = match extract_manifest_from_capsule_archive(bytes.as_ref()) {
+        Ok(manifest) => manifest,
+        Err(_) => return Ok(None),
+    };
+    Ok(Some(manifest))
+}
+
+fn extract_manifest_from_capsule_archive(bytes: &[u8]) -> Result<String> {
+    let mut archive = tar::Archive::new(Cursor::new(bytes));
+    let mut entries = archive
+        .entries()
+        .context("Failed to read .capsule archive entries")?;
+
+    while let Some(entry) = entries.next() {
+        let mut entry = entry.context("Invalid .capsule entry")?;
+        let entry_path = entry
+            .path()
+            .context("Failed to read archive entry path")?
+            .to_string_lossy()
+            .to_string();
+        if entry_path == "capsule.toml" {
+            let mut manifest = String::new();
+            entry
+                .read_to_string(&mut manifest)
+                .context("Failed to read capsule.toml from artifact")?;
+            return Ok(manifest);
+        }
+    }
+
+    anyhow::bail!("Invalid artifact: capsule.toml not found in .capsule archive")
+}
+
 fn json_to_toml_value(value: &serde_json::Value) -> Option<toml::Value> {
     match value {
         serde_json::Value::Null => None,
@@ -407,6 +490,7 @@ fn json_to_toml_value(value: &serde_json::Value) -> Option<toml::Value> {
 #[cfg(test)]
 mod tests {
     use super::RawCapsulesResponse;
+    use super::*;
 
     #[test]
     fn parses_capsules_response_when_latest_version_is_null() {
@@ -467,5 +551,31 @@ mod tests {
 
         let parsed: RawCapsulesResponse = serde_json::from_str(raw).expect("should parse");
         assert_eq!(parsed.capsules.len(), 1);
+    }
+
+    #[test]
+    fn extract_manifest_from_capsule_archive_succeeds() {
+        let manifest = r#"schema_version = "0.2"
+name = "sample"
+version = "1.0.0"
+type = "app"
+default_target = "cli"
+"#;
+        let mut bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut bytes);
+            let mut header = tar::Header::new_gnu();
+            header.set_path("capsule.toml").expect("path");
+            header.set_mode(0o644);
+            header.set_size(manifest.len() as u64);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "capsule.toml", manifest.as_bytes())
+                .expect("append");
+            builder.finish().expect("finish");
+        }
+
+        let extracted = extract_manifest_from_capsule_archive(&bytes).expect("extract");
+        assert!(extracted.contains("name = \"sample\""));
     }
 }

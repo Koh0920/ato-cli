@@ -382,6 +382,20 @@ entrypoint = "main.ts"
         "search response missing test-local capsule"
     );
 
+    let detail: serde_json::Value =
+        reqwest::blocking::get(format!("{}/v1/capsules/by/local/test-local", base_url))
+            .context("detail endpoint call")?
+            .json()
+            .context("detail json parse")?;
+    assert_eq!(
+        detail
+            .get("manifest")
+            .and_then(|v| v.get("name"))
+            .and_then(|v| v.as_str()),
+        Some("test-local"),
+        "detail response should include manifest payload"
+    );
+
     let client = reqwest::blocking::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
