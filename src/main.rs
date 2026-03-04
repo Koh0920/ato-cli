@@ -438,6 +438,10 @@ enum Commands {
         /// GitHub Personal Access Token (legacy fallback, scope: read:user)
         #[arg(long)]
         token: Option<String>,
+
+        /// Do not open browser automatically; print activation URL for another device/session
+        #[arg(long, default_value_t = false)]
+        headless: bool,
     },
 
     #[command(next_help_heading = "Auth", about = "Logout")]
@@ -1713,11 +1717,11 @@ fn run() -> Result<()> {
             command: IpcCommands::Stop { name, force, json },
         } => commands::ipc::run_ipc_stop(name, force, json),
 
-        Commands::Login { token } => {
+        Commands::Login { token, headless } => {
             let rt = tokio::runtime::Runtime::new()?;
             match token {
                 Some(token) => rt.block_on(auth::login_with_token(token)),
-                None => rt.block_on(auth::login_with_store_device_flow()),
+                None => rt.block_on(auth::login_with_store_device_flow(headless)),
             }
         }
 

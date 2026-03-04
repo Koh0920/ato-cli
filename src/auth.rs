@@ -1035,7 +1035,7 @@ pub async fn login_with_token(token: String) -> Result<()> {
 }
 
 /// Login with Store Device Flow
-pub async fn login_with_store_device_flow() -> Result<()> {
+pub async fn login_with_store_device_flow(headless: bool) -> Result<()> {
     let api_base = store_api_base_url();
     let site_base = store_site_base_url();
     let client = reqwest::Client::new();
@@ -1076,16 +1076,24 @@ pub async fn login_with_store_device_flow() -> Result<()> {
         urlencoding::encode(&activate_url)
     );
 
-    println!("🌐 Opening browser for Ato sign-in...");
-    println!("   URL: {}", login_url);
-    println!("🔑 Verification code: {}", start.user_code);
+    if headless {
+        println!("🧩 Headless login mode");
+        println!("   Open this URL on another authenticated browser session:");
+        println!("   {}", login_url);
+        println!("🔑 Verification code: {}", start.user_code);
+        println!("⏳ Waiting for remote approval...");
+    } else {
+        println!("🌐 Opening browser for Ato sign-in...");
+        println!("   URL: {}", login_url);
+        println!("🔑 Verification code: {}", start.user_code);
 
-    if let Err(error) = try_open_browser(&login_url) {
-        eprintln!("⚠️  Could not open browser automatically: {}", error);
-        eprintln!("   Open the URL manually to continue sign-in.");
+        if let Err(error) = try_open_browser(&login_url) {
+            eprintln!("⚠️  Could not open browser automatically: {}", error);
+            eprintln!("   Open the URL manually to continue sign-in.");
+        }
+
+        println!("⏳ Waiting for browser authentication...");
     }
-
-    println!("⏳ Waiting for browser authentication...");
 
     let poll_timeout_secs = start.expires_in.min(300);
     let mut poll_interval_secs = start.poll_interval_sec.unwrap_or(2).max(1);
