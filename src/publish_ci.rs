@@ -392,6 +392,7 @@ pub(crate) fn build_capsule_artifact(
                     skip_validation: false,
                     nacelle_override: None,
                     standalone: false,
+                    strict_v3: false,
                 },
                 reporter,
             )?;
@@ -431,6 +432,7 @@ pub(crate) fn build_capsule_artifact(
                         skip_validation: false,
                         nacelle_override: None,
                         standalone: false,
+                        strict_v3: false,
                     },
                     reporter,
                 )?;

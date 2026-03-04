@@ -158,7 +158,7 @@ Auth:
 Advanced Commands:
   key      Manage signing keys
   config   Manage configuration (registry, engine, source)
-  publish  Publish capsule (official: CI-first, private: direct upload)
+  publish  Publish capsule (Dock/private: direct upload, official: CI-first)
   gen-ci   Generate GitHub Actions workflow for OIDC CI publish
   registry Manage registry commands (resolve/list/cache/serve)
 
@@ -280,7 +280,7 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         allow_unverified: bool,
 
-        /// Output directory (default: ~/.capsule/store/)
+        /// Output directory (default: ~/.ato/store/)
         #[arg(long)]
         output: Option<PathBuf>,
 
@@ -334,6 +334,10 @@ enum Commands {
         /// Keep failed build artifacts when smoke test fails
         #[arg(long, default_value_t = false)]
         keep_failed_artifacts: bool,
+
+        /// Disallow fallback when source_digest/CAS(v3 path) is unavailable
+        #[arg(long, default_value_t = false)]
+        strict_v3: bool,
     },
 
     #[command(
@@ -462,7 +466,7 @@ enum Commands {
 
     #[command(
         next_help_heading = "Advanced Commands",
-        about = "Publish capsule (official registry: CI-first, private registry: direct upload)"
+        about = "Publish capsule (Dock/private registry: direct upload, official registry: CI-first)"
     )]
     Publish {
         /// Registry URL override (default: https://api.ato.run)
@@ -672,6 +676,10 @@ enum Commands {
         /// Keep failed build artifacts when smoke test fails
         #[arg(long, hide = true, default_value_t = false)]
         keep_failed_artifacts: bool,
+
+        /// Disallow fallback when source_digest/CAS(v3 path) is unavailable
+        #[arg(long, hide = true, default_value_t = false)]
+        strict_v3: bool,
     },
 
     #[command(hide = true)]
@@ -836,7 +844,7 @@ enum ConfigEngineCommands {
     /// Show engine capabilities (JSON)
     Features,
 
-    /// Register a nacelle engine binary (writes ~/.capsule/config.toml)
+    /// Register a nacelle engine binary (writes ~/.ato/config.toml)
     Register {
         /// Registration name (e.g. "default" or "my-custom-nacelle")
         #[arg(long)]
@@ -1002,7 +1010,7 @@ enum EngineCommands {
     /// Show engine capabilities (JSON)
     Features,
 
-    /// Register a nacelle engine binary (writes ~/.capsule/config.toml)
+    /// Register a nacelle engine binary (writes ~/.ato/config.toml)
     Register {
         /// Registration name (e.g. "default" or "my-custom-nacelle")
         #[arg(long)]
@@ -1047,7 +1055,7 @@ enum RegistryCommands {
         port: u16,
 
         /// Data directory for local registry state
-        #[arg(long, default_value = "~/.capsule/local-registry")]
+        #[arg(long, default_value = "~/.ato/local-registry")]
         data_dir: String,
 
         /// Listen host (non-loopback requires --auth-token)
@@ -1294,6 +1302,7 @@ fn run() -> Result<()> {
             force_large_payload,
             enforcement,
             keep_failed_artifacts,
+            strict_v3,
         } => commands::build::execute_pack_command(
             dir,
             init,
@@ -1301,6 +1310,7 @@ fn run() -> Result<()> {
             standalone,
             force_large_payload,
             keep_failed_artifacts,
+            strict_v3,
             enforcement.as_str().to_string(),
             reporter.clone(),
             cli.json,
@@ -1342,6 +1352,7 @@ fn run() -> Result<()> {
             force_large_payload,
             enforcement,
             keep_failed_artifacts,
+            strict_v3,
         } => {
             eprintln!("⚠️  'ato pack' is deprecated. Use 'ato build' instead.");
             commands::build::execute_pack_command(
@@ -1351,6 +1362,7 @@ fn run() -> Result<()> {
                 standalone,
                 force_large_payload,
                 keep_failed_artifacts,
+                strict_v3,
                 enforcement.as_str().to_string(),
                 reporter.clone(),
                 cli.json,
@@ -3122,7 +3134,7 @@ async fn resolve_installed_capsule_archive(
 ) -> Result<Option<PathBuf>> {
     let store_root = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".capsule")
+        .join(".ato")
         .join("store");
     if let Some(path) = resolve_installed_capsule_archive_in_store(
         &store_root.join(&scoped_ref.publisher),

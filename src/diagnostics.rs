@@ -364,6 +364,16 @@ fn from_capsule_error(core_err: &capsule_core::CapsuleError, causes: Vec<String>
                 causes,
             )
         }
+        capsule_core::CapsuleError::StrictV3FallbackNotAllowed(detail) => CliDiagnostic::new(
+            CliDiagnosticCode::E102,
+            detail,
+            Some(
+                "strict-v3 を無効化するか、source_digest をCASに登録して v3 経路を成功させてください。",
+            ),
+            None,
+            Some("strict-v3"),
+            causes,
+        ),
         capsule_core::CapsuleError::AuthRequired(detail) => CliDiagnostic::new(
             CliDiagnosticCode::E201,
             format!("Authentication required: {}", detail),
@@ -483,6 +493,15 @@ mod tests {
         ));
         let diagnostic = from_anyhow(&err, CommandContext::Build);
         assert_eq!(diagnostic.code, CliDiagnosticCode::E101);
+    }
+
+    #[test]
+    fn maps_strict_v3_error_to_e102() {
+        let err = anyhow!(capsule_core::CapsuleError::StrictV3FallbackNotAllowed(
+            "fallback blocked".to_string()
+        ));
+        let diagnostic = from_anyhow(&err, CommandContext::Build);
+        assert_eq!(diagnostic.code, CliDiagnosticCode::E102);
     }
 
     #[test]

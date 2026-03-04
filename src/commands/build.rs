@@ -14,6 +14,7 @@ pub fn execute_pack_command(
     standalone: bool,
     force_large_payload: bool,
     keep_failed_artifacts: bool,
+    strict_v3: bool,
     enforcement: String,
     reporter: std::sync::Arc<reporters::CliReporter>,
     cli_json: bool,
@@ -114,6 +115,7 @@ pub fn execute_pack_command(
                     skip_validation: false,
                     nacelle_override,
                     standalone,
+                    strict_v3,
                 },
                 reporter.clone(),
             );
@@ -256,6 +258,7 @@ pub fn execute_pack_command(
                         skip_validation: false,
                         nacelle_override,
                         standalone,
+                        strict_v3,
                     },
                     reporter.clone(),
                 );
