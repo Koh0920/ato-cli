@@ -217,29 +217,29 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: release-${{ matrix.artifact_name }}
-          path: /tmp/ato-smoke
+          path: ato-smoke
 
       - name: Prepare extracted binary
         id: prep
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p /tmp/ato-bin
-          archive="$(find /tmp/ato-smoke -maxdepth 1 -type f \( -name 'ato-*.tar.gz' -o -name 'ato-*.zip' \) | head -n1)"
+          mkdir -p ato-bin
+          archive="$(find ato-smoke -maxdepth 1 -type f \( -name 'ato-*.tar.gz' -o -name 'ato-*.zip' \) | head -n1)"
           if [[ -z "$archive" ]]; then
-            echo "No archive found in /tmp/ato-smoke" >&2
+            echo "No archive found in ato-smoke" >&2
             exit 1
           fi
 
           if [[ "$archive" == *.zip ]]; then
             archive_win="$(cygpath -w "$archive")"
-            dest_win="$(cygpath -w /tmp/ato-bin)"
+            dest_win="$(cygpath -w "$PWD/ato-bin")"
             powershell.exe -NoProfile -Command "Expand-Archive -Path '$archive_win' -DestinationPath '$dest_win' -Force"
           else
-            tar -C /tmp/ato-bin -xzf "$archive"
+            tar -C ato-bin -xzf "$archive"
           fi
 
-          binary_path="/tmp/ato-bin/${{ matrix.binary_name }}"
+          binary_path="$PWD/ato-bin/${{ matrix.binary_name }}"
           if [[ ! -f "$binary_path" ]]; then
             echo "Extracted binary not found: $binary_path" >&2
             exit 1
@@ -253,7 +253,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y qemu-user-static libc6-arm64-cross
+          sudo apt-get install -y qemu-user-static libc6-arm64-cross libgcc-s1-arm64-cross libstdc++6-arm64-cross
 
       - name: Smoke (aarch64 via QEMU)
         if: ${{ matrix.qemu_arm }}
