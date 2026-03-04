@@ -23,7 +23,7 @@ pub struct EngineRegistration {
 pub fn config_dir() -> Result<PathBuf> {
     Ok(dirs::home_dir()
         .context("Failed to determine home directory")?
-    .join(".ato"))
+        .join(".ato"))
 }
 
 pub fn config_path() -> Result<PathBuf> {
