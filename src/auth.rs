@@ -7,8 +7,8 @@ use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use ed25519_dalek::Signer;
 use keyring::{Entry, Error as KeyringError};
-use rand::RngCore;
 use rand::rngs::OsRng;
+use rand::RngCore;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -89,10 +89,11 @@ impl AuthManager {
 
     /// Create AuthManager with custom credentials path (for testing)
     pub fn with_path(credentials_path: PathBuf) -> Self {
-        let suffix = hex::encode(blake3::hash(credentials_path.to_string_lossy().as_bytes()).as_bytes())
-            .chars()
-            .take(8)
-            .collect::<String>();
+        let suffix =
+            hex::encode(blake3::hash(credentials_path.to_string_lossy().as_bytes()).as_bytes())
+                .chars()
+                .take(8)
+                .collect::<String>();
         Self {
             credentials_path,
             keyring_service: format!("{}.test", KEYRING_SERVICE_NAME),
@@ -207,7 +208,6 @@ impl AuthManager {
         .await
         .map_err(|err| anyhow::anyhow!("Keyring worker failed: {err}"))?
     }
-
 
     async fn save_github_token_async(&self, token: String) -> Result<()> {
         let service = self.keyring_service.clone();
@@ -559,7 +559,7 @@ fn prompt_yes_no(prompt: &str, default_yes: bool) -> Result<bool> {
 fn publisher_signing_key_path() -> Result<PathBuf> {
     let home = dirs::home_dir().context("Cannot determine home directory")?;
     Ok(home
-    .join(".ato")
+        .join(".ato")
         .join("keys")
         .join("publisher-signing-key.json"))
 }

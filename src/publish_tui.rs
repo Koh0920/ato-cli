@@ -28,6 +28,8 @@ const POLL_INTERVAL: Duration = Duration::from_secs(4);
 const POLL_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const UI_TICK: Duration = Duration::from_millis(120);
 const MAX_LOG_LINES: usize = 200;
+const STARTUP_INPUT_DRAIN_WINDOW: Duration = Duration::from_millis(120);
+const STARTUP_ENTER_GUARD_WINDOW: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone)]
 pub struct PublishSuccessSummary {
@@ -494,6 +496,8 @@ async fn run_publish_dashboard(app: &mut PublishApp) -> Result<PublishTuiOutcome
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+    crate::tui::common::drain_startup_input_events(STARTUP_INPUT_DRAIN_WINDOW)?;
+    let tui_started_at = Instant::now();
 
     let loop_result: Result<PublishTuiOutcome> = async {
         loop {
@@ -503,6 +507,13 @@ async fn run_publish_dashboard(app: &mut PublishApp) -> Result<PublishTuiOutcome
 
             while crossterm_event::poll(Duration::from_millis(1))? {
                 if let Event::Key(key) = crossterm_event::read()? {
+                    if crate::tui::common::should_ignore_startup_enter(
+                        &key,
+                        tui_started_at,
+                        STARTUP_ENTER_GUARD_WINDOW,
+                    ) {
+                        continue;
+                    }
                     handle_key_event(app, key);
                 }
             }

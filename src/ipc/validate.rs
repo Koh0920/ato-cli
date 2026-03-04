@@ -288,9 +288,7 @@ fn check_import_resolvability(
             let store_path = if from.starts_with('@') {
                 let without_at = from.strip_prefix('@').unwrap_or(from);
                 let name = without_at.split(':').next().unwrap_or(without_at);
-                home.join(".ato")
-                    .join("store")
-                    .join(format!("@{}", name))
+                home.join(".ato").join("store").join(format!("@{}", name))
             } else {
                 home.join(".ato").join("store").join(from)
             };

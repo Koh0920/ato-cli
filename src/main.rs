@@ -3354,7 +3354,7 @@ fn print_permission_summary(permissions: Option<&install::CapsulePermissions>) {
 }
 
 fn can_prompt_interactively(stdin_is_tty: bool, stdout_is_tty: bool) -> bool {
-    stdin_is_tty && stdout_is_tty
+    tui::can_launch_tui(stdin_is_tty, stdout_is_tty)
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -3536,7 +3536,12 @@ fn execute_search_command(
     no_tui: bool,
     show_manifest: bool,
 ) -> Result<()> {
-    if std::io::stdout().is_terminal() && !json && !no_tui {
+    if should_use_search_tui(
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+        json,
+        no_tui,
+    ) {
         let selected = tui::run_search_tui(tui::SearchTuiArgs {
             query: query.clone(),
             category: category.clone(),
@@ -3570,6 +3575,15 @@ fn execute_search_command(
         }
         Ok(())
     })
+}
+
+fn should_use_search_tui(
+    stdin_is_tty: bool,
+    stdout_is_tty: bool,
+    json: bool,
+    no_tui: bool,
+) -> bool {
+    tui::can_launch_tui(stdin_is_tty, stdout_is_tty) && !json && !no_tui
 }
 
 #[cfg(test)]
@@ -3658,6 +3672,15 @@ mod tests {
         assert!(!can_prompt_interactively(true, false));
         assert!(!can_prompt_interactively(false, true));
         assert!(!can_prompt_interactively(false, false));
+    }
+
+    #[test]
+    fn search_tui_gate_requires_tty_and_flags_allowing_tui() {
+        assert!(should_use_search_tui(true, true, false, false));
+        assert!(!should_use_search_tui(false, true, false, false));
+        assert!(!should_use_search_tui(true, false, false, false));
+        assert!(!should_use_search_tui(true, true, true, false));
+        assert!(!should_use_search_tui(true, true, false, true));
     }
 
     #[test]
