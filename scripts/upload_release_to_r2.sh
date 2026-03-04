@@ -113,6 +113,51 @@ find_archive_for_target() {
   return 1
 }
 
+verify_checksums() {
+  local checksum_file="$1"
+  local source_dir="$2"
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    (
+      cd "$source_dir"
+      sha256sum -c "$(basename "$checksum_file")"
+    )
+    return 0
+  fi
+
+  if ! command -v shasum >/dev/null 2>&1; then
+    echo "error: no checksum verifier found (need sha256sum or shasum)" >&2
+    exit 1
+  fi
+
+  (
+    cd "$source_dir"
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+
+      expected_hash="$(awk '{print $1}' <<<"$line")"
+      archive_name="$(awk '{print $2}' <<<"$line")"
+      archive_name="${archive_name#\*}"
+
+      if [[ -z "$expected_hash" || -z "$archive_name" ]]; then
+        echo "error: invalid checksum entry: $line" >&2
+        exit 1
+      fi
+
+      if [[ ! -f "$archive_name" ]]; then
+        echo "error: checksum refers to missing file: $archive_name" >&2
+        exit 1
+      fi
+
+      actual_hash="$(shasum -a 256 "$archive_name" | awk '{print $1}')"
+      if [[ "$actual_hash" != "$expected_hash" ]]; then
+        echo "error: checksum mismatch for $archive_name" >&2
+        exit 1
+      fi
+    done < "$(basename "$checksum_file")"
+  )
+}
+
 need_cmd wrangler
 need_cmd find
 
@@ -182,6 +227,20 @@ if [[ ! -f "$checksum_file" ]]; then
   echo "error: SHA256SUMS not found: $checksum_file" >&2
   exit 1
 fi
+
+for target in "${target_list[@]}"; do
+  if ! archive_file="$(find_archive_for_target "$target")"; then
+    echo "error: archive not found for target '$target': $SOURCE_DIR/ato-$target.tar.gz|.zip" >&2
+    exit 1
+  fi
+  archive_name="$(basename "$archive_file")"
+  if ! grep -qE "^[[:xdigit:]]{64}[[:space:]]+\*?${archive_name}$" "$checksum_file"; then
+    echo "error: SHA256SUMS missing entry for $archive_name" >&2
+    exit 1
+  fi
+done
+
+verify_checksums "$checksum_file" "$SOURCE_DIR"
 
 for target in "${target_list[@]}"; do
   if ! archive_file="$(find_archive_for_target "$target")"; then

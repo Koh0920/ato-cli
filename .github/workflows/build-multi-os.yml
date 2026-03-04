@@ -20,21 +20,29 @@ concurrency:
 
 jobs:
   build:
-    name: Build on ${{ matrix.os }}
+    name: Build ${{ matrix.artifact_name }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - artifact_name: linux-x86_64
+            os: ubuntu-latest
+            binary_name: ato
+            build_target: x86_64-unknown-linux-gnu
+            rustflags: ""
+          - artifact_name: linux-aarch64
+            os: ubuntu-latest
+            binary_name: ato
+            build_target: aarch64-unknown-linux-gnu
+            rustflags: ""
+          - artifact_name: macos-host
+            os: macos-latest
             binary_name: ato
             build_target: ""
             rustflags: ""
-          - os: macos-latest
-            binary_name: ato
-            build_target: ""
-            rustflags: ""
-          - os: windows-latest
+          - artifact_name: windows-x86_64
+            os: windows-latest
             binary_name: ato.exe
             build_target: x86_64-pc-windows-msvc
             rustflags: -C target-feature=+crt-static
@@ -54,7 +62,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          cargo_version="$(sed -nE 's/^version = \"([^\"]+)\"/\1/p' Cargo.toml | head -n1)"
+          cargo_version="$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -n1)"
           if [[ -z "$cargo_version" ]]; then
             echo "Failed to read version from Cargo.toml" >&2
             exit 1
@@ -91,6 +99,21 @@ jobs:
             exit 1
           fi
 
+      - name: Install aarch64 Linux cross toolchain
+        if: ${{ matrix.build_target == 'aarch64-unknown-linux-gnu' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+
+      - name: Add Rust target
+        if: ${{ matrix.build_target != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target add "${{ matrix.build_target }}"
+
       - name: Build release binary
         shell: bash
         env:
@@ -103,11 +126,172 @@ jobs:
             cargo build --release --locked --bin ato
           fi
 
-      - name: Verify strict-v3 fail-fast behavior
-        if: ${{ matrix.os == 'ubuntu-latest' }}
+      - name: Package target archive and checksum
+        id: package
         shell: bash
         run: |
           set -euo pipefail
+
+          if [[ -n "${{ matrix.build_target }}" ]]; then
+            resolved_target="${{ matrix.build_target }}"
+          else
+            resolved_target="$(rustc -vV | sed -n 's/^host: //p')"
+          fi
+          if [[ -z "$resolved_target" ]]; then
+            echo "failed to detect target triple" >&2
+            exit 1
+          fi
+
+          mkdir -p dist/payload
+          binary_path="target/release/${{ matrix.binary_name }}"
+          if [[ -n "${{ matrix.build_target }}" ]]; then
+            binary_path="target/${{ matrix.build_target }}/release/${{ matrix.binary_name }}"
+          fi
+          cp "$binary_path" "dist/payload/${{ matrix.binary_name }}"
+
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            archive_name="ato-${resolved_target}.zip"
+            powershell.exe -NoProfile -Command "Push-Location 'dist/payload'; Compress-Archive -Path '${{ matrix.binary_name }}' -DestinationPath '../${archive_name}' -Force; Pop-Location"
+          else
+            archive_name="ato-${resolved_target}.tar.gz"
+            tar -C dist/payload -czf "dist/${archive_name}" "${{ matrix.binary_name }}"
+          fi
+
+          if command -v python3 >/dev/null 2>&1; then
+            py_cmd=python3
+          elif command -v python >/dev/null 2>&1; then
+            py_cmd=python
+          else
+            echo "python3/python is required to generate SHA256SUMS" >&2
+            exit 1
+          fi
+
+          "$py_cmd" - <<'PY'
+from pathlib import Path
+import hashlib
+
+dist = Path("dist")
+archive = next(dist.glob("ato-*.tar.gz"), None)
+if archive is None:
+    archive = next(dist.glob("ato-*.zip"), None)
+if archive is None:
+    raise SystemExit("archive not found in dist")
+
+h = hashlib.sha256()
+with archive.open("rb") as f:
+    for chunk in iter(lambda: f.read(1024 * 1024), b""):
+        h.update(chunk)
+
+(dist / "SHA256SUMS").write_text(f"{h.hexdigest()}  {archive.name}\n", encoding="utf-8")
+PY
+
+          echo "$resolved_target" > "dist/target-triple.txt"
+          echo "target_triple=$resolved_target" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.artifact_name }}
+          path: |
+            dist/ato-*.tar.gz
+            dist/ato-*.zip
+            dist/SHA256SUMS
+            dist/target-triple.txt
+          if-no-files-found: error
+
+  smoke:
+    name: Smoke ${{ matrix.artifact_name }}
+    needs: build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact_name: linux-x86_64
+            os: ubuntu-latest
+            binary_name: ato
+            qemu_arm: false
+          - artifact_name: linux-aarch64
+            os: ubuntu-latest
+            binary_name: ato
+            qemu_arm: true
+          - artifact_name: macos-host
+            os: macos-latest
+            binary_name: ato
+            qemu_arm: false
+          - artifact_name: windows-x86_64
+            os: windows-latest
+            binary_name: ato.exe
+            qemu_arm: false
+
+    steps:
+      - name: Download packaged artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: release-${{ matrix.artifact_name }}
+          path: /tmp/ato-smoke
+
+      - name: Prepare extracted binary
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/ato-bin
+          archive="$(find /tmp/ato-smoke -maxdepth 1 -type f \( -name 'ato-*.tar.gz' -o -name 'ato-*.zip' \) | head -n1)"
+          if [[ -z "$archive" ]]; then
+            echo "No archive found in /tmp/ato-smoke" >&2
+            exit 1
+          fi
+
+          if [[ "$archive" == *.zip ]]; then
+            archive_win="$(cygpath -w "$archive")"
+            dest_win="$(cygpath -w /tmp/ato-bin)"
+            powershell.exe -NoProfile -Command "Expand-Archive -Path '$archive_win' -DestinationPath '$dest_win' -Force"
+          else
+            tar -C /tmp/ato-bin -xzf "$archive"
+          fi
+
+          binary_path="/tmp/ato-bin/${{ matrix.binary_name }}"
+          if [[ ! -f "$binary_path" ]]; then
+            echo "Extracted binary not found: $binary_path" >&2
+            exit 1
+          fi
+          chmod +x "$binary_path" || true
+          echo "binary=$binary_path" >> "$GITHUB_OUTPUT"
+
+      - name: Install ARM runtime tools
+        if: ${{ matrix.qemu_arm }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static libc6-arm64-cross
+
+      - name: Smoke (aarch64 via QEMU)
+        if: ${{ matrix.qemu_arm }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="${{ steps.prep.outputs.binary }}"
+          qemu-aarch64-static -L /usr/aarch64-linux-gnu "$BIN" --version
+          qemu-aarch64-static -L /usr/aarch64-linux-gnu "$BIN" --help >/dev/null
+
+      - name: Smoke (native commands)
+        if: ${{ !matrix.qemu_arm }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="${{ steps.prep.outputs.binary }}"
+          "$BIN" --version
+          "$BIN" --help >/dev/null
+          "$BIN" run --help >/dev/null
+
+      - name: Verify strict-v3 fail-fast behavior
+        if: ${{ matrix.artifact_name == 'linux-x86_64' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="${{ steps.prep.outputs.binary }}"
 
           tmp_dir="$(mktemp -d)"
           mkdir -p "${tmp_dir}/source"
@@ -128,10 +312,10 @@ jobs:
           EOF
 
           set +e
-          target/release/ato build "${tmp_dir}" --strict-v3 >"${tmp_dir}/stdout.log" 2>"${tmp_dir}/stderr.log"
+          "$BIN" build "${tmp_dir}" --strict-v3 >"${tmp_dir}/stdout.log" 2>"${tmp_dir}/stderr.log"
           status=$?
           set -e
-          if [[ ${status} -eq 0 ]]; then
+          if [[ $status -eq 0 ]]; then
             echo "strict-v3 check unexpectedly succeeded" >&2
             cat "${tmp_dir}/stdout.log" >&2 || true
             cat "${tmp_dir}/stderr.log" >&2 || true
@@ -143,45 +327,66 @@ jobs:
             exit 1
           fi
 
-      - name: Package target archive
-        id: package
+      - name: Verify keyring fail-closed/auth bypass behavior
+        if: ${{ matrix.artifact_name == 'linux-x86_64' }}
         shell: bash
         run: |
           set -euo pipefail
+          BIN="${{ steps.prep.outputs.binary }}"
+          tmp_home="$(mktemp -d)"
 
-          target_triple="$(rustc -vV | sed -n 's/^host: //p')"
-          if [[ -z "$target_triple" ]]; then
-            echo "failed to detect host target triple" >&2
+          set +e
+          env -u ATO_TOKEN HOME="$tmp_home" "$BIN" source rebuild --source-id src_123 --ref main --registry http://127.0.0.1:9 >"$tmp_home/no_token.stdout" 2>"$tmp_home/no_token.stderr"
+          status_no_token=$?
+          set -e
+          if [[ $status_no_token -eq 0 ]]; then
+            echo "Expected authentication failure without ATO_TOKEN" >&2
+            exit 1
+          fi
+          if ! grep -qiE "Source operation requires authentication|Not authenticated" "$tmp_home/no_token.stderr"; then
+            echo "Missing fail-closed auth error without ATO_TOKEN" >&2
+            cat "$tmp_home/no_token.stderr" >&2 || true
             exit 1
           fi
 
-          mkdir -p dist/payload
-          binary_path="target/release/${{ matrix.binary_name }}"
-          if [[ -n "${{ matrix.build_target }}" ]]; then
-            binary_path="target/${{ matrix.build_target }}/release/${{ matrix.binary_name }}"
+          set +e
+          HOME="$tmp_home" ATO_TOKEN=dummy "$BIN" source rebuild --source-id src_123 --ref main --registry http://127.0.0.1:9 >"$tmp_home/with_token.stdout" 2>"$tmp_home/with_token.stderr"
+          status_with_token=$?
+          set -e
+          if [[ $status_with_token -eq 0 ]]; then
+            echo "Expected preflight/network failure with dummy ATO_TOKEN" >&2
+            exit 1
           fi
-          cp "$binary_path" "dist/payload/${{ matrix.binary_name }}"
-
-          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            archive_name="ato-${target_triple}.zip"
-            powershell.exe -NoProfile -Command "Push-Location 'dist/payload'; Compress-Archive -Path '${{ matrix.binary_name }}' -DestinationPath '../${archive_name}' -Force; Pop-Location"
-          else
-            archive_name="ato-${target_triple}.tar.gz"
-            tar -C dist/payload -czf "dist/${archive_name}" "${{ matrix.binary_name }}"
+          if grep -qiE "Source operation requires authentication|Not authenticated" "$tmp_home/with_token.stderr"; then
+            echo "ATO_TOKEN path unexpectedly failed due to authentication" >&2
+            cat "$tmp_home/with_token.stderr" >&2 || true
+            exit 1
+          fi
+          if ! grep -qiE "Failed to preflight source operation|Source preflight failed|Connection refused|error sending request" "$tmp_home/with_token.stderr"; then
+            echo "Expected preflight/network error not found for dummy ATO_TOKEN path" >&2
+            cat "$tmp_home/with_token.stderr" >&2 || true
+            exit 1
           fi
 
-          echo "$target_triple" > "dist/target-triple.txt"
-          echo "archive=dist/${archive_name}" >> "$GITHUB_OUTPUT"
+      - name: Verify Linux dynamic dependencies
+        if: ${{ matrix.artifact_name == 'linux-x86_64' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="${{ steps.prep.outputs.binary }}"
+          ldd "$BIN" | tee /tmp/ato-ldd.txt
+          if grep -q "not found" /tmp/ato-ldd.txt; then
+            echo "Detected unresolved dynamic dependency" >&2
+            exit 1
+          fi
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-${{ matrix.os }}
-          path: |
-            dist/ato-*.tar.gz
-            dist/ato-*.zip
-            dist/target-triple.txt
-          if-no-files-found: error
+      - name: Verify macOS dynamic dependencies
+        if: ${{ matrix.artifact_name == 'macos-host' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="${{ steps.prep.outputs.binary }}"
+          otool -L "$BIN" >/tmp/ato-otool.txt
 
   tar_pack_benchmark:
     name: Tar pack benchmark
@@ -217,7 +422,9 @@ jobs:
 
   upload_r2:
     name: Upload to R2
-    needs: build
+    needs:
+      - build
+      - smoke
     runs-on: ubuntu-latest
     if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
     env:
@@ -266,7 +473,6 @@ jobs:
         with:
           pattern: release-*
           path: /tmp/ato-ci-artifacts
-          merge-multiple: true
 
       - name: Set up Node.js
         if: ${{ steps.tag_main_check.outputs.on_main == 'true' && steps.secrets_check.outputs.available == 'true' }}
@@ -290,13 +496,12 @@ jobs:
             exit 1
           fi
 
-          cargo_version="$(sed -nE 's/^version = \"([^\"]+)\"/\1/p' Cargo.toml | head -n1)"
+          cargo_version="$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -n1)"
           if [[ -z "$cargo_version" ]]; then
             echo "Failed to read version from Cargo.toml" >&2
             exit 1
           fi
 
-          version_input=""
           if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
             release_version="${GITHUB_REF#refs/tags/}"
           elif [[ "${{ github.event_name }}" == "push" ]]; then
@@ -306,29 +511,41 @@ jobs:
           fi
 
           deploy_env="staging"
-
           update_latest="1"
-
           bucket_input=""
           source_dir="/tmp/ato-release/${release_version}"
           mkdir -p "$source_dir"
 
-          shopt -s nullglob
-          archives=(/tmp/ato-ci-artifacts/ato-*.tar.gz /tmp/ato-ci-artifacts/ato-*.zip)
+          mapfile -t archives < <(find /tmp/ato-ci-artifacts -type f \( -name 'ato-*.tar.gz' -o -name 'ato-*.zip' \) | sort)
+          mapfile -t checksum_parts < <(find /tmp/ato-ci-artifacts -type f -name 'SHA256SUMS' | sort)
+
           if [[ "${#archives[@]}" -eq 0 ]]; then
             echo "No packaged archives found under /tmp/ato-ci-artifacts" >&2
             exit 1
           fi
+          if [[ "${#checksum_parts[@]}" -eq 0 ]]; then
+            echo "No SHA256SUMS files found under /tmp/ato-ci-artifacts" >&2
+            exit 1
+          fi
 
           cp "${archives[@]}" "$source_dir/"
-          (
-            cd "$source_dir"
-            if command -v shasum >/dev/null 2>&1; then
-              shasum -a 256 ato-*.tar.gz ato-*.zip > SHA256SUMS
-            else
-              sha256sum ato-*.tar.gz ato-*.zip > SHA256SUMS
+          : > "$source_dir/SHA256SUMS"
+          for checksum_part in "${checksum_parts[@]}"; do
+            cat "$checksum_part" >> "$source_dir/SHA256SUMS"
+          done
+          sed -i.bak '/^[[:space:]]*$/d' "$source_dir/SHA256SUMS"
+          rm -f "$source_dir/SHA256SUMS.bak"
+
+          for archive in "$source_dir"/ato-*.tar.gz "$source_dir"/ato-*.zip; do
+            if [[ ! -f "$archive" ]]; then
+              continue
             fi
-          )
+            archive_name="$(basename "$archive")"
+            if ! grep -qE "[[:xdigit:]]{64}[[:space:]]+\*?${archive_name}$" "$source_dir/SHA256SUMS"; then
+              echo "Missing checksum entry for ${archive_name}" >&2
+              exit 1
+            fi
+          done
 
           echo "release_version=$release_version" >> "$GITHUB_OUTPUT"
           echo "cargo_version=$cargo_version" >> "$GITHUB_OUTPUT"
