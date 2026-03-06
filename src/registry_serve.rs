@@ -413,6 +413,10 @@ pub async fn serve(config: RegistryServerConfig) -> Result<()> {
         )
         .route("/v1/manifest/negotiate", post(handle_manifest_negotiate))
         .route(
+            "/v1/manifest/resolve/:publisher/:slug/:version",
+            get(handle_manifest_resolve_version),
+        )
+        .route(
             "/v1/manifest/documents/:manifest_hash",
             get(handle_manifest_get_manifest),
         )
@@ -1010,6 +1014,57 @@ async fn handle_manifest_get_manifest(
                 &message,
             )
         }
+    }
+}
+
+async fn handle_manifest_resolve_version(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((publisher, slug, version)): AxumPath<(String, String, String)>,
+) -> impl IntoResponse {
+    if let Err(err) = validate_read_auth(&headers, state.auth_token.as_deref()) {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized", &err);
+    }
+    if let Err(err) = validate_capsule_segments(&publisher, &slug) {
+        return json_error(StatusCode::BAD_REQUEST, "invalid_scope", &err.to_string());
+    }
+    let store = match RegistryStore::open(&state.data_dir) {
+        Ok(store) => store,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "registry_store_error",
+                &err.to_string(),
+            )
+        }
+    };
+    match store.resolve_release_version(&publisher, &slug, &version) {
+        Ok(Some(record)) => {
+            if let Some(yanked_at) = record.yanked_at.clone() {
+                return (
+                    StatusCode::GONE,
+                    Json(json!({
+                        "error": "manifest_yanked",
+                        "message": format!(
+                            "manifest yanked: scoped_id={} manifest_hash={} yanked_at={}",
+                            record.scoped_id,
+                            record.manifest_hash,
+                            yanked_at
+                        ),
+                        "yanked": true,
+                        "yanked_at": yanked_at
+                    })),
+                )
+                    .into_response();
+            }
+            (StatusCode::OK, Json(record)).into_response()
+        }
+        Ok(None) => json_error(StatusCode::NOT_FOUND, "not_found", "Version not found"),
+        Err(err) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "resolve_failed",
+            &err.to_string(),
+        ),
     }
 }
 
@@ -3362,24 +3417,69 @@ impl Default for RegistryIndex {
 mod tests {
     use super::*;
     use axum::body::to_bytes;
-    use std::io::Write;
+    use std::io::{Cursor, Write};
 
     fn build_capsule_bytes(manifest: &str) -> Vec<u8> {
         build_capsule_bytes_with_files(manifest, &[("README.md", b"dummy".as_slice())])
     }
 
     fn build_capsule_bytes_with_files(manifest: &str, files: &[(&str, &[u8])]) -> Vec<u8> {
+        let payload_tar = build_payload_tar().expect("build payload tar");
+        let parsed_manifest =
+            capsule_core::types::CapsuleManifest::from_toml(manifest).expect("parse manifest");
+        let (distribution_manifest, _) =
+            capsule_core::packers::payload::build_distribution_manifest(
+                &parsed_manifest,
+                &payload_tar,
+            )
+            .expect("build distribution manifest");
+        let mut raw_manifest: toml::Value = toml::from_str(manifest).expect("parse raw manifest");
+        let raw_manifest_table = raw_manifest
+            .as_table_mut()
+            .expect("raw manifest must be a table");
+        raw_manifest_table.insert(
+            "schema_version".to_string(),
+            toml::Value::String(distribution_manifest.schema_version.clone()),
+        );
+        raw_manifest_table.insert(
+            "distribution".to_string(),
+            toml::Value::try_from(
+                distribution_manifest
+                    .distribution
+                    .expect("distribution metadata"),
+            )
+            .expect("distribution value"),
+        );
+        let manifest_bytes = toml::to_string_pretty(&raw_manifest).expect("serialize manifest");
+        let payload_zst =
+            zstd::stream::encode_all(Cursor::new(payload_tar), 1).expect("encode payload");
+
         let mut out = Vec::new();
         {
             let mut builder = tar::Builder::new(&mut out);
             let mut header = tar::Header::new_gnu();
             header.set_path("capsule.toml").expect("set path");
             header.set_mode(0o644);
-            header.set_size(manifest.len() as u64);
+            header.set_size(manifest_bytes.len() as u64);
             header.set_cksum();
             builder
-                .append_data(&mut header, "capsule.toml", manifest.as_bytes())
+                .append_data(&mut header, "capsule.toml", Cursor::new(manifest_bytes))
                 .expect("append manifest");
+
+            let mut payload_header = tar::Header::new_gnu();
+            payload_header
+                .set_path("payload.tar.zst")
+                .expect("set payload path");
+            payload_header.set_mode(0o644);
+            payload_header.set_size(payload_zst.len() as u64);
+            payload_header.set_cksum();
+            builder
+                .append_data(
+                    &mut payload_header,
+                    "payload.tar.zst",
+                    Cursor::new(payload_zst),
+                )
+                .expect("append payload");
 
             for (path, bytes) in files {
                 let mut extra_header = tar::Header::new_gnu();
@@ -3395,6 +3495,24 @@ mod tests {
         }
         out.flush().expect("flush vec");
         out
+    }
+
+    fn build_payload_tar() -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut out);
+            let source = b"print('hello from registry test')\n";
+            let mut header = tar::Header::new_gnu();
+            header.set_path("main.py")?;
+            header.set_mode(0o644);
+            header.set_size(source.len() as u64);
+            header.set_mtime(0);
+            header.set_cksum();
+            builder.append_data(&mut header, "main.py", Cursor::new(source))?;
+            builder.finish()?;
+        }
+        out.flush().expect("flush payload vec");
+        Ok(out)
     }
 
     #[test]
@@ -4002,5 +4120,103 @@ repository = "koh0920/sample"
             manifest_json.get("yanked"),
             Some(&serde_json::Value::Bool(true))
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn version_resolve_returns_manifest_hash_for_release() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        initialize_storage(tmp.path()).expect("init");
+        let store = RegistryStore::open(tmp.path()).expect("open store");
+        let manifest = "schema_version = \"0.2\"\nname = \"sample\"\nversion = \"1.0.0\"\ntype = \"app\"\ndefault_target = \"cli\"\n";
+        let capsule = build_capsule_bytes(manifest);
+        let published = store
+            .publish_registry_release(
+                "koh0920",
+                "sample",
+                "sample",
+                "demo",
+                "1.0.0",
+                "sample-1.0.0.capsule",
+                "sha256:abc",
+                "blake3:def",
+                capsule.len() as u64,
+                &capsule,
+                "2026-03-05T00:00:00Z",
+            )
+            .expect("publish");
+
+        let state = AppState {
+            listen_url: "http://127.0.0.1:8787".to_string(),
+            data_dir: tmp.path().to_path_buf(),
+            auth_token: None,
+            lock: Arc::new(Mutex::new(())),
+        };
+        let response = handle_manifest_resolve_version(
+            State(state),
+            HeaderMap::new(),
+            AxumPath((
+                "koh0920".to_string(),
+                "sample".to_string(),
+                "1.0.0".to_string(),
+            )),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("parse json");
+        assert_eq!(
+            json.get("manifest_hash")
+                .and_then(serde_json::Value::as_str),
+            Some(published.pointer.manifest_hash.as_str())
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn version_resolve_returns_gone_for_yanked_release() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        initialize_storage(tmp.path()).expect("init");
+        let store = RegistryStore::open(tmp.path()).expect("open store");
+        let manifest = "schema_version = \"0.2\"\nname = \"sample\"\nversion = \"1.0.0\"\ntype = \"app\"\ndefault_target = \"cli\"\n";
+        let capsule = build_capsule_bytes(manifest);
+        let published = store
+            .publish_registry_release(
+                "koh0920",
+                "sample",
+                "sample",
+                "demo",
+                "1.0.0",
+                "sample-1.0.0.capsule",
+                "sha256:abc",
+                "blake3:def",
+                capsule.len() as u64,
+                &capsule,
+                "2026-03-05T00:00:00Z",
+            )
+            .expect("publish");
+        store
+            .yank_manifest("koh0920/sample", &published.pointer.manifest_hash)
+            .expect("yank");
+
+        let state = AppState {
+            listen_url: "http://127.0.0.1:8787".to_string(),
+            data_dir: tmp.path().to_path_buf(),
+            auth_token: None,
+            lock: Arc::new(Mutex::new(())),
+        };
+        let response = handle_manifest_resolve_version(
+            State(state),
+            HeaderMap::new(),
+            AxumPath((
+                "koh0920".to_string(),
+                "sample".to_string(),
+                "1.0.0".to_string(),
+            )),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::GONE);
     }
 }

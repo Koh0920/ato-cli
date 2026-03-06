@@ -22,6 +22,7 @@ use capsule_core::types::identity::public_key_to_did;
 use capsule_core::types::CapsuleManifest;
 
 use crate::registry::RegistryResolver;
+use crate::runtime_tree;
 
 const DEFAULT_STORE_DIR: &str = ".ato/store";
 const SEGMENT_MAX_LEN: usize = 63;
@@ -211,6 +212,12 @@ pub struct ScopedCapsuleRef {
     pub scoped_id: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ParsedCapsuleRequest {
+    pub scoped_ref: ScopedCapsuleRef,
+    pub version: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ScopedSuggestion {
     pub scoped_id: String,
@@ -238,6 +245,30 @@ struct SuggestionPublisher {
     handle: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct VersionManifestResolveResponse {
+    scoped_id: String,
+    version: String,
+    manifest_hash: String,
+    #[serde(default)]
+    yanked_at: Option<String>,
+}
+
+#[derive(Debug)]
+enum ManifestResolution {
+    Current(ManifestEpochResolveResponse),
+    Version(VersionManifestResolveResponse),
+}
+
+impl ManifestResolution {
+    fn manifest_hash(&self) -> &str {
+        match self {
+            Self::Current(response) => &response.pointer.manifest_hash,
+            Self::Version(response) => &response.manifest_hash,
+        }
+    }
+}
+
 fn is_valid_segment(value: &str) -> bool {
     if value.is_empty() || value.len() > SEGMENT_MAX_LEN {
         return false;
@@ -263,12 +294,35 @@ fn is_valid_segment(value: &str) -> bool {
     !value.ends_with('-')
 }
 
-pub fn parse_capsule_ref(input: &str) -> Result<ScopedCapsuleRef> {
+fn split_capsule_request(input: &str) -> Result<(String, Option<String>)> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         bail!("scoped_id_required: use publisher/slug (for example: koh0920/sample-capsule)");
     }
-    let normalized = trimmed.strip_prefix('@').unwrap_or(trimmed);
+
+    let normalized = trimmed.strip_prefix('@').unwrap_or(trimmed).trim();
+    if normalized.is_empty() {
+        bail!("scoped_id_required: use publisher/slug (for example: koh0920/sample-capsule)");
+    }
+
+    if let Some((base, version)) = normalized.rsplit_once('@') {
+        let base = base.trim();
+        let version = version.trim();
+        if base.is_empty() {
+            bail!("scoped_id_required: use publisher/slug (for example: koh0920/sample-capsule)");
+        }
+        if version.is_empty() {
+            bail!("version_required: use publisher/slug@version");
+        }
+        return Ok((base.to_string(), Some(version.to_string())));
+    }
+
+    Ok((normalized.to_string(), None))
+}
+
+pub fn parse_capsule_request(input: &str) -> Result<ParsedCapsuleRequest> {
+    let (scoped_input, version) = split_capsule_request(input)?;
+    let normalized = scoped_input.strip_prefix('@').unwrap_or(&scoped_input);
     let mut parts = normalized.split('/');
     let publisher = parts.next().unwrap_or_default().trim().to_lowercase();
     let slug = parts.next().unwrap_or_default().trim().to_lowercase();
@@ -281,20 +335,50 @@ pub fn parse_capsule_ref(input: &str) -> Result<ScopedCapsuleRef> {
     if !is_valid_segment(&publisher) || !is_valid_segment(&slug) {
         bail!("invalid_capsule_ref: publisher/slug must be lowercase kebab-case");
     }
-    Ok(ScopedCapsuleRef {
-        publisher: publisher.clone(),
-        slug: slug.clone(),
-        scoped_id: format!("{}/{}", publisher, slug),
+    Ok(ParsedCapsuleRequest {
+        scoped_ref: ScopedCapsuleRef {
+            publisher: publisher.clone(),
+            slug: slug.clone(),
+            scoped_id: format!("{}/{}", publisher, slug),
+        },
+        version,
     })
 }
 
+pub fn parse_capsule_ref(input: &str) -> Result<ScopedCapsuleRef> {
+    Ok(parse_capsule_request(input)?.scoped_ref)
+}
+
 pub fn is_slug_only_ref(input: &str) -> bool {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
+    let Ok((scoped_input, _)) = split_capsule_request(input) else {
         return false;
+    };
+    !scoped_input.contains('/')
+}
+
+pub fn merge_requested_version(
+    embedded_version: Option<&str>,
+    explicit_version: Option<&str>,
+) -> Result<Option<String>> {
+    match (
+        embedded_version
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+        explicit_version
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+    ) {
+        (Some(left), Some(right)) if left != right => {
+            bail!(
+                "conflicting_version_request: ref specifies version '{}' but --version requested '{}'",
+                left,
+                right
+            );
+        }
+        (Some(left), _) => Ok(Some(left.to_string())),
+        (None, Some(right)) => Ok(Some(right.to_string())),
+        (None, None) => Ok(None),
     }
-    let normalized = trimmed.strip_prefix('@').unwrap_or(trimmed);
-    !normalized.contains('/')
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -308,7 +392,9 @@ pub async fn install_app(
     allow_downgrade: bool,
     json_output: bool,
 ) -> Result<InstallResult> {
-    let scoped_ref = parse_capsule_ref(capsule_ref)?;
+    let request = parse_capsule_request(capsule_ref)?;
+    let scoped_ref = request.scoped_ref;
+    let requested_version = merge_requested_version(request.version.as_deref(), version)?;
     let registry = resolve_registry_url(registry_url, !json_output).await?;
 
     let client = reqwest::Client::new();
@@ -348,7 +434,7 @@ pub async fn install_app(
         }
     }
 
-    let target_version_owned = match version.map(str::trim).filter(|value| !value.is_empty()) {
+    let target_version_owned = match requested_version.as_deref() {
         Some(explicit) => explicit.to_string(),
         None => capsule
             .latest_version
@@ -372,7 +458,8 @@ pub async fn install_app(
     let (bytes, normalized_file_name) = match install_manifest_delta_path(
         &client,
         &registry,
-        &scoped_ref.scoped_id,
+        &scoped_ref,
+        requested_version.as_deref(),
         capsule.manifest_toml.as_deref(),
         capsule.capsule_lock.as_deref(),
     )
@@ -382,7 +469,8 @@ pub async fn install_app(
             verify_manifest_supply_chain(
                 &client,
                 &registry,
-                &scoped_ref.scoped_id,
+                &scoped_ref,
+                requested_version.as_deref(),
                 &bytes,
                 allow_unverified,
                 allow_downgrade,
@@ -416,6 +504,12 @@ pub async fn install_app(
     let output_path = install_dir.join(normalized_file_name);
     sweep_stale_tmp_capsules(&install_dir)?;
     write_capsule_atomic(&output_path, &bytes, &computed_blake3)?;
+    runtime_tree::prepare_runtime_tree(
+        &scoped_ref.publisher,
+        &scoped_ref.slug,
+        target_version,
+        &bytes,
+    )?;
 
     if !json_output {
         eprintln!("✅ Installed to: {}", output_path.display());
@@ -489,10 +583,121 @@ async fn resolve_registry_url(registry_url: Option<&str>, emit_log: bool) -> Res
     Ok(info.url)
 }
 
+async fn resolve_manifest_target(
+    client: &reqwest::Client,
+    base: &str,
+    scoped_ref: &ScopedCapsuleRef,
+    requested_version: Option<&str>,
+    has_token: bool,
+    require_current_epoch: bool,
+) -> Result<ManifestResolution> {
+    if let Some(version) = requested_version
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let endpoint = format!(
+            "{}/v1/manifest/resolve/{}/{}/{}",
+            base,
+            urlencoding::encode(&scoped_ref.publisher),
+            urlencoding::encode(&scoped_ref.slug),
+            urlencoding::encode(version)
+        );
+        let response = with_ato_token(client.get(&endpoint))
+            .send()
+            .await
+            .with_context(|| "Failed to resolve versioned manifest hash")?;
+        let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED && !has_token {
+            bail!(
+                "{}: registry requires authentication for manifest read APIs. Run `ato login` or set `ATO_TOKEN=<token>`.",
+                crate::error_codes::ATO_ERR_AUTH_REQUIRED
+            );
+        }
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            if let Some(message) = parse_yanked_message(&body) {
+                bail!(
+                    "{}: {}",
+                    crate::error_codes::ATO_ERR_INTEGRITY_FAILURE,
+                    message
+                );
+            }
+            bail!(
+                "Failed to resolve manifest for {}@{} (status={}): {}",
+                scoped_ref.scoped_id,
+                version,
+                status,
+                body
+            );
+        }
+        let payload = response
+            .json::<VersionManifestResolveResponse>()
+            .await
+            .with_context(|| "Invalid version resolve response")?;
+        if payload.scoped_id != scoped_ref.scoped_id {
+            bail!(
+                "version resolve scoped_id mismatch (expected {}, got {})",
+                scoped_ref.scoped_id,
+                payload.scoped_id
+            );
+        }
+        if payload.version != version {
+            bail!(
+                "version resolve mismatch (expected {}, got {})",
+                version,
+                payload.version
+            );
+        }
+        if let Some(yanked_at) = payload.yanked_at.as_deref() {
+            bail!(
+                "{}: manifest has been yanked by the publisher at {}",
+                crate::error_codes::ATO_ERR_INTEGRITY_FAILURE,
+                yanked_at
+            );
+        }
+        return Ok(ManifestResolution::Version(payload));
+    }
+
+    let epoch_endpoint = format!("{}/v1/manifest/epoch/resolve", base);
+    let epoch_response = with_ato_token(
+        client
+            .post(&epoch_endpoint)
+            .json(&serde_json::json!({ "scoped_id": scoped_ref.scoped_id })),
+    )
+    .send()
+    .await
+    .with_context(|| "Failed to fetch manifest epoch pointer")?;
+    if !epoch_response.status().is_success() {
+        if epoch_response.status() == reqwest::StatusCode::UNAUTHORIZED && !has_token {
+            bail!(
+                "{}: registry requires authentication for manifest read APIs. Run `ato login` or set `ATO_TOKEN=<token>`.",
+                crate::error_codes::ATO_ERR_AUTH_REQUIRED
+            );
+        }
+        if require_current_epoch {
+            bail!(
+                "manifest epoch pointer is required for delta install (status={})",
+                epoch_response.status()
+            );
+        }
+        bail!(
+            "manifest epoch pointer is required for verified install (status={})",
+            epoch_response.status()
+        );
+    }
+    let epoch = epoch_response
+        .json::<ManifestEpochResolveResponse>()
+        .await
+        .with_context(|| "Invalid manifest epoch response")?;
+    verify_epoch_signature(&epoch).with_context(|| "Epoch signature verification failed")?;
+    Ok(ManifestResolution::Current(epoch))
+}
+
 async fn install_manifest_delta_path(
     client: &reqwest::Client,
     registry: &str,
-    scoped_id: &str,
+    scoped_ref: &ScopedCapsuleRef,
+    requested_version: Option<&str>,
     capsule_toml: Option<&str>,
     capsule_lock: Option<&str>,
 ) -> Result<DeltaInstallResult> {
@@ -500,7 +705,8 @@ async fn install_manifest_delta_path(
     let result = install_manifest_delta_path_inner(
         client,
         registry,
-        scoped_id,
+        scoped_ref,
+        requested_version,
         capsule_toml,
         capsule_lock,
         &mut lease_id,
@@ -515,45 +721,23 @@ async fn install_manifest_delta_path(
 async fn install_manifest_delta_path_inner(
     client: &reqwest::Client,
     registry: &str,
-    scoped_id: &str,
+    scoped_ref: &ScopedCapsuleRef,
+    requested_version: Option<&str>,
     _capsule_toml: Option<&str>,
     capsule_lock: Option<&str>,
     lease_id: &mut Option<String>,
 ) -> Result<DeltaInstallResult> {
     let base = registry.trim_end_matches('/');
     let has_token = has_ato_token();
-
-    let epoch_endpoint = format!("{}/v1/manifest/epoch/resolve", base);
-    let epoch_response = with_ato_token(
-        client
-            .post(&epoch_endpoint)
-            .json(&serde_json::json!({ "scoped_id": scoped_id })),
-    )
-    .send()
-    .await
-    .with_context(|| "Failed to fetch manifest epoch pointer for delta install")?;
-    if !epoch_response.status().is_success() {
-        if epoch_response.status() == reqwest::StatusCode::UNAUTHORIZED && !has_token {
-            bail!(
-                "{}: registry requires authentication for manifest read APIs. Run `ato login` or set `ATO_TOKEN=<token>`.",
-                crate::error_codes::ATO_ERR_AUTH_REQUIRED
-            );
-        }
-        bail!(
-            "manifest epoch pointer is required for delta install (status={})",
-            epoch_response.status()
-        );
-    }
-    let epoch = epoch_response
-        .json::<ManifestEpochResolveResponse>()
-        .await
-        .with_context(|| "Invalid manifest epoch response for delta install")?;
-    verify_epoch_signature(&epoch).with_context(|| "Epoch signature verification failed")?;
+    let resolution =
+        resolve_manifest_target(client, base, scoped_ref, requested_version, has_token, true)
+            .await?;
+    let target_manifest_hash = resolution.manifest_hash().to_string();
 
     let manifest_endpoint = format!(
         "{}/v1/manifest/documents/{}",
         base,
-        urlencoding::encode(&epoch.pointer.manifest_hash)
+        urlencoding::encode(&target_manifest_hash)
     );
     let manifest_response = with_ato_token(client.get(&manifest_endpoint))
         .send()
@@ -592,11 +776,11 @@ async fn install_manifest_delta_path_inner(
         .with_context(|| "Invalid remote capsule.toml for delta install")?;
     let manifest_hash = compute_manifest_hash_without_signatures(&manifest)?;
     if normalize_hash_for_compare(&manifest_hash)
-        != normalize_hash_for_compare(&epoch.pointer.manifest_hash)
+        != normalize_hash_for_compare(&target_manifest_hash)
     {
         bail!(
             "Manifest hash mismatch for delta install (expected {}, got {})",
-            epoch.pointer.manifest_hash,
+            target_manifest_hash,
             manifest_hash
         );
     }
@@ -605,8 +789,8 @@ async fn install_manifest_delta_path_inner(
         LocalCasIndex::open_default().with_context(|| "Failed to open local CAS index")?;
     let bloom_wire = cas_index.build_bloom(Some(0.01))?.to_wire();
     let negotiate_request = ManifestNegotiateRequest {
-        scoped_id: scoped_id.to_string(),
-        target_manifest_hash: epoch.pointer.manifest_hash.clone(),
+        scoped_id: scoped_ref.scoped_id.clone(),
+        target_manifest_hash: target_manifest_hash.clone(),
         have_chunks: Vec::new(),
         have_chunks_bloom: Some(ManifestChunkBloomRequest {
             m_bits: bloom_wire.m_bits,
@@ -649,8 +833,8 @@ async fn install_manifest_delta_path_inner(
                 .collect::<Vec<_>>(),
         )?;
         let second_request = ManifestNegotiateRequest {
-            scoped_id: scoped_id.to_string(),
-            target_manifest_hash: epoch.pointer.manifest_hash.clone(),
+            scoped_id: scoped_ref.scoped_id.clone(),
+            target_manifest_hash: target_manifest_hash.clone(),
             have_chunks: have_exact,
             have_chunks_bloom: None,
             reuse_lease_id: Some(reuse_lease),
@@ -1064,7 +1248,8 @@ fn write_capsule_atomic(path: &Path, bytes: &[u8], expected_blake3: &str) -> Res
 async fn verify_manifest_supply_chain(
     client: &reqwest::Client,
     registry: &str,
-    scoped_id: &str,
+    scoped_ref: &ScopedCapsuleRef,
+    requested_version: Option<&str>,
     artifact_bytes: &[u8],
     allow_unverified: bool,
     allow_downgrade: bool,
@@ -1072,39 +1257,52 @@ async fn verify_manifest_supply_chain(
     let base = registry.trim_end_matches('/');
     let endpoint = format!("{}/v1/manifest/epoch/resolve", base);
     let has_token = has_ato_token();
-    let response = with_ato_token(
-        client
-            .post(&endpoint)
-            .json(&serde_json::json!({ "scoped_id": scoped_id })),
-    )
-    .send()
-    .await
-    .with_context(|| "Failed to fetch manifest epoch pointer")?;
-    if !response.status().is_success() {
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED && !has_token {
+    let resolution = if requested_version.is_some() {
+        resolve_manifest_target(
+            client,
+            base,
+            scoped_ref,
+            requested_version,
+            has_token,
+            false,
+        )
+        .await?
+    } else {
+        let response = with_ato_token(
+            client
+                .post(&endpoint)
+                .json(&serde_json::json!({ "scoped_id": scoped_ref.scoped_id })),
+        )
+        .send()
+        .await
+        .with_context(|| "Failed to fetch manifest epoch pointer")?;
+        if !response.status().is_success() {
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED && !has_token {
+                bail!(
+                    "{}: registry requires authentication for manifest read APIs. Run `ato login` or set `ATO_TOKEN=<token>`.",
+                    crate::error_codes::ATO_ERR_AUTH_REQUIRED
+                );
+            }
+            if allow_unverified {
+                eprintln!(
+                    "⚠️  manifest epoch pointer unavailable (status={}): continuing due to --allow-unverified",
+                    response.status()
+                );
+                return Ok(());
+            }
             bail!(
-                "{}: registry requires authentication for manifest read APIs. Run `ato login` or set `ATO_TOKEN=<token>`.",
-                crate::error_codes::ATO_ERR_AUTH_REQUIRED
-            );
-        }
-        if allow_unverified {
-            eprintln!(
-                "⚠️  manifest epoch pointer unavailable (status={}): continuing due to --allow-unverified",
+                "manifest epoch pointer is required for verified install (status={})",
                 response.status()
             );
-            return Ok(());
         }
-        bail!(
-            "manifest epoch pointer is required for verified install (status={})",
-            response.status()
-        );
-    }
-    let epoch = response
-        .json::<ManifestEpochResolveResponse>()
-        .await
-        .with_context(|| "Invalid manifest epoch response")?;
-
-    verify_epoch_signature(&epoch).with_context(|| "Epoch signature verification failed")?;
+        let epoch = response
+            .json::<ManifestEpochResolveResponse>()
+            .await
+            .with_context(|| "Invalid manifest epoch response")?;
+        verify_epoch_signature(&epoch).with_context(|| "Epoch signature verification failed")?;
+        ManifestResolution::Current(epoch)
+    };
+    let target_manifest_hash = resolution.manifest_hash().to_string();
 
     let local_manifest_bytes = extract_manifest_toml_from_capsule(artifact_bytes)
         .with_context(|| "capsule.toml is required in artifact")?;
@@ -1112,11 +1310,11 @@ async fn verify_manifest_supply_chain(
         toml::from_str(&local_manifest_bytes).with_context(|| "Invalid local capsule.toml")?;
     let local_manifest_hash = compute_manifest_hash_without_signatures(&local_manifest)?;
     if normalize_hash_for_compare(&local_manifest_hash)
-        != normalize_hash_for_compare(&epoch.pointer.manifest_hash)
+        != normalize_hash_for_compare(&target_manifest_hash)
     {
         bail!(
-            "Artifact manifest hash mismatch against epoch pointer (expected {}, got {})",
-            epoch.pointer.manifest_hash,
+            "Artifact manifest hash mismatch against resolved manifest (expected {}, got {})",
+            target_manifest_hash,
             local_manifest_hash
         );
     }
@@ -1124,7 +1322,7 @@ async fn verify_manifest_supply_chain(
     let manifest_endpoint = format!(
         "{}/v1/manifest/documents/{}",
         base,
-        urlencoding::encode(&epoch.pointer.manifest_hash)
+        urlencoding::encode(&target_manifest_hash)
     );
     let manifest_response = with_ato_token(client.get(&manifest_endpoint))
         .send()
@@ -1142,11 +1340,11 @@ async fn verify_manifest_supply_chain(
             toml::from_str(&remote_manifest_toml).with_context(|| "Invalid remote capsule.toml")?;
         let remote_manifest_hash = compute_manifest_hash_without_signatures(&remote_manifest)?;
         if normalize_hash_for_compare(&remote_manifest_hash)
-            != normalize_hash_for_compare(&epoch.pointer.manifest_hash)
+            != normalize_hash_for_compare(&target_manifest_hash)
         {
             bail!(
-                "Remote manifest hash mismatch against epoch pointer (expected {}, got {})",
-                epoch.pointer.manifest_hash,
+                "Remote manifest hash mismatch against resolved manifest (expected {}, got {})",
+                target_manifest_hash,
                 remote_manifest_hash
             );
         }
@@ -1176,12 +1374,14 @@ async fn verify_manifest_supply_chain(
     verify_payload_chunks(&local_manifest, &payload_tar_bytes)?;
     verify_manifest_merkle_root(&local_manifest)?;
 
-    enforce_epoch_monotonicity(
-        scoped_id,
-        epoch.pointer.epoch,
-        &epoch.pointer.manifest_hash,
-        allow_downgrade,
-    )?;
+    if let ManifestResolution::Current(epoch) = resolution {
+        enforce_epoch_monotonicity(
+            &scoped_ref.scoped_id,
+            epoch.pointer.epoch,
+            &epoch.pointer.manifest_hash,
+            allow_downgrade,
+        )?;
+    }
 
     Ok(())
 }
@@ -1653,6 +1853,10 @@ mod tests {
         }
     }
 
+    fn test_scoped_ref() -> ScopedCapsuleRef {
+        parse_capsule_ref(TEST_SCOPED_ID).expect("valid scoped ref")
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum MockScenario {
         FalsePositiveRecovery,
@@ -1689,6 +1893,7 @@ mod tests {
     #[derive(Debug, Clone, Default)]
     struct MockObservations {
         epoch_calls: usize,
+        version_resolve_calls: usize,
         manifest_calls: usize,
         negotiate_calls: Vec<RecordedNegotiateRequest>,
         chunk_calls: Vec<String>,
@@ -1878,6 +2083,24 @@ entrypoint = "main.py"
         }
     }
 
+    fn build_payload_tar_with_source(path: &str, source: &[u8]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut payload);
+            let mut header = tar::Header::new_gnu();
+            header.set_path(path).expect("set payload path");
+            header.set_mode(0o644);
+            header.set_size(source.len() as u64);
+            header.set_mtime(0);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, path, Cursor::new(source))
+                .expect("append payload source");
+            builder.finish().expect("finish payload tar");
+        }
+        payload
+    }
+
     async fn spawn_mock_registry(
         scenario: MockScenario,
         fixture: MockRegistryFixture,
@@ -1889,6 +2112,10 @@ entrypoint = "main.py"
         }));
         let app = Router::new()
             .route("/v1/manifest/epoch/resolve", post(mock_epoch_resolve))
+            .route(
+                "/v1/manifest/resolve/:publisher/:slug/:version",
+                get(mock_version_resolve),
+            )
             .route("/v1/manifest/documents/:manifest_hash", get(mock_manifest))
             .route("/v1/manifest/negotiate", post(mock_negotiate))
             .route("/v1/manifest/chunks/:chunk_hash", get(mock_chunk))
@@ -1932,6 +2159,27 @@ entrypoint = "main.py"
             }
             _ => Json(guard.fixture.epoch_response.clone()).into_response(),
         }
+    }
+
+    async fn mock_version_resolve(
+        State(state): State<SharedMockState>,
+        AxumPath((publisher, slug, version)): AxumPath<(String, String, String)>,
+    ) -> Response {
+        let mut guard = state.lock().await;
+        guard.observations.version_resolve_calls += 1;
+        if publisher != guard.fixture.publisher
+            || slug != guard.fixture.slug
+            || version != guard.fixture.version
+        {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        Json(serde_json::json!({
+            "scoped_id": guard.fixture.scoped_id,
+            "version": guard.fixture.version,
+            "manifest_hash": guard.fixture.manifest_hash,
+            "yanked_at": serde_json::Value::Null,
+        }))
+        .into_response()
     }
 
     async fn mock_manifest(
@@ -2224,6 +2472,19 @@ entrypoint = "main.py"
     }
 
     #[test]
+    fn test_parse_capsule_request_extracts_version_suffix() {
+        let parsed = parse_capsule_request("koh0920/sample-capsule@1.2.3").unwrap();
+        assert_eq!(parsed.scoped_ref.scoped_id, "koh0920/sample-capsule");
+        assert_eq!(parsed.version.as_deref(), Some("1.2.3"));
+    }
+
+    #[test]
+    fn test_merge_requested_version_rejects_conflicts() {
+        let err = merge_requested_version(Some("1.0.0"), Some("2.0.0")).expect_err("must fail");
+        assert!(err.to_string().contains("conflicting_version_request"));
+    }
+
+    #[test]
     fn test_epoch_guard_rejects_downgrade_without_flag() {
         let temp = tempfile::tempdir().expect("tempdir");
         let state_path = temp.path().join("epoch-guard.json");
@@ -2483,8 +2744,9 @@ entrypoint = "main.py"
         let server =
             spawn_mock_registry(MockScenario::FalsePositiveRecovery, fixture.clone()).await;
         let client = reqwest::Client::new();
+        let scoped_ref = test_scoped_ref();
         let result =
-            install_manifest_delta_path(&client, server.base_url(), TEST_SCOPED_ID, None, None)
+            install_manifest_delta_path(&client, server.base_url(), &scoped_ref, None, None, None)
                 .await
                 .expect("delta install should succeed after retry");
         let DeltaInstallResult::Artifact(artifact) = result;
@@ -2505,13 +2767,56 @@ entrypoint = "main.py"
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn test_install_app_uses_version_resolve_for_explicit_time_travel() {
+        let _env_lock = acquire_test_env_lock().await;
+        let cas_root = tempfile::tempdir().expect("cas root");
+        let output_root = tempfile::tempdir().expect("output root");
+        let runtime_root = tempfile::tempdir().expect("runtime root");
+        let _cas_guard = EnvVarGuard::set(
+            "ATO_CAS_ROOT",
+            Some(cas_root.path().to_string_lossy().as_ref()),
+        );
+        let _runtime_guard = EnvVarGuard::set(
+            "ATO_RUNTIME_ROOT",
+            Some(runtime_root.path().to_string_lossy().as_ref()),
+        );
+        let _token_guard = EnvVarGuard::set("ATO_TOKEN", None);
+
+        let payload_tar = build_payload_tar_with_source("main.py", b"print('time travel')\n");
+        let fixture = build_mock_fixture(TEST_SCOPED_ID, TEST_VERSION, vec![payload_tar]);
+        let server = spawn_mock_registry(MockScenario::FalsePositiveRecovery, fixture).await;
+        let result = install_app(
+            "koh0920/sample@1.0.0",
+            Some(server.base_url()),
+            None,
+            Some(output_root.path().to_path_buf()),
+            false,
+            false,
+            false,
+            true,
+        )
+        .await
+        .expect("explicit version install should succeed");
+        assert_eq!(result.version, TEST_VERSION);
+
+        let observations = server.observations().await;
+        assert_eq!(observations.version_resolve_calls, 2);
+        assert_eq!(observations.epoch_calls, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn test_install_app_fails_closed_on_negotiate_501() {
         let _env_lock = acquire_test_env_lock().await;
         let cas_root = tempfile::tempdir().expect("cas root");
         let output_root = tempfile::tempdir().expect("output root");
+        let runtime_root = tempfile::tempdir().expect("runtime root");
         let _cas_guard = EnvVarGuard::set(
             "ATO_CAS_ROOT",
             Some(cas_root.path().to_string_lossy().as_ref()),
+        );
+        let _runtime_guard = EnvVarGuard::set(
+            "ATO_RUNTIME_ROOT",
+            Some(runtime_root.path().to_string_lossy().as_ref()),
         );
         let _token_guard = EnvVarGuard::set("ATO_TOKEN", None);
 
@@ -2545,9 +2850,14 @@ entrypoint = "main.py"
         let _env_lock = acquire_test_env_lock().await;
         let cas_root = tempfile::tempdir().expect("cas root");
         let output_root = tempfile::tempdir().expect("output root");
+        let runtime_root = tempfile::tempdir().expect("runtime root");
         let _cas_guard = EnvVarGuard::set(
             "ATO_CAS_ROOT",
             Some(cas_root.path().to_string_lossy().as_ref()),
+        );
+        let _runtime_guard = EnvVarGuard::set(
+            "ATO_RUNTIME_ROOT",
+            Some(runtime_root.path().to_string_lossy().as_ref()),
         );
         let _token_guard = EnvVarGuard::set("ATO_TOKEN", None);
 
@@ -2587,8 +2897,9 @@ entrypoint = "main.py"
         let fixture = build_mock_fixture(TEST_SCOPED_ID, TEST_VERSION, vec![b"chunk".to_vec()]);
         let server = spawn_mock_registry(MockScenario::LeaseReleaseOnFailure, fixture).await;
         let client = reqwest::Client::new();
+        let scoped_ref = test_scoped_ref();
         let err =
-            install_manifest_delta_path(&client, server.base_url(), TEST_SCOPED_ID, None, None)
+            install_manifest_delta_path(&client, server.base_url(), &scoped_ref, None, None, None)
                 .await
                 .expect_err("chunk failure should abort delta install");
         assert!(err
@@ -2612,8 +2923,9 @@ entrypoint = "main.py"
         let fixture = build_mock_fixture(TEST_SCOPED_ID, TEST_VERSION, vec![b"chunk".to_vec()]);
         let server = spawn_mock_registry(MockScenario::YankedNegotiate, fixture).await;
         let client = reqwest::Client::new();
+        let scoped_ref = test_scoped_ref();
         let err =
-            install_manifest_delta_path(&client, server.base_url(), TEST_SCOPED_ID, None, None)
+            install_manifest_delta_path(&client, server.base_url(), &scoped_ref, None, None, None)
                 .await
                 .expect_err("yanked negotiate must fail closed");
         let message = err.to_string();
@@ -2626,9 +2938,14 @@ entrypoint = "main.py"
         let _env_lock = acquire_test_env_lock().await;
         let cas_root = tempfile::tempdir().expect("cas root");
         let output_root = tempfile::tempdir().expect("output root");
+        let runtime_root = tempfile::tempdir().expect("runtime root");
         let _cas_guard = EnvVarGuard::set(
             "ATO_CAS_ROOT",
             Some(cas_root.path().to_string_lossy().as_ref()),
+        );
+        let _runtime_guard = EnvVarGuard::set(
+            "ATO_RUNTIME_ROOT",
+            Some(runtime_root.path().to_string_lossy().as_ref()),
         );
         let _token_guard = EnvVarGuard::set("ATO_TOKEN", None);
 

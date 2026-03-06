@@ -18,6 +18,7 @@ use crate::ipc::inject::IpcContext;
 use crate::reporters::CliReporter;
 use crate::runtime_manager;
 use crate::runtime_overrides;
+use crate::runtime_tree;
 use capsule_core::execution_plan::error::AtoExecutionError;
 use capsule_core::execution_plan::guard::{self, ExecutorKind};
 use capsule_core::{lockfile, router, CapsuleReporter};
@@ -64,6 +65,26 @@ pub async fn execute(args: OpenArgs) -> Result<()> {
 }
 
 async fn execute_capsule_file(args: &OpenArgs, capsule_path: &PathBuf) -> Result<()> {
+    if let Some(manifest_path) = runtime_tree::prepare_store_runtime_for_capsule(capsule_path)? {
+        debug!(
+            manifest_path = %manifest_path.display(),
+            "Running capsule from isolated runtime tree"
+        );
+        let open_args = OpenArgs {
+            target: manifest_path,
+            target_label: args.target_label.clone(),
+            watch: args.watch,
+            background: args.background,
+            nacelle: args.nacelle.clone(),
+            enforcement: args.enforcement.clone(),
+            sandbox_mode: args.sandbox_mode,
+            dangerously_skip_permissions: args.dangerously_skip_permissions,
+            assume_yes: args.assume_yes,
+            reporter: args.reporter.clone(),
+        };
+        return execute_normal_mode(open_args).await;
+    }
+
     debug!(capsule = %capsule_path.display(), "Extracting capsule archive");
 
     let extract_dir = capsule_path

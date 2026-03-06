@@ -21,6 +21,7 @@ const KEY_DIR: &str = "keys";
 const ACTIVE_KEY_FILE: &str = "active";
 const DEFAULT_LEASE_TTL_SECS: u64 = 900;
 const DEFAULT_GC_DEFER_SECS: i64 = 30;
+const RETENTION_PINNED_RELEASES: i64 = 5;
 const SCHEMA_MIGRATION_0001: &str = "2026-03-05-0001-manifests-tombstoned";
 const SCHEMA_MIGRATION_0002: &str = "2026-03-05-0002-leases-composite";
 const SCHEMA_MIGRATION_0003: &str = "2026-03-05-0003-gc-indexes";
@@ -54,6 +55,15 @@ pub struct RegistryReleaseRecord {
     pub size_bytes: u64,
     pub signature_status: String,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistryVersionResolveRecord {
+    pub scoped_id: String,
+    pub version: String,
+    pub manifest_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yanked_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -338,6 +348,33 @@ impl RegistryStore {
              WHERE scoped_id=?1 AND version=?2",
             params![scoped_id, version],
             |row| self.map_registry_release_row(row),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn resolve_release_version(
+        &self,
+        publisher: &str,
+        slug: &str,
+        version: &str,
+    ) -> Result<Option<RegistryVersionResolveRecord>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT p.scoped_id, r.version, r.manifest_hash, m.yanked_at
+             FROM registry_packages p
+             JOIN registry_releases r ON r.scoped_id = p.scoped_id
+             JOIN manifests m ON m.manifest_hash = r.manifest_hash
+             WHERE p.publisher=?1 AND p.slug=?2 AND r.version=?3",
+            params![publisher, slug, version],
+            |row| {
+                Ok(RegistryVersionResolveRecord {
+                    scoped_id: row.get(0)?,
+                    version: row.get(1)?,
+                    manifest_hash: row.get(2)?,
+                    yanked_at: row.get(3)?,
+                })
+            },
         )
         .optional()
         .map_err(Into::into)
@@ -1668,8 +1705,35 @@ impl RegistryStore {
                     |row| row.get(0),
                 )
                 .optional()?;
+            let retention_pinned: Option<i64> = conn
+                .query_row(
+                    "SELECT 1
+                     FROM manifest_chunks mc
+                     JOIN (
+                       SELECT scoped_id, manifest_hash
+                       FROM (
+                         SELECT scoped_id,
+                                manifest_hash,
+                                ROW_NUMBER() OVER (
+                                  PARTITION BY scoped_id
+                                  ORDER BY created_at DESC, version DESC
+                                ) AS release_rank
+                         FROM registry_releases
+                       )
+                       WHERE release_rank <= ?2
+                     ) pinned ON pinned.manifest_hash = mc.manifest_hash
+                     WHERE mc.chunk_hash=?1
+                     LIMIT 1",
+                    params![chunk_hash, RETENTION_PINNED_RELEASES],
+                    |row| row.get(0),
+                )
+                .optional()?;
 
-            if !has_tombstone || active_lease.is_some() || live_reference.is_some() {
+            if !has_tombstone
+                || active_lease.is_some()
+                || live_reference.is_some()
+                || retention_pinned.is_some()
+            {
                 let defer_until = chrono::Utc::now()
                     .checked_add_signed(chrono::Duration::seconds(DEFAULT_GC_DEFER_SECS))
                     .unwrap_or_else(chrono::Utc::now)
@@ -2646,6 +2710,8 @@ fn extract_manifest_and_payload_from_capsule(bytes: &[u8]) -> Result<ExtractedMa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+    use std::io::Write;
 
     fn manifest(version: &str) -> String {
         format!(
@@ -2658,6 +2724,68 @@ default_target = "cli"
 "#,
             version
         )
+    }
+
+    fn build_capsule_bytes(manifest: &str) -> Vec<u8> {
+        let payload_tar = build_payload_tar().expect("build payload tar");
+        let parsed_manifest = CapsuleManifest::from_toml(manifest).expect("parse manifest");
+        let (_, manifest_bytes) =
+            manifest_payload::build_distribution_manifest(&parsed_manifest, &payload_tar)
+                .expect("build manifest");
+        let payload_zst =
+            zstd::stream::encode_all(Cursor::new(payload_tar), 1).expect("encode payload");
+
+        let mut capsule = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut capsule);
+
+            let mut manifest_header = tar::Header::new_gnu();
+            manifest_header.set_size(manifest_bytes.len() as u64);
+            manifest_header.set_mode(0o644);
+            manifest_header.set_mtime(0);
+            manifest_header.set_cksum();
+            builder
+                .append_data(
+                    &mut manifest_header,
+                    "capsule.toml",
+                    Cursor::new(manifest_bytes),
+                )
+                .expect("append manifest");
+
+            let mut payload_header = tar::Header::new_gnu();
+            payload_header.set_size(payload_zst.len() as u64);
+            payload_header.set_mode(0o644);
+            payload_header.set_mtime(0);
+            payload_header.set_cksum();
+            builder
+                .append_data(
+                    &mut payload_header,
+                    "payload.tar.zst",
+                    Cursor::new(payload_zst),
+                )
+                .expect("append payload");
+
+            builder.finish().expect("finish capsule");
+        }
+        capsule
+    }
+
+    fn build_payload_tar() -> Result<Vec<u8>> {
+        let mut payload = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut payload);
+            let source = b"print('hello from payload')\n";
+            let mut header = tar::Header::new_gnu();
+            header.set_path("main.py")?;
+            header.set_mode(0o644);
+            header.set_size(source.len() as u64);
+            header.set_mtime(0);
+            header.set_cksum();
+            builder.append_data(&mut header, "main.py", Cursor::new(source))?;
+            builder.finish()?;
+        }
+        payload.flush().expect("flush payload vec");
+        Ok(payload)
     }
 
     #[test]
@@ -3004,6 +3132,68 @@ default_target = "cli"
                 &chrono::Utc::now().to_rfc3339(),
             )
             .expect("enqueue");
+
+        let tick = store
+            .gc_tick(&chrono::Utc::now().to_rfc3339(), 8)
+            .expect("gc tick");
+        assert!(tick.deferred >= 1);
+        assert!(store
+            .load_chunk_bytes(&chunk_hash)
+            .expect("load chunk")
+            .is_some());
+    }
+
+    #[test]
+    fn gc_tick_keeps_retention_pinned_release_chunks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = RegistryStore::open(temp.path()).expect("open store");
+        let publisher = "koh0920";
+        let slug = "sample";
+        let name = "sample";
+        let description = "sample app";
+
+        let mut releases = Vec::new();
+        for idx in 0..6 {
+            let version = format!("1.0.{}", idx);
+            let capsule = build_capsule_bytes(&manifest(&version));
+            let record = store
+                .publish_registry_release(
+                    publisher,
+                    slug,
+                    name,
+                    description,
+                    &version,
+                    &format!("sample-{}.capsule", version),
+                    "sha256:abc",
+                    &format!("blake3:{:064x}", idx + 1),
+                    capsule.len() as u64,
+                    &capsule,
+                    &format!("2026-03-05T00:00:0{}Z", idx),
+                )
+                .expect("publish release");
+            releases.push((version, record.pointer.manifest_hash));
+        }
+
+        let pinned_manifest_hash = releases[1].1.clone();
+        store
+            .tombstone_manifest("koh0920/sample", &pinned_manifest_hash)
+            .expect("tombstone");
+        store
+            .enqueue_manifest_chunks_for_gc(
+                &pinned_manifest_hash,
+                "test-retention",
+                &chrono::Utc::now().to_rfc3339(),
+            )
+            .expect("enqueue");
+
+        let conn = store.connect().expect("connect");
+        let chunk_hash: String = conn
+            .query_row(
+                "SELECT chunk_hash FROM manifest_chunks WHERE manifest_hash=?1 ORDER BY ordinal ASC LIMIT 1",
+                params![&pinned_manifest_hash],
+                |row| row.get(0),
+            )
+            .expect("chunk hash");
 
         let tick = store
             .gc_tick(&chrono::Utc::now().to_rfc3339(), 8)

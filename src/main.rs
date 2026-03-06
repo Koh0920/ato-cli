@@ -112,6 +112,7 @@ mod registry_yank;
 mod reporters;
 mod runtime_manager;
 mod runtime_overrides;
+mod runtime_tree;
 mod scaffold;
 mod search;
 mod sign;
@@ -1599,11 +1600,16 @@ fn run() -> Result<()> {
                     message.push_str("` to see more options.");
                     anyhow::bail!(message);
                 }
+                let request = install::parse_capsule_request(&slug)?;
+                let requested_version = install::merge_requested_version(
+                    request.version.as_deref(),
+                    version.as_deref(),
+                )?;
 
                 let result = install::install_app(
                     &slug,
                     registry.as_deref(),
-                    version.as_deref(),
+                    requested_version.as_deref(),
                     output,
                     default,
                     allow_unverified,
@@ -3173,7 +3179,7 @@ async fn resolve_run_target_or_install(
         return Ok(expand_explicit_local_path(&raw));
     }
 
-    let scoped_ref = match install::parse_capsule_ref(&raw) {
+    let request = match install::parse_capsule_request(&raw) {
         Ok(value) => value,
         Err(error) => {
             if install::is_slug_only_ref(&raw) {
@@ -3208,9 +3214,12 @@ async fn resolve_run_target_or_install(
             );
         }
     };
+    let scoped_ref = request.scoped_ref;
+    let requested_version = request.version;
 
     if let Some(installed_capsule) =
-        resolve_installed_capsule_archive(&scoped_ref, registry).await?
+        resolve_installed_capsule_archive(&scoped_ref, requested_version.as_deref(), registry)
+            .await?
     {
         debug!(
             capsule = %installed_capsule.display(),
@@ -3240,18 +3249,22 @@ async fn resolve_run_target_or_install(
     let effective_registry = registry.unwrap_or(DEFAULT_RUN_REGISTRY_URL);
     let detail =
         install::fetch_capsule_detail(&scoped_ref.scoped_id, Some(effective_registry)).await?;
-    let installable_version = detail
-        .latest_version
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Cannot auto-install '{}': no installable version is published.",
-                detail.scoped_id
-            )
-        })?
-        .to_string();
+    let installable_version = if let Some(version) = requested_version.as_deref() {
+        version.to_string()
+    } else {
+        detail
+            .latest_version
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Cannot auto-install '{}': no installable version is published.",
+                    detail.scoped_id
+                )
+            })?
+            .to_string()
+    };
 
     if !yes {
         let approved = prompt_install_confirmation(&detail, &installable_version)?;
@@ -3266,7 +3279,7 @@ async fn resolve_run_target_or_install(
     }
 
     let install_result = install::install_app(
-        &scoped_ref.scoped_id,
+        &raw,
         Some(effective_registry),
         Some(installable_version.as_str()),
         None,
@@ -3317,6 +3330,7 @@ fn expand_explicit_local_path(raw: &str) -> PathBuf {
 
 async fn resolve_installed_capsule_archive(
     scoped_ref: &install::ScopedCapsuleRef,
+    requested_version: Option<&str>,
     registry: Option<&str>,
 ) -> Result<Option<PathBuf>> {
     let store_root = dirs::home_dir()
@@ -3326,6 +3340,7 @@ async fn resolve_installed_capsule_archive(
     if let Some(path) = resolve_installed_capsule_archive_in_store(
         &store_root.join(&scoped_ref.publisher),
         &scoped_ref.slug,
+        requested_version,
     )? {
         return Ok(Some(path));
     }
@@ -3342,6 +3357,7 @@ async fn resolve_installed_capsule_archive(
         return resolve_installed_capsule_archive_in_store(
             &store_root.join(&scoped_ref.publisher),
             &scoped_ref.slug,
+            requested_version,
         );
     }
 
@@ -3386,16 +3402,25 @@ async fn resolve_installed_capsule_archive(
     resolve_installed_capsule_archive_in_store(
         &store_root.join(&scoped_ref.publisher),
         &scoped_ref.slug,
+        requested_version,
     )
 }
 
 fn resolve_installed_capsule_archive_in_store(
     store_root: &std::path::Path,
     slug: &str,
+    requested_version: Option<&str>,
 ) -> Result<Option<PathBuf>> {
     let slug_dir = store_root.join(slug);
     if !slug_dir.exists() || !slug_dir.is_dir() {
         return Ok(None);
+    }
+
+    if let Some(version) = requested_version
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return select_capsule_file_in_version(&slug_dir.join(version));
     }
 
     let mut version_dirs: Vec<(ParsedSemver, PathBuf)> = Vec::new();
@@ -3427,6 +3452,10 @@ fn resolve_installed_capsule_archive_in_store(
 }
 
 fn select_capsule_file_in_version(version_dir: &std::path::Path) -> Result<Option<PathBuf>> {
+    if !version_dir.exists() || !version_dir.is_dir() {
+        return Ok(None);
+    }
+
     let mut capsules = Vec::new();
     for entry in std::fs::read_dir(version_dir).with_context(|| {
         format!(
@@ -3922,12 +3951,32 @@ mod tests {
         std::fs::write(slug_dir.join("1.2.0-rc1/preview.capsule"), b"preview").unwrap();
         std::fs::write(slug_dir.join("1.2.0/new.capsule"), b"new").unwrap();
 
-        let resolved = resolve_installed_capsule_archive_in_store(tmp.path(), slug)
+        let resolved = resolve_installed_capsule_archive_in_store(tmp.path(), slug, None)
             .unwrap()
             .unwrap();
         assert_eq!(
             resolved.file_name().and_then(|name| name.to_str()),
             Some("new.capsule")
+        );
+    }
+
+    #[test]
+    fn resolve_installed_capsule_honors_explicit_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let slug = "demo-app";
+        let slug_dir = tmp.path().join(slug);
+        std::fs::create_dir_all(slug_dir.join("1.0.0")).unwrap();
+        std::fs::create_dir_all(slug_dir.join("1.2.0")).unwrap();
+
+        std::fs::write(slug_dir.join("1.0.0/old.capsule"), b"old").unwrap();
+        std::fs::write(slug_dir.join("1.2.0/new.capsule"), b"new").unwrap();
+
+        let resolved = resolve_installed_capsule_archive_in_store(tmp.path(), slug, Some("1.0.0"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            resolved.file_name().and_then(|name| name.to_str()),
+            Some("old.capsule")
         );
     }
 
