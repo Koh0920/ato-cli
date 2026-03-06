@@ -19,8 +19,39 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Validate Cargo.lock is up to date
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! cargo metadata --locked --format-version 1 >/dev/null 2>&1; then
+            echo "Cargo.lock is out of date for the current Cargo.toml." >&2
+            echo "Run 'cargo generate-lockfile' (or 'cargo check') locally and commit Cargo.lock." >&2
+            exit 1
+          fi
+
+      - name: Run clippy
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+
   build:
     name: Build ${{ matrix.artifact_name }}
+    needs: clippy
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
