@@ -3,7 +3,7 @@ use std::path::Path;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 
 use crate::error::{CapsuleError, Result};
-use crate::types::capsule_v1::CapsuleManifestV1;
+use crate::types::CapsuleManifest;
 
 const SMART_DEFAULT_EXCLUDES: &[&str] = &[
     ".git/**",
@@ -47,7 +47,7 @@ pub struct PackFilter {
 impl PackFilter {
     pub fn from_manifest_path(manifest_path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(manifest_path).map_err(CapsuleError::Io)?;
-        let manifest = CapsuleManifestV1::from_toml(&raw).map_err(|e| {
+        let manifest = CapsuleManifest::from_toml(&raw).map_err(|e| {
             CapsuleError::Pack(format!(
                 "Failed to parse {}: {}",
                 manifest_path.display(),
@@ -57,7 +57,7 @@ impl PackFilter {
         Self::from_manifest(&manifest)
     }
 
-    pub fn from_manifest(manifest: &CapsuleManifestV1) -> Result<Self> {
+    pub fn from_manifest(manifest: &CapsuleManifest) -> Result<Self> {
         let pack = manifest.pack.clone().unwrap_or_default();
         let include_patterns = normalized_patterns(&pack.include);
         let exclude_patterns = normalized_patterns(&pack.exclude);
@@ -86,6 +86,12 @@ impl PackFilter {
             if !include.is_match(&rel) {
                 return false;
             }
+        }
+
+        // Next.js standalone runtime requires bundled node_modules under `.next/standalone`.
+        // Keep this subtree even when broad node_modules excludes are configured.
+        if is_next_standalone_node_modules(&rel) {
+            return true;
         }
 
         !self.exclude.is_match(&rel)
@@ -129,18 +135,32 @@ fn normalize_rel_path(path: &Path) -> String {
         .join("/")
 }
 
+fn is_next_standalone_node_modules(rel: &str) -> bool {
+    let lower = rel.to_ascii_lowercase();
+    let marker = ".next/standalone/";
+    if let Some(idx) = lower.find(marker) {
+        let tail = &lower[idx + marker.len()..];
+        tail == "node_modules"
+            || tail.starts_with("node_modules/")
+            || tail.contains("/node_modules/")
+            || tail.ends_with("/node_modules")
+    } else {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::capsule_v1::PackConfig;
+    use crate::types::PackConfig;
 
     #[test]
     fn defaults_exclude_node_modules_when_include_absent() {
-        let filter = PackFilter::from_manifest(&CapsuleManifestV1 {
+        let filter = PackFilter::from_manifest(&CapsuleManifest {
             schema_version: "0.2".to_string(),
             name: "test".to_string(),
             version: "0.1.0".to_string(),
-            capsule_type: crate::types::capsule_v1::CapsuleType::App,
+            capsule_type: crate::types::CapsuleType::App,
             default_target: "cli".to_string(),
             metadata: Default::default(),
             capabilities: None,
@@ -158,6 +178,7 @@ mod tests {
             polymorphism: None,
             targets: None,
             services: None,
+            distribution: None,
         })
         .expect("filter");
         assert!(!filter.should_include_file(Path::new("node_modules/a.js")));
@@ -166,11 +187,11 @@ mod tests {
 
     #[test]
     fn include_mode_allows_explicitly_selected_paths() {
-        let mut manifest = CapsuleManifestV1 {
+        let mut manifest = CapsuleManifest {
             schema_version: "0.2".to_string(),
             name: "test".to_string(),
             version: "0.1.0".to_string(),
-            capsule_type: crate::types::capsule_v1::CapsuleType::App,
+            capsule_type: crate::types::CapsuleType::App,
             default_target: "cli".to_string(),
             metadata: Default::default(),
             capabilities: None,
@@ -188,6 +209,7 @@ mod tests {
             polymorphism: None,
             targets: None,
             services: None,
+            distribution: None,
         };
         manifest.pack = Some(PackConfig {
             include: vec!["apps/**".to_string()],
@@ -202,11 +224,11 @@ mod tests {
 
     #[test]
     fn include_mode_cannot_force_include_hard_default_excludes() {
-        let mut manifest = CapsuleManifestV1 {
+        let mut manifest = CapsuleManifest {
             schema_version: "0.2".to_string(),
             name: "test".to_string(),
             version: "0.1.0".to_string(),
-            capsule_type: crate::types::capsule_v1::CapsuleType::App,
+            capsule_type: crate::types::CapsuleType::App,
             default_target: "cli".to_string(),
             metadata: Default::default(),
             capabilities: None,
@@ -224,6 +246,7 @@ mod tests {
             polymorphism: None,
             targets: None,
             services: None,
+            distribution: None,
         };
         manifest.pack = Some(PackConfig {
             include: vec!["**/node_modules/**".to_string()],
@@ -232,5 +255,84 @@ mod tests {
 
         let filter = PackFilter::from_manifest(&manifest).expect("filter");
         assert!(!filter.should_include_file(Path::new("apps/web/node_modules/react/index.js")));
+    }
+
+    #[test]
+    fn next_standalone_node_modules_are_kept_even_with_broad_node_modules_exclude() {
+        let mut manifest = CapsuleManifest {
+            schema_version: "0.2".to_string(),
+            name: "test".to_string(),
+            version: "0.1.0".to_string(),
+            capsule_type: crate::types::CapsuleType::App,
+            default_target: "cli".to_string(),
+            metadata: Default::default(),
+            capabilities: None,
+            requirements: Default::default(),
+            execution: Default::default(),
+            storage: Default::default(),
+            routing: Default::default(),
+            network: None,
+            model: None,
+            transparency: None,
+            pool: None,
+            build: None,
+            pack: None,
+            isolation: None,
+            polymorphism: None,
+            targets: None,
+            services: None,
+            distribution: None,
+        };
+        manifest.pack = Some(PackConfig {
+            include: vec!["apps/dashboard/.next/standalone/**".to_string()],
+            exclude: vec!["**/node_modules/**".to_string()],
+        });
+
+        let filter = PackFilter::from_manifest(&manifest).expect("filter");
+        assert!(filter.should_include_file(Path::new(
+            "apps/dashboard/.next/standalone/node_modules/next/dist/bin/next"
+        )));
+        assert!(filter.should_include_file(Path::new(
+            "apps/dashboard/.next/standalone/apps/dashboard/server.js"
+        )));
+        assert!(!filter
+            .should_include_file(Path::new("apps/dashboard/node_modules/next/dist/bin/next")));
+    }
+
+    #[test]
+    fn nested_next_standalone_node_modules_are_kept() {
+        let mut manifest = CapsuleManifest {
+            schema_version: "0.2".to_string(),
+            name: "test".to_string(),
+            version: "0.1.0".to_string(),
+            capsule_type: crate::types::CapsuleType::App,
+            default_target: "cli".to_string(),
+            metadata: Default::default(),
+            capabilities: None,
+            requirements: Default::default(),
+            execution: Default::default(),
+            storage: Default::default(),
+            routing: Default::default(),
+            network: None,
+            model: None,
+            transparency: None,
+            pool: None,
+            build: None,
+            pack: None,
+            isolation: None,
+            polymorphism: None,
+            targets: None,
+            services: None,
+            distribution: None,
+        };
+        manifest.pack = Some(PackConfig {
+            include: vec!["apps/dashboard/.next/standalone/**".to_string()],
+            exclude: vec!["**/node_modules/**".to_string()],
+        });
+
+        let filter = PackFilter::from_manifest(&manifest).expect("filter");
+        assert!(filter.should_include_file(Path::new(
+            "apps/dashboard/.next/standalone/apps/dashboard/node_modules/next/package.json"
+        )));
     }
 }

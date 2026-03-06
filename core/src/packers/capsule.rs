@@ -12,18 +12,22 @@ use zstd::stream::write::Encoder as ZstdEncoder;
 
 use crate::error::{CapsuleError, Result as CapsuleResult};
 use crate::packers::pack_filter::PackFilter;
+use crate::packers::payload::{
+    build_distribution_manifest, manifest_hash, normalize_relative_utf8_path,
+    reconstruct_from_chunks,
+};
 use crate::packers::sbom::{generate_embedded_sbom_from_inputs_async, SbomFileInput, SBOM_PATH};
 use crate::r3_config;
 
-/// Capsule Format v2 PAX TAR Archive Structure:
+/// Capsule PAX TAR Archive Structure:
 /// ```text
 /// my-app.capsule (PAX TAR)
 /// ├── capsule.toml
+/// ├── capsule.lock
 /// ├── signature.json
 /// └── payload.tar.zst
 ///     ├── source/ (code)
-///     ├── config.json (prepared by controller)
-///     └── capsule.lock (prepared by controller)
+///     └── config.json (prepared by controller)
 /// ```
 
 #[derive(Debug, Clone)]
@@ -58,6 +62,13 @@ impl PayloadEntry {
         match self {
             Self::File(file) => &file.archive_path,
             Self::Symlink { archive_path, .. } => archive_path,
+        }
+    }
+
+    fn kind_rank(&self) -> u8 {
+        match self {
+            Self::Symlink { .. } => 1,
+            Self::File(_) => 2,
         }
     }
 }
@@ -131,12 +142,11 @@ const DEFAULT_REPRO_MTIME: u64 = 0;
 pub async fn pack(
     _plan: &crate::router::ManifestData,
     opts: CapsulePackOptions,
-    _reporter: Arc<dyn crate::reporter::CapsuleReporter + 'static>,
+    reporter: Arc<dyn crate::reporter::CapsuleReporter + 'static>,
 ) -> CapsuleResult<PathBuf> {
     debug!("Creating capsule archive (.capsule format)");
 
     let loaded = crate::manifest::load_manifest(&opts.manifest_path)?;
-    let manifest_content = loaded.raw_text;
     let pack_filter = PackFilter::from_manifest(&loaded.model)?;
 
     // config/lockfile are prepared by the caller once and injected into this packer.
@@ -161,24 +171,32 @@ pub async fn pack(
 
     // Step 2: Resolve source payload input
     let source_dir = opts.manifest_dir.join("source");
-    let source_root = if source_dir.exists() {
-        source_dir.as_path()
+    let (source_root, source_root_warning) = select_payload_source_root(&opts.manifest_dir);
+    if let Some(message) = source_root_warning {
+        reporter
+            .warn(message.to_string())
+            .await
+            .map_err(|err| CapsuleError::Pack(format!("Failed to emit pack warning: {err}")))?;
+    }
+    if source_root.as_path() == source_dir.as_path() {
+        debug!("Packaging source/ directory as source/");
     } else {
-        debug!("No source/ directory found; packaging project root as source/");
-        opts.manifest_dir.as_path()
-    };
+        debug!("Packaging project root as source/");
+    }
 
     // Step 3: Create payload.tar.zst (single-pass stream)
     debug!("Phase 2: creating payload.tar.zst (streaming)");
 
-    let mut payload_entries = collect_payload_entries(source_root, "source", &pack_filter).await?;
+    let mut payload_entries =
+        collect_payload_entries(source_root.as_path(), "source", &pack_filter).await?;
     payload_entries.push(PayloadEntry::File(
         payload_file_entry(&config_path, "config.json".to_string()).await?,
     ));
-    payload_entries.push(PayloadEntry::File(
-        payload_file_entry(&lockfile_path, "capsule.lock".to_string()).await?,
-    ));
-    payload_entries.sort_by(|a, b| a.archive_path().cmp(b.archive_path()));
+    payload_entries.sort_by(|a, b| {
+        a.archive_path()
+            .cmp(b.archive_path())
+            .then_with(|| a.kind_rank().cmp(&b.kind_rank()))
+    });
 
     let temp_dir = tempfile::tempdir()?;
     let payload_zst_path = temp_dir.path().join("payload.tar.zst");
@@ -207,6 +225,26 @@ pub async fn pack(
 
     let compressed_size = fs::metadata(&payload_zst_path)?.len() as usize;
     debug!("Compressed payload size: {}", format_bytes(compressed_size));
+    let payload_tar_bytes = read_payload_tar_bytes_from_zst(&payload_zst_path)?;
+    let (distribution_manifest, manifest_toml_bytes) =
+        build_distribution_manifest(&loaded.model, &payload_tar_bytes)?;
+    let rebuilt_payload = reconstruct_from_chunks(
+        &payload_tar_bytes,
+        &distribution_manifest
+            .distribution
+            .as_ref()
+            .expect("distribution metadata")
+            .chunk_list,
+    )?;
+    if rebuilt_payload != payload_tar_bytes {
+        return Err(CapsuleError::Pack(
+            "failed to reconstruct payload.tar from chunk_list".to_string(),
+        ));
+    }
+    debug!(
+        "Generated manifest hash={}",
+        manifest_hash(&distribution_manifest)?
+    );
 
     // Step 4: Create final .capsule archive
     debug!("Phase 3: creating final .capsule archive");
@@ -221,11 +259,21 @@ pub async fn pack(
 
     // Write actual manifest content
     let manifest_temp_path = temp_dir.path().join("capsule.toml");
-    fs::write(&manifest_temp_path, &manifest_content)?;
+    fs::write(&manifest_temp_path, &manifest_toml_bytes)?;
     append_regular_file_normalized(
         &mut outer_ar,
         &manifest_temp_path,
         "capsule.toml",
+        reproducible_mtime_epoch(),
+    )?;
+    let packaged_lockfile_bytes =
+        crate::lockfile::render_lockfile_for_manifest(&lockfile_path, &distribution_manifest)?;
+    let packaged_lockfile_path = temp_dir.path().join("capsule.lock");
+    fs::write(&packaged_lockfile_path, packaged_lockfile_bytes)?;
+    append_regular_file_normalized(
+        &mut outer_ar,
+        &packaged_lockfile_path,
+        "capsule.lock",
         reproducible_mtime_epoch(),
     )?;
 
@@ -310,7 +358,7 @@ async fn collect_payload_entries(
                 continue;
             }
 
-            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            let rel_str = normalize_relative_utf8_path(rel)?;
             let archive_path = format!("{}/{}", prefix, rel_str);
             if file_type.is_symlink() {
                 let link_target = tokio::fs::read_link(&path).await?;
@@ -602,16 +650,102 @@ fn reproducible_mtime_epoch() -> u64 {
         .unwrap_or(DEFAULT_REPRO_MTIME)
 }
 
+fn select_payload_source_root(manifest_dir: &Path) -> (PathBuf, Option<&'static str>) {
+    let source_dir = manifest_dir.join("source");
+    if !source_dir.exists() {
+        return (manifest_dir.to_path_buf(), None);
+    }
+
+    // If both roots exist and only the project root has Next standalone node_modules,
+    // prefer project root to avoid publishing stale source/ snapshots.
+    if has_next_standalone_node_modules(manifest_dir)
+        && !has_next_standalone_node_modules(source_dir.as_path())
+    {
+        return (
+            manifest_dir.to_path_buf(),
+            Some(
+                "Detected source/ directory without Next standalone node_modules while project root has them; packaging project root to keep runtime-complete artifacts.",
+            ),
+        );
+    }
+
+    (source_dir, None)
+}
+
+fn has_next_standalone_node_modules(root: &Path) -> bool {
+    if root.join(".next/standalone/node_modules").is_dir() {
+        return true;
+    }
+
+    let apps_dir = root.join("apps");
+    let Ok(entries) = fs::read_dir(&apps_dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        if entry.path().join(".next/standalone/node_modules").is_dir() {
+            return true;
+        }
+    }
+    false
+}
+
+fn read_payload_tar_bytes_from_zst(payload_zst_path: &Path) -> CapsuleResult<Vec<u8>> {
+    let payload_file = fs::File::open(payload_zst_path)?;
+    let mut decoder = zstd::stream::Decoder::new(payload_file)?;
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out)?;
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::packers::payload::reconstruct_from_chunks;
     use crate::reporter::NoOpReporter;
     use crate::router::ExecutionProfile;
+    use crate::types::CapsuleManifest;
+    use std::io::Read;
 
     fn sha256_hex(data: &[u8]) -> String {
         let mut hasher = sha2::Sha256::new();
         hasher.update(data);
         hex::encode(hasher.finalize())
+    }
+
+    #[test]
+    fn select_payload_source_root_prefers_manifest_root_for_stale_source_snapshot() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let source_dir = tmp.path().join("source");
+        let root_standalone_nm = tmp
+            .path()
+            .join("apps/dashboard/.next/standalone/node_modules/next");
+        let source_standalone = source_dir.join("apps/dashboard/.next/standalone/apps/dashboard");
+        std::fs::create_dir_all(&root_standalone_nm).expect("mkdir root standalone node_modules");
+        std::fs::create_dir_all(&source_standalone).expect("mkdir source standalone");
+
+        let (selected, warning) = select_payload_source_root(tmp.path());
+        assert_eq!(selected.as_path(), tmp.path());
+        assert!(warning.is_some());
+    }
+
+    #[test]
+    fn select_payload_source_root_uses_source_when_runtime_layout_is_consistent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let source_dir = tmp.path().join("source");
+        let source_standalone_nm =
+            source_dir.join("apps/dashboard/.next/standalone/node_modules/next");
+        std::fs::create_dir_all(&source_standalone_nm)
+            .expect("mkdir source standalone node_modules");
+
+        let (selected, warning) = select_payload_source_root(tmp.path());
+        assert_eq!(selected.as_path(), source_dir.as_path());
+        assert!(warning.is_none());
     }
 
     #[tokio::test]
@@ -696,5 +830,102 @@ manifest_hash = "sha256:dummy"
         let first = std::fs::read(out1).expect("read first artifact");
         let second = std::fs::read(out2).expect("read second artifact");
         assert_eq!(sha256_hex(&first), sha256_hex(&second));
+    }
+
+    #[tokio::test]
+    async fn pack_source_embeds_manifest_and_reconstructs_payload() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manifest_path = tmp.path().join("capsule.toml");
+        std::fs::write(
+            &manifest_path,
+            r#"
+schema_version = "0.2"
+name = "manifest-pack"
+version = "0.1.0"
+type = "app"
+default_target = "cli"
+
+[targets.cli]
+runtime = "source"
+driver = "native"
+entrypoint = "source/main.sh"
+"#,
+        )
+        .expect("write manifest");
+
+        std::fs::create_dir_all(tmp.path().join("source")).expect("mkdir source");
+        std::fs::write(tmp.path().join("source/main.sh"), "echo manifest").expect("write source");
+        let lock_path = tmp.path().join("capsule.lock");
+        std::fs::write(
+            &lock_path,
+            r#"version = "1"
+
+[meta]
+created_at = "2026-01-01T00:00:00Z"
+manifest_hash = "sha256:dummy"
+"#,
+        )
+        .expect("write lockfile");
+
+        let config = Arc::new(
+            crate::r3_config::generate_config(&manifest_path, Some("strict".to_string()), false)
+                .expect("generate config"),
+        );
+        let config_path =
+            crate::r3_config::write_config(&manifest_path, config.as_ref()).expect("write config");
+        let decision =
+            crate::router::route_manifest(&manifest_path, ExecutionProfile::Release, None)
+                .expect("route");
+        let out = tmp.path().join("manifest-pack.capsule");
+        pack(
+            &decision.plan,
+            CapsulePackOptions {
+                manifest_path: manifest_path.clone(),
+                manifest_dir: tmp.path().to_path_buf(),
+                output: Some(out.clone()),
+                config_json: config,
+                config_path,
+                lockfile_path: lock_path,
+            },
+            Arc::new(NoOpReporter),
+        )
+        .await
+        .expect("pack");
+
+        let mut outer = tar::Archive::new(std::fs::File::open(&out).expect("open"));
+        let mut payload_zst = Vec::new();
+        let mut manifest_toml_bytes = None::<Vec<u8>>;
+        for entry in outer.entries().expect("entries") {
+            let mut entry = entry.expect("entry");
+            let path = entry.path().expect("path").to_string_lossy().to_string();
+            if path == "payload.tar.zst" {
+                entry.read_to_end(&mut payload_zst).expect("read payload");
+            } else if path == "capsule.toml" {
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes).expect("read manifest");
+                manifest_toml_bytes = Some(bytes);
+            }
+        }
+        let manifest_toml_bytes = manifest_toml_bytes.expect("capsule.toml");
+        let manifest: CapsuleManifest =
+            toml::from_str(std::str::from_utf8(&manifest_toml_bytes).expect("manifest utf8"))
+                .expect("parse manifest");
+
+        let mut decoder =
+            zstd::stream::Decoder::new(std::io::Cursor::new(payload_zst)).expect("decode payload");
+        let mut payload_tar = Vec::new();
+        decoder
+            .read_to_end(&mut payload_tar)
+            .expect("read tar bytes");
+        let rebuilt = reconstruct_from_chunks(
+            &payload_tar,
+            &manifest
+                .distribution
+                .as_ref()
+                .expect("distribution metadata")
+                .chunk_list,
+        )
+        .expect("rebuild");
+        assert_eq!(rebuilt, payload_tar);
     }
 }

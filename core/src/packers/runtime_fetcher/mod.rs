@@ -393,9 +393,9 @@ impl RuntimeFetcher {
         let total_size = response.content_length();
 
         if show_progress {
-            let _ = self
-                .reporter
-                .progress_start(format!("Downloading {}", url), total_size);
+            self.reporter
+                .progress_start(format!("Downloading {}", url), total_size)
+                .await?;
         }
 
         if let Some(parent) = dest.parent() {
@@ -414,14 +414,14 @@ impl RuntimeFetcher {
             _downloaded += chunk.len() as u64;
 
             if show_progress {
-                let _ = self.reporter.progress_inc(chunk.len() as u64);
+                self.reporter.progress_inc(chunk.len() as u64).await?;
             }
         }
 
         if show_progress {
-            let _ = self
-                .reporter
-                .progress_finish(Some("Download complete".to_string()));
+            self.reporter
+                .progress_finish(Some("Download complete".to_string()))
+                .await?;
         }
 
         Ok(())

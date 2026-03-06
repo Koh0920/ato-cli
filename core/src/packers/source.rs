@@ -25,7 +25,7 @@ pub struct SourcePackOptions {
     pub skip_validation: bool,
     pub nacelle_override: Option<PathBuf>,
     pub standalone: bool,
-    pub strict_v3: bool,
+    pub strict_manifest: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -58,7 +58,7 @@ pub fn pack(
     reporter: std::sync::Arc<dyn crate::reporter::CapsuleReporter + 'static>,
 ) -> Result<PathBuf> {
     let rt = tokio::runtime::Runtime::new()?;
-    let strict_v3 = opts.strict_v3 || strict_v3_from_env()?;
+    let strict_manifest = opts.strict_manifest || strict_manifest_from_env()?;
 
     let loaded = manifest::load_manifest(&opts.manifest_path)?;
     let source_digest = loaded
@@ -71,8 +71,8 @@ pub fn pack(
         let cas = create_cas_client_from_env()?;
         let exists = rt.block_on(cas.exists(digest))?;
         if !exists {
-            if strict_v3 {
-                return Err(CapsuleError::StrictV3FallbackNotAllowed(format!(
+            if strict_manifest {
+                return Err(CapsuleError::StrictManifestFallbackNotAllowed(format!(
                     "CAS blob not found for source_digest {}",
                     digest
                 )));
@@ -83,9 +83,9 @@ pub fn pack(
             );
             futures::executor::block_on(reporter.warn(message))?;
         }
-    } else if strict_v3 {
-        return Err(CapsuleError::StrictV3FallbackNotAllowed(
-            "source_digest is missing; strict-v3 forbids fallback to local source packaging"
+    } else if strict_manifest {
+        return Err(CapsuleError::StrictManifestFallbackNotAllowed(
+            "source_digest is missing; strict-manifest forbids fallback to local source packaging"
                 .to_string(),
         ));
     }
@@ -186,19 +186,19 @@ pub fn pack(
     }
 }
 
-fn strict_v3_from_env() -> Result<bool> {
-    let raw = match std::env::var("ATO_STRICT_V3") {
+fn strict_manifest_from_env() -> Result<bool> {
+    let raw = match std::env::var("ATO_STRICT_MANIFEST") {
         Ok(value) => value,
         Err(std::env::VarError::NotPresent) => return Ok(false),
         Err(err) => {
             return Err(CapsuleError::Config(format!(
-                "Failed to read ATO_STRICT_V3: {}",
+                "Failed to read ATO_STRICT_MANIFEST: {}",
                 err
             )));
         }
     };
 
-    parse_bool_env("ATO_STRICT_V3", &raw)
+    parse_bool_env("ATO_STRICT_MANIFEST", &raw)
 }
 
 fn parse_bool_env(key: &str, raw: &str) -> Result<bool> {
@@ -213,7 +213,7 @@ fn parse_bool_env(key: &str, raw: &str) -> Result<bool> {
     }
 }
 
-fn validate_entrypoint(manifest_path: &PathBuf, manifest_dir: &PathBuf) -> Result<()> {
+fn validate_entrypoint(manifest_path: &Path, manifest_dir: &Path) -> Result<()> {
     use std::fs;
 
     let manifest_content = fs::read_to_string(manifest_path)?;

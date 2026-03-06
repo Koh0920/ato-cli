@@ -67,7 +67,7 @@ impl OciHandle {
         container_id: String,
         last_resources: Arc<Mutex<ResourceStats>>,
     ) {
-        let _ = tokio::spawn(async move {
+        std::mem::drop(tokio::spawn(async move {
             let mut attempts = 0usize;
             loop {
                 let mut got_sample = false;
@@ -110,7 +110,7 @@ impl OciHandle {
 
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
-        });
+        }));
     }
 }
 

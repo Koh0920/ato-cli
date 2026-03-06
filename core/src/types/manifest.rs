@@ -336,7 +336,7 @@ pub struct ReadinessProbe {
 ///
 /// The primary configuration format for all Capsules in Gumball v0.3.0+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CapsuleManifestV1 {
+pub struct CapsuleManifest {
     /// Schema version (must be "0.2")
     #[serde(default = "default_schema_version")]
     pub schema_version: String,
@@ -357,7 +357,7 @@ pub struct CapsuleManifestV1 {
 
     /// Human-readable metadata
     #[serde(default)]
-    pub metadata: CapsuleMetadataV1,
+    pub metadata: CapsuleMetadata,
 
     /// Capsule capabilities (for inference type)
     #[serde(default)]
@@ -423,6 +423,52 @@ pub struct CapsuleManifestV1 {
     /// Optional and dev-first: absence means single-process execution via `execution`.
     #[serde(default)]
     pub services: Option<HashMap<String, ServiceSpec>>,
+
+    /// Distribution metadata generated at pack/publish time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distribution: Option<DistributionInfo>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DistributionInfo {
+    pub manifest_hash: String,
+    pub merkle_root: String,
+    #[serde(default)]
+    pub chunk_list: Vec<ChunkDescriptor>,
+    #[serde(default)]
+    pub signatures: Vec<SignatureEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChunkDescriptor {
+    pub chunk_hash: String,
+    pub offset: u64,
+    pub length: u64,
+    pub codec: String,
+    pub compression: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SignatureEntry {
+    pub signer_did: String,
+    pub key_id: String,
+    pub algorithm: String,
+    pub signature: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EpochPointer {
+    pub scoped_id: String,
+    pub epoch: u64,
+    pub manifest_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_epoch_hash: Option<String>,
+    pub issued_at: String,
+    pub signer_did: String,
+    pub key_id: String,
+    pub signature: String,
 }
 
 /// Polymorphism configuration
@@ -436,6 +482,10 @@ pub struct PolymorphismConfig {
 
 fn default_schema_version() -> String {
     "0.2".to_string()
+}
+
+fn is_supported_schema_version(value: &str) -> bool {
+    matches!(value.trim(), "0.2" | "1")
 }
 
 /// Pre-warmed container pool configuration
@@ -508,7 +558,7 @@ pub struct StorageVolume {
 
 /// Human-readable metadata
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct CapsuleMetadataV1 {
+pub struct CapsuleMetadata {
     /// Display name for UI
     #[serde(default)]
     pub display_name: Option<String>,
@@ -969,7 +1019,7 @@ impl TargetsConfig {
     }
 }
 
-impl CapsuleManifestV1 {
+impl CapsuleManifest {
     /// Parse from TOML string
     pub fn from_toml(content: &str) -> Result<Self, CapsuleError> {
         let raw: toml::Value = toml::from_str(content)
@@ -1094,7 +1144,7 @@ impl CapsuleManifestV1 {
         let mut errors = Vec::new();
 
         // Schema version must be "0.2"
-        if self.schema_version != "0.2" {
+        if !is_supported_schema_version(&self.schema_version) {
             errors.push(ValidationError::InvalidSchemaVersion(
                 self.schema_version.clone(),
             ));
@@ -1529,7 +1579,11 @@ impl std::fmt::Display for ValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ValidationError::InvalidSchemaVersion(v) => {
-                write!(f, "Invalid schema_version '{}', expected '0.2'", v)
+                write!(
+                    f,
+                    "Invalid schema_version '{}', expected '1' or legacy '0.2'",
+                    v
+                )
             }
             ValidationError::InvalidName(n) => {
                 write!(f, "Invalid name '{}', must be kebab-case", n)
@@ -1747,7 +1801,7 @@ quantization = "4bit"
 
     #[test]
     fn test_parse_valid_toml() {
-        let manifest = CapsuleManifestV1::from_toml(VALID_TOML).unwrap();
+        let manifest = CapsuleManifest::from_toml(VALID_TOML).unwrap();
 
         assert_eq!(manifest.name, "mlx-qwen3-8b");
         assert_eq!(manifest.version, "1.0.0");
@@ -1763,14 +1817,14 @@ quantization = "4bit"
 
     #[test]
     fn test_validate_valid_manifest() {
-        let manifest = CapsuleManifestV1::from_toml(VALID_TOML).unwrap();
+        let manifest = CapsuleManifest::from_toml(VALID_TOML).unwrap();
         assert!(manifest.validate().is_ok());
     }
 
     #[test]
     fn test_validate_invalid_schema_version() {
         let toml = VALID_TOML.replace("schema_version = \"0.2\"", "schema_version = \"2.0\"");
-        let manifest = CapsuleManifestV1::from_toml(&toml).unwrap();
+        let manifest = CapsuleManifest::from_toml(&toml).unwrap();
         let errors = manifest.validate().unwrap_err();
         assert!(errors
             .iter()
@@ -1780,7 +1834,7 @@ quantization = "4bit"
     #[test]
     fn test_validate_invalid_memory_string() {
         let toml = VALID_TOML.replace("vram_min = \"6GB\"", "vram_min = \"6XB\"");
-        let manifest = CapsuleManifestV1::from_toml(&toml).unwrap();
+        let manifest = CapsuleManifest::from_toml(&toml).unwrap();
         let errs = manifest.validate().unwrap_err();
         assert!(errs
             .iter()
@@ -1790,7 +1844,7 @@ quantization = "4bit"
     #[test]
     fn test_validate_invalid_name() {
         let toml = VALID_TOML.replace("name = \"mlx-qwen3-8b\"", "name = \"Invalid Name!\"");
-        let manifest = CapsuleManifestV1::from_toml(&toml).unwrap();
+        let manifest = CapsuleManifest::from_toml(&toml).unwrap();
         let errors = manifest.validate().unwrap_err();
         assert!(errors
             .iter()
@@ -1803,7 +1857,7 @@ quantization = "4bit"
             "[targets.cli]\nruntime = \"source\"\nentrypoint = \"server.py\"",
             "[targets.cli]\nruntime = \"source\"\ndriver = \"invalid-driver\"\nentrypoint = \"server.py\"",
         );
-        let manifest = CapsuleManifestV1::from_toml(&toml).unwrap();
+        let manifest = CapsuleManifest::from_toml(&toml).unwrap();
         let errors = manifest.validate().unwrap_err();
         assert!(errors
             .iter()
@@ -1816,7 +1870,7 @@ quantization = "4bit"
             "[targets.cli]\nruntime = \"source\"\nentrypoint = \"server.py\"",
             "[targets.cli]\nruntime = \"source\"\ndriver = \"python\"\nentrypoint = \"server.py\"",
         );
-        let manifest = CapsuleManifestV1::from_toml(&toml).unwrap();
+        let manifest = CapsuleManifest::from_toml(&toml).unwrap();
         let errors = manifest.validate().unwrap_err();
         assert!(errors
             .iter()
@@ -1836,7 +1890,7 @@ default_target = "static"
 runtime = "web"
 entrypoint = "dist"
 "#;
-        let manifest = CapsuleManifestV1::from_toml(toml).unwrap();
+        let manifest = CapsuleManifest::from_toml(toml).unwrap();
         let errors = manifest.validate().unwrap_err();
         assert!(errors.iter().any(|e| matches!(
             e,
@@ -1864,7 +1918,7 @@ entrypoint = "dist"
 public = ["dist/**"]
 port = 8080
 "#;
-        let manifest = CapsuleManifestV1::from_toml(toml).unwrap();
+        let manifest = CapsuleManifest::from_toml(toml).unwrap();
         let errors = manifest.validate().unwrap_err();
         assert!(errors.iter().any(|e| matches!(
             e,
@@ -1887,7 +1941,7 @@ driver = "static"
 entrypoint = "dist"
 port = 8080
 "#;
-        let manifest = CapsuleManifestV1::from_toml(toml).unwrap();
+        let manifest = CapsuleManifest::from_toml(toml).unwrap();
         assert!(manifest.validate().is_ok());
     }
 
@@ -1906,7 +1960,7 @@ driver = "node"
 entrypoint = "npm run start"
 port = 3000
 "#;
-        let manifest = CapsuleManifestV1::from_toml(toml).unwrap();
+        let manifest = CapsuleManifest::from_toml(toml).unwrap();
         let errors = manifest.validate().unwrap_err();
         assert!(errors.iter().any(|e| matches!(
             e,
@@ -1931,7 +1985,7 @@ port = 4173
 [services.main]
 entrypoint = "node apps/dashboard/server.js"
 "#;
-        let manifest = CapsuleManifestV1::from_toml(toml).unwrap();
+        let manifest = CapsuleManifest::from_toml(toml).unwrap();
         assert!(manifest.validate().is_ok());
     }
 
@@ -1952,7 +2006,7 @@ port = 4173
 [services.api]
 entrypoint = "python apps/api/main.py"
 "#;
-        let manifest = CapsuleManifestV1::from_toml(toml).unwrap();
+        let manifest = CapsuleManifest::from_toml(toml).unwrap();
         let errors = manifest.validate().unwrap_err();
         assert!(errors.iter().any(|e| matches!(
             e,
@@ -1979,7 +2033,7 @@ port = 4173
 entrypoint = "node apps/dashboard/server.js"
 depends_on = ["api"]
 "#;
-        let manifest = CapsuleManifestV1::from_toml(toml).unwrap();
+        let manifest = CapsuleManifest::from_toml(toml).unwrap();
         let errors = manifest.validate().unwrap_err();
         assert!(errors.iter().any(|e| matches!(
             e,
@@ -2010,7 +2064,7 @@ depends_on = ["api"]
 entrypoint = "python apps/api/main.py"
 depends_on = ["main"]
 "#;
-        let manifest = CapsuleManifestV1::from_toml(toml).unwrap();
+        let manifest = CapsuleManifest::from_toml(toml).unwrap();
         let errors = manifest.validate().unwrap_err();
         assert!(errors.iter().any(|e| matches!(
             e,
@@ -2040,7 +2094,7 @@ entrypoint = "node apps/dashboard/server.js"
 entrypoint = "python apps/api/main.py"
 readiness_probe = { port = "API_PORT" }
 "#;
-        let manifest = CapsuleManifestV1::from_toml(toml).unwrap();
+        let manifest = CapsuleManifest::from_toml(toml).unwrap();
         let errors = manifest.validate().unwrap_err();
         assert!(errors.iter().any(|e| matches!(
             e,
@@ -2067,7 +2121,7 @@ port = 4173
 entrypoint = "node apps/dashboard/server.js"
 expose = ["API_PORT"]
 "#;
-        let manifest = CapsuleManifestV1::from_toml(toml).unwrap();
+        let manifest = CapsuleManifest::from_toml(toml).unwrap();
         let errors = manifest.validate().unwrap_err();
         assert!(errors.iter().any(|e| matches!(
             e,
@@ -2078,9 +2132,9 @@ expose = ["API_PORT"]
 
     #[test]
     fn test_to_json_roundtrip() {
-        let manifest = CapsuleManifestV1::from_toml(VALID_TOML).unwrap();
+        let manifest = CapsuleManifest::from_toml(VALID_TOML).unwrap();
         let json = manifest.to_json().unwrap();
-        let manifest2 = CapsuleManifestV1::from_json(&json).unwrap();
+        let manifest2 = CapsuleManifest::from_json(&json).unwrap();
 
         assert_eq!(manifest.name, manifest2.name);
         assert_eq!(manifest.version, manifest2.version);
@@ -2093,7 +2147,7 @@ expose = ["API_PORT"]
             VALID_TOML
         );
 
-        let manifest = CapsuleManifestV1::from_toml(&toml).unwrap();
+        let manifest = CapsuleManifest::from_toml(&toml).unwrap();
 
         let build = manifest.build.as_ref().expect("build section should exist");
         assert!(build.gpu);
@@ -2124,19 +2178,19 @@ expose = ["API_PORT"]
 
     #[test]
     fn test_display_name() {
-        let manifest = CapsuleManifestV1::from_toml(VALID_TOML).unwrap();
+        let manifest = CapsuleManifest::from_toml(VALID_TOML).unwrap();
         assert_eq!(manifest.display_name(), "Qwen3 8B (MLX)");
     }
 
     #[test]
     fn test_can_fallback_to_cloud() {
-        let manifest = CapsuleManifestV1::from_toml(VALID_TOML).unwrap();
+        let manifest = CapsuleManifest::from_toml(VALID_TOML).unwrap();
         assert!(manifest.can_fallback_to_cloud());
     }
 
     #[test]
     fn test_vram_parsing() {
-        let manifest = CapsuleManifestV1::from_toml(VALID_TOML).unwrap();
+        let manifest = CapsuleManifest::from_toml(VALID_TOML).unwrap();
         let vram_min = manifest.requirements.vram_min_bytes().unwrap();
         assert_eq!(vram_min, Some(6 * 1024 * 1024 * 1024)); // 6GB
     }
@@ -2159,7 +2213,7 @@ runtime = "source"
 entrypoint = "main.py"
 "#;
 
-        let error = CapsuleManifestV1::from_toml(legacy_manifest).unwrap_err();
+        let error = CapsuleManifest::from_toml(legacy_manifest).unwrap_err();
         assert!(error
             .to_string()
             .contains("legacy [execution] section is not supported in schema_version=0.2"));
@@ -2185,7 +2239,7 @@ entrypoint = "main.py"
   }
 }"#;
 
-        let error = CapsuleManifestV1::from_json(legacy_manifest).unwrap_err();
+        let error = CapsuleManifest::from_json(legacy_manifest).unwrap_err();
         assert!(error
             .to_string()
             .contains("legacy [execution] section is not supported in schema_version=0.2"));

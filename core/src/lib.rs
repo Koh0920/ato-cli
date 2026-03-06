@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 pub mod common;
 pub mod config;
 pub mod diagnostics;
@@ -21,7 +19,6 @@ pub mod resource;
 pub mod router;
 pub mod runner;
 pub mod runtime;
-pub mod schema;
 pub mod schema_registry;
 pub mod security;
 pub mod signing;
