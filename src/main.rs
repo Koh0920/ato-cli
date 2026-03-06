@@ -160,7 +160,7 @@ Advanced Commands:
   key      Manage signing keys
   config   Manage configuration (registry, engine, source)
   publish  Publish capsule (Dock/private: direct upload, official: CI-first)
-  gen-ci   Generate GitHub Actions workflow for OIDC CI publish
+    gen-ci   Generate and write GitHub Actions workflow file to .github/workflows/ato-publish.yml
   registry Manage registry commands (resolve/list/cache/serve/delete)
 
 Options:
@@ -571,7 +571,7 @@ enum Commands {
 
     #[command(
         next_help_heading = "Advanced Commands",
-        about = "Generate fixed GitHub Actions workflow for OIDC CI publish"
+        about = "Generate and write GitHub Actions workflow file to .github/workflows/ato-publish.yml"
     )]
     GenCi,
 
@@ -874,6 +874,15 @@ enum ConfigCommands {
     Registry {
         #[command(subcommand)]
         command: ConfigRegistryCommands,
+    },
+
+    /// Set a config key/value (currently supports: registry.url)
+    Set {
+        /// Config key (e.g. registry.url)
+        key: String,
+
+        /// Config value
+        value: String,
     },
 }
 
@@ -1656,7 +1665,7 @@ fn run() -> Result<()> {
             limit,
             cursor,
             registry,
-            json,
+            json || cli.json,
             no_tui,
             show_manifest,
         ),
@@ -1694,6 +1703,9 @@ fn run() -> Result<()> {
                     ConfigRegistryCommands::ClearCache => RegistryCommands::ClearCache,
                 };
                 execute_registry_command(mapped)
+            }
+            ConfigCommands::Set { key, value } => {
+                execute_config_set_command(&key, &value, cli.json)
             }
         },
 
@@ -3865,10 +3877,46 @@ fn execute_search_command(
         .await?;
 
         if json {
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            println!("{}", serde_json::to_string_pretty(&result.capsules)?);
         }
         Ok(())
     })
+}
+
+fn execute_config_set_command(key: &str, value: &str, json_output: bool) -> Result<()> {
+    let mut config = capsule_core::config::load_config()?;
+
+    match key {
+        "registry.url" => {
+            config.registry.url = Some(value.to_string());
+        }
+        _ => {
+            anyhow::bail!(
+                "Unsupported config key '{}'. Supported keys: registry.url",
+                key
+            );
+        }
+    }
+
+    capsule_core::config::save_config(&config)?;
+    let path = capsule_core::config::config_path()?;
+
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "updated": true,
+                "key": key,
+                "value": value,
+                "path": path,
+            }))?
+        );
+    } else {
+        println!("✅ Updated config: {} = {}", key, value);
+        println!("📄 File: {}", path.display());
+    }
+
+    Ok(())
 }
 
 fn should_use_search_tui(

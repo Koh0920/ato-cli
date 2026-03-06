@@ -668,7 +668,7 @@ fn preflight_native_sandbox(
     })
     .map_err(|_| {
         AtoExecutionError::engine_missing(
-            "Tier 2 execution requires 'nacelle' to be installed and registered (use --nacelle, NACELLE_PATH, or `ato engine register`).",
+            "Tier 2 execution requires 'nacelle' to be installed and registered (run `ato config engine install --engine nacelle`, or use --nacelle / NACELLE_PATH / `ato config engine register`).",
             Some("nacelle"),
         )
     })?;

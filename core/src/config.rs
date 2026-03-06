@@ -13,11 +13,22 @@ pub struct CapsuleConfig {
     /// Registered engines by name.
     #[serde(default)]
     pub engines: HashMap<String, EngineRegistration>,
+
+    /// Registry-related user settings.
+    #[serde(default)]
+    pub registry: RegistryConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineRegistration {
     pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RegistryConfig {
+    /// Default registry URL used by supported commands.
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 pub fn config_dir() -> Result<PathBuf> {
