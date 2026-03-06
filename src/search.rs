@@ -9,7 +9,7 @@ use std::io::{Cursor, Read};
 const DEFAULT_STORE_API_URL: &str = "https://api.ato.run";
 const ENV_STORE_API_URL: &str = "ATO_STORE_API_URL";
 
-/// Store API package summary (from GET /v1/capsules)
+/// Store API package summary (from GET /v1/manifest/capsules)
 #[derive(Debug, Deserialize)]
 struct RawCapsulesResponse {
     capsules: Vec<RawCapsuleSummary>,
@@ -157,7 +157,7 @@ pub async fn search_capsules(
     let client = reqwest::Client::new();
 
     // Build query parameters
-    let mut url = format!("{}/v1/capsules", registry);
+    let mut url = format!("{}/v1/manifest/capsules", registry);
     let mut params = Vec::new();
 
     if let Some(q) = query {
@@ -263,7 +263,7 @@ pub async fn fetch_capsule_manifest(scoped_id: &str, registry_url: Option<&str>)
 
     let client = reqwest::Client::new();
     let url = format!(
-        "{}/v1/capsules/by/{}/{}",
+        "{}/v1/manifest/capsules/by/{}/{}",
         registry,
         urlencoding::encode(&publisher),
         urlencoding::encode(&slug)
@@ -395,7 +395,7 @@ async fn fetch_manifest_from_distribution_artifact(
     slug: &str,
 ) -> Result<Option<String>> {
     let distribution_url = format!(
-        "{}/v1/capsules/by/{}/{}/distributions",
+        "{}/v1/manifest/capsules/by/{}/{}/distributions",
         registry,
         urlencoding::encode(publisher),
         urlencoding::encode(slug)
@@ -435,11 +435,11 @@ async fn fetch_manifest_from_distribution_artifact(
 
 fn extract_manifest_from_capsule_archive(bytes: &[u8]) -> Result<String> {
     let mut archive = tar::Archive::new(Cursor::new(bytes));
-    let mut entries = archive
+    let entries = archive
         .entries()
         .context("Failed to read .capsule archive entries")?;
 
-    while let Some(entry) = entries.next() {
+    for entry in entries {
         let mut entry = entry.context("Invalid .capsule entry")?;
         let entry_path = entry
             .path()

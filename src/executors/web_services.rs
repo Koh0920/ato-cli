@@ -13,6 +13,7 @@ use capsule_core::router::ManifestData;
 use capsule_core::types::ServiceSpec;
 
 use crate::runtime_manager;
+use crate::runtime_overrides;
 
 use super::source::IpcEnvVars;
 
@@ -131,8 +132,10 @@ fn resolve_runtime_bins(
     plan: &ManifestData,
     services: &HashMap<String, ServiceSpec>,
 ) -> Result<RuntimeBins> {
-    let mut bins = RuntimeBins::default();
-    bins.deno = Some(runtime_manager::ensure_deno_binary(plan)?);
+    let mut bins = RuntimeBins {
+        deno: Some(runtime_manager::ensure_deno_binary(plan)?),
+        ..RuntimeBins::default()
+    };
 
     let mut required_tools: HashSet<String> = HashSet::new();
     for service in services.values() {
@@ -195,12 +198,12 @@ fn build_service_env(
     service: &ServiceSpec,
     ipc_env: Option<&IpcEnvVars>,
 ) -> Result<HashMap<String, String>> {
-    let mut env = plan.execution_env();
+    let mut env = runtime_overrides::merged_env(plan.execution_env());
     if let Some(extra) = service.env.as_ref() {
         env.extend(extra.clone());
     }
     if service_name == "main" {
-        if let Some(port) = plan.execution_port() {
+        if let Some(port) = runtime_overrides::override_port(plan.execution_port()) {
             env.insert("PORT".to_string(), port.to_string());
         }
     }

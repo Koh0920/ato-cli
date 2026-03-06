@@ -72,7 +72,7 @@ fn endpoint_from_tempdir(temp_dir: &TempDir) -> TsnetEndpoint {
 }
 
 async fn start_sidecar_for_test(temp_dir: &TempDir) -> (Child, TsnetClient, TsnetEndpoint) {
-    let mut child = spawn_sidecar(temp_dir).expect("failed to spawn ato-tsnetd");
+    let child = spawn_sidecar(temp_dir).expect("failed to spawn ato-tsnetd");
     let endpoint = endpoint_from_tempdir(temp_dir);
     let client =
         TsnetClient::from_endpoint(endpoint.clone()).expect("failed to create tsnet client");

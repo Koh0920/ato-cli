@@ -79,8 +79,6 @@ impl Drop for SidecarCleanup {
 
 mod ato_error_jsonl;
 mod auth;
-#[cfg(feature = "manifest-signing")]
-mod capsule_capnp;
 mod commands;
 mod common;
 mod consent_store;
@@ -96,7 +94,6 @@ mod install;
 mod ipc;
 mod keygen;
 mod new;
-mod observability;
 mod payload_guard;
 mod process_manager;
 mod profile;
@@ -107,11 +104,14 @@ mod publish_official;
 mod publish_preflight;
 mod publish_prepare;
 mod publish_private;
-mod publish_tui;
 mod registry;
+mod registry_delete;
 mod registry_serve;
+mod registry_store;
+mod registry_yank;
 mod reporters;
 mod runtime_manager;
+mod runtime_overrides;
 mod scaffold;
 mod search;
 mod sign;
@@ -160,7 +160,7 @@ Advanced Commands:
   config   Manage configuration (registry, engine, source)
   publish  Publish capsule (Dock/private: direct upload, official: CI-first)
   gen-ci   Generate GitHub Actions workflow for OIDC CI publish
-  registry Manage registry commands (resolve/list/cache/serve)
+  registry Manage registry commands (resolve/list/cache/serve/delete)
 
 Options:
 {options}
@@ -250,6 +250,10 @@ enum Commands {
         /// Allow installing/running unverified signatures in non-production environments
         #[arg(long, default_value_t = false)]
         allow_unverified: bool,
+
+        /// Allow explicit downgrade when remote epoch is older than locally trusted epoch
+        #[arg(long, default_value_t = false)]
+        allow_downgrade: bool,
     },
 
     #[command(
@@ -280,9 +284,38 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         allow_unverified: bool,
 
+        /// Allow explicit downgrade when remote epoch is older than locally trusted epoch
+        #[arg(long, default_value_t = false)]
+        allow_downgrade: bool,
+
         /// Output directory (default: ~/.ato/store/)
         #[arg(long)]
         output: Option<PathBuf>,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    #[command(
+        next_help_heading = "Primary Commands",
+        about = "Rollback a capsule to a specific manifest hash"
+    )]
+    Rollback {
+        /// Capsule scoped ID (publisher/slug)
+        scoped_id: String,
+
+        /// Target manifest hash (blake3:...)
+        #[arg(long = "to-manifest")]
+        to_manifest: String,
+
+        /// Registry URL
+        #[arg(long)]
+        registry: Option<String>,
+
+        /// Skip confirmation prompt
+        #[arg(long, default_value_t = false)]
+        yes: bool,
 
         /// Emit machine-readable JSON output
         #[arg(long)]
@@ -335,9 +368,9 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         keep_failed_artifacts: bool,
 
-        /// Disallow fallback when source_digest/CAS(v3 path) is unavailable
+        /// Disallow fallback when source_digest/CAS path is unavailable
         #[arg(long, default_value_t = false)]
-        strict_v3: bool,
+        strict_manifest: bool,
     },
 
     #[command(
@@ -681,9 +714,9 @@ enum Commands {
         #[arg(long, hide = true, default_value_t = false)]
         keep_failed_artifacts: bool,
 
-        /// Disallow fallback when source_digest/CAS(v3 path) is unavailable
+        /// Disallow fallback when source_digest/CAS path is unavailable
         #[arg(long, hide = true, default_value_t = false)]
-        strict_v3: bool,
+        strict_manifest: bool,
     },
 
     #[command(hide = true)]
@@ -1052,6 +1085,83 @@ enum RegistryCommands {
     /// Clear registry cache
     ClearCache,
 
+    /// Rotate local registry signing key with overlap window
+    RotateKey {
+        /// Data directory for local registry state
+        #[arg(long, default_value = "~/.ato/local-registry")]
+        data_dir: String,
+
+        /// Overlap window hours for previous key
+        #[arg(long, default_value_t = 24)]
+        overlap_hours: i64,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Revoke local registry trusted key by key id
+    RevokeKey {
+        /// Key id to revoke
+        kid: String,
+
+        /// Optional DID when key id is shared by multiple DIDs
+        #[arg(long)]
+        did: Option<String>,
+
+        /// Data directory for local registry state
+        #[arg(long, default_value = "~/.ato/local-registry")]
+        data_dir: String,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Delete a capsule (or a specific version) from a local registry server
+    Delete {
+        /// Scoped capsule id (publisher/slug)
+        #[arg(long = "scoped-id")]
+        scoped_id: String,
+
+        /// Local registry URL (for example: http://127.0.0.1:8787)
+        #[arg(long, default_value = "http://127.0.0.1:8787")]
+        registry: String,
+
+        /// Delete only a specific version (default deletes all versions)
+        #[arg(long)]
+        version: Option<String>,
+
+        /// Skip interactive confirmation
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Yank a manifest hash from local registry history (irreversible)
+    Yank {
+        /// Scoped capsule id (publisher/slug)
+        scoped_id: String,
+
+        /// Target manifest hash (blake3:...)
+        manifest_hash: String,
+
+        /// Local registry URL (for example: http://127.0.0.1:8787)
+        #[arg(long, default_value = "http://127.0.0.1:8787")]
+        registry: String,
+
+        /// Skip interactive confirmation
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Start local HTTP registry server for offline development
     Serve {
         /// Listen port
@@ -1217,6 +1327,7 @@ fn run() -> Result<()> {
             dangerously_skip_permissions,
             yes,
             allow_unverified,
+            allow_downgrade,
         } => execute_run_like_command(
             path,
             target,
@@ -1231,6 +1342,7 @@ fn run() -> Result<()> {
             dangerously_skip_permissions,
             yes,
             allow_unverified,
+            allow_downgrade,
             skill,
             from_skill,
             None,
@@ -1276,6 +1388,7 @@ fn run() -> Result<()> {
             dangerously_skip_permissions,
             yes,
             false,
+            false,
             None,
             None,
             Some("⚠️  'ato open' is deprecated. Use 'ato run' instead."),
@@ -1306,7 +1419,7 @@ fn run() -> Result<()> {
             force_large_payload,
             enforcement,
             keep_failed_artifacts,
-            strict_v3,
+            strict_manifest,
         } => commands::build::execute_pack_command(
             dir,
             init,
@@ -1314,7 +1427,7 @@ fn run() -> Result<()> {
             standalone,
             force_large_payload,
             keep_failed_artifacts,
-            strict_v3,
+            strict_manifest,
             enforcement.as_str().to_string(),
             reporter.clone(),
             cli.json,
@@ -1356,7 +1469,7 @@ fn run() -> Result<()> {
             force_large_payload,
             enforcement,
             keep_failed_artifacts,
-            strict_v3,
+            strict_manifest,
         } => {
             eprintln!("⚠️  'ato pack' is deprecated. Use 'ato build' instead.");
             commands::build::execute_pack_command(
@@ -1366,7 +1479,7 @@ fn run() -> Result<()> {
                 standalone,
                 force_large_payload,
                 keep_failed_artifacts,
-                strict_v3,
+                strict_manifest,
                 enforcement.as_str().to_string(),
                 reporter.clone(),
                 cli.json,
@@ -1446,6 +1559,7 @@ fn run() -> Result<()> {
             default,
             skip_verify_legacy,
             allow_unverified,
+            allow_downgrade,
             output,
             json,
         } => {
@@ -1493,6 +1607,7 @@ fn run() -> Result<()> {
                     output,
                     default,
                     allow_unverified,
+                    allow_downgrade,
                     json,
                 )
                 .await?;
@@ -1509,6 +1624,14 @@ fn run() -> Result<()> {
                 Ok(())
             })
         }
+
+        Commands::Rollback {
+            scoped_id,
+            to_manifest,
+            registry,
+            yes,
+            json,
+        } => execute_rollback_command(scoped_id, to_manifest, registry, yes, json),
 
         Commands::Search {
             query,
@@ -1850,6 +1973,108 @@ fn execute_registry_command(command: RegistryCommands) -> Result<()> {
                 println!("✅ Registry cache cleared");
                 Ok(())
             }
+            RegistryCommands::RotateKey {
+                data_dir,
+                overlap_hours,
+                json,
+            } => {
+                let expanded = expand_explicit_local_path(&data_dir);
+                let store = registry_store::RegistryStore::open(&expanded)?;
+                let result = store.rotate_signing_key(overlap_hours)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                } else {
+                    println!("✅ Rotated registry signing key");
+                    println!("   did: {}", result.signer_did);
+                    println!("   key_id: {}", result.key_id);
+                    if let Some(previous_key_id) = result.previous_key_id {
+                        println!("   previous_key_id: {}", previous_key_id);
+                    }
+                    if let Some(previous_valid_to) = result.previous_valid_to {
+                        println!("   previous_valid_to: {}", previous_valid_to);
+                    }
+                }
+                Ok(())
+            }
+            RegistryCommands::RevokeKey {
+                kid,
+                did,
+                data_dir,
+                json,
+            } => {
+                let expanded = expand_explicit_local_path(&data_dir);
+                let store = registry_store::RegistryStore::open(&expanded)?;
+                let result = store.revoke_key(&kid, did.as_deref())?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                } else {
+                    println!("✅ Revoked key {}", kid);
+                    println!("   revoked_rows: {}", result.revoked);
+                    if let Some(rotated_to) = result.active_key_rotated_to {
+                        println!("   active_key_rotated_to: {}", rotated_to);
+                    }
+                }
+                Ok(())
+            }
+            RegistryCommands::Delete {
+                scoped_id,
+                registry,
+                version,
+                yes,
+                json,
+            } => {
+                if !yes {
+                    confirm_registry_delete(&scoped_id, version.as_deref())?;
+                }
+                let result =
+                    registry_delete::delete_capsule(registry_delete::RegistryDeleteArgs {
+                        scoped_id,
+                        registry_url: registry,
+                        version,
+                    })?;
+
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                } else if result.removed_capsule {
+                    println!(
+                        "✅ Deleted {} from registry ({} version removed)",
+                        result.scoped_id, result.removed_versions
+                    );
+                } else if let Some(removed_version) = result.removed_version {
+                    println!(
+                        "✅ Deleted {}@{} from registry",
+                        result.scoped_id, removed_version
+                    );
+                } else {
+                    println!("✅ Delete request completed for {}", result.scoped_id);
+                }
+                Ok(())
+            }
+            RegistryCommands::Yank {
+                scoped_id,
+                manifest_hash,
+                registry,
+                yes,
+                json,
+            } => {
+                if !yes {
+                    confirm_registry_yank(&scoped_id, &manifest_hash)?;
+                }
+                let result = registry_yank::yank_manifest(registry_yank::RegistryYankArgs {
+                    scoped_id,
+                    manifest_hash,
+                    registry_url: registry,
+                })?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                } else {
+                    println!(
+                        "✅ Yanked manifest {} for {}",
+                        result.target_manifest_hash, result.scoped_id
+                    );
+                }
+                Ok(())
+            }
             RegistryCommands::Serve {
                 port,
                 data_dir,
@@ -1875,6 +2100,48 @@ fn execute_registry_command(command: RegistryCommands) -> Result<()> {
             }
         }
     })
+}
+
+fn confirm_registry_delete(scoped_id: &str, version: Option<&str>) -> Result<()> {
+    if !io::stdin().is_terminal() {
+        anyhow::bail!("Refusing to delete without --yes in non-interactive mode");
+    }
+
+    let target = if let Some(version) = version {
+        format!("{}@{}", scoped_id, version)
+    } else {
+        format!("{} (all versions)", scoped_id)
+    };
+    print!("Delete {} from registry? [y/N]: ", target);
+    io::stdout().flush()?;
+
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    let accepted = matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+    if !accepted {
+        anyhow::bail!("Delete cancelled");
+    }
+    Ok(())
+}
+
+fn confirm_registry_yank(scoped_id: &str, manifest_hash: &str) -> Result<()> {
+    if !io::stdin().is_terminal() {
+        anyhow::bail!("Refusing to yank without --yes in non-interactive mode");
+    }
+    print!(
+        "Yank manifest {} for {}? This is irreversible. [y/N]: ",
+        manifest_hash.trim(),
+        scoped_id.trim()
+    );
+    io::stdout().flush()?;
+
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    let accepted = matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+    if !accepted {
+        anyhow::bail!("Yank cancelled");
+    }
+    Ok(())
 }
 
 fn execute_publish_ci_command(
@@ -1951,35 +2218,6 @@ fn execute_publish_dry_run_command(
         )?;
         Ok(())
     })
-}
-
-fn execute_publish_guidance_command(json_output: bool, registry_url: &str) -> Result<()> {
-    if json_output {
-        let payload = serde_json::json!({
-            "ok": false,
-            "code": "CI_ONLY_PUBLISH",
-            "message": "Official registry publishing is CI-first. Use `ato publish --ci` in GitHub Actions, or `ato publish --dry-run` locally."
-        });
-        println!("{}", serde_json::to_string_pretty(&payload)?);
-    } else {
-        println!(
-            "❌ Direct local publishing is disabled for official registry ({}).",
-            registry_url
-        );
-        println!();
-        println!("Ato uses a strict CI-first publishing model via GitHub Actions (OIDC).");
-        println!("This guarantees published capsules match committed source.");
-        println!();
-        println!("👉 Next steps:");
-        println!("  1. Run `ato gen-ci` to generate `.github/workflows/ato-publish.yml`.");
-        println!("  2. Commit and tag your release (e.g. `git tag v0.1.0`).");
-        println!("  3. Push the tag to GitHub (`git push origin v0.1.0`).");
-        println!("  4. GitHub Actions runs `ato publish --ci` automatically.");
-        println!();
-        println!("💡 Tip: Run `ato publish --dry-run` to validate locally before pushing.");
-        println!("💡 Private registry directly publish: `ato publish --registry <url>`");
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -2469,7 +2707,7 @@ fn build_capsule_artifact_for_publish(cwd: &std::path::Path) -> Result<PathBuf> 
     let manifest_path = cwd.join("capsule.toml");
     let manifest_raw = std::fs::read_to_string(&manifest_path)
         .with_context(|| format!("Failed to read {}", manifest_path.display()))?;
-    let manifest = capsule_core::types::capsule_v1::CapsuleManifestV1::from_toml(&manifest_raw)
+    let manifest = capsule_core::types::CapsuleManifest::from_toml(&manifest_raw)
         .map_err(|err| anyhow::anyhow!("Failed to parse capsule.toml: {}", err))?;
     crate::publish_ci::build_capsule_artifact(&manifest_path, &manifest.name, &manifest.version)
         .with_context(|| "Failed to build artifact for publish")
@@ -2649,66 +2887,6 @@ fn is_official_publish_registry(url: &str) -> bool {
     host.eq_ignore_ascii_case("api.ato.run") || host.eq_ignore_ascii_case("staging.api.ato.run")
 }
 
-fn execute_publish_tui_command(reporter: std::sync::Arc<reporters::CliReporter>) -> Result<()> {
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
-        let outcome = publish_tui::execute().await?;
-        match outcome {
-            publish_tui::PublishTuiOutcome::Success(summary) => {
-                println!("✅ Ato publish completed successfully.");
-                println!("   Capsule: {} v{}", summary.capsule, summary.version);
-                println!("   Run URL: {}", summary.run_url);
-                futures::executor::block_on(
-                    reporter.notify("Interactive publish orchestration completed.".to_string()),
-                )?;
-                Ok(())
-            }
-            publish_tui::PublishTuiOutcome::Failure(summary) => {
-                println!("❌ Ato publish failed.");
-                println!("   {}", summary.message);
-                if let Some(conclusion) = summary.conclusion {
-                    println!("   Conclusion: {}", conclusion);
-                }
-                if let Some(run_url) = summary.run_url {
-                    println!("   Run URL: {}", run_url);
-                }
-                if !summary.details.is_empty() {
-                    println!();
-                    println!("Failure details:");
-                    for job in summary.details {
-                        println!(" - Job: {} ({})", job.name, job.status);
-                        if job.failed_steps.is_empty() {
-                            println!("   Failed steps: (not available)");
-                        } else {
-                            println!("   Failed steps: {}", job.failed_steps.join(", "));
-                        }
-                        if let Some(excerpt) = job.log_excerpt {
-                            for line in excerpt.lines().take(12) {
-                                println!("   {}", line);
-                            }
-                            if excerpt.lines().count() > 12 {
-                                println!("   ... (truncated)");
-                            }
-                        }
-                    }
-                }
-                if let Some(tag) = summary.tag {
-                    println!();
-                    println!("💡 Recovery:");
-                    println!("   git tag -d {}", tag);
-                    println!("   git push --delete origin {}", tag);
-                    println!("   fix and run `ato publish` again");
-                }
-                anyhow::bail!(summary.message)
-            }
-            publish_tui::PublishTuiOutcome::Cancelled => {
-                println!("Publish was cancelled.");
-                Ok(())
-            }
-        }
-    })
-}
-
 fn execute_setup_command(
     engine: String,
     version: Option<String>,
@@ -2881,6 +3059,7 @@ fn is_sha256_hex(value: &str) -> bool {
     value.len() == 64 && value.as_bytes().iter().all(|b| b.is_ascii_hexdigit())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_run_like_command(
     path: PathBuf,
     target: Option<String>,
@@ -2895,6 +3074,7 @@ fn execute_run_like_command(
     dangerously_skip_permissions: bool,
     yes: bool,
     allow_unverified: bool,
+    allow_downgrade: bool,
     skill: Option<String>,
     from_skill: Option<PathBuf>,
     deprecation_warning: Option<&str>,
@@ -2954,6 +3134,7 @@ fn execute_run_like_command(
         path,
         yes,
         allow_unverified,
+        allow_downgrade,
         registry.as_deref(),
         reporter.clone(),
     ))?;
@@ -2983,6 +3164,7 @@ async fn resolve_run_target_or_install(
     path: PathBuf,
     yes: bool,
     allow_unverified: bool,
+    allow_downgrade: bool,
     registry: Option<&str>,
     reporter: std::sync::Arc<reporters::CliReporter>,
 ) -> Result<PathBuf> {
@@ -3090,6 +3272,7 @@ async fn resolve_run_target_or_install(
         None,
         false,
         allow_unverified,
+        allow_downgrade,
         json_mode,
     )
     .await?;
@@ -3452,6 +3635,7 @@ fn enforce_sandbox_mode_flags(
     Ok(enforcement)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_open_command(
     path: PathBuf,
     target: Option<String>,
@@ -3529,6 +3713,83 @@ fn execute_source_rebuild_command(
     })
 }
 
+fn execute_rollback_command(
+    scoped_id: String,
+    to_manifest: String,
+    registry: Option<String>,
+    yes: bool,
+    json: bool,
+) -> Result<()> {
+    if !yes && !io::stdin().is_terminal() {
+        anyhow::bail!("Refusing rollback without --yes in non-interactive mode");
+    }
+    if !yes {
+        print!(
+            "Rollback {} to {} ? [y/N]: ",
+            scoped_id.trim(),
+            to_manifest.trim()
+        );
+        io::stdout().flush()?;
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        let accepted = matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
+        if !accepted {
+            anyhow::bail!("Rollback cancelled");
+        }
+    }
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let registry = if let Some(value) = registry {
+            value
+        } else {
+            registry::RegistryResolver::default()
+                .resolve("localhost")
+                .await?
+                .url
+        };
+        let client = reqwest::Client::new();
+        let endpoint = format!("{}/v1/manifest/rollback", registry.trim_end_matches('/'));
+        let request = client.post(&endpoint).json(&serde_json::json!({
+            "scoped_id": scoped_id,
+            "target_manifest_hash": to_manifest,
+        }));
+        let request = if let Some(token) = read_ato_token() {
+            request.header("authorization", format!("Bearer {}", token))
+        } else {
+            request
+        };
+        let response = request
+            .send()
+            .await
+            .with_context(|| "Failed to call rollback API")?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("Rollback failed ({}): {}", status, body);
+        }
+        let payload: serde_json::Value = response
+            .json()
+            .await
+            .with_context(|| "Invalid rollback response payload")?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&payload)?);
+        } else {
+            println!("✅ Rollback completed");
+            println!("{}", serde_json::to_string_pretty(&payload)?);
+        }
+        Ok(())
+    })
+}
+
+fn read_ato_token() -> Option<String> {
+    std::env::var("ATO_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn execute_search_command(
     query: Option<String>,
     category: Option<String>,

@@ -183,15 +183,6 @@ impl JsonRpcError {
         }
     }
 
-    /// Create a "parse error" (-32700).
-    pub fn parse_error(detail: &str) -> Self {
-        Self::new(
-            error_codes::PARSE_ERROR,
-            format!("Parse error: {}", detail),
-            Some("Ensure the message is valid JSON".to_string()),
-        )
-    }
-
     /// Create a "method not found" (-32601).
     pub fn method_not_found(method: &str) -> Self {
         Self::new(
@@ -210,27 +201,6 @@ impl JsonRpcError {
             error_codes::PERMISSION_DENIED,
             format!("Permission denied: {}", reason),
             Some("Check that your token has the required capability".to_string()),
-        )
-    }
-
-    /// Create a "service unavailable" (-32002).
-    pub fn service_unavailable(service: &str) -> Self {
-        Self::new(
-            error_codes::SERVICE_UNAVAILABLE,
-            format!("Service unavailable: {}", service),
-            Some(format!(
-                "Service '{}' is not running. It may have been stopped or never started. Check ato ipc status.",
-                service
-            )),
-        )
-    }
-
-    /// Create an "internal error" (-32603).
-    pub fn internal_error(detail: &str) -> Self {
-        Self::new(
-            error_codes::INTERNAL_ERROR,
-            format!("Internal error: {}", detail),
-            None,
         )
     }
 }
@@ -270,38 +240,6 @@ impl JsonRpcNotification {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Capsule-specific method names
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Well-known JSON-RPC method names for Capsule IPC.
-pub mod methods {
-    /// Handshake — must be first call from client.
-    pub const INITIALIZE: &str = "capsule/initialize";
-    /// Invoke a method on a remote service.
-    pub const INVOKE: &str = "capsule/invoke";
-    /// Health check ping.
-    pub const PING: &str = "capsule/ping";
-    /// Graceful shutdown request.
-    pub const SHUTDOWN: &str = "capsule/lifecycle.shutdown";
-    /// Service reports ready to shut down.
-    pub const READY_TO_SHUTDOWN: &str = "capsule/lifecycle.ready_to_shutdown";
-    /// Read payload (guest protocol).
-    pub const PAYLOAD_READ: &str = "capsule/payload.read";
-    /// Write payload (guest protocol).
-    pub const PAYLOAD_WRITE: &str = "capsule/payload.write";
-    /// List payload files (guest protocol).
-    pub const PAYLOAD_LIST: &str = "capsule/payload.list";
-    /// Read context (guest protocol).
-    pub const CONTEXT_READ: &str = "capsule/context.read";
-    /// Write context (guest protocol).
-    pub const CONTEXT_WRITE: &str = "capsule/context.write";
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Initialize handshake types
-// ═══════════════════════════════════════════════════════════════════════════
-
 /// Parameters for `capsule/initialize`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InitializeParams {
@@ -312,19 +250,6 @@ pub struct InitializeParams {
     /// Capabilities the client supports.
     #[serde(default)]
     pub capabilities: Vec<String>,
-}
-
-/// Result for `capsule/initialize`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InitializeResult {
-    /// Protocol version negotiated.
-    pub protocol_version: String,
-    /// Server capsule name.
-    pub server_name: String,
-    /// Methods available on the server.
-    pub available_methods: Vec<String>,
-    /// Bearer token for subsequent calls.
-    pub token: String,
 }
 
 /// Parameters for `capsule/invoke`.
@@ -339,17 +264,6 @@ pub struct InvokeParams {
     /// Method arguments.
     #[serde(default)]
     pub args: Value,
-}
-
-/// Parameters for `capsule/ping`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PingResult {
-    /// Service name.
-    pub service: String,
-    /// Uptime in seconds.
-    pub uptime_secs: u64,
-    /// Current timestamp (ISO 8601).
-    pub timestamp: String,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

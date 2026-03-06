@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -70,14 +72,6 @@ fn wait_for_well_known(base_url: &str) -> Result<()> {
         thread::sleep(Duration::from_millis(100));
     }
     anyhow::bail!("local registry did not become ready: {}", url);
-}
-
-fn run_ato(ato: &Path, args: &[&str], cwd: &Path) -> Result<std::process::Output> {
-    Command::new(ato)
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .with_context(|| format!("failed to run ato {:?}", args))
 }
 
 fn run_ato_with_home(
@@ -294,9 +288,8 @@ entrypoint = "main.ts"
         String::from_utf8_lossy(&third_publish.stderr)
     );
     let third_stdout = String::from_utf8_lossy(&third_publish.stdout);
-    assert_eq!(
+    assert!(
         third_stdout.contains("Existing release reused (same sha256, no new upload)."),
-        true,
         "expected reused-release message in allow-existing path; stdout={}",
         third_stdout
     );
@@ -382,11 +375,13 @@ entrypoint = "main.ts"
         "search response missing test-local capsule"
     );
 
-    let detail: serde_json::Value =
-        reqwest::blocking::get(format!("{}/v1/capsules/by/local/test-local", base_url))
-            .context("detail endpoint call")?
-            .json()
-            .context("detail json parse")?;
+    let detail: serde_json::Value = reqwest::blocking::get(format!(
+        "{}/v1/manifest/capsules/by/local/test-local",
+        base_url
+    ))
+    .context("detail endpoint call")?
+    .json()
+    .context("detail json parse")?;
     assert_eq!(
         detail
             .get("manifest")
@@ -402,7 +397,7 @@ entrypoint = "main.ts"
         .context("build client")?;
     let resp = client
         .get(format!(
-            "{}/v1/capsules/by/local/test-local/download?version=1.0.0",
+            "{}/v1/manifest/capsules/by/local/test-local/download?version=1.0.0",
             base_url
         ))
         .send()

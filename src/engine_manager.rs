@@ -1,11 +1,14 @@
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 const ENGINES_DIR: &str = ".ato/engines";
 
+#[cfg(test)]
+use serde::{Deserialize, Serialize};
+
+#[cfg(test)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineInfo {
     pub name: String,
@@ -14,11 +17,6 @@ pub struct EngineInfo {
     pub sha256: String,
     pub arch: String,
     pub os: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EngineManifest {
-    pub engines: Vec<EngineInfo>,
 }
 
 pub struct EngineManager {
@@ -43,42 +41,11 @@ impl EngineManager {
         Ok(Self { engines_dir })
     }
 
-    pub fn get_engines_dir(&self) -> &Path {
-        &self.engines_dir
-    }
-
     pub fn engine_path(&self, name: &str, version: &str) -> PathBuf {
         self.engines_dir.join(format!("{}-{}", name, version))
     }
 
-    pub fn list_engines(&self) -> Result<Vec<EngineInfo>> {
-        if !self.engines_dir.exists() {
-            return Ok(Vec::new());
-        }
-
-        let mut engines = Vec::new();
-
-        for entry in fs::read_dir(&self.engines_dir).with_context(|| {
-            format!(
-                "Failed to read engines directory: {}",
-                self.engines_dir.display()
-            )
-        })? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.is_file() {
-                if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-                    if let Some(info) = self.parse_engine_filename(filename) {
-                        engines.push(info);
-                    }
-                }
-            }
-        }
-
-        Ok(engines)
-    }
-
+    #[cfg(test)]
     fn parse_engine_filename(&self, filename: &str) -> Option<EngineInfo> {
         let parts: Vec<&str> = filename.split('-').collect();
         if parts.len() < 3 {
@@ -184,26 +151,6 @@ impl EngineManager {
 
         Ok(output_path)
     }
-
-    pub fn remove_engine(&self, name: &str, version: &str) -> Result<bool> {
-        let path = self.engine_path(name, version);
-
-        if !path.exists() {
-            return Ok(false);
-        }
-
-        fs::remove_file(&path).with_context(|| format!("Failed to remove: {}", path.display()))?;
-
-        Ok(true)
-    }
-
-    pub fn get_default_engine(&self) -> Option<EngineInfo> {
-        let config = capsule_core::config::load_config().ok()?;
-        let default = config.default_engine?;
-
-        let engines = self.list_engines().ok()?;
-        engines.into_iter().find(|e| e.name == default)
-    }
 }
 
 #[cfg(test)]
@@ -278,37 +225,5 @@ mod tests {
         assert_eq!(info.sha256, deserialized.sha256);
         assert_eq!(info.arch, deserialized.arch);
         assert_eq!(info.os, deserialized.os);
-    }
-
-    #[test]
-    fn test_engine_manifest_serialization() {
-        let manifest = EngineManifest {
-            engines: vec![
-                EngineInfo {
-                    name: "nacelle".to_string(),
-                    version: "v1.0.0".to_string(),
-                    url: "https://example.com/nacelle".to_string(),
-                    sha256: "sha123".to_string(),
-                    arch: "x64".to_string(),
-                    os: "linux".to_string(),
-                },
-                EngineInfo {
-                    name: "nacelle".to_string(),
-                    version: "v1.1.0".to_string(),
-                    url: "https://example.com/nacelle-v1.1.0".to_string(),
-                    sha256: "sha456".to_string(),
-                    arch: "arm64".to_string(),
-                    os: "darwin".to_string(),
-                },
-            ],
-        };
-
-        let serialized = serde_json::to_string(&manifest).expect("Failed to serialize");
-        let deserialized: EngineManifest =
-            serde_json::from_str(&serialized).expect("Failed to deserialize");
-
-        assert_eq!(deserialized.engines.len(), 2);
-        assert_eq!(deserialized.engines[0].version, "v1.0.0");
-        assert_eq!(deserialized.engines[1].version, "v1.1.0");
     }
 }

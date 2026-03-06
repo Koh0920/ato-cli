@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
@@ -316,6 +315,7 @@ fn sanitize_manifest_name(raw: &str) -> String {
         .to_string()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_capsule_manifest(
     name: &str,
     version: &str,
@@ -356,9 +356,10 @@ fn write_capsule_lock(root: &Path, manifest_path: &Path) -> Result<()> {
             manifest_path.display()
         )
     })?;
-    let mut hasher = Sha256::new();
-    hasher.update(manifest_text.as_bytes());
-    let hash = format!("sha256:{:x}", hasher.finalize());
+    let manifest = capsule_core::types::CapsuleManifest::from_toml(&manifest_text)
+        .context("failed to parse generated manifest schema")?;
+    let hash = capsule_core::packers::payload::compute_manifest_hash_without_signatures(&manifest)
+        .context("failed to compute generated manifest hash")?;
 
     let lock = format!(
         "version = \"1\"\n\n[meta]\ncreated_at = \"2026-02-24T00:00:00Z\"\nmanifest_hash = \"{}\"\n\n[targets]\n",

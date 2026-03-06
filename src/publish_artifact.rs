@@ -125,7 +125,7 @@ pub fn inspect_artifact_manifest(path: &Path) -> Result<ArtifactManifestInfo> {
     let bytes = std::fs::read(path)
         .with_context(|| format!("Failed to read artifact: {}", path.display()))?;
     let manifest = extract_manifest_from_capsule(&bytes)?;
-    let parsed = capsule_core::types::capsule_v1::CapsuleManifestV1::from_toml(&manifest)
+    let parsed = capsule_core::types::CapsuleManifest::from_toml(&manifest)
         .map_err(|err| anyhow::anyhow!("Failed to parse capsule.toml from artifact: {}", err))?;
 
     Ok(ArtifactManifestInfo {
@@ -174,7 +174,7 @@ fn load_artifact_payload(path: &Path, scoped_id: &str) -> Result<ArtifactPayload
     let bytes = std::fs::read(path)
         .with_context(|| format!("Failed to read artifact: {}", path.display()))?;
     let manifest = extract_manifest_from_capsule(&bytes)?;
-    let parsed = capsule_core::types::capsule_v1::CapsuleManifestV1::from_toml(&manifest)
+    let parsed = capsule_core::types::CapsuleManifest::from_toml(&manifest)
         .map_err(|err| anyhow::anyhow!("Failed to parse capsule.toml from artifact: {}", err))?;
 
     if parsed.name != scoped.slug {
@@ -200,11 +200,11 @@ fn load_artifact_payload(path: &Path, scoped_id: &str) -> Result<ArtifactPayload
 
 fn extract_manifest_from_capsule(bytes: &[u8]) -> Result<String> {
     let mut archive = tar::Archive::new(Cursor::new(bytes));
-    let mut entries = archive
+    let entries = archive
         .entries()
         .context("Failed to read .capsule archive entries")?;
 
-    while let Some(entry) = entries.next() {
+    for entry in entries {
         let mut entry = entry.context("Invalid .capsule entry")?;
         let entry_path = entry
             .path()
@@ -398,9 +398,7 @@ entrypoint = "main.ts"
         let path = tmp.path().join("sample-capsule.capsule");
         std::fs::write(&path, test_capsule_bytes("sample-capsule", "1.0.0")).expect("write");
 
-        let err = load_artifact_payload(&path, "koh0920/another-slug")
-            .err()
-            .expect("must fail");
+        let err = load_artifact_payload(&path, "koh0920/another-slug").expect_err("must fail");
         assert!(err
             .to_string()
             .contains("must match artifact manifest.name"));

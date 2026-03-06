@@ -17,13 +17,12 @@ use crate::executors::source::ExecuteMode;
 use crate::ipc::inject::IpcContext;
 use crate::reporters::CliReporter;
 use crate::runtime_manager;
+use crate::runtime_overrides;
 use capsule_core::execution_plan::error::AtoExecutionError;
 use capsule_core::execution_plan::guard::{self, ExecutorKind};
 use capsule_core::{lockfile, router, CapsuleReporter};
 
 mod watch;
-
-const DEFAULT_DEBOUNCE_MS: u64 = 300;
 
 pub struct OpenArgs {
     pub target: PathBuf,
@@ -40,10 +39,9 @@ pub struct OpenArgs {
 
 pub async fn execute(args: OpenArgs) -> Result<()> {
     let target = args.target.clone();
-    let target_name = target
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(|s| s.to_string());
+    let target_is_manifest_file =
+        target.is_file() && target.file_name().and_then(|n| n.to_str()) == Some("capsule.toml");
+    let target_is_manifest_dir = target.is_dir() && target.join("capsule.toml").exists();
 
     if target
         .extension()
@@ -51,13 +49,7 @@ pub async fn execute(args: OpenArgs) -> Result<()> {
         == Some("capsule".to_string())
     {
         execute_capsule_file(&args, &target).await
-    } else if target.is_dir() && target.join("capsule.toml").exists() {
-        if args.watch {
-            execute_watch_mode(args)
-        } else {
-            execute_normal_mode(args).await
-        }
-    } else if target.is_file() && target_name == Some("capsule.toml".to_string()) {
+    } else if target_is_manifest_dir || target_is_manifest_file {
         if args.watch {
             execute_watch_mode(args)
         } else {
@@ -135,16 +127,11 @@ async fn execute_capsule_file(args: &OpenArgs, capsule_path: &PathBuf) -> Result
         anyhow::bail!("Extracted capsule does not contain capsule.toml");
     }
 
-    let original_dir = {
-        let parent = capsule_path.parent();
-        if parent.map(|p| p.as_os_str().is_empty()).unwrap_or(true) {
-            std::env::current_dir().context("Failed to get current directory")?
-        } else if parent == Some(std::path::Path::new(".")) {
-            std::env::current_dir().context("Failed to get current directory")?
-        } else {
-            parent.unwrap().to_path_buf()
-        }
-    };
+    let original_dir = capsule_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty() && *parent != std::path::Path::new("."))
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or(std::env::current_dir().context("Failed to get current directory")?);
 
     let has_source_files = check_has_source_files(&extract_dir);
     let original_has_source = check_has_source_files(&original_dir);
@@ -247,54 +234,51 @@ fn check_has_source_files(dir: &Path) -> bool {
     let mut file_count = 0usize;
     let mut has_actual_source_files = false;
 
-    for entry in entries {
-        if let Ok(entry) = entry {
-            file_count += 1;
-            let file_name = entry.file_name();
-            let path = entry.path();
+    for entry in entries.flatten() {
+        file_count += 1;
+        let file_name = entry.file_name();
+        let path = entry.path();
 
-            if file_name == "capsule.toml"
-                || file_name == "capsule.lock"
-                || file_name == "config.json"
-                || file_name == "signature.json"
+        if file_name == "capsule.toml"
+            || file_name == "capsule.lock"
+            || file_name == "config.json"
+            || file_name == "signature.json"
+        {
+            continue;
+        }
+
+        if path.is_file() {
+            let name = file_name.to_string_lossy();
+            if name == "package.json"
+                || name == "pyproject.toml"
+                || name == "requirements.txt"
+                || name == "go.mod"
+                || name == "Cargo.toml"
             {
-                continue;
+                return true;
+            }
+            if is_source_file(&file_name) {
+                return true;
+            }
+            has_actual_source_files = true;
+        }
+
+        if path.is_dir() && !is_hidden(&file_name) {
+            if file_name == "source"
+                && fs::read_dir(&path)
+                    .ok()
+                    .and_then(|mut it| it.next())
+                    .is_some()
+            {
+                return true;
             }
 
-            if path.is_file() {
-                let name = file_name.to_string_lossy();
-                if name == "package.json"
-                    || name == "pyproject.toml"
-                    || name == "requirements.txt"
-                    || name == "go.mod"
-                    || name == "Cargo.toml"
-                {
-                    return true;
-                }
-                if is_source_file(&file_name) {
-                    return true;
-                }
-                has_actual_source_files = true;
-            }
-
-            if path.is_dir() && !is_hidden(&file_name) {
-                if file_name == "source" {
-                    if fs::read_dir(&path)
-                        .ok()
-                        .and_then(|mut it| it.next())
-                        .is_some()
-                    {
-                        return true;
-                    }
-                }
-
-                if path.join("package.json").exists()
-                    || path.join("pyproject.toml").exists()
-                    || path.join("index.js").exists()
-                    || path.join("main.py").exists()
-                {
-                    return true;
-                }
+            if path.join("package.json").exists()
+                || path.join("pyproject.toml").exists()
+                || path.join("index.js").exists()
+                || path.join("main.py").exists()
+            {
+                return true;
             }
         }
     }
@@ -487,6 +471,8 @@ async fn execute_normal_mode(args: OpenArgs) -> Result<()> {
                     },
                     start_time: std::time::SystemTime::now(),
                     manifest_path: Some(decision.plan.manifest_path.clone()),
+                    scoped_id: runtime_overrides::scoped_id_override(),
+                    target_label: Some(decision.plan.selected_target_label().to_string()),
                 };
 
                 let pm = crate::process_manager::ProcessManager::new()?;
@@ -540,6 +526,8 @@ async fn execute_normal_mode(args: OpenArgs) -> Result<()> {
                     runtime: "web-static".to_string(),
                     start_time: std::time::SystemTime::now(),
                     manifest_path: Some(decision.plan.manifest_path.clone()),
+                    scoped_id: runtime_overrides::scoped_id_override(),
+                    target_label: Some(decision.plan.selected_target_label().to_string()),
                 };
 
                 let pm = crate::process_manager::ProcessManager::new()?;
@@ -590,7 +578,7 @@ async fn notify_web_endpoint(
     plan: &capsule_core::router::ManifestData,
     reporter: &Arc<CliReporter>,
 ) -> Result<()> {
-    let port = plan.execution_port().ok_or_else(|| {
+    let port = runtime_overrides::override_port(plan.execution_port()).ok_or_else(|| {
         anyhow::anyhow!(
             "runtime=web target '{}' requires targets.<label>.port",
             plan.selected_target_label()
@@ -714,9 +702,17 @@ fn preflight_required_environment_variables(
         return Ok(());
     }
 
+    let override_env = runtime_overrides::override_env();
     let missing: Vec<String> = required
         .into_iter()
         .filter(|name| {
+            if override_env
+                .get(name)
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false)
+            {
+                return false;
+            }
             std::env::var(name)
                 .map(|v| v.trim().is_empty())
                 .unwrap_or(true)
@@ -966,12 +962,7 @@ fn detect_required_glibc_from_entrypoint(
     let has_verneed = elf
         .dynamic
         .as_ref()
-        .map(|dynamic| {
-            dynamic
-                .dyns
-                .iter()
-                .any(|entry| entry.d_tag == DT_VERNEED as u64)
-        })
+        .map(|dynamic| dynamic.dyns.iter().any(|entry| entry.d_tag == DT_VERNEED))
         .unwrap_or(false);
     if !has_verneed {
         return Ok(None);
@@ -1257,6 +1248,18 @@ mod tests {
         assert!(preflight_required_environment_variables(&plan).is_ok());
 
         std::env::remove_var(key);
+    }
+
+    #[test]
+    fn preflight_required_env_passes_with_runtime_override() {
+        let key = "ATO_TEST_REQUIRED_ENV_FROM_OVERRIDE";
+        std::env::remove_var(key);
+        std::env::set_var("ATO_UI_OVERRIDE_ENV_JSON", format!(r#"{{"{}":"ok"}}"#, key));
+
+        let plan = manifest_with_required_env(vec![key]);
+        assert!(preflight_required_environment_variables(&plan).is_ok());
+
+        std::env::remove_var("ATO_UI_OVERRIDE_ENV_JSON");
     }
 
     fn manifest_with_required_env(keys: Vec<&str>) -> ManifestData {

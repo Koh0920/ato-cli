@@ -26,25 +26,18 @@
 //! - **Universal Runtime**: IPC works across Source, OCI, and Wasm runtimes.
 //! - **Process Boundary Pattern**: JSON-RPC 2.0 over Unix Domain Sockets.
 
-// IPC modules will be fully integrated in Phase 13b.6+.
-// Suppress dead_code warnings until then.
-#[allow(dead_code)]
 pub mod broker;
-#[allow(dead_code)]
+#[cfg(test)]
 pub mod dag;
-#[allow(dead_code)]
 pub mod inject;
-#[allow(dead_code)]
+#[cfg(test)]
 pub mod jsonrpc;
-#[allow(dead_code)]
+#[cfg(test)]
 pub mod refcount;
-#[allow(dead_code)]
 pub mod registry;
-#[allow(dead_code)]
+#[cfg(test)]
 pub mod schema;
-#[allow(dead_code)]
 pub mod token;
-#[allow(dead_code)]
 pub mod types;
-#[allow(dead_code)]
+#[cfg(test)]
 pub mod validate;

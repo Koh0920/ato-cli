@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 #[cfg(any(unix, windows))]
 use std::process::Command;
 use std::time::SystemTime;
@@ -18,6 +18,10 @@ pub struct ProcessInfo {
     pub runtime: String,
     pub start_time: SystemTime,
     pub manifest_path: Option<PathBuf>,
+    #[serde(default)]
+    pub scoped_id: Option<String>,
+    #[serde(default)]
+    pub target_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,10 +58,6 @@ impl ProcessManager {
         }
 
         Ok(Self { run_dir })
-    }
-
-    pub fn get_run_dir(&self) -> &Path {
-        &self.run_dir
     }
 
     pub fn pid_file_path(&self, id: &str) -> PathBuf {
@@ -104,7 +104,7 @@ impl ProcessManager {
 
             if path
                 .extension()
-                .map_or(false, |ext| ext == PID_FILE_EXT.trim_start_matches('.'))
+                .is_some_and(|ext| ext == PID_FILE_EXT.trim_start_matches('.'))
             {
                 if let Some(filename) = path.file_stem() {
                     if let Some(id) = filename.to_str() {
@@ -169,14 +169,47 @@ impl ProcessManager {
             return Ok(false);
         }
 
-        if terminate_process(info.pid, force)? {
-            wait_for_process_exit(info.pid, 10)?;
-            self.delete_pid(id)?;
-            Ok(true)
+        let runtime_is_ato_run = info.runtime.eq_ignore_ascii_case("ato-run");
+
+        let terminated = if runtime_is_ato_run {
+            #[cfg(unix)]
+            {
+                let group = terminate_process_group(info.pid, force).unwrap_or_default();
+                let single = terminate_process(info.pid, force)?;
+                group || single
+            }
+            #[cfg(not(unix))]
+            {
+                terminate_process(info.pid, force)?
+            }
         } else {
+            terminate_process(info.pid, force)?
+        };
+
+        if !terminated {
             self.delete_pid(id)?;
-            Ok(false)
+            return Ok(false);
         }
+
+        if let Err(wait_err) = wait_for_process_exit(info.pid, 10) {
+            if !force {
+                if runtime_is_ato_run {
+                    #[cfg(unix)]
+                    {
+                        let _ = terminate_process_group(info.pid, true);
+                    }
+                }
+                let _ = terminate_process(info.pid, true);
+                if wait_for_process_exit(info.pid, 3).is_ok() || !is_process_alive(info.pid) {
+                    self.delete_pid(id)?;
+                    return Ok(true);
+                }
+            }
+            return Err(wait_err);
+        }
+
+        self.delete_pid(id)?;
+        Ok(true)
     }
 
     pub fn cleanup_dead_processes(&self) -> Result<usize> {
@@ -189,7 +222,7 @@ impl ProcessManager {
 
             if path
                 .extension()
-                .map_or(false, |ext| ext == PID_FILE_EXT.trim_start_matches('.'))
+                .is_some_and(|ext| ext == PID_FILE_EXT.trim_start_matches('.'))
             {
                 if let Some(filename) = path.file_stem() {
                     if let Some(id) = filename.to_str() {
@@ -217,9 +250,17 @@ fn is_process_alive(pid: i32) -> bool {
     }
 
     #[cfg(unix)]
-    unsafe {
-        let result = libc::kill(pid as i32, 0);
-        return result == 0 || errno() != libc::ESRCH;
+    {
+        if try_reap_child_process(pid) {
+            return false;
+        }
+        if is_process_zombie(pid) {
+            return false;
+        }
+        unsafe {
+            let result = libc::kill(pid, 0);
+            result == 0 || errno() != libc::ESRCH
+        }
     }
 
     #[cfg(windows)]
@@ -247,8 +288,48 @@ fn is_process_alive(pid: i32) -> bool {
 }
 
 #[cfg(unix)]
+fn try_reap_child_process(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+
+    let mut status: libc::c_int = 0;
+    let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+    result == pid
+}
+
+#[cfg(unix)]
+fn is_process_zombie(pid: i32) -> bool {
+    let Some(output) = run_ps_output(&["-p", &pid.to_string(), "-o", "stat="]) else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let stat = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    !stat.is_empty() && stat.starts_with('Z')
+}
+
+#[cfg(unix)]
 fn errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+}
+
+#[cfg(unix)]
+fn run_ps_output(args: &[&str]) -> Option<std::process::Output> {
+    let mut last_output = None;
+    for bin in ["ps", "/bin/ps", "/usr/bin/ps"] {
+        match Command::new(bin).args(args).output() {
+            Ok(output) => {
+                if output.status.success() {
+                    return Some(output);
+                }
+                last_output = Some(output);
+            }
+            Err(_) => continue,
+        }
+    }
+    last_output
 }
 
 fn process_identity_matches(info: &ProcessInfo) -> bool {
@@ -300,10 +381,7 @@ fn read_process_commandline(pid: i32) -> Option<String> {
 
     #[cfg(unix)]
     {
-        let output = Command::new("ps")
-            .args(["-p", &pid.to_string(), "-o", "command="])
-            .output()
-            .ok()?;
+        let output = run_ps_output(&["-p", &pid.to_string(), "-o", "command="])?;
         if !output.status.success() {
             return None;
         }
@@ -415,6 +493,29 @@ fn terminate_process(pid: i32, force: bool) -> Result<bool> {
     }
 }
 
+#[cfg(unix)]
+fn terminate_process_group(pgid: i32, force: bool) -> Result<bool> {
+    if pgid <= 0 {
+        return Ok(false);
+    }
+
+    let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
+    let result = unsafe { libc::kill(-pgid, signal) };
+    if result == 0 {
+        return Ok(true);
+    }
+
+    let err = errno();
+    if err == libc::ESRCH {
+        Ok(false)
+    } else {
+        Err(anyhow::anyhow!(
+            "Failed to send signal to process group {}",
+            pgid
+        ))
+    }
+}
+
 pub fn get_process_uptime(start_time: SystemTime) -> Result<std::time::Duration> {
     let now = SystemTime::now();
     now.duration_since(start_time)
@@ -483,6 +584,8 @@ mod tests {
             runtime: "nacelle".to_string(),
             start_time: SystemTime::UNIX_EPOCH,
             manifest_path: Some(PathBuf::from("/path/to/capsule.toml")),
+            scoped_id: Some("capsules/my-capsule".to_string()),
+            target_label: Some("cli".to_string()),
         };
 
         let serialized = toml::to_string(&info).expect("Failed to serialize");
@@ -494,6 +597,8 @@ mod tests {
         assert_eq!(info.status, deserialized.status);
         assert_eq!(info.runtime, deserialized.runtime);
         assert_eq!(info.manifest_path, deserialized.manifest_path);
+        assert_eq!(info.scoped_id, deserialized.scoped_id);
+        assert_eq!(info.target_label, deserialized.target_label);
     }
 
     #[test]
@@ -506,6 +611,8 @@ mod tests {
             runtime: "nacelle".to_string(),
             start_time: SystemTime::UNIX_EPOCH,
             manifest_path: None,
+            scoped_id: None,
+            target_label: None,
         };
 
         let serialized = toml::to_string(&info).expect("Failed to serialize");
@@ -548,5 +655,19 @@ mod tests {
             "host",
             Some("/usr/bin/python app.py")
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_process_alive_reaps_exited_child() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn test child");
+        let pid = child.id() as i32;
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!is_process_alive(pid));
+        let _ = child.wait();
     }
 }

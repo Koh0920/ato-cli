@@ -95,7 +95,7 @@ pub async fn execute(
     let manifest_path = cwd.join("capsule.toml");
     let manifest_raw = fs::read_to_string(&manifest_path)
         .with_context(|| format!("Failed to read {}", manifest_path.display()))?;
-    let manifest = capsule_core::types::capsule_v1::CapsuleManifestV1::from_toml(&manifest_raw)
+    let manifest = capsule_core::types::CapsuleManifest::from_toml(&manifest_raw)
         .map_err(|err| anyhow::anyhow!("Failed to parse capsule.toml: {}", err))?;
 
     let tag = github.r#ref.strip_prefix("refs/tags/").unwrap_or_default();
@@ -392,7 +392,7 @@ pub(crate) fn build_capsule_artifact(
                     skip_validation: false,
                     nacelle_override: None,
                     standalone: false,
-                    strict_v3: false,
+                    strict_manifest: false,
                 },
                 reporter,
             )?;
@@ -432,7 +432,7 @@ pub(crate) fn build_capsule_artifact(
                         skip_validation: false,
                         nacelle_override: None,
                         standalone: false,
-                        strict_v3: false,
+                        strict_manifest: false,
                     },
                     reporter,
                 )?;

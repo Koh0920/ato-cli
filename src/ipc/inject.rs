@@ -1,7 +1,7 @@
 //! IPC environment injection — bridges the IPC Broker with runtime executors.
 //!
 //! `IpcContext` is created once per `ato open` session. It holds the
-//! resolved IPC environment variables and socket paths that executors need
+//! resolved IPC environment variables that executors need
 //! to inject into child processes.
 //!
 //! ## Flow
@@ -10,7 +10,7 @@
 //! capsule.toml [ipc.imports]
 //!   → IpcBroker.resolve() per import
 //!   → IpcBroker.generate_ipc_env() per resolved service
-//!   → IpcContext { env_vars, socket_paths }
+//!   → IpcContext { env_vars }
 //!   → executor injects into child process
 //! ```
 
@@ -26,15 +26,12 @@ use super::types::IpcConfig;
 /// IPC context for a single `ato open` session.
 ///
 /// Created by resolving all `[ipc.imports]` entries and generating
-/// environment variables and socket paths for sandbox policy injection.
+/// environment variables for runtime injection.
 #[derive(Debug, Clone, Default)]
 pub struct IpcContext {
     /// Environment variables to inject into the child process.
     /// Keys are `CAPSULE_IPC_<SERVICE>_URL`, `_TOKEN`, `_SOCKET`.
     pub env_vars: HashMap<String, String>,
-
-    /// Socket paths to allow in nacelle's sandbox (Landlock/Seatbelt).
-    pub socket_paths: Vec<PathBuf>,
 
     /// Number of services successfully resolved.
     pub resolved_count: usize,
@@ -56,8 +53,7 @@ impl IpcContext {
 
     /// Build an IPC context from a capsule manifest's `[ipc]` section.
     ///
-    /// Resolves all imports via the broker, generates tokens, and collects
-    /// environment variables and socket paths.
+    /// Resolves all imports via the broker and generates environment variables.
     pub fn from_manifest(raw_manifest: &toml::Value) -> Result<Self> {
         let ipc_section = raw_manifest.get("ipc");
         if ipc_section.is_none() {
@@ -106,10 +102,7 @@ impl IpcContext {
                         "IPC import resolved (running)"
                     );
                 }
-                ResolvedService::LocalStore {
-                    capsule_root,
-                    runtime_kind,
-                } => {
+                ResolvedService::LocalStore { runtime_kind, .. } => {
                     // Service is installed but not running.
                     // For eager activation, we would start it here.
                     // For now, register the endpoint info and generate env vars
@@ -125,9 +118,6 @@ impl IpcContext {
                         started_at: None,
                         runtime_kind,
                         sharing_mode: super::types::SharingMode::default(),
-                        activation: import_config.activation,
-                        capsule_root,
-                        port: None,
                     };
 
                     let token = broker.token_manager.generate(vec![]);
@@ -169,9 +159,6 @@ impl IpcContext {
             }
         }
 
-        // Collect socket paths for sandbox policy
-        let socket_paths = broker.collect_ipc_socket_paths(config);
-
         // Add protocol marker env vars
         if resolved_count > 0 {
             env_vars.insert(
@@ -187,13 +174,11 @@ impl IpcContext {
         info!(
             resolved = resolved_count,
             env_count = env_vars.len(),
-            socket_count = socket_paths.len(),
             "IPC imports resolved"
         );
 
         Ok(Self {
             env_vars,
-            socket_paths,
             resolved_count,
             warnings,
         })
@@ -218,7 +203,6 @@ mod tests {
         let ctx = IpcContext::empty();
         assert!(!ctx.has_ipc());
         assert!(ctx.env_vars.is_empty());
-        assert!(ctx.socket_paths.is_empty());
         assert_eq!(ctx.resolved_count, 0);
     }
 
@@ -303,7 +287,6 @@ mod tests {
                 );
                 m
             },
-            socket_paths: vec![],
             resolved_count: 1,
             warnings: vec![],
         };

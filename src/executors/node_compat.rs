@@ -21,6 +21,7 @@ use capsule_core::router::ManifestData;
 
 use crate::common::proxy;
 use crate::runtime_manager;
+use crate::runtime_overrides;
 
 use super::source::IpcEnvVars;
 
@@ -103,6 +104,7 @@ fn run_provisioning(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_runtime(
     deno_bin: &Path,
     plan: &ManifestData,
@@ -157,11 +159,11 @@ fn run_runtime(
         }
     }
 
-    for (key, value) in plan.execution_env() {
+    for (key, value) in runtime_overrides::merged_env(plan.execution_env()) {
         cmd.env(key, value);
     }
     if execution_plan.target.runtime == ExecutionRuntime::Web {
-        if let Some(port) = plan.execution_port() {
+        if let Some(port) = runtime_overrides::override_port(plan.execution_port()) {
             cmd.env("PORT", port.to_string());
         }
         if !dangerously_skip_permissions {
@@ -241,6 +243,7 @@ fn resolve_package_lock_path(manifest_dir: &Path, runtime_dir: &Path) -> Option<
     candidates.into_iter().find(|path| path.exists())
 }
 
+#[cfg(test)]
 fn map_deno_permission_error(stderr: &[u8]) -> Option<AtoExecutionError> {
     let text = String::from_utf8_lossy(stderr);
     let lower = text.to_ascii_lowercase();
@@ -265,6 +268,7 @@ fn map_deno_permission_error(stderr: &[u8]) -> Option<AtoExecutionError> {
     ))
 }
 
+#[cfg(test)]
 fn map_node_compat_error(stderr: &[u8]) -> Option<AtoExecutionError> {
     let text = String::from_utf8_lossy(stderr);
     let lower = text.to_ascii_lowercase();
@@ -283,6 +287,7 @@ fn map_node_compat_error(stderr: &[u8]) -> Option<AtoExecutionError> {
     ))
 }
 
+#[cfg(test)]
 fn extract_deno_net_target(stderr: &str) -> Option<String> {
     let marker = "Requires net access to \"";
     let start = stderr.find(marker)? + marker.len();

@@ -64,7 +64,7 @@ pub fn execute(
         return Ok(());
     }
 
-    if (!args.force && private_path.exists()) || (!args.force && public_path.exists()) {
+    if (public_path.exists() || private_path.exists()) && !args.force {
         anyhow::bail!(
             "Refusing to overwrite existing keys (use --force): {} {}",
             private_path.display(),

@@ -88,6 +88,7 @@ impl AuthManager {
     }
 
     /// Create AuthManager with custom credentials path (for testing)
+    #[cfg(test)]
     pub fn with_path(credentials_path: PathBuf) -> Self {
         let suffix =
             hex::encode(blake3::hash(credentials_path.to_string_lossy().as_bytes()).as_bytes())

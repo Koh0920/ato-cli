@@ -25,7 +25,7 @@ pub fn execute(args: LogsArgs, reporter: Arc<CliReporter>) -> Result<()> {
         let info = pm
             .read_pid(id)
             .with_context(|| format!("Failed to read PID file for: {}", id))?;
-        let log_path = get_log_path(&id);
+        let log_path = get_log_path(id);
         (info, log_path)
     } else if let Some(name) = &args.name {
         let processes = pm

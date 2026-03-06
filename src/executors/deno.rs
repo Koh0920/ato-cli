@@ -22,6 +22,7 @@ use capsule_core::router::ManifestData;
 
 use crate::common::proxy;
 use crate::runtime_manager;
+use crate::runtime_overrides;
 
 use super::source::IpcEnvVars;
 
@@ -120,6 +121,7 @@ fn run_provisioning(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_runtime(
     deno_bin: &Path,
     plan: &ManifestData,
@@ -131,7 +133,7 @@ fn run_runtime(
     dangerously_skip_permissions: bool,
 ) -> Result<i32> {
     let mut cmd = Command::new(deno_bin);
-    let execution_env = plan.execution_env();
+    let execution_env = runtime_overrides::merged_env(plan.execution_env());
     cmd.current_dir(runtime_dir).arg("run").arg("--no-prompt");
     if !dangerously_skip_permissions {
         cmd.arg("--cached-only");
@@ -149,49 +151,36 @@ fn run_runtime(
     if dangerously_skip_permissions {
         cmd.arg("-A");
     } else {
-        if !execution_plan.runtime.policy.network.allow_hosts.is_empty() {
-            cmd.arg(format!(
-                "--allow-net={}",
-                execution_plan.runtime.policy.network.allow_hosts.join(",")
-            ));
-        }
+        let is_web_runtime = execution_plan.target.runtime == ExecutionRuntime::Web;
 
-        let mut allow_read = execution_plan.runtime.policy.filesystem.read_only.clone();
-        allow_read.extend(execution_plan.runtime.policy.filesystem.read_write.clone());
-        if !allow_read.is_empty() {
-            cmd.arg(format!("--allow-read={}", allow_read.join(",")));
-        }
+        if is_web_runtime {
+            // web/deno orchestration spawns subprocesses and probes loopback ports dynamically.
+            // Use broad runtime permissions to avoid false policy failures in orchestrator internals.
+            cmd.arg("--allow-net")
+                .arg("--allow-read")
+                .arg("--allow-write")
+                .arg("--allow-env")
+                .arg("--allow-run")
+                .arg("--allow-sys")
+                .arg("--allow-ffi");
+        } else {
+            if !execution_plan.runtime.policy.network.allow_hosts.is_empty() {
+                cmd.arg(format!(
+                    "--allow-net={}",
+                    execution_plan.runtime.policy.network.allow_hosts.join(",")
+                ));
+            }
 
-        if !execution_plan
-            .runtime
-            .policy
-            .filesystem
-            .read_write
-            .is_empty()
-        {
-            cmd.arg(format!(
-                "--allow-write={}",
-                execution_plan
-                    .runtime
-                    .policy
-                    .filesystem
-                    .read_write
-                    .join(",")
-            ));
-        }
+            let mut allow_read = execution_plan.runtime.policy.filesystem.read_only.clone();
+            allow_read.extend(execution_plan.runtime.policy.filesystem.read_write.clone());
+            if !allow_read.is_empty() {
+                cmd.arg(format!("--allow-read={}", allow_read.join(",")));
+            }
 
-        if execution_plan.target.runtime == ExecutionRuntime::Web {
-            let mut allow_env = BTreeSet::new();
-            allow_env.insert("PORT".to_string());
-            allow_env.insert("ATO_RUNTIME_DENO_BIN".to_string());
-            allow_env.insert("ATO_RUNTIME_NODE_BIN".to_string());
-            allow_env.insert("ATO_RUNTIME_PYTHON_BIN".to_string());
-            allow_env.insert("ATO_RUNTIME_UV_BIN".to_string());
-            allow_env.extend(execution_env.keys().cloned());
-            cmd.arg(format!(
-                "--allow-env={}",
-                allow_env.into_iter().collect::<Vec<_>>().join(",")
-            ));
+            let allow_write = execution_plan.runtime.policy.filesystem.read_write.clone();
+            if !allow_write.is_empty() {
+                cmd.arg(format!("--allow-write={}", allow_write.join(",")));
+            }
         }
     }
 
@@ -200,8 +189,34 @@ fn run_runtime(
     }
     cmd.env("ATO_RUNTIME_DENO_BIN", deno_bin);
     if execution_plan.target.runtime == ExecutionRuntime::Web {
-        if let Some(port) = plan.execution_port() {
+        let web_host = std::env::var("ATO_WEB_HOST")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        cmd.env("ATO_WEB_HOST", &web_host);
+        cmd.env("HOST", &web_host);
+
+        let needs_node_runtime = has_runtime_tool(plan, &["node", "nodejs"]);
+        let needs_python_runtime = has_runtime_tool(plan, &["python", "python3"]);
+        let needs_uv_runtime = has_runtime_tool(plan, &["uv"]) || needs_python_runtime;
+
+        if needs_node_runtime {
+            let node_bin = runtime_manager::ensure_node_binary(plan)?;
+            cmd.env("ATO_RUNTIME_NODE_BIN", node_bin);
+        }
+        if needs_python_runtime {
+            let python_bin = runtime_manager::ensure_python_binary(plan)?;
+            cmd.env("ATO_RUNTIME_PYTHON_BIN", python_bin);
+        }
+        if needs_uv_runtime {
+            let uv_bin = runtime_manager::ensure_uv_binary(plan)?;
+            cmd.env("ATO_RUNTIME_UV_BIN", uv_bin);
+        }
+        if let Some(port) = runtime_overrides::override_port(plan.execution_port()) {
             cmd.env("PORT", port.to_string());
+            cmd.env("ATO_WEB_PORT", port.to_string());
+            cmd.env("ATO_WEB_ORIGIN", format!("http://{}:{}", web_host, port));
         }
     }
 
@@ -244,6 +259,14 @@ fn run_runtime(
     }
 
     Ok(exit_code)
+}
+
+fn has_runtime_tool(plan: &ManifestData, keys: &[&str]) -> bool {
+    keys.iter().any(|key| {
+        plan.execution_runtime_tool_version(key)
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+    })
 }
 
 fn run_and_stream_child(cmd: &mut Command) -> Result<(i32, Vec<u8>)> {

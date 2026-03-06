@@ -121,8 +121,12 @@ run_publish_auto_submit_check() {
     return 0
   fi
 
+  local normalized_repo_url="${repo_url%/}"
+  local capsule_publisher
   local capsule_slug
+  capsule_publisher="$(printf '%s' "${normalized_repo_url}" | sed -E 's#^(git@[^:]+:|https?://[^/]+/)([^/]+)/([^/]+?)(\\.git)?$#\\2#')"
   capsule_slug="$(basename "${repo_url}")"
+  capsule_slug="${capsule_slug%.git}"
 
   if "${ATO_CLI}" publish "${repo_url}" --apply-playground --registry "${registry_url}" --json >"${log_file}" 2>&1; then
     log_info "publish --apply-playground succeeded"
@@ -130,7 +134,7 @@ run_publish_auto_submit_check() {
     if grep -q 'source_exists' "${log_file}"; then
       if [ "${E2E_ALLOW_SOURCE_EXISTS:-0}" = "1" ]; then
         log_warn "publish returned source_exists and is allowed by E2E_ALLOW_SOURCE_EXISTS=1"
-        curl -sS "${registry_url}/v1/capsules/${capsule_slug}" > "${E2E_WORK_DIR}/capsule_detail_existing.json"
+        curl -sS "${registry_url}/v1/manifest/capsules/by/${capsule_publisher}/${capsule_slug}" > "${E2E_WORK_DIR}/capsule_detail_existing.json"
         python3 - <<'PY' "${E2E_WORK_DIR}/capsule_detail_existing.json"
 import json, sys, pathlib
 p = pathlib.Path(sys.argv[1])
@@ -174,7 +178,7 @@ print("publish assertions passed")
 PY
   log_info "publish response assertions passed"
 
-  curl -sS "${registry_url}/v1/capsules/${capsule_slug}" > "${E2E_WORK_DIR}/capsule_detail.json"
+  curl -sS "${registry_url}/v1/manifest/capsules/by/${capsule_publisher}/${capsule_slug}" > "${E2E_WORK_DIR}/capsule_detail.json"
   python3 - <<'PY' "${E2E_WORK_DIR}/capsule_detail.json"
 import json, sys, pathlib
 p = pathlib.Path(sys.argv[1])

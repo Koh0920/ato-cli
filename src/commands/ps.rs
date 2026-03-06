@@ -49,7 +49,7 @@ pub fn execute(args: PsArgs, reporter: Arc<CliReporter>) -> Result<()> {
         let output = serde_json::to_string_pretty(&json_output)?;
         futures::executor::block_on(reporter.notify(output))?;
     } else {
-        futures::executor::block_on(reporter.notify(format!("{}", "-".repeat(100))))?;
+        futures::executor::block_on(reporter.notify("-".repeat(100)))?;
         futures::executor::block_on(reporter.notify(format!(
             "{:>8} {:>8} {:>12} {:>15} {:>20} {}",
             "PID", "ID", "NAME", "STATUS", "RUNTIME", "UPTIME"
@@ -86,7 +86,7 @@ pub fn execute(args: PsArgs, reporter: Arc<CliReporter>) -> Result<()> {
             )))?;
         }
 
-        futures::executor::block_on(reporter.notify(format!("{}", "-".repeat(100))))?;
+        futures::executor::block_on(reporter.notify("-".repeat(100)))?;
         futures::executor::block_on(
             reporter.notify(format!("Total: {} capsule(s)", processes.len())),
         )?;

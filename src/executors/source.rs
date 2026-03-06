@@ -15,6 +15,7 @@ use capsule_core::router::ManifestData;
 
 use crate::common::proxy;
 use crate::runtime_manager;
+use crate::runtime_overrides;
 
 /// Additional IPC environment variables to inject into the child process.
 pub type IpcEnvVars = std::collections::HashMap<String, String>;
@@ -41,12 +42,8 @@ pub fn execute(
         .execution_entrypoint()
         .map(|entry| entry.trim().to_ascii_lowercase().ends_with(".py"))
         .unwrap_or(false);
-    let injected_port = plan
-        .execution_runtime()
-        .map(|runtime| runtime.trim().eq_ignore_ascii_case("web"))
-        .unwrap_or(false)
-        .then(|| plan.execution_port().map(|port| port.to_string()))
-        .flatten();
+    let injected_port =
+        runtime_overrides::override_port(plan.execution_port()).map(|port| port.to_string());
 
     let nacelle = engine::discover_nacelle(engine::EngineRequest {
         explicit_path: nacelle_override.clone(),
@@ -154,12 +151,8 @@ pub fn execute_host(
         runtime_dir.join(&entrypoint)
     };
     let force_python_no_bytecode = is_python_entrypoint(plan, &entrypoint);
-    let injected_port = plan
-        .execution_runtime()
-        .map(|runtime| runtime.trim().eq_ignore_ascii_case("web"))
-        .unwrap_or(false)
-        .then(|| plan.execution_port().map(|port| port.to_string()))
-        .flatten();
+    let injected_port =
+        runtime_overrides::override_port(plan.execution_port()).map(|port| port.to_string());
 
     let mut cmd = if force_python_no_bytecode {
         let python_bin = runtime_manager::ensure_python_binary(plan)?;
@@ -177,7 +170,7 @@ pub fn execute_host(
     apply_allowlisted_session_env(&mut cmd, ipc_env)?;
     apply_python_runtime_hardening(&mut cmd, force_python_no_bytecode);
 
-    for (key, value) in plan.execution_env() {
+    for (key, value) in runtime_overrides::merged_env(plan.execution_env()) {
         cmd.env(key, value);
     }
     if let Some(port) = injected_port {
@@ -249,6 +242,9 @@ async fn run_bundle(
 
     apply_allowlisted_session_env(&mut cmd, ipc_env)?;
     apply_python_runtime_hardening(&mut cmd, force_python_no_bytecode);
+    for (key, value) in runtime_overrides::override_env() {
+        cmd.env(key, value);
+    }
     if let Some(port) = injected_port {
         cmd.env("PORT", port);
     }

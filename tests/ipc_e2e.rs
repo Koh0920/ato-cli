@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 //! IPC E2E tests
 //!
 //! Integration tests for `ato ipc` subcommands.

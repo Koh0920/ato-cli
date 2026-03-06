@@ -12,7 +12,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 
 use crate::ipc::broker::IpcBroker;
-use crate::ipc::types::{ActivationMode, IpcRuntimeKind, IpcServiceInfo, IpcTransport};
+use crate::ipc::types::{IpcRuntimeKind, IpcServiceInfo, IpcTransport};
 
 /// Run `ato ipc status`.
 ///
@@ -148,9 +148,6 @@ pub fn run_ipc_start(path: PathBuf, json_output: bool) -> Result<()> {
             .and_then(|c| c.exports.as_ref())
             .map(|e| e.sharing.mode)
             .unwrap_or_default(),
-        activation: ActivationMode::Eager,
-        capsule_root: capsule_root.clone(),
-        port: None,
     };
     broker.registry.register(info);
 
@@ -279,9 +276,6 @@ pub fn run_ipc_stop(name: String, force: bool, json_output: bool) -> Result<()> 
 
     // Remove from registry
     broker.registry.unregister(&name);
-
-    // Revoke associated tokens
-    broker.token_manager.revoke_all();
 
     // Clean up socket file
     let socket_path = broker.socket_path(&name);

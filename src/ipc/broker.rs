@@ -14,12 +14,11 @@
 
 use std::path::PathBuf;
 
-use anyhow::Result;
 use tracing::{debug, info, warn};
 
 use super::registry::IpcRegistry;
 use super::token::TokenManager;
-use super::types::{IpcConfig, IpcRuntimeKind, IpcServiceInfo, IpcTransport};
+use super::types::{IpcRuntimeKind, IpcServiceInfo, IpcTransport};
 
 /// IPC Broker — the central IPC coordinator.
 ///
@@ -42,8 +41,6 @@ pub enum ResolvedService {
     Running(IpcServiceInfo),
     /// Service found in local store but not yet started.
     LocalStore {
-        /// Path to the capsule root.
-        capsule_root: PathBuf,
         /// Detected runtime kind.
         runtime_kind: IpcRuntimeKind,
     },
@@ -98,10 +95,7 @@ impl IpcBroker {
                 runtime = %runtime_kind,
                 "IPC service found in local store"
             );
-            return ResolvedService::LocalStore {
-                capsule_root: store_path,
-                runtime_kind,
-            };
+            return ResolvedService::LocalStore { runtime_kind };
         }
 
         // 3. Not found
@@ -150,52 +144,6 @@ impl IpcBroker {
         }
 
         env
-    }
-
-    /// Collect all IPC socket paths for sandbox policy injection.
-    ///
-    /// Returns paths that nacelle should allow in the Landlock/Seatbelt sandbox.
-    pub fn collect_ipc_socket_paths(&self, config: &IpcConfig) -> Vec<PathBuf> {
-        let mut paths = Vec::new();
-        for import_name in config.imports.keys() {
-            paths.push(self.socket_path(import_name));
-        }
-        // Also allow the socket directory itself
-        if !config.imports.is_empty() {
-            paths.push(self.socket_dir.clone());
-        }
-        paths
-    }
-
-    /// Shutdown all running services.
-    pub fn shutdown_all(&self) -> Result<()> {
-        let services = self.registry.list();
-        info!(count = services.len(), "Shutting down all IPC services");
-
-        for svc in &services {
-            if let Some(pid) = svc.pid {
-                debug!(service = %svc.name, pid, "Sending SIGTERM to IPC service");
-                #[cfg(unix)]
-                {
-                    let ret = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-                    if ret != 0 {
-                        let errno = std::io::Error::last_os_error();
-                        warn!(
-                            service = %svc.name,
-                            pid,
-                            error = %errno,
-                            "Failed to send SIGTERM to IPC service"
-                        );
-                    }
-                }
-            }
-            self.registry.unregister(&svc.name);
-        }
-
-        // Revoke all tokens
-        self.token_manager.revoke_all();
-
-        Ok(())
     }
 
     /// Compute the local store path for a service.
@@ -274,10 +222,9 @@ fn sanitize_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use std::time::Instant;
 
-    use crate::ipc::types::{ActivationMode, IpcImportConfig, SharingMode};
+    use crate::ipc::types::SharingMode;
 
     fn test_broker() -> IpcBroker {
         let dir = std::env::temp_dir().join("capsule-ipc-test");
@@ -308,9 +255,6 @@ mod tests {
             started_at: Some(Instant::now()),
             runtime_kind: IpcRuntimeKind::Source,
             sharing_mode: SharingMode::Singleton,
-            activation: ActivationMode::Eager,
-            capsule_root: PathBuf::from("/app/greeter"),
-            port: None,
         });
 
         match broker.resolve("greeter") {
@@ -341,9 +285,6 @@ mod tests {
             started_at: None,
             runtime_kind: IpcRuntimeKind::Source,
             sharing_mode: SharingMode::Singleton,
-            activation: ActivationMode::Eager,
-            capsule_root: PathBuf::from("/app/llm"),
-            port: None,
         };
 
         let env = broker.generate_ipc_env("llm-service", &info, "token123");
@@ -355,29 +296,6 @@ mod tests {
         assert!(env
             .iter()
             .any(|(k, _)| k == "CAPSULE_IPC_LLM_SERVICE_SOCKET"));
-    }
-
-    #[test]
-    fn test_collect_ipc_socket_paths() {
-        let broker = test_broker();
-        let mut imports = HashMap::new();
-        imports.insert(
-            "greeter".to_string(),
-            IpcImportConfig {
-                from: "greeter-service".to_string(),
-                activation: ActivationMode::Eager,
-                optional: false,
-            },
-        );
-
-        let config = IpcConfig {
-            exports: None,
-            imports,
-        };
-
-        let paths = broker.collect_ipc_socket_paths(&config);
-        // Should include the socket file + the socket directory
-        assert_eq!(paths.len(), 2);
     }
 
     #[test]

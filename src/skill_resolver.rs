@@ -43,7 +43,7 @@ fn resolve_skill_path_with_roots(skill_name: &str, cwd: &Path, home: &Path) -> R
         return Ok(store);
     }
 
-    return Err(AtoExecutionError::skill_not_found(
+    Err(AtoExecutionError::skill_not_found(
         format!(
             "Skill '{}' not found. Searched in:\n  - {}\n  - {}\n  - {}\n  - {}/.ato/store/*/{}/<version>/source/SKILL.md",
             skill_name,
@@ -55,7 +55,7 @@ fn resolve_skill_path_with_roots(skill_name: &str, cwd: &Path, home: &Path) -> R
         ),
         Some(skill_name),
     )
-    .into());
+    .into())
 }
 
 fn resolve_from_capsule_store(skill_name: &str, home: &Path) -> Result<Option<PathBuf>> {
