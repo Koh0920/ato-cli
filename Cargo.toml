@@ -54,9 +54,6 @@ zip = "2.1"
 zstd = { version = "0.13", features = ["zstdmt"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "net", "signal"] }
 tempfile = "3.8"
-wasmtime = "16.0"
-wasmtime-wasi = "16.0"
-wasi-common = "16.0"
 rust-embed = "8.5"
 mime_guess = "2.0"
 chrono = { version = "0.4", default-features = true }
@@ -81,6 +78,11 @@ tempfile = "3"
 assert_cmd = "2"
 predicates = "3"
 wat = "1.0"
+
+[target.'cfg(not(windows))'.dependencies]
+wasmtime = "16.0"
+wasmtime-wasi = "16.0"
+wasi-common = "16.0"
 
 [features]
 default = []
