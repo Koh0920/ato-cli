@@ -11,19 +11,12 @@ pub struct PsArgs {
 }
 
 pub fn execute(args: PsArgs, reporter: Arc<CliReporter>) -> Result<()> {
-    futures::executor::block_on(reporter.notify("📋 Listing capsule sessions...".to_string()))?;
-
     let pm = ProcessManager::new()?;
     pm.cleanup_dead_processes()?;
     let mut processes = pm.list_processes()?;
 
     if !args.all {
         processes.retain(|p| p.status.is_active());
-    }
-
-    if processes.is_empty() {
-        futures::executor::block_on(reporter.notify("No capsules found.".to_string()))?;
-        return Ok(());
     }
 
     if args.json {
@@ -55,11 +48,13 @@ pub fn execute(args: PsArgs, reporter: Arc<CliReporter>) -> Result<()> {
         let output = serde_json::to_string_pretty(&json_output)?;
         futures::executor::block_on(reporter.notify(output))?;
     } else {
-        futures::executor::block_on(reporter.notify("-".repeat(100)))?;
-        futures::executor::block_on(reporter.notify(format!(
-            "{:>8} {:>8} {:>12} {:>15} {:>20} {}",
-            "PID", "ID", "NAME", "STATUS", "RUNTIME", "UPTIME"
-        )))?;
+        futures::executor::block_on(reporter.notify("📋 Listing capsule sessions...".to_string()))?;
+
+        if processes.is_empty() {
+            futures::executor::block_on(reporter.notify("No capsules found.".to_string()))?;
+            return Ok(());
+        }
+
         futures::executor::block_on(reporter.notify("-".repeat(100)))?;
         futures::executor::block_on(reporter.notify(format!(
             "{:>8} {:>8} {:>12} {:>15} {:>20} {}",
