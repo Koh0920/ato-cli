@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 pub mod capsule_v3;
 pub mod common;
 pub mod config;
@@ -14,6 +12,7 @@ pub mod lockfile;
 pub mod mag_uri;
 pub mod manifest;
 pub mod metrics;
+pub mod orchestration;
 pub mod packers;
 pub mod policy;
 pub mod r3_config;
@@ -22,7 +21,6 @@ pub mod resource;
 pub mod router;
 pub mod runner;
 pub mod runtime;
-pub mod schema;
 pub mod schema_registry;
 pub mod security;
 pub mod signing;

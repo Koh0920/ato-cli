@@ -241,24 +241,6 @@ fn reproducible_created_at() -> chrono::DateTime<Utc> {
         .unwrap_or_else(|| chrono::DateTime::<Utc>::from_timestamp(0, 0).expect("unix epoch"))
 }
 
-fn collect_lockfile_packages(files: &[(String, PathBuf)]) -> Vec<SpdxPackage> {
-    let mut packages = BTreeMap::<String, SpdxPackage>::new();
-    for (archive_path, disk_path) in files {
-        // Lockfile names are normalized by packers into archive paths.
-        let file_name = archive_path
-            .rsplit('/')
-            .next()
-            .unwrap_or(archive_path.as_str());
-        match file_name {
-            "package-lock.json" => parse_package_lock(disk_path, &mut packages),
-            "deno.lock" => parse_deno_lock(disk_path, &mut packages),
-            "uv.lock" => parse_uv_lock(disk_path, &mut packages),
-            _ => {}
-        }
-    }
-    packages.into_values().collect()
-}
-
 fn collect_lockfile_packages_from_inputs(files: &[SbomFileInput]) -> Vec<SpdxPackage> {
     let mut packages = BTreeMap::<String, SpdxPackage>::new();
     for file in files {

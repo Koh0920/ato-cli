@@ -14,8 +14,10 @@ use tempfile::TempDir;
 
 use crate::common::paths::toolchain_cache_dir;
 use crate::error::{CapsuleError, Result};
+use crate::packers::payload;
 use crate::packers::runtime_fetcher::RuntimeFetcher;
 use crate::reporter::CapsuleReporter;
+use crate::types::CapsuleManifest;
 
 const UV_VERSION: &str = "0.4.19";
 const PNPM_VERSION: &str = "9.9.0";
@@ -211,6 +213,17 @@ pub fn verify_lockfile_manifest(manifest_path: &Path, lockfile_path: &Path) -> R
     verify_lockfile_manifest_with_open_manifest(&mut manifest_file, lockfile_path)
 }
 
+pub fn render_lockfile_for_manifest(
+    lockfile_path: &Path,
+    manifest: &CapsuleManifest,
+) -> Result<Vec<u8>> {
+    let mut lockfile = read_lockfile(lockfile_path)?;
+    lockfile.meta.manifest_hash = semantic_manifest_hash(manifest)?;
+    toml::to_string_pretty(&lockfile)
+        .map(|toml| toml.into_bytes())
+        .map_err(|e| CapsuleError::Pack(format!("Failed to serialize capsule.lock: {}", e)))
+}
+
 fn verify_lockfile_manifest_with_open_manifest(
     manifest_file: &mut fs::File,
     lockfile_path: &Path,
@@ -261,7 +274,7 @@ fn manifest_hash_from_open_file(file: &mut fs::File) -> Result<String> {
         .map_err(|e| CapsuleError::Config(format!("Failed to read manifest: {}", e)))?;
     file.seek(SeekFrom::Start(0))
         .map_err(|e| CapsuleError::Config(format!("Failed to rewind manifest: {}", e)))?;
-    Ok(format!("sha256:{}", sha256_hex(text.as_bytes())))
+    semantic_manifest_hash_from_text(&text)
 }
 
 fn lockfile_inputs_snapshot_path(manifest_dir: &Path) -> PathBuf {
@@ -592,7 +605,7 @@ async fn generate_lockfile(
         version: "1".to_string(),
         meta: LockMeta {
             created_at: Utc::now().to_rfc3339(),
-            manifest_hash: format!("sha256:{}", sha256_hex(manifest_text.as_bytes())),
+            manifest_hash: semantic_manifest_hash_from_text(manifest_text)?,
         },
         allowlist,
         tools,
@@ -604,6 +617,17 @@ async fn generate_lockfile(
         },
         targets,
     })
+}
+
+fn semantic_manifest_hash(manifest: &CapsuleManifest) -> Result<String> {
+    payload::compute_manifest_hash_without_signatures(manifest)
+        .map_err(|e| CapsuleError::Config(format!("Failed to compute manifest hash: {}", e)))
+}
+
+fn semantic_manifest_hash_from_text(text: &str) -> Result<String> {
+    let manifest = CapsuleManifest::from_toml(text)
+        .map_err(|e| CapsuleError::Config(format!("Failed to parse manifest schema: {}", e)))?;
+    semantic_manifest_hash(&manifest)
 }
 
 async fn generate_uv_lock(
@@ -1307,6 +1331,7 @@ async fn run_command(
     run_command_inner_with_manifest_env(cmd, manifest).await
 }
 
+#[cfg(test)]
 async fn run_command_inner(cmd: std::process::Command) -> Result<std::process::ExitStatus> {
     run_command_inner_with_manifest_env(cmd, None).await
 }
@@ -1889,7 +1914,7 @@ fn required_runtime_version(manifest: &toml::Value) -> Result<Option<String>> {
     })
 }
 
-fn selected_target_table<'a>(manifest: &'a toml::Value) -> Option<&'a toml::Value> {
+fn selected_target_table(manifest: &toml::Value) -> Option<&toml::Value> {
     let targets = manifest.get("targets")?;
     let default_target = manifest
         .get("default_target")
@@ -2032,14 +2057,19 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let manifest_path = temp.path().join("capsule.toml");
         let lockfile_path = temp.path().join("capsule.lock");
-        let manifest_text = "name = \"demo\"";
+        let manifest_text = r#"schema_version = "0.2"
+name = "demo"
+version = "1.0.0"
+type = "app"
+default_target = "cli"
+"#;
         fs::write(&manifest_path, manifest_text).unwrap();
 
         let lockfile = CapsuleLock {
             version: "1".to_string(),
             meta: LockMeta {
                 created_at: "2026-01-20T00:00:00Z".to_string(),
-                manifest_hash: format!("sha256:{}", sha256_hex(manifest_text.as_bytes())),
+                manifest_hash: semantic_manifest_hash_from_text(manifest_text).unwrap(),
             },
             allowlist: None,
             tools: None,
@@ -2175,6 +2205,7 @@ env = { ATO_ORCH_REQUIRED_ENVS = "LEGACY_ONE, LEGACY_TWO,API_TOKEN" }
 schema_version = "0.2"
 name = "demo"
 version = "0.1.0"
+type = "app"
 default_target = "default"
 [targets.default]
 runtime = "source"

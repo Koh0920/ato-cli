@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -70,14 +72,6 @@ fn wait_for_well_known(base_url: &str) -> Result<()> {
         thread::sleep(Duration::from_millis(100));
     }
     anyhow::bail!("local registry did not become ready: {}", url);
-}
-
-fn run_ato(ato: &Path, args: &[&str], cwd: &Path) -> Result<std::process::Output> {
-    Command::new(ato)
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .with_context(|| format!("failed to run ato {:?}", args))
 }
 
 fn run_ato_with_home(
@@ -167,6 +161,60 @@ fn build_publish_install(
     Ok(())
 }
 
+fn build_capsule_artifact(
+    ato: &Path,
+    project_dir: &Path,
+    capsule_name: &str,
+    home_dir: &Path,
+) -> Result<std::path::PathBuf> {
+    let build = run_ato_with_home(ato, &["build", "."], project_dir, home_dir)?;
+    assert!(
+        build.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let capsule_path = project_dir.join(format!("{}.capsule", capsule_name));
+    assert!(
+        capsule_path.exists(),
+        "capsule artifact not found: {}",
+        capsule_path.display()
+    );
+    Ok(capsule_path)
+}
+
+fn publish_artifact_with_scoped_id(
+    ato: &Path,
+    artifact_path: &Path,
+    scoped_id: &str,
+    base_url: &str,
+    cwd: &Path,
+    home_dir: &Path,
+) -> Result<()> {
+    let artifact = artifact_path.to_string_lossy().to_string();
+    let publish = run_ato_with_home(
+        ato,
+        &[
+            "publish",
+            "--deploy",
+            "--registry",
+            base_url,
+            "--artifact",
+            &artifact,
+            "--scoped-id",
+            scoped_id,
+            "--json",
+        ],
+        cwd,
+        home_dir,
+    )?;
+    assert!(
+        publish.status.success(),
+        "publish failed: {}",
+        String::from_utf8_lossy(&publish.stderr)
+    );
+    Ok(())
+}
+
 #[test]
 fn e2e_publish_artifact_without_cwd_manifest() -> Result<()> {
     let ato = assert_cmd::cargo::cargo_bin("ato");
@@ -192,6 +240,9 @@ runtime = "source"
 driver = "deno"
 runtime_version = "1.46.3"
 entrypoint = "main.ts"
+
+[build.lifecycle]
+prepare = "echo prepare"
 "#,
     )?;
     std::fs::write(
@@ -294,9 +345,8 @@ entrypoint = "main.ts"
         String::from_utf8_lossy(&third_publish.stderr)
     );
     let third_stdout = String::from_utf8_lossy(&third_publish.stdout);
-    assert_eq!(
+    assert!(
         third_stdout.contains("Existing release reused (same sha256, no new upload)."),
-        true,
         "expected reused-release message in allow-existing path; stdout={}",
         third_stdout
     );
@@ -327,6 +377,9 @@ runtime = "source"
 driver = "deno"
 runtime_version = "1.46.3"
 entrypoint = "main.ts"
+
+[build.lifecycle]
+prepare = "echo prepare"
 "#,
     )?;
     std::fs::write(
@@ -382,13 +435,29 @@ entrypoint = "main.ts"
         "search response missing test-local capsule"
     );
 
+    let detail: serde_json::Value = reqwest::blocking::get(format!(
+        "{}/v1/manifest/capsules/by/local/test-local",
+        base_url
+    ))
+    .context("detail endpoint call")?
+    .json()
+    .context("detail json parse")?;
+    assert_eq!(
+        detail
+            .get("manifest")
+            .and_then(|v| v.get("name"))
+            .and_then(|v| v.as_str()),
+        Some("test-local"),
+        "detail response should include manifest payload"
+    );
+
     let client = reqwest::blocking::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("build client")?;
     let resp = client
         .get(format!(
-            "{}/v1/capsules/by/local/test-local/download?version=1.0.0",
+            "{}/v1/manifest/capsules/by/local/test-local/download?version=1.0.0",
             base_url
         ))
         .send()
@@ -397,6 +466,459 @@ entrypoint = "main.ts"
     assert!(
         resp.headers().get("location").is_some(),
         "download endpoint should return Location header"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn e2e_local_registry_publish_phases_preserve_readme() -> Result<()> {
+    let ato = assert_cmd::cargo::cargo_bin("ato");
+    let tmp = TempDir::new().context("create temp dir")?;
+    let home_dir = tmp.path().join("home");
+    std::fs::create_dir_all(&home_dir)?;
+    let data_dir = tmp.path().join("registry-data");
+    let project_dir = tmp.path().join("project-readme-phases");
+    std::fs::create_dir_all(&project_dir)?;
+
+    std::fs::write(
+        project_dir.join("capsule.toml"),
+        r#"schema_version = "0.2"
+name = "test-readme-phases"
+version = "1.0.0"
+type = "app"
+default_target = "cli"
+
+[build.lifecycle]
+prepare = "echo prepare"
+
+[targets.cli]
+runtime = "source"
+driver = "deno"
+runtime_version = "1.46.3"
+entrypoint = "main.ts"
+"#,
+    )?;
+    std::fs::write(
+        project_dir.join("main.ts"),
+        r#"console.log("hello readme phases");"#,
+    )?;
+    std::fs::write(
+        project_dir.join("README.md"),
+        "# Readme Phase Test\n\nThis README must be visible in the local registry UI.\n",
+    )?;
+    std::fs::write(
+        project_dir.join("deno.lock"),
+        r#"{"version":"5","specifiers":{},"packages":{}}"#,
+    )?;
+
+    let Some((_guard, base_url)) = start_local_registry_or_skip(
+        &ato,
+        &data_dir,
+        "e2e_local_registry_publish_phases_preserve_readme",
+    )?
+    else {
+        return Ok(());
+    };
+
+    let publish = run_ato_with_home(
+        &ato,
+        &[
+            "publish",
+            "--prepare",
+            "--build",
+            "--deploy",
+            "--registry",
+            &base_url,
+            "--json",
+        ],
+        &project_dir,
+        &home_dir,
+    )?;
+    let publish_stdout = String::from_utf8_lossy(&publish.stdout);
+    let publish_stderr = String::from_utf8_lossy(&publish.stderr);
+    assert!(
+        publish.status.success(),
+        "publish phases failed: stdout={} stderr={}",
+        publish_stdout,
+        publish_stderr
+    );
+
+    let detail: serde_json::Value = reqwest::blocking::get(format!(
+        "{}/v1/manifest/capsules/by/local/test-readme-phases",
+        base_url
+    ))
+    .context("detail endpoint call")?
+    .json()
+    .context("detail json parse")?;
+    assert_eq!(
+        detail
+            .get("readme_markdown")
+            .and_then(|value| value.as_str()),
+        Some("# Readme Phase Test\n\nThis README must be visible in the local registry UI.\n"),
+        "detail response should surface README.md from publish phase artifact"
+    );
+    assert_eq!(
+        detail.get("readme_source").and_then(|value| value.as_str()),
+        Some("artifact"),
+        "README source should indicate artifact extraction"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn e2e_local_registry_monorepo_publish_uses_parent_readme() -> Result<()> {
+    let ato = assert_cmd::cargo::cargo_bin("ato");
+    let tmp = TempDir::new().context("create temp dir")?;
+    let home_dir = tmp.path().join("home");
+    std::fs::create_dir_all(&home_dir)?;
+    let data_dir = tmp.path().join("registry-data");
+    let repo_dir = tmp.path().join("repo");
+    let project_dir = repo_dir.join("apps/file2api-monorepo");
+    std::fs::create_dir_all(&project_dir)?;
+
+    std::fs::write(
+        repo_dir.join("README.md"),
+        "# File2API Monorepo\n\nParent README should be visible after publish.\n",
+    )?;
+    std::fs::write(
+        project_dir.join("capsule.toml"),
+        r#"schema_version = "0.2"
+name = "file2api-monorepo"
+version = "1.0.0"
+type = "app"
+default_target = "cli"
+
+[metadata]
+repository = "Koh0920/file2api-monorepo"
+
+[build.lifecycle]
+prepare = "echo prepare"
+
+[targets.cli]
+runtime = "source"
+driver = "deno"
+runtime_version = "1.46.3"
+entrypoint = "main.ts"
+"#,
+    )?;
+    std::fs::write(
+        project_dir.join("main.ts"),
+        r#"console.log("hello monorepo readme");"#,
+    )?;
+    std::fs::write(
+        project_dir.join("deno.lock"),
+        r#"{"version":"5","specifiers":{},"packages":{}}"#,
+    )?;
+
+    let Some((_guard, base_url)) = start_local_registry_or_skip(
+        &ato,
+        &data_dir,
+        "e2e_local_registry_monorepo_publish_uses_parent_readme",
+    )?
+    else {
+        return Ok(());
+    };
+
+    let publish = run_ato_with_home(
+        &ato,
+        &[
+            "publish",
+            "--prepare",
+            "--build",
+            "--deploy",
+            "--registry",
+            &base_url,
+            "--json",
+        ],
+        &project_dir,
+        &home_dir,
+    )?;
+    assert!(
+        publish.status.success(),
+        "monorepo publish failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&publish.stdout),
+        String::from_utf8_lossy(&publish.stderr)
+    );
+
+    let detail: serde_json::Value = reqwest::blocking::get(format!(
+        "{}/v1/manifest/capsules/by/koh0920/file2api-monorepo",
+        base_url
+    ))
+    .context("detail endpoint call")?
+    .json()
+    .context("detail json parse")?;
+    assert_eq!(
+        detail
+            .get("readme_markdown")
+            .and_then(|value| value.as_str()),
+        Some("# File2API Monorepo\n\nParent README should be visible after publish.\n"),
+        "detail response should surface parent monorepo README.md"
+    );
+    assert_eq!(
+        detail.get("readme_source").and_then(|value| value.as_str()),
+        Some("artifact"),
+        "README source should indicate artifact extraction"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn e2e_local_registry_package_json_prepare_publish_exposes_readme() -> Result<()> {
+    let ato = assert_cmd::cargo::cargo_bin("ato");
+    let tmp = TempDir::new().context("create temp dir")?;
+    let home_dir = tmp.path().join("home");
+    std::fs::create_dir_all(&home_dir)?;
+    let data_dir = tmp.path().join("registry-data");
+    let project_dir = tmp.path().join("file2api-like");
+    std::fs::create_dir_all(&project_dir)?;
+
+    std::fs::write(
+        project_dir.join("capsule.toml"),
+        r#"schema_version = "0.2"
+name = "file2api-monorepo"
+version = "0.1.19"
+description = ""
+type = "app"
+default_target = "default"
+
+[pack]
+include = [
+  "ato-entry.ts",
+  "capsule.toml",
+  "capsule.lock",
+  "deno.lock",
+  "package.json"
+]
+
+[targets.default]
+runtime = "web"
+driver = "deno"
+runtime_version = "1.46.3"
+entrypoint = "ato-entry.ts"
+port = 4173
+
+[metadata]
+repository = "Koh0920/file2api"
+"#,
+    )?;
+    std::fs::write(
+        project_dir.join("package.json"),
+        r#"{"scripts":{"capsule:prepare":"echo prepare"}}"#,
+    )?;
+    std::fs::write(
+        project_dir.join("README.md"),
+        "# DB-Nexus MVP\n\nThis README should remain visible after private publish.\n",
+    )?;
+    std::fs::write(
+        project_dir.join("ato-entry.ts"),
+        "console.log('file2api package-json prepare');\n",
+    )?;
+    std::fs::write(
+        project_dir.join("capsule.lock"),
+        "version = \"1\"\n\n[meta]\ncreated_at = \"2026-01-01T00:00:00Z\"\nmanifest_hash = \"sha256:dummy\"\n",
+    )?;
+    std::fs::write(
+        project_dir.join("deno.lock"),
+        r#"{"version":"5","specifiers":{},"packages":{}}"#,
+    )?;
+
+    let Some((_guard, base_url)) = start_local_registry_or_skip(
+        &ato,
+        &data_dir,
+        "e2e_local_registry_package_json_prepare_publish_exposes_readme",
+    )?
+    else {
+        return Ok(());
+    };
+
+    let publish = run_ato_with_home(
+        &ato,
+        &[
+            "publish",
+            "--prepare",
+            "--build",
+            "--deploy",
+            "--registry",
+            &base_url,
+            "--json",
+        ],
+        &project_dir,
+        &home_dir,
+    )?;
+    assert!(
+        publish.status.success(),
+        "package.json prepare publish failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&publish.stdout),
+        String::from_utf8_lossy(&publish.stderr)
+    );
+
+    let detail: serde_json::Value = reqwest::blocking::get(format!(
+        "{}/v1/manifest/capsules/by/koh0920/file2api-monorepo",
+        base_url
+    ))
+    .context("detail endpoint call")?
+    .json()
+    .context("detail json parse")?;
+
+    assert_eq!(
+        detail.get("description").and_then(|value| value.as_str()),
+        Some(""),
+        "description should remain empty while README is still available"
+    );
+    assert_eq!(
+        detail.get("readme_source").and_then(|value| value.as_str()),
+        Some("artifact"),
+        "README source should indicate artifact extraction"
+    );
+    assert_eq!(
+        detail
+            .get("readme_markdown")
+            .and_then(|value| value.as_str()),
+        Some("# DB-Nexus MVP\n\nThis README should remain visible after private publish.\n"),
+        "detail response should expose README content for package.json prepare flow"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn e2e_local_registry_run_seeds_execution_consent() -> Result<()> {
+    let ato = assert_cmd::cargo::cargo_bin("ato");
+    let tmp = TempDir::new().context("create temp dir")?;
+    let home_dir = tmp.path().join("home");
+    std::fs::create_dir_all(&home_dir)?;
+    let data_dir = tmp.path().join("registry-data");
+    let project_dir = tmp.path().join("project-run-consent");
+    std::fs::create_dir_all(&project_dir)?;
+
+    std::fs::write(
+        project_dir.join("capsule.toml"),
+        r#"schema_version = "0.2"
+name = "test-run-consent"
+version = "1.0.0"
+type = "app"
+default_target = "cli"
+
+[network]
+egress_allow = ["api.github.com"]
+
+[targets.cli]
+runtime = "source"
+driver = "node"
+runtime_version = "20.12.0"
+entrypoint = "main.js"
+"#,
+    )?;
+    std::fs::write(
+        project_dir.join("main.js"),
+        r#"console.log("local registry seeded consent run");"#,
+    )?;
+    std::fs::write(project_dir.join("package-lock.json"), "{}")?;
+
+    let Some((_guard, base_url)) = start_local_registry_or_skip(
+        &ato,
+        &data_dir,
+        "e2e_local_registry_run_seeds_execution_consent",
+    )?
+    else {
+        return Ok(());
+    };
+
+    build_publish_install(
+        &ato,
+        &project_dir,
+        &base_url,
+        "local/test-run-consent",
+        "test-run-consent",
+        tmp.path(),
+        &home_dir,
+    )?;
+
+    let client = reqwest::blocking::Client::builder()
+        .build()
+        .context("build client")?;
+    let run_response = client
+        .post(format!(
+            "{}/v1/local/capsules/by/local/test-run-consent/run",
+            base_url
+        ))
+        .json(&serde_json::json!({
+            "confirmed": true,
+        }))
+        .send()
+        .context("run endpoint call")?;
+    assert_eq!(run_response.status(), reqwest::StatusCode::ACCEPTED);
+
+    let mut process_id = None::<String>;
+    for _ in 0..100 {
+        let processes: serde_json::Value = client
+            .get(format!("{}/v1/local/processes", base_url))
+            .send()
+            .context("process list call")?
+            .json()
+            .context("process list json parse")?;
+        process_id = processes.as_array().and_then(|rows| {
+            rows.iter().find_map(|row| {
+                (row.get("scoped_id").and_then(|value| value.as_str())
+                    == Some("local/test-run-consent"))
+                .then(|| {
+                    row.get("id")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string)
+                })
+                .flatten()
+            })
+        });
+        if process_id.is_some() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let process_id = process_id.context("local registry process record missing")?;
+
+    let mut logs = Vec::<String>::new();
+    for _ in 0..100 {
+        let log_payload: serde_json::Value = client
+            .get(format!(
+                "{}/v1/local/processes/{}/logs?tail=200",
+                base_url, process_id
+            ))
+            .send()
+            .context("process logs call")?
+            .json()
+            .context("process logs json parse")?;
+        logs = log_payload
+            .get("lines")
+            .and_then(|value| value.as_array())
+            .map(|lines| {
+                lines
+                    .iter()
+                    .filter_map(|line| line.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if logs
+            .iter()
+            .any(|line| line.contains("local registry seeded consent run"))
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    let joined_logs = logs.join("\n");
+    assert!(
+        !joined_logs.contains("ExecutionPlan consent missing in non-interactive mode"),
+        "run should seed consent before non-interactive spawn; logs={}",
+        joined_logs
+    );
+    assert!(
+        joined_logs.contains("local registry seeded consent run"),
+        "run should complete after consent seeding; logs={}",
+        joined_logs
     );
 
     Ok(())
@@ -479,137 +1001,6 @@ port = {static_port}
 
     // Best-effort cleanup in case background process was started.
     let _ = run_ato_with_home(&ato, &["close", "--all", "--force"], tmp.path(), &home_dir);
-
-    Ok(())
-}
-
-#[test]
-fn e2e_local_registry_v3_sync_endpoints_roundtrip() -> Result<()> {
-    let ato = assert_cmd::cargo::cargo_bin("ato");
-    let tmp = TempDir::new().context("create temp dir")?;
-    let home_dir = tmp.path().join("home");
-    std::fs::create_dir_all(&home_dir)?;
-    let data_dir = tmp.path().join("registry-data");
-    let project_dir = tmp.path().join("project-v3-sync");
-    let local_cas_dir = tmp.path().join("local-cas");
-    std::fs::create_dir_all(&project_dir)?;
-    std::fs::create_dir_all(&local_cas_dir)?;
-
-    std::fs::write(
-        project_dir.join("capsule.toml"),
-        r#"schema_version = "0.2"
-name = "test-v3-sync"
-version = "1.0.0"
-type = "app"
-default_target = "cli"
-
-[targets.cli]
-runtime = "source"
-driver = "deno"
-runtime_version = "1.46.3"
-entrypoint = "main.ts"
-"#,
-    )?;
-    std::fs::write(
-        project_dir.join("main.ts"),
-        r#"console.log("hello v3 sync");"#,
-    )?;
-    std::fs::write(
-        project_dir.join("deno.lock"),
-        r#"{"version":"5","specifiers":{},"packages":{}}"#,
-    )?;
-
-    let build = Command::new(&ato)
-        .args(["build", "."])
-        .current_dir(&project_dir)
-        .env("HOME", &home_dir)
-        .env("ATO_EXPERIMENTAL_V3_PACK", "1")
-        .env("ATO_CAS_ROOT", &local_cas_dir)
-        .output()
-        .context("run build with v3")?;
-    assert!(
-        build.status.success(),
-        "build failed: {}",
-        String::from_utf8_lossy(&build.stderr)
-    );
-
-    let artifact = project_dir.join("test-v3-sync.capsule");
-    assert!(
-        artifact.exists(),
-        "artifact missing: {}",
-        artifact.display()
-    );
-
-    let Some((_guard, base_url)) = start_local_registry_or_skip(
-        &ato,
-        &data_dir,
-        "e2e_local_registry_v3_sync_endpoints_roundtrip",
-    )?
-    else {
-        return Ok(());
-    };
-
-    let publish = Command::new(&ato)
-        .args([
-            "publish",
-            "--deploy",
-            "--registry",
-            &base_url,
-            "--artifact",
-            artifact.to_string_lossy().as_ref(),
-            "--scoped-id",
-            "local/test-v3-sync",
-            "--json",
-        ])
-        .current_dir(&project_dir)
-        .env("HOME", &home_dir)
-        .env("ATO_CAS_ROOT", &local_cas_dir)
-        .output()
-        .context("publish artifact with v3 sync")?;
-    assert!(
-        publish.status.success(),
-        "publish failed: {}",
-        String::from_utf8_lossy(&publish.stderr)
-    );
-
-    let manifest_resp = reqwest::blocking::get(format!(
-        "{}/v1/releases/local/test-v3-sync/1.0.0/manifest",
-        base_url
-    ))
-    .context("fetch v3 manifest")?;
-    assert_eq!(
-        manifest_resp.status(),
-        reqwest::StatusCode::OK,
-        "manifest endpoint failed"
-    );
-    let manifest_json: serde_json::Value = manifest_resp.json().context("manifest json")?;
-    let first_chunk = manifest_json
-        .get("chunks")
-        .and_then(|v| v.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|v| v.get("raw_hash"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .context("missing first chunk hash in manifest")?;
-
-    let chunk_resp = reqwest::blocking::get(format!(
-        "{}/v1/chunks/{}",
-        base_url,
-        urlencoding::encode(&first_chunk)
-    ))
-    .context("fetch chunk")?;
-    assert_eq!(chunk_resp.status(), reqwest::StatusCode::OK);
-    let cache_control = chunk_resp
-        .headers()
-        .get("cache-control")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default()
-        .to_string();
-    assert!(
-        cache_control.contains("immutable"),
-        "chunk response should be immutable cacheable: {}",
-        cache_control
-    );
 
     Ok(())
 }
@@ -984,6 +1375,293 @@ entrypoint = "main.py"
         "unexpected uv.lock error in --sandbox --yes python run; stderr={}",
         python_with_lock_unsafe_yes_stderr
     );
+
+    Ok(())
+}
+
+#[test]
+fn e2e_local_registry_release_ops_reflect_current_and_yanked_state() -> Result<()> {
+    let ato = assert_cmd::cargo::cargo_bin("ato");
+    let tmp = TempDir::new().context("create temp dir")?;
+    let home_dir = tmp.path().join("home");
+    std::fs::create_dir_all(&home_dir)?;
+    let data_dir = tmp.path().join("registry-data");
+    let v1_dir = tmp.path().join("release-v1");
+    let v2_dir = tmp.path().join("release-v2");
+    std::fs::create_dir_all(&v1_dir)?;
+    std::fs::create_dir_all(&v2_dir)?;
+
+    for (dir, version, body) in [
+        (&v1_dir, "1.0.0", "console.log('release v1');"),
+        (&v2_dir, "2.0.0", "console.log('release v2');"),
+    ] {
+        std::fs::write(
+            dir.join("capsule.toml"),
+            format!(
+                r#"schema_version = "0.2"
+name = "release-ops"
+version = "{version}"
+type = "app"
+default_target = "cli"
+
+[targets.cli]
+runtime = "source"
+driver = "deno"
+runtime_version = "1.46.3"
+entrypoint = "main.ts"
+"#
+            ),
+        )?;
+        std::fs::write(dir.join("main.ts"), body)?;
+        std::fs::write(
+            dir.join("deno.lock"),
+            r#"{"version":"5","specifiers":{},"packages":{}}"#,
+        )?;
+    }
+
+    let Some((_guard, base_url)) = start_local_registry_or_skip(
+        &ato,
+        &data_dir,
+        "e2e_local_registry_release_ops_reflect_current_and_yanked_state",
+    )?
+    else {
+        return Ok(());
+    };
+
+    let scoped_id = "team-x/release-ops";
+    let artifact_v1 = build_capsule_artifact(&ato, &v1_dir, "release-ops", &home_dir)?;
+    publish_artifact_with_scoped_id(
+        &ato,
+        &artifact_v1,
+        scoped_id,
+        &base_url,
+        tmp.path(),
+        &home_dir,
+    )?;
+
+    let artifact_v2 = build_capsule_artifact(&ato, &v2_dir, "release-ops", &home_dir)?;
+    publish_artifact_with_scoped_id(
+        &ato,
+        &artifact_v2,
+        scoped_id,
+        &base_url,
+        tmp.path(),
+        &home_dir,
+    )?;
+
+    let client = reqwest::blocking::Client::builder()
+        .build()
+        .context("build release ops client")?;
+    let detail_url = format!("{}/v1/manifest/capsules/by/team-x/release-ops", base_url);
+
+    let mut detail: serde_json::Value = client
+        .get(&detail_url)
+        .send()
+        .context("detail fetch after publish")?
+        .error_for_status()
+        .context("detail status after publish")?
+        .json()
+        .context("detail json after publish")?;
+
+    let releases = detail
+        .get("releases")
+        .and_then(|value| value.as_array())
+        .context("releases array missing after publish")?;
+    let release_v1 = releases
+        .iter()
+        .find(|release| release.get("version").and_then(|value| value.as_str()) == Some("1.0.0"))
+        .context("release 1.0.0 missing")?;
+    let release_v2 = releases
+        .iter()
+        .find(|release| release.get("version").and_then(|value| value.as_str()) == Some("2.0.0"))
+        .context("release 2.0.0 missing")?;
+
+    let manifest_hash_v1 = release_v1
+        .get("manifest_hash")
+        .and_then(|value| value.as_str())
+        .context("manifest hash missing for v1")?
+        .to_string();
+    let manifest_hash_v2 = release_v2
+        .get("manifest_hash")
+        .and_then(|value| value.as_str())
+        .context("manifest hash missing for v2")?
+        .to_string();
+
+    assert_eq!(
+        release_v1
+            .get("is_current")
+            .and_then(|value| value.as_bool()),
+        Some(false),
+        "v1 should not be current after v2 publish"
+    );
+    assert_eq!(
+        release_v2
+            .get("is_current")
+            .and_then(|value| value.as_bool()),
+        Some(true),
+        "v2 should be current after latest publish"
+    );
+    assert!(
+        release_v2.get("yanked_at").is_none() || release_v2.get("yanked_at").unwrap().is_null(),
+        "freshly published release must not be yanked"
+    );
+
+    let rollback_response = client
+        .post(format!("{}/v1/manifest/rollback", base_url))
+        .json(&serde_json::json!({
+            "scoped_id": scoped_id,
+            "target_manifest_hash": manifest_hash_v1,
+        }))
+        .send()
+        .context("rollback request")?;
+    assert_eq!(rollback_response.status(), reqwest::StatusCode::OK);
+    let rollback_payload: serde_json::Value =
+        rollback_response.json().context("rollback response json")?;
+    assert_eq!(
+        rollback_payload
+            .get("target_manifest_hash")
+            .and_then(|value| value.as_str()),
+        Some(manifest_hash_v1.as_str()),
+        "rollback response should echo target_manifest_hash"
+    );
+    assert_eq!(
+        rollback_payload
+            .get("manifest_hash")
+            .and_then(|value| value.as_str()),
+        Some(manifest_hash_v1.as_str()),
+        "rollback response should expose current manifest_hash at top level"
+    );
+    assert_eq!(
+        rollback_payload
+            .get("pointer")
+            .and_then(|value| value.get("manifest_hash"))
+            .and_then(|value| value.as_str()),
+        Some(manifest_hash_v1.as_str()),
+        "rollback response pointer should match target manifest"
+    );
+
+    let epoch_pointer: serde_json::Value = client
+        .post(format!("{}/v1/manifest/epoch/resolve", base_url))
+        .json(&serde_json::json!({ "scoped_id": scoped_id }))
+        .send()
+        .context("epoch resolve request")?
+        .error_for_status()
+        .context("epoch resolve status")?
+        .json()
+        .context("epoch resolve json")?;
+    assert_eq!(
+        epoch_pointer
+            .get("pointer")
+            .and_then(|value| value.get("manifest_hash"))
+            .and_then(|value| value.as_str()),
+        Some(manifest_hash_v1.as_str()),
+        "epoch pointer should move to the rollback target"
+    );
+
+    detail = client
+        .get(&detail_url)
+        .send()
+        .context("detail fetch after rollback")?
+        .error_for_status()
+        .context("detail status after rollback")?
+        .json()
+        .context("detail json after rollback")?;
+    let releases = detail
+        .get("releases")
+        .and_then(|value| value.as_array())
+        .context("releases array missing after rollback")?;
+    let release_v1 = releases
+        .iter()
+        .find(|release| release.get("version").and_then(|value| value.as_str()) == Some("1.0.0"))
+        .context("release 1.0.0 missing after rollback")?;
+    let release_v2 = releases
+        .iter()
+        .find(|release| release.get("version").and_then(|value| value.as_str()) == Some("2.0.0"))
+        .context("release 2.0.0 missing after rollback")?;
+    assert_eq!(
+        release_v1
+            .get("is_current")
+            .and_then(|value| value.as_bool()),
+        Some(true),
+        "v1 should be current after rollback"
+    );
+    assert_eq!(
+        release_v2
+            .get("is_current")
+            .and_then(|value| value.as_bool()),
+        Some(false),
+        "v2 should no longer be current after rollback"
+    );
+
+    let yank_response = client
+        .post(format!("{}/v1/manifest/yank", base_url))
+        .json(&serde_json::json!({
+            "scoped_id": scoped_id,
+            "target_manifest_hash": manifest_hash_v2,
+        }))
+        .send()
+        .context("yank request")?;
+    assert!(
+        yank_response.status().is_success(),
+        "yank failed: {}",
+        yank_response.text().unwrap_or_default()
+    );
+
+    detail = client
+        .get(&detail_url)
+        .send()
+        .context("detail fetch after yank")?
+        .error_for_status()
+        .context("detail status after yank")?
+        .json()
+        .context("detail json after yank")?;
+    let releases = detail
+        .get("releases")
+        .and_then(|value| value.as_array())
+        .context("releases array missing after yank")?;
+    let release_v2 = releases
+        .iter()
+        .find(|release| release.get("version").and_then(|value| value.as_str()) == Some("2.0.0"))
+        .context("release 2.0.0 missing after yank")?;
+    assert!(
+        release_v2
+            .get("yanked_at")
+            .and_then(|value| value.as_str())
+            .is_some(),
+        "yanked release should expose yanked_at"
+    );
+    assert_eq!(
+        release_v2
+            .get("is_current")
+            .and_then(|value| value.as_bool()),
+        Some(false),
+        "yanked v2 must remain non-current after rollback"
+    );
+
+    let resolve_v2 = client
+        .get(format!(
+            "{}/v1/manifest/resolve/team-x/release-ops/2.0.0",
+            base_url
+        ))
+        .send()
+        .context("resolve v2 after yank")?;
+    assert_eq!(resolve_v2.status(), reqwest::StatusCode::GONE);
+    let resolve_v2_body: serde_json::Value = resolve_v2.json().context("resolve v2 json")?;
+    assert_eq!(
+        resolve_v2_body
+            .get("yanked")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+
+    let resolve_v1 = client
+        .get(format!(
+            "{}/v1/manifest/resolve/team-x/release-ops/1.0.0",
+            base_url
+        ))
+        .send()
+        .context("resolve v1 after rollback")?;
+    assert_eq!(resolve_v1.status(), reqwest::StatusCode::OK);
 
     Ok(())
 }

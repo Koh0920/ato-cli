@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
 
@@ -7,27 +7,30 @@ use sha2::{Digest, Sha256};
 use tar::{Builder, EntryType, Header};
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc as tokio_mpsc;
-use tracing::{debug, warn};
+use tracing::debug;
 use zstd::stream::write::Encoder as ZstdEncoder;
 
-use crate::capsule_v3::{
-    CasProvider, CasStore, FastCdcWriteReport, FastCdcWriter, FastCdcWriterConfig,
-    V3_PAYLOAD_MANIFEST_PATH,
-};
+use crate::capsule_v3::{CasStore, FastCdcWriter, FastCdcWriterConfig, V3_PAYLOAD_MANIFEST_PATH};
 use crate::error::{CapsuleError, Result as CapsuleResult};
 use crate::packers::pack_filter::PackFilter;
+use crate::packers::payload::{
+    build_distribution_manifest, manifest_hash, normalize_relative_utf8_path,
+    reconstruct_from_chunks,
+};
 use crate::packers::sbom::{generate_embedded_sbom_from_inputs_async, SbomFileInput, SBOM_PATH};
 use crate::r3_config;
 
-/// Capsule Format v2 PAX TAR Archive Structure:
+const README_CANDIDATES: [&str; 4] = ["README.md", "README.mdx", "README.txt", "README"];
+
+/// Capsule PAX TAR Archive Structure:
 /// ```text
 /// my-app.capsule (PAX TAR)
 /// ├── capsule.toml
+/// ├── capsule.lock
 /// ├── signature.json
 /// └── payload.tar.zst
 ///     ├── source/ (code)
-///     ├── config.json (prepared by controller)
-///     └── capsule.lock (prepared by controller)
+///     └── config.json (prepared by controller)
 /// ```
 
 #[derive(Debug, Clone)]
@@ -62,6 +65,13 @@ impl PayloadEntry {
         match self {
             Self::File(file) => &file.archive_path,
             Self::Symlink { archive_path, .. } => archive_path,
+        }
+    }
+
+    fn kind_rank(&self) -> u8 {
+        match self {
+            Self::Symlink { .. } => 1,
+            Self::File(_) => 2,
         }
     }
 }
@@ -131,160 +141,15 @@ const ZSTD_COMPRESSION_LEVEL: i32 = 19;
 const PAYLOAD_CHUNK_BYTES: usize = 64 * 1024;
 const PAYLOAD_CHANNEL_DEPTH: usize = 8;
 const DEFAULT_REPRO_MTIME: u64 = 0;
-const EXPERIMENTAL_V3_ENV: &str = "ATO_EXPERIMENTAL_V3_PACK";
-
-struct PayloadWriteResult {
-    v3_report: Option<FastCdcWriteReport>,
-}
-
-struct DualSinkWriter {
-    v2: Option<ZstdEncoder<'static, fs::File>>,
-    v3: Option<FastCdcWriter>,
-    sticky_error: Option<String>,
-}
-
-impl DualSinkWriter {
-    fn new(v2: ZstdEncoder<'static, fs::File>, v3: FastCdcWriter) -> Self {
-        Self {
-            v2: Some(v2),
-            v3: Some(v3),
-            sticky_error: None,
-        }
-    }
-
-    fn finalize(mut self) -> CapsuleResult<FastCdcWriteReport> {
-        self.ensure_healthy()?;
-        let v2 = self.v2.take().ok_or_else(|| {
-            CapsuleError::Pack("DualSinkWriter v2 encoder already finalized".to_string())
-        })?;
-        v2.finish()
-            .map_err(|e| CapsuleError::Pack(format!("Failed to finish v2 zstd payload: {}", e)))?;
-        let v3 = self.v3.take().ok_or_else(|| {
-            CapsuleError::Pack("DualSinkWriter v3 writer already finalized".to_string())
-        })?;
-        v3.finalize()
-    }
-
-    fn ensure_healthy(&self) -> std::io::Result<()> {
-        if let Some(message) = &self.sticky_error {
-            return Err(std::io::Error::other(message.clone()));
-        }
-        Ok(())
-    }
-
-    fn mark_error(&mut self, message: impl Into<String>) -> std::io::Error {
-        let message = message.into();
-        self.sticky_error = Some(message.clone());
-        std::io::Error::other(message)
-    }
-}
-
-impl Write for DualSinkWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.ensure_healthy()?;
-        if buf.is_empty() {
-            return Ok(0);
-        }
-
-        let v2 = match self.v2.as_mut() {
-            Some(v2) => v2,
-            None => {
-                return Err(self.mark_error("DualSinkWriter v2 encoder not available during write"));
-            }
-        };
-        write_all_exact(v2, buf).map_err(|e| {
-            self.mark_error(format!(
-                "Failed to write full chunk to v2 payload encoder: {}",
-                e
-            ))
-        })?;
-
-        let v3 = match self.v3.as_mut() {
-            Some(v3) => v3,
-            None => {
-                return Err(self.mark_error("DualSinkWriter v3 writer not available during write"));
-            }
-        };
-        v3.write_bytes(buf).map_err(|e| {
-            self.mark_error(format!(
-                "Failed to write chunk into v3 FastCDC pipeline: {}",
-                e
-            ))
-        })?;
-
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.ensure_healthy()?;
-        let v2 = match self.v2.as_mut() {
-            Some(v2) => v2,
-            None => {
-                return Err(self.mark_error("DualSinkWriter v2 encoder not available during flush"));
-            }
-        };
-        v2.flush().map_err(|e| {
-            self.mark_error(format!(
-                "Failed to flush v2 payload encoder before finalize: {}",
-                e
-            ))
-        })
-    }
-}
-
-enum PayloadSink {
-    V2Only(Option<ZstdEncoder<'static, fs::File>>),
-    Dual(Option<DualSinkWriter>),
-}
-
-impl PayloadSink {
-    fn finalize(self) -> CapsuleResult<Option<FastCdcWriteReport>> {
-        match self {
-            Self::V2Only(Some(encoder)) => {
-                encoder.finish().map_err(|e| {
-                    CapsuleError::Pack(format!("Failed to finish v2 payload encoder: {}", e))
-                })?;
-                Ok(None)
-            }
-            Self::Dual(Some(dual)) => dual.finalize().map(Some),
-            Self::V2Only(None) | Self::Dual(None) => Err(CapsuleError::Pack(
-                "Payload sink was finalized more than once".to_string(),
-            )),
-        }
-    }
-}
-
-impl Write for PayloadSink {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match self {
-            Self::V2Only(Some(encoder)) => write_all_exact(encoder, buf).map(|()| buf.len()),
-            Self::Dual(Some(dual)) => dual.write(buf),
-            Self::V2Only(None) | Self::Dual(None) => {
-                Err(std::io::Error::other("payload sink is not available"))
-            }
-        }
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        match self {
-            Self::V2Only(Some(encoder)) => encoder.flush(),
-            Self::Dual(Some(dual)) => dual.flush(),
-            Self::V2Only(None) | Self::Dual(None) => {
-                Err(std::io::Error::other("payload sink is not available"))
-            }
-        }
-    }
-}
 
 pub async fn pack(
     _plan: &crate::router::ManifestData,
     opts: CapsulePackOptions,
-    _reporter: Arc<dyn crate::reporter::CapsuleReporter + 'static>,
+    reporter: Arc<dyn crate::reporter::CapsuleReporter + 'static>,
 ) -> CapsuleResult<PathBuf> {
     debug!("Creating capsule archive (.capsule format)");
 
     let loaded = crate::manifest::load_manifest(&opts.manifest_path)?;
-    let manifest_content = loaded.raw_text;
     let pack_filter = PackFilter::from_manifest(&loaded.model)?;
 
     // config/lockfile are prepared by the caller once and injected into this packer.
@@ -309,48 +174,40 @@ pub async fn pack(
 
     // Step 2: Resolve source payload input
     let source_dir = opts.manifest_dir.join("source");
-    let source_root = if source_dir.exists() {
-        source_dir.as_path()
+    let (source_root, source_root_warning) = select_payload_source_root(&opts.manifest_dir);
+    if let Some(message) = source_root_warning {
+        reporter
+            .warn(message.to_string())
+            .await
+            .map_err(|err| CapsuleError::Pack(format!("Failed to emit pack warning: {err}")))?;
+    }
+    if source_root.as_path() == source_dir.as_path() {
+        debug!("Packaging source/ directory as source/");
     } else {
-        debug!("No source/ directory found; packaging project root as source/");
-        opts.manifest_dir.as_path()
-    };
+        debug!("Packaging project root as source/");
+    }
 
     // Step 3: Create payload.tar.zst (single-pass stream)
     debug!("Phase 2: creating payload.tar.zst (streaming)");
-    let v3_cas = if experimental_v3_pack_enabled() {
-        debug!(
-            "{}=1 detected: enabling payload v3 CAS dual-write path",
-            EXPERIMENTAL_V3_ENV
-        );
-        match CasProvider::from_env() {
-            CasProvider::Enabled(cas) => Some(cas),
-            CasProvider::Disabled(reason) => {
-                CasProvider::log_disabled_once("capsule_pack_v3", &reason);
-                None
-            }
-        }
-    } else {
-        None
-    };
 
-    let mut payload_entries = collect_payload_entries(source_root, "source", &pack_filter).await?;
+    let mut payload_entries =
+        collect_payload_entries(source_root.as_path(), "source", &pack_filter).await?;
     payload_entries.push(PayloadEntry::File(
         payload_file_entry(&config_path, "config.json".to_string()).await?,
     ));
-    payload_entries.push(PayloadEntry::File(
-        payload_file_entry(&lockfile_path, "capsule.lock".to_string()).await?,
-    ));
-    payload_entries.sort_by(|a, b| a.archive_path().cmp(b.archive_path()));
+    payload_entries.sort_by(|a, b| {
+        a.archive_path()
+            .cmp(b.archive_path())
+            .then_with(|| a.kind_rank().cmp(&b.kind_rank()))
+    });
 
     let temp_dir = tempfile::tempdir()?;
     let payload_zst_path = temp_dir.path().join("payload.tar.zst");
 
     let (tar_tx, tar_rx) = mpsc::channel::<TarStreamCommand>();
     let writer_payload_path = payload_zst_path.clone();
-    let writer_handle = std::thread::spawn(move || {
-        write_payload_tar_zstd_stream(&writer_payload_path, tar_rx, v3_cas)
-    });
+    let writer_handle =
+        std::thread::spawn(move || write_payload_tar_zstd_stream(&writer_payload_path, tar_rx));
 
     let stream_result = stream_payload_entries_to_writer(&payload_entries, &tar_tx).await;
     drop(tar_tx);
@@ -358,9 +215,9 @@ pub async fn pack(
         .join()
         .map_err(|_| CapsuleError::Pack("Payload writer thread panicked".to_string()))?;
 
-    let (sbom_inputs, v3_report) = match (stream_result, writer_result) {
-        (Ok(files), Ok(result)) => (files, result.v3_report),
-        (Err(producer_err), Ok(_)) => return Err(producer_err),
+    let sbom_inputs = match (stream_result, writer_result) {
+        (Ok(files), Ok(())) => files,
+        (Err(producer_err), Ok(())) => return Err(producer_err),
         (Ok(_), Err(writer_err)) => return Err(writer_err),
         (Err(producer_err), Err(writer_err)) => {
             return Err(CapsuleError::Pack(format!(
@@ -371,6 +228,27 @@ pub async fn pack(
 
     let compressed_size = fs::metadata(&payload_zst_path)?.len() as usize;
     debug!("Compressed payload size: {}", format_bytes(compressed_size));
+    let payload_tar_bytes = read_payload_tar_bytes_from_zst(&payload_zst_path)?;
+    let (distribution_manifest, manifest_toml_bytes) =
+        build_distribution_manifest(&loaded.model, &payload_tar_bytes)?;
+    let rebuilt_payload = reconstruct_from_chunks(
+        &payload_tar_bytes,
+        &distribution_manifest
+            .distribution
+            .as_ref()
+            .expect("distribution metadata")
+            .chunk_list,
+    )?;
+    if rebuilt_payload != payload_tar_bytes {
+        return Err(CapsuleError::Pack(
+            "failed to reconstruct payload.tar from chunk_list".to_string(),
+        ));
+    }
+    debug!(
+        "Generated manifest hash={}",
+        manifest_hash(&distribution_manifest)?
+    );
+    let payload_v3_manifest_bytes = maybe_build_payload_v3_manifest(&payload_tar_bytes)?;
 
     // Step 4: Create final .capsule archive
     debug!("Phase 3: creating final .capsule archive");
@@ -385,11 +263,21 @@ pub async fn pack(
 
     // Write actual manifest content
     let manifest_temp_path = temp_dir.path().join("capsule.toml");
-    fs::write(&manifest_temp_path, &manifest_content)?;
+    fs::write(&manifest_temp_path, &manifest_toml_bytes)?;
     append_regular_file_normalized(
         &mut outer_ar,
         &manifest_temp_path,
         "capsule.toml",
+        reproducible_mtime_epoch(),
+    )?;
+    let packaged_lockfile_bytes =
+        crate::lockfile::render_lockfile_for_manifest(&lockfile_path, &distribution_manifest)?;
+    let packaged_lockfile_path = temp_dir.path().join("capsule.lock");
+    fs::write(&packaged_lockfile_path, packaged_lockfile_bytes)?;
+    append_regular_file_normalized(
+        &mut outer_ar,
+        &packaged_lockfile_path,
+        "capsule.lock",
         reproducible_mtime_epoch(),
     )?;
 
@@ -403,25 +291,10 @@ pub async fn pack(
         SBOM_PATH,
         reproducible_mtime_epoch(),
     )?;
-    if let Some(report) = &v3_report {
-        let v3_manifest_temp_path = temp_dir.path().join(V3_PAYLOAD_MANIFEST_PATH);
-        let canonical_manifest = serde_jcs::to_vec(&report.manifest).map_err(|e| {
-            CapsuleError::Pack(format!(
-                "Failed to serialize payload v3 manifest (JCS): {e}"
-            ))
-        })?;
-        fs::write(&v3_manifest_temp_path, canonical_manifest)?;
-        append_regular_file_normalized(
-            &mut outer_ar,
-            &v3_manifest_temp_path,
-            V3_PAYLOAD_MANIFEST_PATH,
-            reproducible_mtime_epoch(),
-        )?;
-    }
 
     // Add signature.json metadata
     let sig_temp_path = temp_dir.path().join("signature.json");
-    let mut signature = serde_json::json!({
+    let signature = serde_json::json!({
         "signed": false,
         "note": "To be signed",
         "sbom": {
@@ -430,20 +303,6 @@ pub async fn pack(
             "format": "spdx-json",
         }
     });
-    if let Some(report) = &v3_report {
-        if let Some(obj) = signature.as_object_mut() {
-            obj.insert(
-                "payload_v3".to_string(),
-                serde_json::json!({
-                    "path": V3_PAYLOAD_MANIFEST_PATH,
-                    "artifact_hash": report.manifest.artifact_hash,
-                    "schema_version": report.manifest.schema_version,
-                    "chunk_count": report.manifest.chunks.len(),
-                    "total_raw_size": report.total_raw_size,
-                }),
-            );
-        }
-    }
     let signature_bytes = serde_jcs::to_vec(&signature).map_err(|e| {
         CapsuleError::Pack(format!("Failed to serialize signature metadata (JCS): {e}"))
     })?;
@@ -462,6 +321,26 @@ pub async fn pack(
         "payload.tar.zst",
         reproducible_mtime_epoch(),
     )?;
+
+    if let Some(payload_v3_manifest_bytes) = payload_v3_manifest_bytes {
+        let payload_v3_manifest_path = temp_dir.path().join(V3_PAYLOAD_MANIFEST_PATH);
+        fs::write(&payload_v3_manifest_path, payload_v3_manifest_bytes)?;
+        append_regular_file_normalized(
+            &mut outer_ar,
+            &payload_v3_manifest_path,
+            V3_PAYLOAD_MANIFEST_PATH,
+            reproducible_mtime_epoch(),
+        )?;
+    }
+
+    if let Some((readme_path, archive_name)) = find_nearest_readme_candidate(&opts.manifest_dir) {
+        append_regular_file_normalized(
+            &mut outer_ar,
+            &readme_path,
+            &archive_name,
+            reproducible_mtime_epoch(),
+        )?;
+    }
 
     outer_ar.finish()?;
     drop(outer_ar);
@@ -503,7 +382,7 @@ async fn collect_payload_entries(
                 continue;
             }
 
-            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            let rel_str = normalize_relative_utf8_path(rel)?;
             let archive_path = format!("{}/{}", prefix, rel_str);
             if file_type.is_symlink() {
                 let link_target = tokio::fs::read_link(&path).await?;
@@ -663,8 +542,7 @@ async fn stream_file_to_tar_writer(
 fn write_payload_tar_zstd_stream(
     payload_zst_path: &Path,
     tar_rx: mpsc::Receiver<TarStreamCommand>,
-    v3_cas: Option<CasStore>,
-) -> CapsuleResult<PayloadWriteResult> {
+) -> CapsuleResult<()> {
     let payload_file = fs::File::create(payload_zst_path)?;
     let mut encoder = ZstdEncoder::new(payload_file, ZSTD_COMPRESSION_LEVEL)?;
     let threads = std::thread::available_parallelism()
@@ -673,25 +551,7 @@ fn write_payload_tar_zstd_stream(
     if threads > 1 {
         encoder.multithread(threads)?;
     }
-
-    let sink = if let Some(cas) = v3_cas {
-        match FastCdcWriter::new(FastCdcWriterConfig::default(), cas) {
-            Ok(fastcdc_writer) => {
-                PayloadSink::Dual(Some(DualSinkWriter::new(encoder, fastcdc_writer)))
-            }
-            Err(err) => {
-                warn!(
-                    error = %err,
-                    "Failed to initialize payload v3 FastCDC writer; continuing with v2-only payload"
-                );
-                PayloadSink::V2Only(Some(encoder))
-            }
-        }
-    } else {
-        PayloadSink::V2Only(Some(encoder))
-    };
-
-    let mut tar = Builder::new(sink);
+    let mut tar = Builder::new(encoder);
     let mtime = reproducible_mtime_epoch();
 
     while let Ok(command) = tar_rx.recv() {
@@ -729,30 +589,9 @@ fn write_payload_tar_zstd_stream(
     }
 
     tar.finish()?;
-    let sink = tar.into_inner()?;
-    let v3_report = sink.finalize()?;
-    Ok(PayloadWriteResult { v3_report })
-}
-
-fn write_all_exact<W: Write>(writer: &mut W, mut buf: &[u8]) -> std::io::Result<()> {
-    while !buf.is_empty() {
-        let written = writer.write(buf)?;
-        if written == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WriteZero,
-                "writer returned zero bytes",
-            ));
-        }
-        buf = &buf[written..];
-    }
+    let encoder = tar.into_inner()?;
+    let _ = encoder.finish()?;
     Ok(())
-}
-
-fn experimental_v3_pack_enabled() -> bool {
-    std::env::var(EXPERIMENTAL_V3_ENV)
-        .ok()
-        .map(|value| value.trim() == "1")
-        .unwrap_or(false)
 }
 
 #[cfg(unix)]
@@ -836,48 +675,146 @@ fn reproducible_mtime_epoch() -> u64 {
         .unwrap_or(DEFAULT_REPRO_MTIME)
 }
 
+pub(crate) fn find_nearest_readme_candidate(start_dir: &Path) -> Option<(PathBuf, String)> {
+    let mut current = Some(start_dir);
+    while let Some(dir) = current {
+        for candidate in README_CANDIDATES {
+            let path = dir.join(candidate);
+            if path.is_file() {
+                return Some((path, candidate.to_string()));
+            }
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+fn select_payload_source_root(manifest_dir: &Path) -> (PathBuf, Option<&'static str>) {
+    let source_dir = manifest_dir.join("source");
+    if !source_dir.exists() {
+        return (manifest_dir.to_path_buf(), None);
+    }
+
+    // If both roots exist and only the project root has Next standalone node_modules,
+    // prefer project root to avoid publishing stale source/ snapshots.
+    if has_next_standalone_node_modules(manifest_dir)
+        && !has_next_standalone_node_modules(source_dir.as_path())
+    {
+        return (
+            manifest_dir.to_path_buf(),
+            Some(
+                "Detected source/ directory without Next standalone node_modules while project root has them; packaging project root to keep runtime-complete artifacts.",
+            ),
+        );
+    }
+
+    (source_dir, None)
+}
+
+fn has_next_standalone_node_modules(root: &Path) -> bool {
+    if root.join(".next/standalone/node_modules").is_dir() {
+        return true;
+    }
+
+    let apps_dir = root.join("apps");
+    let Ok(entries) = fs::read_dir(&apps_dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        if entry.path().join(".next/standalone/node_modules").is_dir() {
+            return true;
+        }
+    }
+    false
+}
+
+fn read_payload_tar_bytes_from_zst(payload_zst_path: &Path) -> CapsuleResult<Vec<u8>> {
+    let payload_file = fs::File::open(payload_zst_path)?;
+    let mut decoder = zstd::stream::Decoder::new(payload_file)?;
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out)?;
+    Ok(out)
+}
+
+fn maybe_build_payload_v3_manifest(payload_tar_bytes: &[u8]) -> CapsuleResult<Option<Vec<u8>>> {
+    if !experimental_v3_pack_enabled()? {
+        return Ok(None);
+    }
+
+    let cas = CasStore::from_env()?;
+    let manifest_bytes = build_payload_v3_manifest_bytes_with_cas(
+        payload_tar_bytes,
+        cas,
+        FastCdcWriterConfig::default(),
+    )?;
+    Ok(Some(manifest_bytes))
+}
+
+fn build_payload_v3_manifest_bytes_with_cas(
+    payload_tar_bytes: &[u8],
+    cas: CasStore,
+    config: FastCdcWriterConfig,
+) -> CapsuleResult<Vec<u8>> {
+    let mut writer = FastCdcWriter::new(config, cas)?;
+    writer.write_bytes(payload_tar_bytes)?;
+    let report = writer.finalize()?;
+    debug!(
+        chunks = report.manifest.chunks.len(),
+        inserted = report.chunks_inserted,
+        reused = report.chunks_reused,
+        total_raw_size = report.total_raw_size,
+        "Generated payload v3 manifest and populated CAS"
+    );
+
+    serde_jcs::to_vec(&report.manifest).map_err(|err| {
+        CapsuleError::Pack(format!(
+            "Failed to serialize payload.v3.manifest.json (JCS): {err}"
+        ))
+    })
+}
+
+fn experimental_v3_pack_enabled() -> CapsuleResult<bool> {
+    let raw = match std::env::var("ATO_EXPERIMENTAL_V3_PACK") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(false),
+        Err(err) => {
+            return Err(CapsuleError::Config(format!(
+                "Failed to read ATO_EXPERIMENTAL_V3_PACK: {}",
+                err
+            )))
+        }
+    };
+
+    parse_bool_env("ATO_EXPERIMENTAL_V3_PACK", &raw)
+}
+
+fn parse_bool_env(key: &str, raw: &str) -> CapsuleResult<bool> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" | "" => Ok(false),
+        _ => Err(CapsuleError::Config(format!(
+            "Invalid {} value '{}'; expected one of 1,true,yes,on,0,false,no,off",
+            key, raw
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-    use std::ffi::{OsStr, OsString};
-    use std::sync::{Mutex, OnceLock};
-
-    use crate::capsule_v3::hash::verify_artifact_hash;
-    use crate::capsule_v3::CapsuleManifestV3;
+    use crate::capsule_v3::{verify_artifact_hash, CapsuleManifestV3};
+    use crate::packers::payload::reconstruct_from_chunks;
     use crate::reporter::NoOpReporter;
     use crate::router::ExecutionProfile;
-
-    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-    fn env_lock() -> &'static Mutex<()> {
-        ENV_LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<OsString>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: Option<&OsStr>) -> Self {
-            let previous = std::env::var_os(key);
-            match value {
-                Some(v) => std::env::set_var(key, v),
-                None => std::env::remove_var(key),
-            }
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
+    use crate::types::CapsuleManifest;
+    use std::io::Read;
 
     fn sha256_hex(data: &[u8]) -> String {
         let mut hasher = sha2::Sha256::new();
@@ -885,17 +822,100 @@ mod tests {
         hex::encode(hasher.finalize())
     }
 
-    fn create_source_fixture(
-        tmp: &tempfile::TempDir,
-        name: &str,
-    ) -> (PathBuf, Arc<crate::r3_config::ConfigJson>, PathBuf, PathBuf) {
+    #[test]
+    fn select_payload_source_root_prefers_manifest_root_for_stale_source_snapshot() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let source_dir = tmp.path().join("source");
+        let root_standalone_nm = tmp
+            .path()
+            .join("apps/dashboard/.next/standalone/node_modules/next");
+        let source_standalone = source_dir.join("apps/dashboard/.next/standalone/apps/dashboard");
+        std::fs::create_dir_all(&root_standalone_nm).expect("mkdir root standalone node_modules");
+        std::fs::create_dir_all(&source_standalone).expect("mkdir source standalone");
+
+        let (selected, warning) = select_payload_source_root(tmp.path());
+        assert_eq!(selected.as_path(), tmp.path());
+        assert!(warning.is_some());
+    }
+
+    #[test]
+    fn select_payload_source_root_uses_source_when_runtime_layout_is_consistent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let source_dir = tmp.path().join("source");
+        let source_standalone_nm =
+            source_dir.join("apps/dashboard/.next/standalone/node_modules/next");
+        std::fs::create_dir_all(&source_standalone_nm)
+            .expect("mkdir source standalone node_modules");
+
+        let (selected, warning) = select_payload_source_root(tmp.path());
+        assert_eq!(selected.as_path(), source_dir.as_path());
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn find_nearest_readme_candidate_walks_up_to_parent_dirs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let app_dir = tmp.path().join("apps/file2api");
+        std::fs::create_dir_all(&app_dir).expect("mkdir app dir");
+        std::fs::write(tmp.path().join("README.md"), "# monorepo readme")
+            .expect("write root readme");
+
+        let found = find_nearest_readme_candidate(&app_dir).expect("find readme");
+        assert_eq!(found.0, tmp.path().join("README.md"));
+        assert_eq!(found.1, "README.md");
+    }
+
+    #[test]
+    fn parse_bool_env_accepts_truthy_values() {
+        for value in ["1", "true", "TRUE", "yes", "on"] {
+            let parsed = parse_bool_env("TEST", value).expect("parse env");
+            assert!(parsed, "value should be true: {}", value);
+        }
+    }
+
+    #[test]
+    fn parse_bool_env_accepts_falsey_values() {
+        for value in ["0", "false", "FALSE", "no", "off", ""] {
+            let parsed = parse_bool_env("TEST", value).expect("parse env");
+            assert!(!parsed, "value should be false: {}", value);
+        }
+    }
+
+    #[test]
+    fn parse_bool_env_rejects_unknown_value() {
+        let err = parse_bool_env("TEST", "maybe").expect_err("must reject unknown");
+        assert!(err.to_string().contains("Invalid TEST value"));
+    }
+
+    #[test]
+    fn build_payload_v3_manifest_populates_cas_and_produces_valid_manifest() {
+        let cas_root = tempfile::tempdir().expect("cas tempdir");
+        let cas = CasStore::new(cas_root.path()).expect("cas store");
+
+        let manifest_bytes = build_payload_v3_manifest_bytes_with_cas(
+            b"payload bytes for v3",
+            cas.clone(),
+            FastCdcWriterConfig::default(),
+        )
+        .expect("build payload v3 manifest");
+
+        let manifest: CapsuleManifestV3 =
+            serde_json::from_slice(&manifest_bytes).expect("parse v3 manifest");
+        verify_artifact_hash(&manifest).expect("verify artifact hash");
+        let fsck = cas.fsck_manifest(&manifest).expect("fsck manifest");
+        assert!(fsck.is_ok(), "fsck report should be clean: {fsck:?}");
+        assert!(!manifest.chunks.is_empty(), "manifest should contain chunks");
+    }
+
+    #[tokio::test]
+    async fn pack_source_is_reproducible_for_identical_inputs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
         let manifest_path = tmp.path().join("capsule.toml");
         std::fs::write(
             &manifest_path,
-            format!(
-                r#"
+            r#"
 schema_version = "0.2"
-name = "{name}"
+name = "repro-source-pack"
 version = "0.1.0"
 type = "app"
 default_target = "cli"
@@ -905,17 +925,11 @@ runtime = "source"
 driver = "native"
 entrypoint = "source/main.sh"
 "#,
-            ),
         )
         .expect("write manifest");
 
         std::fs::create_dir_all(tmp.path().join("source")).expect("mkdir source");
         std::fs::write(tmp.path().join("source/main.sh"), "echo repro").expect("write source");
-        std::fs::write(
-            tmp.path().join("source/data.bin"),
-            vec![b'x'; 512 * 1024 + 333],
-        )
-        .expect("write payload");
 
         let lock_path = tmp.path().join("capsule.lock");
         std::fs::write(
@@ -935,109 +949,6 @@ manifest_hash = "sha256:dummy"
         );
         let config_path =
             crate::r3_config::write_config(&manifest_path, config.as_ref()).expect("write config");
-
-        (manifest_path, config, config_path, lock_path)
-    }
-
-    fn read_outer_entries(path: &Path) -> HashMap<String, Vec<u8>> {
-        let mut out = HashMap::new();
-        let file = std::fs::File::open(path).expect("open capsule");
-        let mut archive = tar::Archive::new(file);
-        for entry in archive.entries().expect("entries") {
-            let mut entry = entry.expect("entry");
-            let key = entry.path().expect("path").to_string_lossy().to_string();
-            let mut bytes = Vec::new();
-            entry.read_to_end(&mut bytes).expect("read");
-            out.insert(key, bytes);
-        }
-        out
-    }
-
-    fn extract_payload_tar_bytes_from_entries(entries: &HashMap<String, Vec<u8>>) -> Vec<u8> {
-        let payload = entries
-            .get("payload.tar.zst")
-            .expect("payload.tar.zst missing");
-        let mut decoder = zstd::stream::Decoder::new(std::io::Cursor::new(payload))
-            .expect("create payload decoder");
-        let mut out = Vec::new();
-        decoder.read_to_end(&mut out).expect("decode payload");
-        out
-    }
-
-    fn reconstruct_payload_tar_from_cas(manifest: &CapsuleManifestV3, cas: &CasStore) -> Vec<u8> {
-        let mut out = Vec::new();
-        for chunk in &manifest.chunks {
-            let path = cas.chunk_path(&chunk.raw_hash).expect("chunk path");
-            let mut decoder =
-                zstd::stream::Decoder::new(std::fs::File::open(path).expect("open chunk from cas"))
-                    .expect("decoder");
-            decoder.read_to_end(&mut out).expect("decode chunk");
-        }
-        out
-    }
-
-    struct PartialWriter {
-        inner: Vec<u8>,
-        max_write: usize,
-    }
-
-    impl PartialWriter {
-        fn new(max_write: usize) -> Self {
-            Self {
-                inner: Vec::new(),
-                max_write,
-            }
-        }
-    }
-
-    impl Write for PartialWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            if buf.is_empty() {
-                return Ok(0);
-            }
-            let n = std::cmp::min(self.max_write.max(1), buf.len());
-            self.inner.extend_from_slice(&buf[..n]);
-            Ok(n)
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn test_dual_sink_handles_partial_write_correctly() {
-        let payload = vec![0xAB; 16 * 1024];
-        let mut writer = PartialWriter::new(17);
-        write_all_exact(&mut writer, &payload).expect("write_all_exact");
-        assert_eq!(writer.inner, payload);
-    }
-
-    #[test]
-    fn test_dual_sink_propagates_secondary_sink_error() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let v2_file = std::fs::File::create(tmp.path().join("v2.zst")).expect("v2 file");
-        let v2_encoder = ZstdEncoder::new(v2_file, 3).expect("v2 encoder");
-        let cas = CasStore::new(tmp.path().join("cas")).expect("cas");
-        let mut v3_writer =
-            FastCdcWriter::new(FastCdcWriterConfig::default(), cas).expect("v3 writer");
-        v3_writer.inject_sticky_error_for_test("injected secondary sink failure");
-        let mut dual = DualSinkWriter::new(v2_encoder, v3_writer);
-
-        let err = dual.write(b"abc").expect_err("must fail");
-        assert!(err.to_string().contains("secondary sink failure"));
-    }
-
-    #[tokio::test]
-    async fn pack_source_is_reproducible_for_identical_inputs() {
-        let _env_guard = env_lock().lock().expect("env lock");
-        let _exp = EnvVarGuard::set(EXPERIMENTAL_V3_ENV, None);
-        let _cas = EnvVarGuard::set("ATO_CAS_ROOT", None);
-        let _epoch = EnvVarGuard::set("SOURCE_DATE_EPOCH", Some(OsStr::new("0")));
-
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let (manifest_path, config, config_path, lock_path) =
-            create_source_fixture(&tmp, "repro-source-pack");
 
         let decision =
             crate::router::route_manifest(&manifest_path, ExecutionProfile::Release, None)
@@ -1081,223 +992,56 @@ manifest_hash = "sha256:dummy"
     }
 
     #[tokio::test]
-    async fn test_experimental_v3_off_keeps_v2_layout() {
-        let _env_guard = env_lock().lock().expect("env lock");
-        let _exp = EnvVarGuard::set(EXPERIMENTAL_V3_ENV, None);
-
+    async fn pack_source_embeds_manifest_and_reconstructs_payload() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let cas_root = tmp.path().join("cas-off-store");
-        let _cas = EnvVarGuard::set("ATO_CAS_ROOT", Some(cas_root.as_os_str()));
-        let (manifest_path, config, config_path, lock_path) =
-            create_source_fixture(&tmp, "v3-off-layout");
-        let decision =
-            crate::router::route_manifest(&manifest_path, ExecutionProfile::Release, None)
-                .expect("route");
-        let out = tmp.path().join("off.capsule");
-        pack(
-            &decision.plan,
-            CapsulePackOptions {
-                manifest_path,
-                manifest_dir: tmp.path().to_path_buf(),
-                output: Some(out.clone()),
-                config_json: config,
-                config_path,
-                lockfile_path: lock_path,
-            },
-            Arc::new(NoOpReporter),
-        )
-        .await
-        .expect("pack");
+        let manifest_path = tmp.path().join("capsule.toml");
+        std::fs::write(
+            &manifest_path,
+            r#"
+schema_version = "0.2"
+name = "manifest-pack"
+version = "0.1.0"
+type = "app"
+default_target = "cli"
 
-        let entries = read_outer_entries(&out);
-        assert!(entries.contains_key("payload.tar.zst"));
-        assert!(!entries.contains_key(V3_PAYLOAD_MANIFEST_PATH));
-        let signature: serde_json::Value =
-            serde_json::from_slice(entries.get("signature.json").expect("signature"))
-                .expect("json");
-        assert!(signature.get("payload_v3").is_none());
-        assert!(
-            !cas_root.exists(),
-            "v3 disabled must not create CAS root: {}",
-            cas_root.display()
+[targets.cli]
+runtime = "source"
+driver = "native"
+entrypoint = "source/main.sh"
+"#,
+        )
+        .expect("write manifest");
+
+        std::fs::create_dir_all(tmp.path().join("source")).expect("mkdir source");
+        std::fs::write(tmp.path().join("source/main.sh"), "echo manifest").expect("write source");
+        let lock_path = tmp.path().join("capsule.lock");
+        std::fs::write(
+            &lock_path,
+            r#"version = "1"
+
+[meta]
+created_at = "2026-01-01T00:00:00Z"
+manifest_hash = "sha256:dummy"
+"#,
+        )
+        .expect("write lockfile");
+
+        let config = Arc::new(
+            crate::r3_config::generate_config(&manifest_path, Some("strict".to_string()), false)
+                .expect("generate config"),
         );
-    }
-
-    #[tokio::test]
-    async fn test_experimental_v3_on_embeds_manifest_and_writes_cas() {
-        let _env_guard = env_lock().lock().expect("env lock");
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let cas_root = tmp.path().join("cas-store");
-        let _exp = EnvVarGuard::set(EXPERIMENTAL_V3_ENV, Some(OsStr::new("1")));
-        let _cas = EnvVarGuard::set("ATO_CAS_ROOT", Some(cas_root.as_os_str()));
-        let _epoch = EnvVarGuard::set("SOURCE_DATE_EPOCH", Some(OsStr::new("0")));
-
-        let (manifest_path, config, config_path, lock_path) =
-            create_source_fixture(&tmp, "v3-on-layout");
+        let config_path =
+            crate::r3_config::write_config(&manifest_path, config.as_ref()).expect("write config");
         let decision =
             crate::router::route_manifest(&manifest_path, ExecutionProfile::Release, None)
                 .expect("route");
-        let out = tmp.path().join("on.capsule");
-        pack(
-            &decision.plan,
-            CapsulePackOptions {
-                manifest_path,
-                manifest_dir: tmp.path().to_path_buf(),
-                output: Some(out.clone()),
-                config_json: config,
-                config_path,
-                lockfile_path: lock_path,
-            },
-            Arc::new(NoOpReporter),
-        )
-        .await
-        .expect("pack");
-
-        let entries = read_outer_entries(&out);
-        let manifest_bytes = entries
-            .get(V3_PAYLOAD_MANIFEST_PATH)
-            .expect("v3 manifest missing");
-        let manifest: CapsuleManifestV3 =
-            serde_json::from_slice(manifest_bytes).expect("parse v3 manifest");
-        verify_artifact_hash(&manifest).expect("verify hash");
-
-        let cas = CasStore::new(&cas_root).expect("cas");
-        for chunk in &manifest.chunks {
-            assert!(cas.has_chunk(&chunk.raw_hash).expect("has_chunk"));
-        }
-
-        let signature: serde_json::Value =
-            serde_json::from_slice(entries.get("signature.json").expect("signature"))
-                .expect("json");
-        assert_eq!(
-            signature
-                .get("payload_v3")
-                .and_then(|v| v.get("path"))
-                .and_then(|v| v.as_str()),
-            Some(V3_PAYLOAD_MANIFEST_PATH)
-        );
-    }
-
-    #[tokio::test]
-    async fn test_v3_manifest_reconstructs_payload_tar_bytes() {
-        let _env_guard = env_lock().lock().expect("env lock");
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let cas_root = tmp.path().join("cas-store");
-        let _exp = EnvVarGuard::set(EXPERIMENTAL_V3_ENV, Some(OsStr::new("1")));
-        let _cas = EnvVarGuard::set("ATO_CAS_ROOT", Some(cas_root.as_os_str()));
-        let _epoch = EnvVarGuard::set("SOURCE_DATE_EPOCH", Some(OsStr::new("0")));
-
-        let (manifest_path, config, config_path, lock_path) =
-            create_source_fixture(&tmp, "v3-reconstruct");
-        let decision =
-            crate::router::route_manifest(&manifest_path, ExecutionProfile::Release, None)
-                .expect("route");
-        let out = tmp.path().join("reconstruct.capsule");
-        pack(
-            &decision.plan,
-            CapsulePackOptions {
-                manifest_path,
-                manifest_dir: tmp.path().to_path_buf(),
-                output: Some(out.clone()),
-                config_json: config,
-                config_path,
-                lockfile_path: lock_path,
-            },
-            Arc::new(NoOpReporter),
-        )
-        .await
-        .expect("pack");
-
-        let entries = read_outer_entries(&out);
-        let payload_tar_bytes = extract_payload_tar_bytes_from_entries(&entries);
-        let manifest: CapsuleManifestV3 =
-            serde_json::from_slice(entries.get(V3_PAYLOAD_MANIFEST_PATH).expect("manifest"))
-                .expect("parse manifest");
-        let cas = CasStore::new(&cas_root).expect("cas");
-        let reconstructed = reconstruct_payload_tar_from_cas(&manifest, &cas);
-        assert_eq!(payload_tar_bytes, reconstructed);
-        assert_eq!(
-            crate::capsule_v3::manifest::blake3_digest(&payload_tar_bytes),
-            crate::capsule_v3::manifest::blake3_digest(&reconstructed)
-        );
-    }
-
-    #[tokio::test]
-    async fn test_experimental_v3_cas_init_error_falls_back_to_v2() {
-        let _env_guard = env_lock().lock().expect("env lock");
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let cas_root_file = tmp.path().join("cas-root-as-file");
-        std::fs::write(&cas_root_file, "not-a-directory").expect("write cas file");
-        let _exp = EnvVarGuard::set(EXPERIMENTAL_V3_ENV, Some(OsStr::new("1")));
-        let _cas = EnvVarGuard::set("ATO_CAS_ROOT", Some(cas_root_file.as_os_str()));
-
-        let (manifest_path, config, config_path, lock_path) =
-            create_source_fixture(&tmp, "v3-fail-closed");
-        let decision =
-            crate::router::route_manifest(&manifest_path, ExecutionProfile::Release, None)
-                .expect("route");
-        let out = tmp.path().join("fail.capsule");
-        pack(
-            &decision.plan,
-            CapsulePackOptions {
-                manifest_path,
-                manifest_dir: tmp.path().to_path_buf(),
-                output: Some(out.clone()),
-                config_json: config,
-                config_path,
-                lockfile_path: lock_path,
-            },
-            Arc::new(NoOpReporter),
-        )
-        .await
-        .expect("pack should fall back to v2");
-
-        let entries = read_outer_entries(&out);
-        assert!(entries.contains_key("payload.tar.zst"));
-        assert!(!entries.contains_key(V3_PAYLOAD_MANIFEST_PATH));
-        let signature: serde_json::Value =
-            serde_json::from_slice(entries.get("signature.json").expect("signature"))
-                .expect("json");
-        assert!(signature.get("payload_v3").is_none());
-    }
-
-    #[tokio::test]
-    async fn test_experimental_v3_reproducible_manifest_for_identical_inputs() {
-        let _env_guard = env_lock().lock().expect("env lock");
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let cas_root = tmp.path().join("cas-store");
-        let _exp = EnvVarGuard::set(EXPERIMENTAL_V3_ENV, Some(OsStr::new("1")));
-        let _cas = EnvVarGuard::set("ATO_CAS_ROOT", Some(cas_root.as_os_str()));
-        let _epoch = EnvVarGuard::set("SOURCE_DATE_EPOCH", Some(OsStr::new("0")));
-
-        let (manifest_path, config, config_path, lock_path) =
-            create_source_fixture(&tmp, "v3-repro-manifest");
-        let decision =
-            crate::router::route_manifest(&manifest_path, ExecutionProfile::Release, None)
-                .expect("route");
-        let out1 = tmp.path().join("v3-1.capsule");
-        let out2 = tmp.path().join("v3-2.capsule");
-
+        let out = tmp.path().join("manifest-pack.capsule");
         pack(
             &decision.plan,
             CapsulePackOptions {
                 manifest_path: manifest_path.clone(),
                 manifest_dir: tmp.path().to_path_buf(),
-                output: Some(out1.clone()),
-                config_json: config.clone(),
-                config_path: config_path.clone(),
-                lockfile_path: lock_path.clone(),
-            },
-            Arc::new(NoOpReporter),
-        )
-        .await
-        .expect("first pack");
-        pack(
-            &decision.plan,
-            CapsulePackOptions {
-                manifest_path,
-                manifest_dir: tmp.path().to_path_buf(),
-                output: Some(out2.clone()),
+                output: Some(out.clone()),
                 config_json: config,
                 config_path,
                 lockfile_path: lock_path,
@@ -1305,13 +1049,42 @@ manifest_hash = "sha256:dummy"
             Arc::new(NoOpReporter),
         )
         .await
-        .expect("second pack");
+        .expect("pack");
 
-        let entries1 = read_outer_entries(&out1);
-        let entries2 = read_outer_entries(&out2);
-        assert_eq!(
-            entries1.get(V3_PAYLOAD_MANIFEST_PATH),
-            entries2.get(V3_PAYLOAD_MANIFEST_PATH)
-        );
+        let mut outer = tar::Archive::new(std::fs::File::open(&out).expect("open"));
+        let mut payload_zst = Vec::new();
+        let mut manifest_toml_bytes = None::<Vec<u8>>;
+        for entry in outer.entries().expect("entries") {
+            let mut entry = entry.expect("entry");
+            let path = entry.path().expect("path").to_string_lossy().to_string();
+            if path == "payload.tar.zst" {
+                entry.read_to_end(&mut payload_zst).expect("read payload");
+            } else if path == "capsule.toml" {
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes).expect("read manifest");
+                manifest_toml_bytes = Some(bytes);
+            }
+        }
+        let manifest_toml_bytes = manifest_toml_bytes.expect("capsule.toml");
+        let manifest: CapsuleManifest =
+            toml::from_str(std::str::from_utf8(&manifest_toml_bytes).expect("manifest utf8"))
+                .expect("parse manifest");
+
+        let mut decoder =
+            zstd::stream::Decoder::new(std::io::Cursor::new(payload_zst)).expect("decode payload");
+        let mut payload_tar = Vec::new();
+        decoder
+            .read_to_end(&mut payload_tar)
+            .expect("read tar bytes");
+        let rebuilt = reconstruct_from_chunks(
+            &payload_tar,
+            &manifest
+                .distribution
+                .as_ref()
+                .expect("distribution metadata")
+                .chunk_list,
+        )
+        .expect("rebuild");
+        assert_eq!(rebuilt, payload_tar);
     }
 }

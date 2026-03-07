@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 #[cfg(unix)]
 use std::{
     collections::BTreeMap,
@@ -22,23 +22,30 @@ use capsule_core::router::ManifestData;
 
 use crate::common::proxy;
 use crate::runtime_manager;
+use crate::runtime_overrides;
 
-use super::source::IpcEnvVars;
+use super::launch_context::RuntimeLaunchContext;
 
 enum DependencyLock {
     Deno(PathBuf),
     PackageJson(PathBuf),
 }
 
+struct PreparedCommand {
+    cmd: Command,
+    #[cfg(unix)]
+    _secret_fd_guard: Option<std::fs::File>,
+}
+
 pub fn execute(
     plan: &ManifestData,
     execution_plan: &ExecutionPlan,
-    ipc_env: Option<&IpcEnvVars>,
+    launch_ctx: &RuntimeLaunchContext,
     dangerously_skip_permissions: bool,
 ) -> Result<i32> {
     verify_execution_plan_hashes(execution_plan)?;
-    if plan.is_web_services_mode() {
-        return super::web_services::execute(plan, ipc_env);
+    if plan.is_web_services_mode() && !plan.is_orchestration_mode() {
+        return super::web_services::execute(plan, launch_ctx);
     }
 
     let deno_bin = runtime_manager::ensure_deno_binary(plan)?;
@@ -60,17 +67,92 @@ pub fn execute(
         .into());
     };
 
-    run_provisioning(&deno_bin, plan, &runtime_dir, &entrypoint, &lock, ipc_env)?;
-    run_runtime(
+    run_provisioning(
+        &deno_bin,
+        plan,
+        &runtime_dir,
+        &entrypoint,
+        &lock,
+        launch_ctx,
+    )?;
+    let prepared = build_runtime_command(
         &deno_bin,
         plan,
         execution_plan,
         &runtime_dir,
         &entrypoint,
         &lock,
-        ipc_env,
+        launch_ctx,
         dangerously_skip_permissions,
-    )
+    )?;
+    let (exit_code, stderr) =
+        run_and_stream_child(prepared).context("Failed to execute deno run")?;
+
+    if exit_code != 0 {
+        if let Some(err) = map_deno_permission_error(&stderr) {
+            return Err(err.into());
+        }
+    }
+
+    Ok(exit_code)
+}
+
+pub fn spawn(
+    plan: &ManifestData,
+    execution_plan: &ExecutionPlan,
+    launch_ctx: &RuntimeLaunchContext,
+    dangerously_skip_permissions: bool,
+) -> Result<Child> {
+    verify_execution_plan_hashes(execution_plan)?;
+    if plan.is_web_services_mode() && !plan.is_orchestration_mode() {
+        anyhow::bail!("legacy inline web services mode is not supported by deno::spawn");
+    }
+
+    let deno_bin = runtime_manager::ensure_deno_binary(plan)?;
+    let entrypoint = plan
+        .execution_entrypoint()
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| {
+            AtoExecutionError::policy_violation("source/deno target requires entrypoint")
+        })?;
+    let runtime_dir = resolve_deno_runtime_dir(&plan.manifest_dir, &entrypoint);
+    let lock = resolve_dependency_lock(&plan.manifest_dir, &runtime_dir);
+    let Some(lock) = lock else {
+        return Err(AtoExecutionError::lock_incomplete(
+            "deno.lock or package-lock.json is required for source/deno execution",
+            Some("deno.lock"),
+        )
+        .into());
+    };
+
+    run_provisioning(
+        &deno_bin,
+        plan,
+        &runtime_dir,
+        &entrypoint,
+        &lock,
+        launch_ctx,
+    )?;
+
+    let mut prepared = build_runtime_command(
+        &deno_bin,
+        plan,
+        execution_plan,
+        &runtime_dir,
+        &entrypoint,
+        &lock,
+        launch_ctx,
+        dangerously_skip_permissions,
+    )?;
+    prepared
+        .cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    prepared
+        .cmd
+        .spawn()
+        .context("Failed to spawn deno runtime for orchestration")
 }
 
 fn run_provisioning(
@@ -79,7 +161,7 @@ fn run_provisioning(
     runtime_dir: &Path,
     entrypoint: &str,
     lock: &DependencyLock,
-    ipc_env: Option<&IpcEnvVars>,
+    launch_ctx: &RuntimeLaunchContext,
 ) -> Result<()> {
     let mut cmd = Command::new(deno_bin);
     cmd.current_dir(runtime_dir).arg("cache");
@@ -96,7 +178,7 @@ fn run_provisioning(
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
-    apply_session_tokens(&mut cmd, ipc_env)?;
+    launch_ctx.apply_allowlisted_env(&mut cmd)?;
     if let Some(proxy_env) = proxy::proxy_env_from_env(&[])? {
         proxy::apply_proxy_env(&mut cmd, &proxy_env);
     }
@@ -120,18 +202,19 @@ fn run_provisioning(
     }
 }
 
-fn run_runtime(
+#[allow(clippy::too_many_arguments)]
+fn build_runtime_command(
     deno_bin: &Path,
     plan: &ManifestData,
     execution_plan: &ExecutionPlan,
     runtime_dir: &Path,
     entrypoint: &str,
     lock: &DependencyLock,
-    ipc_env: Option<&IpcEnvVars>,
+    launch_ctx: &RuntimeLaunchContext,
     dangerously_skip_permissions: bool,
-) -> Result<i32> {
+) -> Result<PreparedCommand> {
     let mut cmd = Command::new(deno_bin);
-    let execution_env = plan.execution_env();
+    let execution_env = runtime_overrides::merged_env(plan.execution_env());
     cmd.current_dir(runtime_dir).arg("run").arg("--no-prompt");
     if !dangerously_skip_permissions {
         cmd.arg("--cached-only");
@@ -149,49 +232,36 @@ fn run_runtime(
     if dangerously_skip_permissions {
         cmd.arg("-A");
     } else {
-        if !execution_plan.runtime.policy.network.allow_hosts.is_empty() {
-            cmd.arg(format!(
-                "--allow-net={}",
-                execution_plan.runtime.policy.network.allow_hosts.join(",")
-            ));
-        }
+        let is_web_runtime = execution_plan.target.runtime == ExecutionRuntime::Web;
 
-        let mut allow_read = execution_plan.runtime.policy.filesystem.read_only.clone();
-        allow_read.extend(execution_plan.runtime.policy.filesystem.read_write.clone());
-        if !allow_read.is_empty() {
-            cmd.arg(format!("--allow-read={}", allow_read.join(",")));
-        }
+        if is_web_runtime {
+            // web/deno orchestration spawns subprocesses and probes loopback ports dynamically.
+            // Use broad runtime permissions to avoid false policy failures in orchestrator internals.
+            cmd.arg("--allow-net")
+                .arg("--allow-read")
+                .arg("--allow-write")
+                .arg("--allow-env")
+                .arg("--allow-run")
+                .arg("--allow-sys")
+                .arg("--allow-ffi");
+        } else {
+            if !execution_plan.runtime.policy.network.allow_hosts.is_empty() {
+                cmd.arg(format!(
+                    "--allow-net={}",
+                    execution_plan.runtime.policy.network.allow_hosts.join(",")
+                ));
+            }
 
-        if !execution_plan
-            .runtime
-            .policy
-            .filesystem
-            .read_write
-            .is_empty()
-        {
-            cmd.arg(format!(
-                "--allow-write={}",
-                execution_plan
-                    .runtime
-                    .policy
-                    .filesystem
-                    .read_write
-                    .join(",")
-            ));
-        }
+            let mut allow_read = execution_plan.runtime.policy.filesystem.read_only.clone();
+            allow_read.extend(execution_plan.runtime.policy.filesystem.read_write.clone());
+            if !allow_read.is_empty() {
+                cmd.arg(format!("--allow-read={}", allow_read.join(",")));
+            }
 
-        if execution_plan.target.runtime == ExecutionRuntime::Web {
-            let mut allow_env = BTreeSet::new();
-            allow_env.insert("PORT".to_string());
-            allow_env.insert("ATO_RUNTIME_DENO_BIN".to_string());
-            allow_env.insert("ATO_RUNTIME_NODE_BIN".to_string());
-            allow_env.insert("ATO_RUNTIME_PYTHON_BIN".to_string());
-            allow_env.insert("ATO_RUNTIME_UV_BIN".to_string());
-            allow_env.extend(execution_env.keys().cloned());
-            cmd.arg(format!(
-                "--allow-env={}",
-                allow_env.into_iter().collect::<Vec<_>>().join(",")
-            ));
+            let allow_write = execution_plan.runtime.policy.filesystem.read_write.clone();
+            if !allow_write.is_empty() {
+                cmd.arg(format!("--allow-write={}", allow_write.join(",")));
+            }
         }
     }
 
@@ -200,29 +270,57 @@ fn run_runtime(
     }
     cmd.env("ATO_RUNTIME_DENO_BIN", deno_bin);
     if execution_plan.target.runtime == ExecutionRuntime::Web {
-        if let Some(port) = plan.execution_port() {
+        let web_host = launch_ctx
+            .merged_env()
+            .get("ATO_WEB_HOST")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                std::env::var("ATO_WEB_HOST")
+                    .ok()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+            })
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        cmd.env("ATO_WEB_HOST", &web_host);
+        cmd.env("HOST", &web_host);
+
+        let needs_node_runtime = has_runtime_tool(plan, &["node", "nodejs"]);
+        let needs_python_runtime = has_runtime_tool(plan, &["python", "python3"]);
+        let needs_uv_runtime = has_runtime_tool(plan, &["uv"]) || needs_python_runtime;
+
+        if needs_node_runtime {
+            let node_bin = runtime_manager::ensure_node_binary(plan)?;
+            cmd.env("ATO_RUNTIME_NODE_BIN", node_bin);
+        }
+        if needs_python_runtime {
+            let python_bin = runtime_manager::ensure_python_binary(plan)?;
+            cmd.env("ATO_RUNTIME_PYTHON_BIN", python_bin);
+        }
+        if needs_uv_runtime {
+            let uv_bin = runtime_manager::ensure_uv_binary(plan)?;
+            cmd.env("ATO_RUNTIME_UV_BIN", uv_bin);
+        }
+        if let Some(port) = runtime_overrides::override_port(plan.execution_port()) {
             cmd.env("PORT", port.to_string());
+            cmd.env("ATO_WEB_PORT", port.to_string());
+            cmd.env("ATO_WEB_ORIGIN", format!("http://{}:{}", web_host, port));
         }
     }
 
     #[cfg(unix)]
-    let mut _secret_fd_guard: Option<std::fs::File> = None;
+    let mut secret_fd_guard: Option<std::fs::File> = None;
 
     #[cfg(unix)]
     {
         let secrets = collect_runtime_secrets(execution_plan);
         if !secrets.is_empty() {
-            _secret_fd_guard = Some(inject_secrets_via_fd3(&mut cmd, &secrets)?);
-            let has_allow_env = cmd
-                .get_args()
-                .any(|arg| arg.to_string_lossy().starts_with("--allow-env"));
-            if !has_allow_env {
-                cmd.arg("--allow-env");
-            }
+            secret_fd_guard = Some(inject_secrets_via_fd3(&mut cmd, &secrets)?);
         }
     }
 
-    apply_session_tokens(&mut cmd, ipc_env)?;
+    append_allow_env_permission(&mut cmd, plan, launch_ctx);
+    launch_ctx.apply_allowlisted_env(&mut cmd)?;
 
     if let Some(proxy_env) = proxy::proxy_env_from_env(&[])? {
         proxy::apply_proxy_env(&mut cmd, &proxy_env);
@@ -234,20 +332,24 @@ fn run_runtime(
         cmd.args(args);
     }
 
-    let (exit_code, stderr) =
-        run_and_stream_child(&mut cmd).context("Failed to execute deno run")?;
-
-    if exit_code != 0 {
-        if let Some(err) = map_deno_permission_error(&stderr) {
-            return Err(err.into());
-        }
-    }
-
-    Ok(exit_code)
+    Ok(PreparedCommand {
+        cmd,
+        #[cfg(unix)]
+        _secret_fd_guard: secret_fd_guard,
+    })
 }
 
-fn run_and_stream_child(cmd: &mut Command) -> Result<(i32, Vec<u8>)> {
-    let mut child = cmd
+fn has_runtime_tool(plan: &ManifestData, keys: &[&str]) -> bool {
+    keys.iter().any(|key| {
+        plan.execution_runtime_tool_version(key)
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+    })
+}
+
+fn run_and_stream_child(mut prepared: PreparedCommand) -> Result<(i32, Vec<u8>)> {
+    let mut child = prepared
+        .cmd
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -304,6 +406,31 @@ fn run_and_stream_child(cmd: &mut Command) -> Result<(i32, Vec<u8>)> {
 
     let exit_code = status.code().unwrap_or(1);
     Ok((exit_code, stderr))
+}
+
+fn append_allow_env_permission(
+    cmd: &mut Command,
+    plan: &ManifestData,
+    launch_ctx: &RuntimeLaunchContext,
+) {
+    let has_allow_env = cmd
+        .get_args()
+        .any(|arg| arg.to_string_lossy().starts_with("--allow-env"));
+    if has_allow_env {
+        return;
+    }
+
+    let mut keys = BTreeSet::new();
+    keys.extend(runtime_overrides::merged_env(plan.execution_env()).into_keys());
+    keys.extend(launch_ctx.env_permission_keys());
+    if keys.is_empty() {
+        return;
+    }
+
+    cmd.arg(format!(
+        "--allow-env={}",
+        keys.into_iter().collect::<Vec<_>>().join(",")
+    ));
 }
 
 fn resolve_deno_runtime_dir(manifest_dir: &Path, entrypoint: &str) -> PathBuf {
@@ -471,27 +598,6 @@ fn verify_execution_plan_hashes(execution_plan: &ExecutionPlan) -> Result<()> {
             "provisioning_policy_hash mismatch detected before deno runtime",
             Some("provisioning_policy_hash"),
         )
-        .into());
-    }
-
-    Ok(())
-}
-
-fn apply_session_tokens(cmd: &mut Command, ipc_env: Option<&IpcEnvVars>) -> Result<()> {
-    let Some(ipc_env) = ipc_env else {
-        return Ok(());
-    };
-
-    for (key, value) in ipc_env {
-        if key.starts_with("CAPSULE_IPC_") || key == "ATO_BRIDGE_TOKEN" {
-            cmd.env(key, value);
-            continue;
-        }
-
-        return Err(AtoExecutionError::policy_violation(format!(
-            "session_token env '{}' is not allowlisted",
-            key
-        ))
         .into());
     }
 

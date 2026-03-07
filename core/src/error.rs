@@ -55,6 +55,9 @@ pub enum CapsuleError {
     #[error("Build/Pack error: {0}")]
     Pack(String),
 
+    #[error("Strict manifest fallback is not allowed: {0}")]
+    StrictManifestFallbackNotAllowed(String),
+
     #[error("Unknown error: {0}")]
     Other(#[from] anyhow::Error),
 }

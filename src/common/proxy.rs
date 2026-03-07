@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
@@ -71,6 +72,7 @@ pub fn apply_proxy_env(cmd: &mut std::process::Command, proxy: &ProxyEnv) {
         .env("NO_PROXY", &proxy.no_proxy);
 }
 
+#[cfg(test)]
 pub fn extend_env_map(env: &mut HashMap<String, String>, proxy: &ProxyEnv) {
     env.insert("HTTP_PROXY".to_string(), proxy.http_proxy.clone());
     env.insert("HTTPS_PROXY".to_string(), proxy.https_proxy.clone());

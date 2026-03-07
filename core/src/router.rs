@@ -4,7 +4,11 @@ use std::path::{Path, PathBuf};
 use tracing::debug;
 
 use crate::manifest;
-use crate::types::ServiceSpec;
+use crate::orchestration;
+use crate::types::{
+    NamedTarget, OrchestrationPlan, ResolvedService, ResolvedServiceNetwork,
+    ResolvedServiceRuntime, ResolvedTargetRuntime, ServiceConnectionInfo, ServiceSpec,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeKind {
@@ -167,6 +171,223 @@ impl ManifestData {
             .unwrap_or_default()
     }
 
+    pub fn is_orchestration_mode(&self) -> bool {
+        self.services().values().any(|service| {
+            service
+                .target
+                .as_ref()
+                .map(|target| !target.trim().is_empty())
+                .unwrap_or(false)
+        })
+    }
+
+    pub fn target_for_service(&self, service_name: &str) -> Result<Option<String>> {
+        let services = self.services();
+        let service = services
+            .get(service_name)
+            .ok_or_else(|| anyhow!("services.{} is missing", service_name))?;
+
+        if let Some(target) = service
+            .target
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        {
+            return Ok(Some(target.to_string()));
+        }
+
+        if self.is_orchestration_mode()
+            && service_name == "main"
+            && service.entrypoint.trim().is_empty()
+        {
+            return Ok(Some(self.default_target_label()?));
+        }
+
+        Ok(None)
+    }
+
+    pub fn resolve_services(&self) -> Result<OrchestrationPlan> {
+        if !self.is_orchestration_mode() {
+            anyhow::bail!("services target-based orchestration mode is not enabled");
+        }
+
+        let services = self.services();
+        if services.is_empty() {
+            anyhow::bail!("top-level [services] must define at least one service");
+        }
+
+        let mut dependencies = HashMap::new();
+        let mut resolved_services = Vec::new();
+        let mut resolved_runtime_by_name = HashMap::new();
+
+        let mut names: Vec<String> = services.keys().cloned().collect();
+        names.sort();
+
+        for name in &names {
+            let service = services
+                .get(name)
+                .ok_or_else(|| anyhow!("services.{} is missing from parsed manifest", name))?;
+
+            if !service.entrypoint.trim().is_empty() {
+                anyhow::bail!(
+                    "services.{}.entrypoint is only supported in legacy inline services mode",
+                    name
+                );
+            }
+
+            let target_label = self
+                .target_for_service(name)?
+                .ok_or_else(|| anyhow!("services.{}.target is required", name))?;
+            let target = self.target_named(name, &target_label)?;
+            let depends_on = service.depends_on.clone().unwrap_or_default();
+            let runtime_kind = parse_runtime_kind(&target.runtime).ok_or_else(|| {
+                anyhow!(
+                    "services.{}.target '{}' has unsupported runtime '{}'",
+                    name,
+                    target_label,
+                    target.runtime
+                )
+            })?;
+
+            let target_runtime = ResolvedTargetRuntime {
+                target: target_label.clone(),
+                runtime: target.runtime.clone(),
+                driver: target.driver.clone(),
+                image: target.image.clone().or_else(|| {
+                    (!target.entrypoint.trim().is_empty()).then(|| target.entrypoint.clone())
+                }),
+                entrypoint: target.entrypoint.clone(),
+                cmd: target.cmd.clone(),
+                env: {
+                    let mut env = self.target_env(&target_label);
+                    if let Some(extra_env) = service.env.as_ref() {
+                        env.extend(extra_env.clone());
+                    }
+                    env
+                },
+                working_dir: target.working_dir.clone(),
+                port: self.target_port(&target_label),
+                required_env: self.target_required_envs(&target_label),
+            };
+
+            let runtime = match runtime_kind {
+                RuntimeKind::Oci => ResolvedServiceRuntime::Oci(target_runtime),
+                RuntimeKind::Wasm => {
+                    anyhow::bail!(
+                        "services.{}.target '{}' cannot use runtime=wasm",
+                        name,
+                        target_label
+                    )
+                }
+                RuntimeKind::Source | RuntimeKind::Web => {
+                    ResolvedServiceRuntime::Managed(target_runtime)
+                }
+            };
+
+            let mut aliases = vec![name.clone()];
+            if let Some(network) = service.network.as_ref() {
+                for alias in &network.aliases {
+                    let trimmed = alias.trim();
+                    if !trimmed.is_empty() && !aliases.iter().any(|value| value == trimmed) {
+                        aliases.push(trimmed.to_string());
+                    }
+                }
+            }
+
+            let connections = depends_on
+                .iter()
+                .filter_map(|dependency| {
+                    let dependency_service = services.get(dependency)?;
+                    let dependency_target = self.target_for_service(dependency).ok().flatten()?;
+                    let dependency_port = self.target_port(&dependency_target);
+                    let dependency_network = dependency_service.network.as_ref();
+                    let default_host = dependency_network
+                        .and_then(|network| network.aliases.first())
+                        .cloned()
+                        .unwrap_or_else(|| dependency.clone());
+                    Some(ServiceConnectionInfo {
+                        dependency: dependency.clone(),
+                        host_env: connection_env_key(dependency, "HOST"),
+                        port_env: connection_env_key(dependency, "PORT"),
+                        container_port: dependency_port,
+                        default_host,
+                    })
+                })
+                .collect();
+
+            let mut network = ResolvedServiceNetwork {
+                aliases,
+                publish: service
+                    .network
+                    .as_ref()
+                    .map(|network| network.publish)
+                    .unwrap_or(false),
+                allow_from: service
+                    .network
+                    .as_ref()
+                    .map(|network| network.allow_from.clone())
+                    .unwrap_or_default(),
+            };
+            if name == "main" && runtime.runtime().port.is_some() {
+                network.publish = true;
+            }
+
+            dependencies.insert(name.clone(), depends_on.clone());
+            resolved_runtime_by_name.insert(name.clone(), runtime_kind);
+            resolved_services.push(ResolvedService {
+                name: name.clone(),
+                depends_on,
+                connections,
+                readiness_probe: service.readiness_probe.clone(),
+                network,
+                runtime,
+            });
+        }
+
+        for service in &resolved_services {
+            for dependency in &service.depends_on {
+                let Some(dependency_service) = services.get(dependency) else {
+                    anyhow::bail!(
+                        "services.{}.depends_on references unknown service '{}'",
+                        service.name,
+                        dependency
+                    );
+                };
+                if let Some(network) = dependency_service.network.as_ref() {
+                    if !network.allow_from.is_empty()
+                        && !network
+                            .allow_from
+                            .iter()
+                            .any(|value| value == &service.name)
+                    {
+                        anyhow::bail!(
+                            "service '{}' is not allowed to connect to '{}'",
+                            service.name,
+                            dependency
+                        );
+                    }
+                }
+
+                let dependency_runtime = resolved_runtime_by_name
+                    .get(dependency)
+                    .ok_or_else(|| anyhow!("service '{}' is unresolved", dependency))?;
+                if service.runtime.is_oci() && *dependency_runtime != RuntimeKind::Oci {
+                    anyhow::bail!(
+                        "OCI service '{}' cannot depend on non-OCI service '{}'",
+                        service.name,
+                        dependency
+                    );
+                }
+            }
+        }
+
+        let startup_order = orchestration::startup_order_from_dependencies(&dependencies)?;
+        Ok(OrchestrationPlan {
+            startup_order,
+            services: resolved_services,
+        })
+    }
+
     pub fn is_web_services_mode(&self) -> bool {
         self.execution_runtime()
             .map(|runtime| runtime.eq_ignore_ascii_case("web"))
@@ -187,14 +408,11 @@ impl ManifestData {
     }
 
     pub fn execution_port(&self) -> Option<u16> {
-        self.get_value(&["targets", &self.selected_target, "port"])
-            .or_else(|| self.get_value(&["port"]))
-            .and_then(|v| v.as_integer())
-            .and_then(|v| u16::try_from(v).ok())
+        self.target_port(&self.selected_target)
     }
 
     pub fn execution_working_dir(&self) -> Option<String> {
-        self.get_str(&["targets", &self.selected_target, "working_dir"])
+        self.target_working_dir(&self.selected_target)
     }
 
     pub fn execution_preference(&self) -> Option<Vec<RuntimeKind>> {
@@ -220,24 +438,19 @@ impl ManifestData {
         if !runtime.eq_ignore_ascii_case("oci") {
             return None;
         }
-        self.get_str(&["targets", &self.selected_target, "image"])
-            .or_else(|| self.execution_entrypoint())
+        self.target_image(&self.selected_target)
     }
 
     pub fn targets_oci_cmd(&self) -> Vec<String> {
-        self.get_array(&["targets", &self.selected_target, "cmd"])
-            .map(|a| array_to_vec(a))
-            .unwrap_or_default()
+        self.target_cmd(&self.selected_target)
     }
 
     pub fn targets_oci_env(&self) -> HashMap<String, String> {
-        self.get_table(&["targets", &self.selected_target, "env"])
-            .map(table_to_map)
-            .unwrap_or_default()
+        self.target_env(&self.selected_target)
     }
 
     pub fn targets_oci_working_dir(&self) -> Option<String> {
-        self.get_str(&["targets", &self.selected_target, "working_dir"])
+        self.target_working_dir(&self.selected_target)
     }
 
     pub fn targets_wasm_component(&self) -> Option<String> {
@@ -265,6 +478,13 @@ impl ManifestData {
 
     pub fn selected_target_label(&self) -> &str {
         &self.selected_target
+    }
+
+    pub fn default_target_label(&self) -> Result<String> {
+        self.get_str(&["default_target"])
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("Missing required field: default_target"))
     }
 
     pub fn build_gpu(&self) -> bool {
@@ -307,6 +527,78 @@ impl ManifestData {
         }
     }
 
+    pub fn target_runtime(&self, target_label: &str) -> Option<String> {
+        self.get_str(&["targets", target_label, "runtime"])
+    }
+
+    pub fn target_driver(&self, target_label: &str) -> Option<String> {
+        self.get_str(&["targets", target_label, "driver"])
+    }
+
+    pub fn target_entrypoint(&self, target_label: &str) -> Option<String> {
+        self.get_str(&["targets", target_label, "entrypoint"])
+    }
+
+    pub fn target_image(&self, target_label: &str) -> Option<String> {
+        self.get_str(&["targets", target_label, "image"])
+            .or_else(|| self.target_entrypoint(target_label))
+    }
+
+    pub fn target_cmd(&self, target_label: &str) -> Vec<String> {
+        self.get_array(&["targets", target_label, "cmd"])
+            .map(|values| array_to_vec(values))
+            .unwrap_or_default()
+    }
+
+    pub fn target_env(&self, target_label: &str) -> HashMap<String, String> {
+        self.get_table(&["targets", target_label, "env"])
+            .map(table_to_map)
+            .unwrap_or_default()
+    }
+
+    pub fn target_required_envs(&self, target_label: &str) -> Vec<String> {
+        let mut ordered = Vec::new();
+        let mut seen = HashSet::new();
+
+        if let Some(required) = self.get_array(&["targets", target_label, "required_env"]) {
+            for value in required {
+                if let Some(name) = value.as_str() {
+                    let trimmed = name.trim();
+                    if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+                        ordered.push(trimmed.to_string());
+                    }
+                }
+            }
+        }
+
+        ordered
+    }
+
+    pub fn target_port(&self, target_label: &str) -> Option<u16> {
+        self.get_value(&["targets", target_label, "port"])
+            .or_else(|| self.get_value(&["port"]))
+            .and_then(|v| v.as_integer())
+            .and_then(|v| u16::try_from(v).ok())
+    }
+
+    pub fn target_working_dir(&self, target_label: &str) -> Option<String> {
+        self.get_str(&["targets", target_label, "working_dir"])
+    }
+
+    fn target_named(&self, service_name: &str, target_label: &str) -> Result<NamedTarget> {
+        let value = self.get_value(&["targets", target_label]).ok_or_else(|| {
+            anyhow!(
+                "services.{}.target '{}' does not exist",
+                service_name,
+                target_label
+            )
+        })?;
+        value
+            .clone()
+            .try_into()
+            .map_err(|_| anyhow!("targets.{} is not a valid target table", target_label))
+    }
+
     fn get_value<'a>(&'a self, path: &[&str]) -> Option<&'a toml::Value> {
         let mut current = &self.manifest;
         for key in path {
@@ -329,6 +621,20 @@ impl ManifestData {
             .and_then(|v| v.as_str())
             .map(|v| v.to_string())
     }
+}
+
+fn connection_env_key(service_name: &str, suffix: &str) -> String {
+    let sanitized = service_name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    format!("ATO_SERVICE_{}_{}", sanitized, suffix)
 }
 
 fn parse_runtime_kind(value: &str) -> Option<RuntimeKind> {
@@ -378,4 +684,166 @@ fn array_to_vec(values: &[toml::Value]) -> Vec<String> {
         .iter()
         .filter_map(|v| v.as_str().map(|s| s.to_string()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{route_manifest, ExecutionProfile};
+    use std::fs;
+
+    fn write_manifest(contents: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("capsule.toml"), contents).expect("write manifest");
+        dir
+    }
+
+    #[test]
+    fn orchestration_mode_detects_target_services() {
+        let dir = write_manifest(
+            r#"
+schema_version = "0.2"
+name = "demo-app"
+version = "0.1.0"
+type = "app"
+default_target = "web"
+
+[targets.web]
+runtime = "web"
+driver = "node"
+entrypoint = "server.js"
+port = 3000
+required_env = ["API_KEY"]
+
+[targets.db]
+runtime = "oci"
+image = "mysql:8"
+port = 3306
+
+[services.main]
+target = "web"
+depends_on = ["db"]
+
+[services.db]
+target = "db"
+"#,
+        );
+
+        let decision = route_manifest(
+            &dir.path().join("capsule.toml"),
+            ExecutionProfile::Dev,
+            None,
+        )
+        .expect("route manifest");
+
+        assert!(decision.plan.is_orchestration_mode());
+        assert_eq!(
+            decision
+                .plan
+                .target_for_service("main")
+                .expect("main target"),
+            Some("web".to_string())
+        );
+    }
+
+    #[test]
+    fn orchestration_mode_defaults_main_target() {
+        let dir = write_manifest(
+            r#"
+schema_version = "0.2"
+name = "demo-app"
+version = "0.1.0"
+type = "app"
+default_target = "web"
+
+[targets.web]
+runtime = "web"
+driver = "node"
+entrypoint = "server.js"
+port = 3000
+
+[targets.db]
+runtime = "oci"
+image = "mysql:8"
+port = 3306
+
+[services.main]
+depends_on = ["db"]
+
+[services.db]
+target = "db"
+"#,
+        );
+
+        let decision = route_manifest(
+            &dir.path().join("capsule.toml"),
+            ExecutionProfile::Dev,
+            None,
+        )
+        .expect("route manifest");
+
+        assert_eq!(
+            decision
+                .plan
+                .target_for_service("main")
+                .expect("main target"),
+            Some("web".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_services_builds_connections() {
+        let dir = write_manifest(
+            r#"
+schema_version = "0.2"
+name = "demo-app"
+version = "0.1.0"
+type = "app"
+default_target = "web"
+
+[targets.web]
+runtime = "web"
+driver = "node"
+entrypoint = "server.js"
+port = 3000
+required_env = ["API_KEY"]
+
+[targets.db]
+runtime = "oci"
+image = "mysql:8"
+port = 3306
+
+[services.main]
+target = "web"
+depends_on = ["db"]
+
+[services.db]
+target = "db"
+network = { aliases = ["mysql"] }
+"#,
+        );
+
+        let decision = route_manifest(
+            &dir.path().join("capsule.toml"),
+            ExecutionProfile::Dev,
+            None,
+        )
+        .expect("route manifest");
+        let plan = decision.plan.resolve_services().expect("resolve services");
+
+        assert_eq!(
+            plan.startup_order,
+            vec!["db".to_string(), "main".to_string()]
+        );
+        let main = plan.service("main").expect("main service");
+        assert_eq!(main.runtime.runtime().target, "web");
+        assert_eq!(
+            main.runtime.runtime().required_env,
+            vec!["API_KEY".to_string()]
+        );
+        assert_eq!(main.connections.len(), 1);
+        assert_eq!(main.connections[0].dependency, "db");
+        assert_eq!(main.connections[0].default_host, "mysql");
+        assert_eq!(main.connections[0].host_env, "ATO_SERVICE_DB_HOST");
+        assert_eq!(main.connections[0].port_env, "ATO_SERVICE_DB_PORT");
+    }
 }

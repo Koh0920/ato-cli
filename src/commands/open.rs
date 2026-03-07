@@ -10,20 +10,28 @@ use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::Command;
+use std::sync::mpsc::Receiver;
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Once};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant, SystemTime};
 use tracing::debug;
 
 use crate::executors::source::ExecuteMode;
-use crate::ipc::inject::IpcContext;
+use crate::executors::source::NacelleExecEvent;
+use crate::executors::target_runner::{self, TargetLaunchOptions};
 use crate::reporters::CliReporter;
 use crate::runtime_manager;
+use crate::runtime_overrides;
+use crate::runtime_tree;
 use capsule_core::execution_plan::error::AtoExecutionError;
-use capsule_core::execution_plan::guard::{self, ExecutorKind};
-use capsule_core::{lockfile, router, CapsuleReporter};
+use capsule_core::execution_plan::guard::ExecutorKind;
+use capsule_core::{router, CapsuleReporter};
 
 mod watch;
 
-const DEFAULT_DEBOUNCE_MS: u64 = 300;
+const BACKGROUND_READY_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+const BACKGROUND_READY_WAIT_TIMEOUT_ENV: &str = "ATO_BACKGROUND_READY_WAIT_TIMEOUT_SECS";
 
 pub struct OpenArgs {
     pub target: PathBuf,
@@ -40,10 +48,9 @@ pub struct OpenArgs {
 
 pub async fn execute(args: OpenArgs) -> Result<()> {
     let target = args.target.clone();
-    let target_name = target
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(|s| s.to_string());
+    let target_is_manifest_file =
+        target.is_file() && target.file_name().and_then(|n| n.to_str()) == Some("capsule.toml");
+    let target_is_manifest_dir = target.is_dir() && target.join("capsule.toml").exists();
 
     if target
         .extension()
@@ -51,13 +58,7 @@ pub async fn execute(args: OpenArgs) -> Result<()> {
         == Some("capsule".to_string())
     {
         execute_capsule_file(&args, &target).await
-    } else if target.is_dir() && target.join("capsule.toml").exists() {
-        if args.watch {
-            execute_watch_mode(args)
-        } else {
-            execute_normal_mode(args).await
-        }
-    } else if target.is_file() && target_name == Some("capsule.toml".to_string()) {
+    } else if target_is_manifest_dir || target_is_manifest_file {
         if args.watch {
             execute_watch_mode(args)
         } else {
@@ -72,6 +73,26 @@ pub async fn execute(args: OpenArgs) -> Result<()> {
 }
 
 async fn execute_capsule_file(args: &OpenArgs, capsule_path: &PathBuf) -> Result<()> {
+    if let Some(manifest_path) = runtime_tree::prepare_store_runtime_for_capsule(capsule_path)? {
+        debug!(
+            manifest_path = %manifest_path.display(),
+            "Running capsule from isolated runtime tree"
+        );
+        let open_args = OpenArgs {
+            target: manifest_path,
+            target_label: args.target_label.clone(),
+            watch: args.watch,
+            background: args.background,
+            nacelle: args.nacelle.clone(),
+            enforcement: args.enforcement.clone(),
+            sandbox_mode: args.sandbox_mode,
+            dangerously_skip_permissions: args.dangerously_skip_permissions,
+            assume_yes: args.assume_yes,
+            reporter: args.reporter.clone(),
+        };
+        return execute_normal_mode(open_args).await;
+    }
+
     debug!(capsule = %capsule_path.display(), "Extracting capsule archive");
 
     let extract_dir = capsule_path
@@ -134,16 +155,11 @@ async fn execute_capsule_file(args: &OpenArgs, capsule_path: &PathBuf) -> Result
         anyhow::bail!("Extracted capsule does not contain capsule.toml");
     }
 
-    let original_dir = {
-        let parent = capsule_path.parent();
-        if parent.map(|p| p.as_os_str().is_empty()).unwrap_or(true) {
-            std::env::current_dir().context("Failed to get current directory")?
-        } else if parent == Some(std::path::Path::new(".")) {
-            std::env::current_dir().context("Failed to get current directory")?
-        } else {
-            parent.unwrap().to_path_buf()
-        }
-    };
+    let original_dir = capsule_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty() && *parent != std::path::Path::new("."))
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or(std::env::current_dir().context("Failed to get current directory")?);
 
     let has_source_files = check_has_source_files(&extract_dir);
     let original_has_source = check_has_source_files(&original_dir);
@@ -266,54 +282,51 @@ fn check_has_source_files(dir: &Path) -> bool {
     let mut file_count = 0usize;
     let mut has_actual_source_files = false;
 
-    for entry in entries {
-        if let Ok(entry) = entry {
-            file_count += 1;
-            let file_name = entry.file_name();
-            let path = entry.path();
+    for entry in entries.flatten() {
+        file_count += 1;
+        let file_name = entry.file_name();
+        let path = entry.path();
 
-            if file_name == "capsule.toml"
-                || file_name == "capsule.lock"
-                || file_name == "config.json"
-                || file_name == "signature.json"
+        if file_name == "capsule.toml"
+            || file_name == "capsule.lock"
+            || file_name == "config.json"
+            || file_name == "signature.json"
+        {
+            continue;
+        }
+
+        if path.is_file() {
+            let name = file_name.to_string_lossy();
+            if name == "package.json"
+                || name == "pyproject.toml"
+                || name == "requirements.txt"
+                || name == "go.mod"
+                || name == "Cargo.toml"
             {
-                continue;
+                return true;
+            }
+            if is_source_file(&file_name) {
+                return true;
+            }
+            has_actual_source_files = true;
+        }
+
+        if path.is_dir() && !is_hidden(&file_name) {
+            if file_name == "source"
+                && fs::read_dir(&path)
+                    .ok()
+                    .and_then(|mut it| it.next())
+                    .is_some()
+            {
+                return true;
             }
 
-            if path.is_file() {
-                let name = file_name.to_string_lossy();
-                if name == "package.json"
-                    || name == "pyproject.toml"
-                    || name == "requirements.txt"
-                    || name == "go.mod"
-                    || name == "Cargo.toml"
-                {
-                    return true;
-                }
-                if is_source_file(&file_name) {
-                    return true;
-                }
-                has_actual_source_files = true;
-            }
-
-            if path.is_dir() && !is_hidden(&file_name) {
-                if file_name == "source" {
-                    if fs::read_dir(&path)
-                        .ok()
-                        .and_then(|mut it| it.next())
-                        .is_some()
-                    {
-                        return true;
-                    }
-                }
-
-                if path.join("package.json").exists()
-                    || path.join("pyproject.toml").exists()
-                    || path.join("index.js").exists()
-                    || path.join("main.py").exists()
-                {
-                    return true;
-                }
+            if path.join("package.json").exists()
+                || path.join("pyproject.toml").exists()
+                || path.join("index.js").exists()
+                || path.join("main.py").exists()
+            {
+                return true;
             }
         }
     }
@@ -364,41 +377,67 @@ async fn execute_normal_mode(args: OpenArgs) -> Result<()> {
         args.target.clone()
     };
 
-    let compiled = capsule_core::execution_plan::derive::compile_execution_plan(
+    let decision = capsule_core::router::route_manifest(
         &manifest_path,
         router::ExecutionProfile::Dev,
         args.target_label.as_deref(),
     )?;
-    let execution_plan = compiled.execution_plan;
-    let decision = compiled.runtime_decision;
-    let tier = compiled.tier;
+    let launch_ctx = target_runner::resolve_launch_context(&decision.plan, &args.reporter).await?;
 
-    preflight_required_environment_variables(&decision.plan)?;
-    preflight_web_services_requirements(&decision.plan)?;
-
-    let lockfile_path = manifest_path.parent().map(|p| p.join("capsule.lock"));
-    if let Some(lock_path) = lockfile_path {
-        if lock_path.exists() {
-            lockfile::verify_lockfile_manifest(&manifest_path, &lock_path).map_err(|err| {
-                if err.to_string().contains("manifest hash mismatch") {
-                    AtoExecutionError::lockfile_tampered(err.to_string(), Some("capsule.lock"))
-                } else {
-                    AtoExecutionError::policy_violation(err.to_string())
-                }
-            })?;
-            debug!("capsule.lock integrity verified");
+    if decision.plan.is_orchestration_mode() {
+        if args.background {
+            anyhow::bail!("--background is not supported for orchestration mode");
         }
+
+        let exit = crate::executors::orchestrator::execute(
+            &decision.plan,
+            args.reporter.clone(),
+            &launch_ctx,
+            crate::executors::orchestrator::OrchestratorOptions {
+                enforcement: args.enforcement.clone(),
+                sandbox_mode: args.sandbox_mode,
+                dangerously_skip_permissions: args.dangerously_skip_permissions,
+                assume_yes: args.assume_yes,
+                nacelle: args.nacelle.clone(),
+            },
+        )
+        .await?;
+        if exit != 0 {
+            std::process::exit(exit);
+        }
+        return Ok(());
     }
 
-    let guard_result = guard::evaluate(
-        &execution_plan,
-        &decision.plan.manifest_dir,
-        &args.enforcement,
-        args.sandbox_mode,
-        args.dangerously_skip_permissions,
-    )?;
+    if matches!(decision.kind, capsule_core::router::RuntimeKind::Oci) {
+        if args.background {
+            anyhow::bail!("--background is not supported for runtime=oci");
+        }
 
-    crate::consent_store::require_consent(&execution_plan, args.assume_yes)?;
+        target_runner::preflight_required_environment_variables(&decision.plan, &launch_ctx)?;
+        let exit =
+            crate::executors::oci::execute(&decision.plan, args.reporter.clone(), &launch_ctx)
+                .await?;
+        if exit != 0 {
+            std::process::exit(exit);
+        }
+        return Ok(());
+    }
+
+    let prepared = target_runner::prepare_target_execution(
+        &decision.plan,
+        launch_ctx.clone(),
+        &TargetLaunchOptions {
+            enforcement: args.enforcement.clone(),
+            sandbox_mode: args.sandbox_mode,
+            dangerously_skip_permissions: args.dangerously_skip_permissions,
+            assume_yes: args.assume_yes,
+        },
+    )?;
+    let execution_plan = prepared.execution_plan;
+    let decision = prepared.runtime_decision;
+    let tier = prepared.tier;
+    let guard_result = prepared.guard_result;
+    let launch_ctx = prepared.launch_ctx;
 
     debug!(
         runtime = execution_plan.target.runtime.as_str(),
@@ -433,31 +472,12 @@ async fn execute_normal_mode(args: OpenArgs) -> Result<()> {
         ExecuteMode::Foreground
     };
 
-    // ── IPC: Resolve imports and build IPC environment context ──
-    let ipc_ctx = match IpcContext::from_manifest(&decision.plan.manifest) {
-        Ok(ctx) => {
-            if ctx.has_ipc() {
-                debug!(
-                    resolved_services = ctx.resolved_count,
-                    injected_env_vars = ctx.env_vars.len(),
-                    "IPC resolved"
-                );
-            }
-            for warning in &ctx.warnings {
-                debug!(warning = %warning, "IPC warning");
-            }
-            ctx
+    let run_scoped_id = runtime_overrides::scoped_id_override();
+    if args.background {
+        if let Some(scoped_id) = run_scoped_id.as_deref() {
+            cleanup_existing_scoped_processes_before_run(scoped_id, &args.reporter).await?;
         }
-        Err(err) => {
-            debug!(error = %err, "IPC resolution failed");
-            IpcContext::empty()
-        }
-    };
-    let ipc_env = if ipc_ctx.has_ipc() {
-        Some(&ipc_ctx.env_vars)
-    } else {
-        None
-    };
+    }
 
     if execution_plan.target.runtime == capsule_core::execution_plan::model::ExecutionRuntime::Web {
         notify_web_endpoint(&decision.plan, &args.reporter).await?;
@@ -470,23 +490,25 @@ async fn execute_normal_mode(args: OpenArgs) -> Result<()> {
                     &decision.plan,
                     args.reporter.clone(),
                     mode,
-                    ipc_env,
+                    &launch_ctx,
                 )?
             } else {
-                preflight_native_sandbox(args.nacelle.clone(), &decision.plan)?;
+                let nacelle =
+                    preflight_native_sandbox(args.nacelle.clone(), &decision.plan, &args.reporter)?;
                 crate::executors::source::execute(
                     &decision.plan,
-                    args.nacelle,
+                    Some(nacelle),
                     args.reporter.clone(),
                     &args.enforcement,
                     mode,
-                    ipc_env,
+                    &launch_ctx,
                 )?
             };
 
             if args.background {
                 let pid = process.child.id();
                 let id = format!("capsule-{}", pid);
+                let now = SystemTime::now();
 
                 let info = crate::process_manager::ProcessInfo {
                     id: id.clone(),
@@ -498,32 +520,102 @@ async fn execute_normal_mode(args: OpenArgs) -> Result<()> {
                         .unwrap_or("unknown")
                         .to_string(),
                     pid: pid as i32,
-                    status: crate::process_manager::ProcessStatus::Running,
+                    workload_pid: process.workload_pid.map(|value| value as i32),
+                    status: if args.dangerously_skip_permissions {
+                        crate::process_manager::ProcessStatus::Ready
+                    } else {
+                        crate::process_manager::ProcessStatus::Starting
+                    },
                     runtime: if args.dangerously_skip_permissions {
                         "host".to_string()
                     } else {
                         "nacelle".to_string()
                     },
-                    start_time: std::time::SystemTime::now(),
+                    start_time: now,
                     manifest_path: Some(decision.plan.manifest_path.clone()),
+                    scoped_id: run_scoped_id.clone(),
+                    target_label: Some(decision.plan.selected_target_label().to_string()),
+                    log_path: process.log_path.clone(),
+                    ready_at: if args.dangerously_skip_permissions {
+                        Some(now)
+                    } else {
+                        None
+                    },
+                    last_event: Some("spawned".to_string()),
+                    last_error: None,
+                    exit_code: None,
                 };
 
                 let pm = crate::process_manager::ProcessManager::new()?;
                 pm.write_pid(&info)?;
 
-                args.reporter
-                    .notify(format!("🚀 Capsule started in background (ID: {})", id))
-                    .await?;
+                let (startup_outcome, event_rx) = if args.dangerously_skip_permissions {
+                    (BackgroundStartupOutcome::Ready, None)
+                } else {
+                    wait_for_background_native_startup(&mut process, &pm, &id)?
+                };
 
-                drop(process);
+                cleanup_process_artifacts(&process.cleanup_paths);
+
+                match startup_outcome {
+                    BackgroundStartupOutcome::Ready => {
+                        let _ = process.child;
+                        let _ = event_rx;
+                        let _ = pm.read_pid(&id)?;
+                        args.reporter
+                            .notify(format!(
+                                "🚀 Capsule started in background and is ready (ID: {})",
+                                id
+                            ))
+                            .await?;
+                    }
+                    BackgroundStartupOutcome::TimedOut => {
+                        let _ = process.child;
+                        let _ = event_rx;
+                        let _ = pm.read_pid(&id)?;
+                        args.reporter
+                            .warn(format!(
+                                "⏳ Capsule is still starting in background (ID: {}). Use `ato ps --all` to inspect readiness.",
+                                id
+                            ))
+                            .await?;
+                    }
+                    BackgroundStartupOutcome::FailedBeforeReady => {
+                        let state = pm.read_pid(&id).ok();
+                        let mut message =
+                            format!("Background capsule failed before readiness (ID: {})", id);
+                        if let Some(state) = state {
+                            if let Some(error) = state.last_error {
+                                message.push_str(&format!(": {}", error));
+                            } else if let Some(code) = state.exit_code {
+                                message.push_str(&format!(": exit code {}", code));
+                            }
+                            if let Some(log_path) = state.log_path {
+                                message.push_str(&format!(". See logs at {}", log_path.display()));
+                            }
+                        }
+                        sidecar_cleanup.stop_now();
+                        anyhow::bail!(message);
+                    }
+                }
                 sidecar_cleanup.stop_now();
                 return Ok(());
             }
 
+            let readiness_notifier = spawn_foreground_native_event_reporter(
+                args.reporter.clone(),
+                process.event_rx.take(),
+                !args.dangerously_skip_permissions,
+                launch_ctx
+                    .socket_paths()
+                    .map(|paths| !paths.is_empty())
+                    .unwrap_or(false),
+            )?;
             let exit_code = crate::executors::source::wait_for_exit(&mut process.child).await?;
-            if process.bundle_path.exists() {
-                let _ = std::fs::remove_file(&process.bundle_path);
+            if let Some(handle) = readiness_notifier {
+                let _ = handle.join();
             }
+            cleanup_process_artifacts(&process.cleanup_paths);
 
             sidecar_cleanup.stop_now();
 
@@ -532,8 +624,11 @@ async fn execute_normal_mode(args: OpenArgs) -> Result<()> {
             }
         }
         ExecutorKind::Wasm => {
-            let exit =
-                crate::executors::wasm::execute(&decision.plan, args.reporter.clone(), ipc_env)?;
+            let exit = crate::executors::wasm::execute(
+                &decision.plan,
+                args.reporter.clone(),
+                &launch_ctx,
+            )?;
             sidecar_cleanup.stop_now();
             if exit != 0 {
                 std::process::exit(exit);
@@ -555,10 +650,18 @@ async fn execute_normal_mode(args: OpenArgs) -> Result<()> {
                         .unwrap_or("unknown")
                         .to_string(),
                     pid: pid as i32,
-                    status: crate::process_manager::ProcessStatus::Running,
+                    workload_pid: None,
+                    status: crate::process_manager::ProcessStatus::Ready,
                     runtime: "web-static".to_string(),
                     start_time: std::time::SystemTime::now(),
                     manifest_path: Some(decision.plan.manifest_path.clone()),
+                    scoped_id: run_scoped_id.clone(),
+                    target_label: Some(decision.plan.selected_target_label().to_string()),
+                    log_path: None,
+                    ready_at: Some(std::time::SystemTime::now()),
+                    last_event: Some("spawned".to_string()),
+                    last_error: None,
+                    exit_code: None,
                 };
 
                 let pm = crate::process_manager::ProcessManager::new()?;
@@ -580,7 +683,7 @@ async fn execute_normal_mode(args: OpenArgs) -> Result<()> {
             let exit = crate::executors::deno::execute(
                 &decision.plan,
                 &execution_plan,
-                ipc_env,
+                &launch_ctx,
                 args.dangerously_skip_permissions,
             )?;
             sidecar_cleanup.stop_now();
@@ -592,7 +695,7 @@ async fn execute_normal_mode(args: OpenArgs) -> Result<()> {
             let exit = crate::executors::node_compat::execute(
                 &decision.plan,
                 &execution_plan,
-                ipc_env,
+                &launch_ctx,
                 args.dangerously_skip_permissions,
             )?;
             sidecar_cleanup.stop_now();
@@ -605,16 +708,248 @@ async fn execute_normal_mode(args: OpenArgs) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ForegroundEventMessage {
+    Notify(String),
+    Warn(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackgroundStartupOutcome {
+    Ready,
+    TimedOut,
+    FailedBeforeReady,
+}
+
+fn spawn_foreground_native_event_reporter(
+    reporter: Arc<CliReporter>,
+    event_rx: Option<Receiver<NacelleExecEvent>>,
+    sandbox_initialized: bool,
+    ipc_socket_mapped: bool,
+) -> Result<Option<JoinHandle<()>>> {
+    let Some(event_rx) = event_rx else {
+        return Ok(None);
+    };
+
+    for message in initial_foreground_native_messages(sandbox_initialized, ipc_socket_mapped) {
+        futures::executor::block_on(CapsuleReporter::notify(&*reporter, message))?;
+    }
+
+    Ok(Some(std::thread::spawn(move || {
+        let mut ready_reported = false;
+        for event in event_rx {
+            for message in foreground_native_event_messages(&event, ready_reported) {
+                match message {
+                    ForegroundEventMessage::Notify(message) => {
+                        let _ = futures::executor::block_on(CapsuleReporter::notify(
+                            &*reporter, message,
+                        ));
+                    }
+                    ForegroundEventMessage::Warn(message) => {
+                        let _ =
+                            futures::executor::block_on(CapsuleReporter::warn(&*reporter, message));
+                    }
+                }
+            }
+
+            if matches!(event, NacelleExecEvent::IpcReady { .. }) {
+                ready_reported = true;
+            }
+        }
+    })))
+}
+
+fn wait_for_background_native_startup(
+    process: &mut crate::executors::source::CapsuleProcess,
+    process_manager: &crate::process_manager::ProcessManager,
+    process_id: &str,
+) -> Result<(BackgroundStartupOutcome, Option<Receiver<NacelleExecEvent>>)> {
+    let Some(event_rx) = process.event_rx.take() else {
+        return Ok((BackgroundStartupOutcome::TimedOut, None));
+    };
+    let event_rx = Some(event_rx);
+
+    let deadline = Instant::now() + background_ready_wait_timeout();
+
+    loop {
+        if let Some(status) = process.child.try_wait()? {
+            let exit_code = status.code();
+            let _ = process_manager.update_pid(process_id, |info| {
+                info.exit_code = exit_code;
+                info.last_event = Some("process_exited".to_string());
+                if matches!(info.status, crate::process_manager::ProcessStatus::Starting) {
+                    info.status = crate::process_manager::ProcessStatus::Failed;
+                    if info.last_error.is_none() {
+                        info.last_error = Some("process exited before readiness".to_string());
+                    }
+                } else if info.status.is_active() {
+                    info.status = crate::process_manager::ProcessStatus::Exited;
+                }
+            });
+            return Ok((BackgroundStartupOutcome::FailedBeforeReady, event_rx));
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            let _ = process_manager.update_pid(process_id, |info| {
+                info.last_event = Some("startup_timeout".to_string());
+            });
+            return Ok((BackgroundStartupOutcome::TimedOut, event_rx));
+        }
+
+        let wait_for = std::cmp::min(Duration::from_millis(100), deadline - now);
+        match event_rx
+            .as_ref()
+            .expect("event receiver should still be present during startup wait")
+            .recv_timeout(wait_for)
+        {
+            Ok(event) => {
+                match persist_background_native_event(process_manager, process_id, &event)? {
+                    BackgroundStartupOutcome::Ready => {
+                        return Ok((BackgroundStartupOutcome::Ready, event_rx));
+                    }
+                    BackgroundStartupOutcome::FailedBeforeReady => {
+                        return Ok((BackgroundStartupOutcome::FailedBeforeReady, event_rx));
+                    }
+                    BackgroundStartupOutcome::TimedOut => {}
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => {
+                let _ = process_manager.update_pid(process_id, |info| {
+                    if matches!(info.status, crate::process_manager::ProcessStatus::Starting) {
+                        info.status = crate::process_manager::ProcessStatus::Unknown;
+                        info.last_error =
+                            Some("event stream disconnected before readiness".to_string());
+                    }
+                });
+                return Ok((BackgroundStartupOutcome::TimedOut, None));
+            }
+        }
+    }
+}
+
+fn background_ready_wait_timeout() -> Duration {
+    std::env::var(BACKGROUND_READY_WAIT_TIMEOUT_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .filter(|duration| !duration.is_zero())
+        .unwrap_or(BACKGROUND_READY_WAIT_TIMEOUT)
+}
+
+fn persist_background_native_event(
+    process_manager: &crate::process_manager::ProcessManager,
+    process_id: &str,
+    event: &NacelleExecEvent,
+) -> Result<BackgroundStartupOutcome> {
+    let now = SystemTime::now();
+    let updated = process_manager.update_pid(process_id, |info| match event {
+        NacelleExecEvent::IpcReady { .. } => {
+            info.status = crate::process_manager::ProcessStatus::Ready;
+            info.ready_at = Some(now);
+            info.last_event = Some("ipc_ready".to_string());
+            info.last_error = None;
+        }
+        NacelleExecEvent::ServiceExited { service, exit_code } => {
+            info.exit_code = *exit_code;
+            info.last_event = Some("service_exited".to_string());
+            if matches!(info.status, crate::process_manager::ProcessStatus::Starting) {
+                info.status = crate::process_manager::ProcessStatus::Failed;
+                info.last_error = Some(format!("service '{}' exited before readiness", service));
+            } else if info.status.is_active() {
+                info.status = crate::process_manager::ProcessStatus::Exited;
+            }
+        }
+    })?;
+
+    Ok(match updated.status {
+        crate::process_manager::ProcessStatus::Ready => BackgroundStartupOutcome::Ready,
+        crate::process_manager::ProcessStatus::Failed => {
+            BackgroundStartupOutcome::FailedBeforeReady
+        }
+        _ => BackgroundStartupOutcome::TimedOut,
+    })
+}
+
+fn cleanup_process_artifacts(paths: &[PathBuf]) {
+    for path in paths {
+        if path.exists() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+async fn cleanup_existing_scoped_processes_before_run(
+    scoped_id: &str,
+    reporter: &Arc<CliReporter>,
+) -> Result<()> {
+    let process_manager = crate::process_manager::ProcessManager::new()?;
+    let cleaned = process_manager.cleanup_scoped_processes(scoped_id, true)?;
+    if cleaned > 0 {
+        reporter
+            .warn(format!(
+                "🧹 Cleaned up {} existing process record(s) for {} before run",
+                cleaned, scoped_id
+            ))
+            .await?;
+    }
+    Ok(())
+}
+
+fn initial_foreground_native_messages(
+    sandbox_initialized: bool,
+    ipc_socket_mapped: bool,
+) -> Vec<String> {
+    let mut messages = Vec::new();
+    if sandbox_initialized {
+        messages.push("[✓] Sandbox initialized".to_string());
+    }
+    if ipc_socket_mapped {
+        messages.push("[✓] IPC socket mapped".to_string());
+    }
+    messages
+}
+
+fn foreground_native_event_messages(
+    event: &NacelleExecEvent,
+    ready_reported: bool,
+) -> Vec<ForegroundEventMessage> {
+    match event {
+        NacelleExecEvent::IpcReady { service, .. } if !ready_reported => {
+            let ready_message = if service == "main" {
+                "[✓] Service is ready (ipc_ready received)".to_string()
+            } else {
+                format!("[✓] Service '{service}' is ready (ipc_ready received)")
+            };
+            vec![
+                ForegroundEventMessage::Notify(ready_message),
+                ForegroundEventMessage::Notify("    Streaming logs...".to_string()),
+            ]
+        }
+        NacelleExecEvent::ServiceExited { service, exit_code } if !ready_reported => {
+            let exit_code = exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            vec![ForegroundEventMessage::Warn(format!(
+                "❌ Service '{service}' exited before readiness (exit code: {exit_code})"
+            ))]
+        }
+        _ => Vec::new(),
+    }
+}
+
 async fn notify_web_endpoint(
     plan: &capsule_core::router::ManifestData,
     reporter: &Arc<CliReporter>,
 ) -> Result<()> {
-    let port = plan.execution_port().ok_or_else(|| {
+    let port = runtime_overrides::override_port(plan.execution_port()).ok_or_else(|| {
         anyhow::anyhow!(
             "runtime=web target '{}' requires targets.<label>.port",
             plan.selected_target_label()
         )
     })?;
+
     reporter
         .notify(format!(
             "🌐 Web target '{}' is available at http://127.0.0.1:{}/",
@@ -626,6 +961,23 @@ async fn notify_web_endpoint(
 }
 
 fn execute_watch_mode(args: OpenArgs) -> Result<()> {
+    let manifest_path = if args.target.is_dir() {
+        args.target.join("capsule.toml")
+    } else {
+        args.target.clone()
+    };
+    let decision = capsule_core::router::route_manifest(
+        &manifest_path,
+        router::ExecutionProfile::Dev,
+        args.target_label.as_deref(),
+    )?;
+    if decision.plan.is_orchestration_mode() {
+        anyhow::bail!("--watch is not supported for orchestration mode");
+    }
+    if matches!(decision.kind, capsule_core::router::RuntimeKind::Oci) {
+        anyhow::bail!("--watch is not supported for runtime=oci");
+    }
+
     futures::executor::block_on(CapsuleReporter::notify(
         &*args.reporter,
         "👀 Starting watch mode (foreground)".to_string(),
@@ -663,25 +1015,17 @@ fn execute_watch_mode(args: OpenArgs) -> Result<()> {
     Ok(())
 }
 
-fn preflight_native_sandbox(
+pub(crate) fn preflight_native_sandbox(
     nacelle_override: Option<PathBuf>,
     plan: &capsule_core::router::ManifestData,
-) -> Result<()> {
+    reporter: &Arc<CliReporter>,
+) -> Result<PathBuf> {
     preflight_python_uv_lock_for_source_driver(plan)?;
     preflight_python_uv_binary_for_source_driver(plan)?;
     preflight_glibc_compat(plan)?;
     preflight_macos_compat(plan)?;
 
-    let nacelle = capsule_core::engine::discover_nacelle(capsule_core::engine::EngineRequest {
-        explicit_path: nacelle_override,
-        manifest_path: Some(plan.manifest_path.clone()),
-    })
-    .map_err(|_| {
-        AtoExecutionError::engine_missing(
-            "Tier 2 execution requires 'nacelle' to be installed and registered (use --nacelle, NACELLE_PATH, or `ato engine register`).",
-            Some("nacelle"),
-        )
-    })?;
+    let nacelle = resolve_nacelle_for_tier2(nacelle_override, plan, reporter)?;
     let response = capsule_core::engine::run_internal(
         &nacelle,
         "features",
@@ -706,52 +1050,92 @@ fn preflight_native_sandbox(
         .into());
     }
 
-    Ok(())
+    Ok(nacelle)
 }
 
-fn preflight_web_services_requirements(plan: &capsule_core::router::ManifestData) -> Result<()> {
-    if !plan.is_web_services_mode() {
-        return Ok(());
-    }
+fn resolve_nacelle_for_tier2(
+    nacelle_override: Option<PathBuf>,
+    plan: &capsule_core::router::ManifestData,
+    reporter: &Arc<CliReporter>,
+) -> Result<PathBuf> {
+    let request = capsule_core::engine::EngineRequest {
+        explicit_path: nacelle_override.clone(),
+        manifest_path: Some(plan.manifest_path.clone()),
+    };
 
-    let services = plan.services();
-    if !services.contains_key("main") {
-        return Err(AtoExecutionError::policy_violation(
-            "web/deno services mode requires top-level [services.main]",
-        )
-        .into());
-    }
+    match capsule_core::engine::discover_nacelle(request) {
+        Ok(path) => Ok(path),
+        Err(err) => {
+            if !should_attempt_nacelle_auto_bootstrap(
+                nacelle_override.as_deref(),
+                &plan.manifest_path,
+            )? {
+                return Err(AtoExecutionError::engine_missing(
+                    format!(
+                        "Tier 2 execution requires 'nacelle', but the configured engine is not usable: {err}"
+                    ),
+                    Some("nacelle"),
+                )
+                .into());
+            }
 
-    Ok(())
+            crate::engine_manager::auto_bootstrap_nacelle(&**reporter)
+                .map(|installed| installed.path)
+                .map_err(|bootstrap_err| {
+                    AtoExecutionError::engine_missing(
+                        format!(
+                            "Tier 2 execution requires 'nacelle', and auto-bootstrap failed: {bootstrap_err}"
+                        ),
+                        Some("nacelle"),
+                    )
+                    .into()
+                })
+        }
+    }
 }
 
+fn should_attempt_nacelle_auto_bootstrap(
+    nacelle_override: Option<&Path>,
+    manifest_path: &Path,
+) -> Result<bool> {
+    if nacelle_override.is_some() {
+        return Ok(false);
+    }
+    if std::env::var("NACELLE_PATH")
+        .ok()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+    {
+        return Ok(false);
+    }
+    if manifest_declares_engine_override(manifest_path)? {
+        return Ok(false);
+    }
+
+    let cfg = capsule_core::config::load_config()?;
+    Ok(cfg.default_engine.is_none())
+}
+
+fn manifest_declares_engine_override(manifest_path: &Path) -> Result<bool> {
+    if !manifest_path.exists() {
+        return Ok(false);
+    }
+
+    let raw = fs::read_to_string(manifest_path)
+        .with_context(|| format!("Failed to read manifest: {}", manifest_path.display()))?;
+    let parsed = toml::from_str::<toml::Value>(&raw)
+        .with_context(|| format!("Failed to parse manifest TOML: {}", manifest_path.display()))?;
+    Ok(parsed.get("engine").is_some())
+}
+
+#[cfg(test)]
 fn preflight_required_environment_variables(
     plan: &capsule_core::router::ManifestData,
 ) -> Result<()> {
-    let required = plan.execution_required_envs();
-    if required.is_empty() {
-        return Ok(());
-    }
-
-    let missing: Vec<String> = required
-        .into_iter()
-        .filter(|name| {
-            std::env::var(name)
-                .map(|v| v.trim().is_empty())
-                .unwrap_or(true)
-        })
-        .collect();
-
-    if missing.is_empty() {
-        return Ok(());
-    }
-
-    Err(AtoExecutionError::policy_violation(format!(
-        "missing required environment variables for target '{}': {} (set them before `ato run`)",
-        plan.selected_target_label(),
-        missing.join(", ")
-    ))
-    .into())
+    target_runner::preflight_required_environment_variables(
+        plan,
+        &crate::executors::launch_context::RuntimeLaunchContext::empty(),
+    )
 }
 
 fn preflight_macos_compat(plan: &capsule_core::router::ManifestData) -> Result<()> {
@@ -985,12 +1369,7 @@ fn detect_required_glibc_from_entrypoint(
     let has_verneed = elf
         .dynamic
         .as_ref()
-        .map(|dynamic| {
-            dynamic
-                .dyns
-                .iter()
-                .any(|entry| entry.d_tag == DT_VERNEED as u64)
-        })
+        .map(|dynamic| dynamic.dyns.iter().any(|entry| entry.d_tag == DT_VERNEED))
         .unwrap_or(false);
     if !has_verneed {
         return Ok(None);
@@ -1190,7 +1569,7 @@ fn detect_host_glibc_version() -> Option<String> {
             return None;
         }
         let cstr = unsafe { std::ffi::CStr::from_ptr(ptr) };
-        return Some(cstr.to_string_lossy().to_string());
+        Some(cstr.to_string_lossy().to_string())
     }
 
     #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
@@ -1237,12 +1616,17 @@ fn resolve_python_dependency_lock_path(manifest_dir: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{preflight_required_environment_variables, resolve_python_dependency_lock_path};
+    use super::{
+        foreground_native_event_messages, initial_foreground_native_messages,
+        preflight_required_environment_variables, resolve_python_dependency_lock_path,
+        ForegroundEventMessage,
+    };
+    use crate::executors::source::NacelleExecEvent;
     use capsule_core::router::{ExecutionProfile, ManifestData};
     use std::path::PathBuf;
 
     #[test]
-    fn resolve_python_dependency_detects_uv_lock() {
+    fn resolve_python_dependency_lock_path_prefers_source_uv_lock() {
         let tmp = tempfile::tempdir().expect("create temp dir");
         std::fs::create_dir_all(tmp.path().join("source")).expect("create source dir");
         std::fs::write(tmp.path().join("source").join("uv.lock"), "").expect("write uv.lock");
@@ -1256,13 +1640,13 @@ mod tests {
         let key_missing = "ATO_TEST_REQUIRED_ENV_MISSING";
         let key_empty = "ATO_TEST_REQUIRED_ENV_EMPTY";
         std::env::remove_var(key_missing);
-        std::env::set_var(key_empty, "   ");
+        std::env::set_var(key_empty, "");
 
         let plan = manifest_with_required_env(vec![key_missing, key_empty]);
         let err = preflight_required_environment_variables(&plan).expect_err("must fail-closed");
         let msg = err.to_string();
-        assert!(msg.contains(key_missing));
-        assert!(msg.contains(key_empty));
+        assert!(msg.contains(key_missing), "msg={msg}");
+        assert!(msg.contains(key_empty), "msg={msg}");
 
         std::env::remove_var(key_empty);
     }
@@ -1276,6 +1660,69 @@ mod tests {
         assert!(preflight_required_environment_variables(&plan).is_ok());
 
         std::env::remove_var(key);
+    }
+
+    #[test]
+    fn preflight_required_env_passes_with_runtime_override() {
+        let key = "ATO_TEST_REQUIRED_ENV_FROM_OVERRIDE";
+        std::env::set_var("ATO_UI_OVERRIDE_ENV_JSON", format!(r#"{{"{}":"ok"}}"#, key));
+
+        let plan = manifest_with_required_env(vec![key]);
+        assert!(preflight_required_environment_variables(&plan).is_ok());
+
+        std::env::remove_var("ATO_UI_OVERRIDE_ENV_JSON");
+    }
+
+    #[test]
+    fn foreground_native_messages_include_boot_sequence() {
+        let messages = initial_foreground_native_messages(true, true);
+        assert_eq!(
+            messages,
+            vec![
+                "[✓] Sandbox initialized".to_string(),
+                "[✓] IPC socket mapped".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn foreground_native_ipc_ready_message_matches_expected_copy() {
+        let message = foreground_native_event_messages(
+            &NacelleExecEvent::IpcReady {
+                service: "main".to_string(),
+                endpoint: "unix:///tmp/main.sock".to_string(),
+                port: None,
+            },
+            false,
+        );
+
+        assert_eq!(
+            message,
+            vec![
+                ForegroundEventMessage::Notify(
+                    "[✓] Service is ready (ipc_ready received)".to_string()
+                ),
+                ForegroundEventMessage::Notify("    Streaming logs...".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn foreground_native_service_exited_warns_before_readiness() {
+        let message = foreground_native_event_messages(
+            &NacelleExecEvent::ServiceExited {
+                service: "main".to_string(),
+                exit_code: Some(42),
+            },
+            false,
+        );
+
+        assert_eq!(
+            message,
+            vec![ForegroundEventMessage::Warn(
+                "❌ Service 'main' exited before readiness (exit code: 42)".to_string()
+            )]
+        );
     }
 
     fn manifest_with_required_env(keys: Vec<&str>) -> ManifestData {

@@ -1,0 +1,3 @@
+tmpdir=/tmp/ato-sbom-e2e-NL8mTK
+EXIT_CODE_BUILD=0
+EXIT_CODE_UPLOAD=2

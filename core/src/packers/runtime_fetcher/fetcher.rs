@@ -9,26 +9,6 @@ use tracing::{debug, info};
 use super::RuntimeFetcher;
 use crate::error::{CapsuleError, Result};
 
-/// A checksum manifest URL and (optional) detached signature URL.
-///
-/// Phase 1 reads the unsigned checksum text to extract the expected sha256.
-/// Phase 2 will verify `signature_url` before trusting the checksum contents.
-#[derive(Debug, Clone)]
-struct ChecksumManifest {
-    unsigned_url: String,
-    #[allow(dead_code)]
-    signature_url: Option<String>,
-}
-
-impl ChecksumManifest {
-    fn new(unsigned_url: String, signature_url: Option<String>) -> Self {
-        Self {
-            unsigned_url,
-            signature_url,
-        }
-    }
-}
-
 #[async_trait]
 pub(crate) trait ToolchainFetcher: Send + Sync {
     fn language(&self) -> &'static str;

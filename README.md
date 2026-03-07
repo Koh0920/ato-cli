@@ -69,6 +69,17 @@ cargo build -p ato-cli
 - `--legacy-full-publish` (official only) temporarily restores legacy default (`prepare -> build -> deploy`), is deprecated, and is scheduled for removal in the next major release.
 - `--ci` / `--dry-run` cannot be combined with phase flags.
 
+## Dock-first Flow (Personal Dock)
+
+The Dock-first path uses existing commands (no new subcommands):
+
+1. Open `/publish` in Store Web and create/connect your Dock.
+2. Build artifact locally: `ato build .`
+3. Publish to your Dock endpoint:
+   `ATO_TOKEN=... ato publish --registry <dock-endpoint> --artifact ./<name>.capsule`
+4. Share your public Dock page: `/d/<handle>`
+5. When ready, submit from Dock Control Tower (`Submit to Official Marketplace`).
+
 ```bash
 # pre-build + direct publish to a private registry (recommended)
 ato build .
@@ -275,7 +286,7 @@ ato run --from-skill /path/to/SKILL.md
 - `ATO_TOKEN`: auth token for local/private registry publish
 - `ATO_STORE_API_URL`: API base URL for `ato search` / install flows (default: `https://api.ato.run`)
 - `ATO_STORE_SITE_URL`: store web base URL (default: `https://store.ato.run`)
-- `ATO_SESSION_TOKEN`: session token (`CAPSULE_SESSION_TOKEN` is supported for compatibility)
+- `ATO_TOKEN`: session token for headless/CI environments
 
 ## Search and Auth
 
@@ -288,7 +299,7 @@ ato whoami
 Default endpoints:
 - `ATO_STORE_API_URL` (default: `https://api.ato.run`)
 - `ATO_STORE_SITE_URL` (default: `https://store.ato.run`)
-- `ATO_SESSION_TOKEN` (`CAPSULE_SESSION_TOKEN` is compatibility alias)
+- `ATO_TOKEN`
 
 ## Development Tests
 

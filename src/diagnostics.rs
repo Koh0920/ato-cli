@@ -188,6 +188,26 @@ pub fn from_anyhow(err: &AnyhowError, command_context: CommandContext) -> CliDia
     }
 
     let message = err.to_string();
+    if message.contains(error_codes::ATO_ERR_AUTH_REQUIRED) {
+        return CliDiagnostic::new(
+            CliDiagnosticCode::E201,
+            message,
+            Some("`ato login` を実行するか `ATO_TOKEN=<token>` を設定して再試行してください。"),
+            None,
+            None,
+            causes,
+        );
+    }
+    if message.contains(error_codes::ATO_ERR_INTEGRITY_FAILURE) {
+        return CliDiagnostic::new(
+            CliDiagnosticCode::E999,
+            message,
+            Some("レジストリ整合性またはネットワーク改ざんの可能性があります。再試行しても継続する場合は管理者へ連絡してください。"),
+            None,
+            None,
+            causes,
+        );
+    }
     if is_manifest_parse(&message) {
         return CliDiagnostic::new(
             CliDiagnosticCode::E001,
@@ -238,23 +258,19 @@ pub fn from_anyhow(err: &AnyhowError, command_context: CommandContext) -> CliDia
     }
 
     if matches!(command_context, CommandContext::Publish) {
-        if let Some(upload_error) =
+        if let Some(crate::publish_artifact::PublishArtifactError::VersionExists { message }) =
             err.downcast_ref::<crate::publish_artifact::PublishArtifactError>()
         {
-            if let crate::publish_artifact::PublishArtifactError::VersionExists { message } =
-                upload_error
-            {
-                return CliDiagnostic::new(
-                    CliDiagnosticCode::E202,
-                    message.clone(),
-                    Some(
-                        "同じ version が既に存在します。version を上げるか、同一内容なら --allow-existing を使用してください。必要に応じてローカル registry を初期化してください。",
-                    ),
-                    None,
-                    None,
-                    causes,
-                );
-            }
+            return CliDiagnostic::new(
+                CliDiagnosticCode::E202,
+                message.clone(),
+                Some(
+                    "同じ version が既に存在します。version を上げるか、同一内容なら --allow-existing を使用してください。必要に応じてローカル registry を初期化してください。",
+                ),
+                None,
+                None,
+                causes,
+            );
         }
 
         if is_publish_version_exists_conflict(&message) {
@@ -364,6 +380,16 @@ fn from_capsule_error(core_err: &capsule_core::CapsuleError, causes: Vec<String>
                 causes,
             )
         }
+        capsule_core::CapsuleError::StrictManifestFallbackNotAllowed(detail) => CliDiagnostic::new(
+            CliDiagnosticCode::E102,
+            detail,
+            Some(
+                "--strict-v3 を無効化するか、source_digest をCASに登録して manifest 経路を成功させてください。",
+            ),
+            None,
+            Some("strict-v3"),
+            causes,
+        ),
         capsule_core::CapsuleError::AuthRequired(detail) => CliDiagnostic::new(
             CliDiagnosticCode::E201,
             format!("Authentication required: {}", detail),
@@ -483,6 +509,23 @@ mod tests {
         ));
         let diagnostic = from_anyhow(&err, CommandContext::Build);
         assert_eq!(diagnostic.code, CliDiagnosticCode::E101);
+    }
+
+    #[test]
+    fn maps_strict_manifest_error_to_e102() {
+        let err = anyhow!(
+            capsule_core::CapsuleError::StrictManifestFallbackNotAllowed(
+                "fallback blocked".to_string()
+            )
+        );
+        let diagnostic = from_anyhow(&err, CommandContext::Build);
+        assert_eq!(diagnostic.code, CliDiagnosticCode::E102);
+        assert_eq!(diagnostic.field.as_deref(), Some("strict-v3"));
+        assert!(diagnostic
+            .hint
+            .as_deref()
+            .unwrap_or_default()
+            .contains("--strict-v3"));
     }
 
     #[test]
