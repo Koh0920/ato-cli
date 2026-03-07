@@ -561,6 +561,7 @@ async fn execute_normal_mode(args: OpenArgs) -> Result<()> {
                     BackgroundStartupOutcome::Ready => {
                         let _ = process.child;
                         let _ = event_rx;
+                        let _ = pm.read_pid(&id)?;
                         args.reporter
                             .notify(format!(
                                 "🚀 Capsule started in background and is ready (ID: {})",
@@ -571,6 +572,7 @@ async fn execute_normal_mode(args: OpenArgs) -> Result<()> {
                     BackgroundStartupOutcome::TimedOut => {
                         let _ = process.child;
                         let _ = event_rx;
+                        let _ = pm.read_pid(&id)?;
                         args.reporter
                             .warn(format!(
                                 "⏳ Capsule is still starting in background (ID: {}). Use `ato ps --all` to inspect readiness.",
