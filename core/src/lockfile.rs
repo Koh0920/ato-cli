@@ -237,6 +237,7 @@ pub async fn ensure_lockfile(
     if lock_path.exists()
         && verify_lockfile_manifest_hash(&lock_path, &manifest_hash).is_ok()
         && lockfile_inputs_snapshot_matches(&manifest_dir, &manifest_hash, &inputs)?
+        && existing_lockfile_has_required_platform_coverage(&lock_path, manifest_raw)?
     {
         return Ok(lock_path);
     }
@@ -288,6 +289,56 @@ fn read_lockfile(path: &Path) -> Result<CapsuleLock> {
         .map_err(|e| CapsuleError::Config(format!("Failed to read capsule.lock: {}", e)))?;
     toml::from_str(&raw)
         .map_err(|e| CapsuleError::Config(format!("Failed to parse capsule.lock: {}", e)))
+}
+
+fn existing_lockfile_has_required_platform_coverage(
+    lockfile_path: &Path,
+    manifest: &toml::Value,
+) -> Result<bool> {
+    let lockfile = read_lockfile(lockfile_path)?;
+    lockfile_has_required_platform_coverage(&lockfile, manifest)
+}
+
+fn lockfile_has_required_platform_coverage(
+    lockfile: &CapsuleLock,
+    manifest: &toml::Value,
+) -> Result<bool> {
+    let required_platforms = lockfile_runtime_platforms(manifest)?;
+    if required_platforms.len() <= 1 {
+        return Ok(true);
+    }
+
+    let runtime_targets = lockfile.runtimes.as_ref();
+    let runtime_target_sets = [
+        runtime_targets.and_then(|r| r.deno.as_ref()).map(|entry| &entry.targets),
+        runtime_targets.and_then(|r| r.node.as_ref()).map(|entry| &entry.targets),
+        runtime_targets.and_then(|r| r.python.as_ref()).map(|entry| &entry.targets),
+    ];
+
+    for targets in runtime_target_sets.into_iter().flatten() {
+        if required_platforms
+            .iter()
+            .any(|platform| !targets.contains_key(platform.target_triple))
+        {
+            return Ok(false);
+        }
+    }
+
+    if let Some(targets) = lockfile
+        .tools
+        .as_ref()
+        .and_then(|tools| tools.uv.as_ref())
+        .map(|entry| &entry.targets)
+    {
+        if required_platforms
+            .iter()
+            .any(|platform| !targets.contains_key(platform.target_triple))
+        {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
 }
 
 fn manifest_hash_from_open_inputs(
@@ -2277,6 +2328,150 @@ runtime_tools = { python = "3.11.7" }
         for expected in SUPPORTED_RUNTIME_PLATFORMS {
             assert!(platforms.contains(expected));
         }
+    }
+
+    #[test]
+    fn stale_universal_lockfile_is_detected_when_runtime_targets_are_host_only() {
+        let manifest: toml::Value = toml::from_str(
+            r#"
+default_target = "default"
+[targets.default]
+runtime = "web"
+driver = "deno"
+runtime_version = "1.46.3"
+runtime_tools = { node = "20.11.0", python = "3.11.10" }
+"#,
+        )
+        .unwrap();
+
+        let host_only_targets = HashMap::from([(
+            "aarch64-apple-darwin".to_string(),
+            RuntimeArtifact {
+                url: "https://example.com/runtime.tar.gz".to_string(),
+                sha256: "deadbeef".to_string(),
+            },
+        )]);
+        let host_only_tool_targets = HashMap::from([(
+            "aarch64-apple-darwin".to_string(),
+            ToolArtifact {
+                url: "https://example.com/uv.tar.gz".to_string(),
+                sha256: Some("deadbeef".to_string()),
+                version: Some("0.4.19".to_string()),
+            },
+        )]);
+        let lockfile = CapsuleLock {
+            version: "1".to_string(),
+            meta: LockMeta {
+                created_at: "2026-03-08T00:00:00Z".to_string(),
+                manifest_hash: "blake3:deadbeef".to_string(),
+            },
+            allowlist: None,
+            tools: Some(ToolSection {
+                uv: Some(ToolTargets {
+                    targets: host_only_tool_targets,
+                }),
+                pnpm: None,
+            }),
+            runtimes: Some(RuntimeSection {
+                python: Some(RuntimeEntry {
+                    provider: "python-build-standalone".to_string(),
+                    version: "3.11.10".to_string(),
+                    targets: host_only_targets.clone(),
+                }),
+                deno: Some(RuntimeEntry {
+                    provider: "official".to_string(),
+                    version: "1.46.3".to_string(),
+                    targets: host_only_targets.clone(),
+                }),
+                node: Some(RuntimeEntry {
+                    provider: "official".to_string(),
+                    version: "20.11.0".to_string(),
+                    targets: host_only_targets,
+                }),
+                java: None,
+                dotnet: None,
+            }),
+            targets: HashMap::new(),
+        };
+
+        assert!(!lockfile_has_required_platform_coverage(&lockfile, &manifest).unwrap());
+    }
+
+    #[test]
+    fn universal_lockfile_passes_when_all_runtime_targets_are_present() {
+        let manifest: toml::Value = toml::from_str(
+            r#"
+default_target = "default"
+[targets.default]
+runtime = "web"
+driver = "deno"
+runtime_version = "1.46.3"
+runtime_tools = { node = "20.11.0", python = "3.11.10" }
+"#,
+        )
+        .unwrap();
+
+        let runtime_targets: HashMap<String, RuntimeArtifact> = SUPPORTED_RUNTIME_PLATFORMS
+            .iter()
+            .map(|platform| {
+                (
+                    platform.target_triple.to_string(),
+                    RuntimeArtifact {
+                        url: format!("https://example.com/{}/runtime.tar.gz", platform.target_triple),
+                        sha256: "deadbeef".to_string(),
+                    },
+                )
+            })
+            .collect();
+        let tool_targets: HashMap<String, ToolArtifact> = SUPPORTED_RUNTIME_PLATFORMS
+            .iter()
+            .map(|platform| {
+                (
+                    platform.target_triple.to_string(),
+                    ToolArtifact {
+                        url: format!("https://example.com/{}/uv.tar.gz", platform.target_triple),
+                        sha256: Some("deadbeef".to_string()),
+                        version: Some("0.4.19".to_string()),
+                    },
+                )
+            })
+            .collect();
+        let lockfile = CapsuleLock {
+            version: "1".to_string(),
+            meta: LockMeta {
+                created_at: "2026-03-08T00:00:00Z".to_string(),
+                manifest_hash: "blake3:deadbeef".to_string(),
+            },
+            allowlist: None,
+            tools: Some(ToolSection {
+                uv: Some(ToolTargets {
+                    targets: tool_targets,
+                }),
+                pnpm: None,
+            }),
+            runtimes: Some(RuntimeSection {
+                python: Some(RuntimeEntry {
+                    provider: "python-build-standalone".to_string(),
+                    version: "3.11.10".to_string(),
+                    targets: runtime_targets.clone(),
+                }),
+                deno: Some(RuntimeEntry {
+                    provider: "official".to_string(),
+                    version: "1.46.3".to_string(),
+                    targets: runtime_targets.clone(),
+                }),
+                node: Some(RuntimeEntry {
+                    provider: "official".to_string(),
+                    version: "20.11.0".to_string(),
+                    targets: runtime_targets,
+                }),
+                java: None,
+                dotnet: None,
+            }),
+            targets: HashMap::new(),
+        };
+
+        assert!(lockfile_has_required_platform_coverage(&lockfile, &manifest).unwrap());
     }
 
     #[test]
