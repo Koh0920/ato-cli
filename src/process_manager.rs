@@ -131,7 +131,8 @@ impl ProcessManager {
         let pid_path = self.pid_file_path(id);
         let mut info = self.read_pid(id)?;
         updater(&mut info);
-        let serialized = toml::to_string(&info).with_context(|| "Failed to serialize process info")?;
+        let serialized =
+            toml::to_string(&info).with_context(|| "Failed to serialize process info")?;
         fs::write(&pid_path, serialized)
             .with_context(|| format!("Failed to write PID file: {}", pid_path.display()))?;
         Ok(info)
@@ -203,7 +204,9 @@ impl ProcessManager {
             } else {
                 Some(-1)
             },
-            last_error: if matches!(info.status, ProcessStatus::Starting) && info.last_error.is_none() {
+            last_error: if matches!(info.status, ProcessStatus::Starting)
+                && info.last_error.is_none()
+            {
                 Some("process exited before readiness".to_string())
             } else {
                 info.last_error.clone()
@@ -224,9 +227,11 @@ impl ProcessManager {
         let mut cleaned = 0usize;
         let mut failures = Vec::new();
 
-        for process in self.list_processes()?.into_iter().filter(|process| {
-            process.scoped_id.as_deref() == Some(scoped_id)
-        }) {
+        for process in self
+            .list_processes()?
+            .into_iter()
+            .filter(|process| process.scoped_id.as_deref() == Some(scoped_id))
+        {
             if process.status.is_active() {
                 match self.stop_process(&process.id, force) {
                     Ok(_) => {

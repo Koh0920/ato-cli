@@ -52,30 +52,6 @@ pub fn prepare_source_config(
     })
 }
 
-#[derive(Debug, Clone)]
-pub struct PreparedSourceConfig {
-    pub config_json: Arc<r3_config::ConfigJson>,
-    pub config_path: PathBuf,
-}
-
-pub fn prepare_source_config(
-    manifest_path: &Path,
-    enforcement: String,
-    standalone: bool,
-) -> Result<PreparedSourceConfig> {
-    let config_json = Arc::new(r3_config::generate_config(
-        manifest_path,
-        Some(enforcement),
-        standalone,
-    )?);
-    let config_path = r3_config::write_config(manifest_path, config_json.as_ref())?;
-
-    Ok(PreparedSourceConfig {
-        config_json,
-        config_path,
-    })
-}
-
 pub fn pack(
     plan: &ManifestData,
     opts: SourcePackOptions,

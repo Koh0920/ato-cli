@@ -301,20 +301,6 @@ pub async fn pack(
             "format": "spdx-json",
         }
     });
-    if let Some(report) = &v3_report {
-        if let Some(obj) = signature.as_object_mut() {
-            obj.insert(
-                "payload_v3".to_string(),
-                serde_json::json!({
-                    "path": V3_PAYLOAD_MANIFEST_PATH,
-                    "artifact_hash": report.manifest.artifact_hash,
-                    "schema_version": report.manifest.schema_version,
-                    "chunk_count": report.manifest.chunks.len(),
-                    "total_raw_size": report.total_raw_size,
-                }),
-            );
-        }
-    }
     let signature_bytes = serde_jcs::to_vec(&signature).map_err(|e| {
         CapsuleError::Pack(format!("Failed to serialize signature metadata (JCS): {e}"))
     })?;

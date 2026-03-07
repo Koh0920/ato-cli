@@ -79,8 +79,6 @@ impl Drop for SidecarCleanup {
 
 mod ato_error_jsonl;
 mod auth;
-#[cfg(feature = "manifest-signing")]
-mod capsule_capnp;
 mod commands;
 mod common;
 mod consent_store;
@@ -2987,7 +2985,8 @@ async fn resolve_run_target_or_install(
 
                 if let Some(version) = registry_installable_version.as_deref() {
                     if let Some(installed_capsule) =
-                        resolve_installed_capsule_archive(&scoped_ref, registry, Some(version)).await?
+                        resolve_installed_capsule_archive(&scoped_ref, registry, Some(version))
+                            .await?
                     {
                         debug!(
                             capsule = %installed_capsule.display(),
