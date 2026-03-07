@@ -6,6 +6,7 @@
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use futures::stream::{FuturesUnordered, StreamExt};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
@@ -14,7 +15,9 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
 
 use capsule_core::packers::payload as manifest_payload;
 use capsule_core::resource::cas::LocalCasIndex;
@@ -190,6 +193,19 @@ struct ManifestLeaseReleaseRequest {
 #[derive(Debug)]
 enum DeltaInstallResult {
     Artifact(Vec<u8>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum V3SyncOutcome {
+    Synced,
+    SkippedUnsupportedRegistry,
+    SkippedDisabledCas(capsule_core::capsule_v3::CasDisableReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChunkDownloadOutcome {
+    Stored,
+    UnsupportedRegistry,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -592,7 +608,7 @@ async fn sync_v3_chunks_from_manifest(
             return Ok(V3SyncOutcome::SkippedDisabledCas(reason));
         }
     };
-    let token = read_ato_token();
+    let token = current_ato_token();
     let concurrency = sync_concurrency_limit();
     sync_v3_chunks_from_manifest_with_options(client, registry, manifest, cas, token, concurrency)
         .await

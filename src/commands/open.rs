@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::RecvTimeoutError;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 use tracing::debug;

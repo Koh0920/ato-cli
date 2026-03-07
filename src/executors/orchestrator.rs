@@ -649,25 +649,23 @@ fn poll_local_readiness_events(local: &mut RunningLocalService) -> Result<LocalR
         return Ok(local.readiness_state);
     }
 
-    loop {
-        let Some(event_rx) = local.event_rx.as_ref() else {
-            return Ok(LocalReadinessState::Pending);
-        };
+    let Some(event_rx) = local.event_rx.as_ref() else {
+        return Ok(LocalReadinessState::Pending);
+    };
 
-        match event_rx.try_recv() {
-            Ok(NacelleExecEvent::IpcReady { .. }) => {
-                local.readiness_state = LocalReadinessState::Ready;
-                return Ok(local.readiness_state);
-            }
-            Ok(NacelleExecEvent::ServiceExited { exit_code, .. }) => {
-                local.readiness_state = LocalReadinessState::Exited(exit_code.unwrap_or(1));
-                return Ok(local.readiness_state);
-            }
-            Err(TryRecvError::Empty) => return Ok(local.readiness_state),
-            Err(TryRecvError::Disconnected) => {
-                local.event_rx = None;
-                return Ok(local.readiness_state);
-            }
+    match event_rx.try_recv() {
+        Ok(NacelleExecEvent::IpcReady { .. }) => {
+            local.readiness_state = LocalReadinessState::Ready;
+            Ok(local.readiness_state)
+        }
+        Ok(NacelleExecEvent::ServiceExited { exit_code, .. }) => {
+            local.readiness_state = LocalReadinessState::Exited(exit_code.unwrap_or(1));
+            Ok(local.readiness_state)
+        }
+        Err(TryRecvError::Empty) => Ok(local.readiness_state),
+        Err(TryRecvError::Disconnected) => {
+            local.event_rx = None;
+            Ok(local.readiness_state)
         }
     }
 }

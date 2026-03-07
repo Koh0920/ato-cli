@@ -15,8 +15,8 @@ use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
-use capsule_core::capsule_v3::manifest::{validate_blake3_digest, V3_PAYLOAD_MANIFEST_PATH};
-use capsule_core::capsule_v3::{verify_artifact_hash, CapsuleManifestV3, CasStore};
+use capsule_core::capsule_v3::manifest::validate_blake3_digest;
+use capsule_core::capsule_v3::{verify_artifact_hash, CasStore};
 use chrono::Utc;
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,10 @@ use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::process_manager::{ProcessInfo, ProcessManager, ProcessStatus};
+use crate::publish_artifact::{
+    ChunkUploadResponse, SyncCommitRequest, SyncCommitResponse, SyncNegotiateRequest,
+    SyncNegotiateResponse,
+};
 use crate::registry_store::{
     EpochResolveRequest, KeyRevokeRequest, KeyRotateRequest, LeaseRefreshRequest,
     LeaseReleaseRequest, NegotiateRequest, RegistryStore, RollbackRequest, YankRequest,
@@ -1714,47 +1718,6 @@ async fn handle_sync_commit(
             "manifest_write_failed",
             &err.to_string(),
         );
-    }
-
-    let _guard = state.lock.lock().await;
-    let mut index = match load_index(&state.data_dir) {
-        Ok(index) => index,
-        Err(err) => {
-            return json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "index_read_failed",
-                &err.to_string(),
-            );
-        }
-    };
-    let mut changed = false;
-    if let Some(capsule) = index
-        .capsules
-        .iter_mut()
-        .find(|c| c.publisher == request.publisher && c.slug == request.slug)
-    {
-        if let Some(release) = capsule
-            .releases
-            .iter_mut()
-            .find(|r| r.version == request.version)
-        {
-            release.payload_v3 = Some(StoredPayloadV3 {
-                artifact_hash: request.manifest.artifact_hash.clone(),
-                chunk_count: request.manifest.chunks.len(),
-                total_raw_size: request.manifest.total_raw_size,
-                manifest_rel_path: rel_path.clone(),
-            });
-            changed = true;
-        }
-    }
-    if changed {
-        if let Err(err) = write_index(&state.data_dir, &index) {
-            return json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "index_write_failed",
-                &err.to_string(),
-            );
-        }
     }
 
     (
@@ -3829,6 +3792,7 @@ fn load_index(data_dir: &Path) -> Result<RegistryIndex> {
                         size_bytes: release.size_bytes,
                         signature_status: release.signature_status,
                         created_at: release.created_at,
+                        payload_v3: None,
                     })
                     .collect(),
                 downloads: 0,
@@ -3837,6 +3801,33 @@ fn load_index(data_dir: &Path) -> Result<RegistryIndex> {
             })
             .collect(),
     })
+}
+
+fn release_manifest_rel_path(publisher: &str, slug: &str, version: &str) -> PathBuf {
+    PathBuf::from("payload-v3")
+        .join(publisher)
+        .join(slug)
+        .join(format!("{}.json", version))
+}
+
+fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("payload v3 manifest path must have a parent directory")?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("Failed to create directory {}", parent.display()))?;
+
+    let tmp_path = path.with_extension("tmp");
+    std::fs::write(&tmp_path, bytes)
+        .with_context(|| format!("Failed to write temporary file {}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, path).with_context(|| {
+        format!(
+            "Failed to atomically rename {} to {}",
+            tmp_path.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
 }
 
 fn load_store_metadata(data_dir: &Path) -> Result<StoreMetadataIndex> {
@@ -4290,6 +4281,7 @@ mod tests {
                 size_bytes: 1,
                 signature_status: "verified".to_string(),
                 created_at: now.clone(),
+                payload_v3: None,
             },
             &now,
         );
@@ -4307,6 +4299,7 @@ mod tests {
                 size_bytes: 1,
                 signature_status: "verified".to_string(),
                 created_at: now.clone(),
+                payload_v3: None,
             },
             &now,
         );
@@ -4350,6 +4343,7 @@ mod tests {
                 size_bytes: 1,
                 signature_status: "verified".to_string(),
                 created_at: now.clone(),
+                payload_v3: None,
             },
             &now,
         );
@@ -4380,6 +4374,7 @@ mod tests {
                 size_bytes: 1,
                 signature_status: "verified".to_string(),
                 created_at: now.clone(),
+                payload_v3: None,
             },
             &now,
         );
@@ -4401,6 +4396,7 @@ mod tests {
             size_bytes: 1,
             signature_status: "verified".to_string(),
             created_at: Utc::now().to_rfc3339(),
+            payload_v3: None,
         };
 
         let outcome = existing_release_outcome(&release.sha256, false, "sha256:abc");
@@ -4420,6 +4416,7 @@ mod tests {
             size_bytes: 1,
             signature_status: "verified".to_string(),
             created_at: Utc::now().to_rfc3339(),
+            payload_v3: None,
         };
 
         let outcome = existing_release_outcome(&release.sha256, true, "sha256:abc");
@@ -4436,6 +4433,7 @@ mod tests {
             size_bytes: 1,
             signature_status: "verified".to_string(),
             created_at: Utc::now().to_rfc3339(),
+            payload_v3: None,
         };
 
         let outcome = existing_release_outcome(&release.sha256, true, "sha256:xyz");
@@ -4678,6 +4676,7 @@ repository = "koh0920/sample"
                 size_bytes: 1,
                 signature_status: "verified".to_string(),
                 created_at: Utc::now().to_rfc3339(),
+                payload_v3: None,
             }],
             downloads: 0,
             created_at: Utc::now().to_rfc3339(),

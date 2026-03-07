@@ -1,7 +1,5 @@
-use std::collections::HashMap;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -77,53 +75,48 @@ struct RegistryErrorPayload {
     message: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct SyncChunkDescriptor {
-    raw_hash: String,
-    raw_size: u32,
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct SyncChunkDescriptor {
+    pub(crate) raw_hash: String,
+    pub(crate) raw_size: u32,
 }
 
-#[derive(Debug, Serialize)]
-struct SyncNegotiateRequest {
-    artifact_hash: String,
-    schema_version: u32,
-    chunks: Vec<SyncChunkDescriptor>,
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct SyncNegotiateRequest {
+    pub(crate) artifact_hash: String,
+    pub(crate) schema_version: u32,
+    pub(crate) chunks: Vec<SyncChunkDescriptor>,
 }
 
-#[derive(Debug, Deserialize)]
-struct SyncNegotiateResponse {
-    missing_chunks: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct SyncCommitRequest {
-    publisher: String,
-    slug: String,
-    version: String,
-    manifest: capsule_core::capsule_v3::CapsuleManifestV3,
-}
-
-#[derive(Debug, Error)]
-pub enum PublishArtifactError {
-    #[error("Artifact upload conflict (409 version_exists): {message}")]
-    VersionExists { message: String },
-    #[error("Artifact upload failed ({status}): {message}")]
-    UploadFailed { status: u16, message: String },
-}
-
-#[derive(Debug, Clone)]
-pub struct ArtifactManifestInfo {
-    pub name: String,
-    pub version: String,
-    pub repository_owner: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RegistryErrorPayload {
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct SyncNegotiateResponse {
+    pub(crate) missing_chunks: Vec<String>,
     #[serde(default)]
-    error: Option<String>,
-    #[serde(default)]
-    message: Option<String>,
+    pub(crate) total_chunks: usize,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct ChunkUploadResponse {
+    pub(crate) raw_hash: String,
+    pub(crate) inserted: bool,
+    pub(crate) zstd_size: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct SyncCommitRequest {
+    pub(crate) publisher: String,
+    pub(crate) slug: String,
+    pub(crate) version: String,
+    pub(crate) manifest: capsule_core::capsule_v3::CapsuleManifestV3,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct SyncCommitResponse {
+    pub(crate) scoped_id: String,
+    pub(crate) version: String,
+    pub(crate) artifact_hash: String,
+    pub(crate) chunk_count: usize,
+    pub(crate) total_raw_size: u64,
 }
 
 #[derive(Debug, Error)]
@@ -142,6 +135,7 @@ pub fn publish_artifact(args: PublishArtifactArgs) -> Result<PublishArtifactResu
         "--force-large-payload",
     )?;
     let payload = load_artifact_payload(&args.artifact_path, &args.scoped_id)?;
+    let v3_sync_payload = payload.v3_sync_payload();
     let endpoint = build_upload_endpoint(
         &base_url,
         &payload.publisher,
@@ -248,6 +242,7 @@ fn load_artifact_payload(path: &Path, scoped_id: &str) -> Result<ArtifactPayload
     let bytes = std::fs::read(path)
         .with_context(|| format!("Failed to read artifact: {}", path.display()))?;
     let manifest = extract_manifest_from_capsule(&bytes)?;
+    let v3_manifest = extract_payload_v3_manifest_from_capsule(&bytes)?;
     let parsed = capsule_core::types::CapsuleManifest::from_toml(&manifest)
         .map_err(|err| anyhow::anyhow!("Failed to parse capsule.toml from artifact: {}", err))?;
 
@@ -330,6 +325,156 @@ fn extract_payload_v3_manifest_from_capsule(
     }
 
     Ok(None)
+}
+
+fn sync_v3_chunks_if_present(base_url: &str, payload: Option<&V3SyncPayload>) -> Result<()> {
+    let Some(payload) = payload else {
+        return Ok(());
+    };
+
+    let cas = match capsule_core::capsule_v3::CasProvider::from_env() {
+        capsule_core::capsule_v3::CasProvider::Enabled(store) => store,
+        capsule_core::capsule_v3::CasProvider::Disabled(reason) => {
+            capsule_core::capsule_v3::CasProvider::log_disabled_once(
+                "publish_v3_chunk_sync",
+                &reason,
+            );
+            return Ok(());
+        }
+    };
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("Failed to create v3 sync client")?;
+    let token = read_ato_token();
+
+    let negotiate_request = SyncNegotiateRequest {
+        artifact_hash: payload.manifest.artifact_hash.clone(),
+        schema_version: payload.manifest.schema_version,
+        chunks: payload
+            .manifest
+            .chunks
+            .iter()
+            .map(|chunk| SyncChunkDescriptor {
+                raw_hash: chunk.raw_hash.clone(),
+                raw_size: chunk.raw_size,
+            })
+            .collect(),
+    };
+
+    let negotiate_endpoint = format!("{}/v1/sync/negotiate", base_url);
+    let mut negotiate = client.post(&negotiate_endpoint).json(&negotiate_request);
+    if let Some(token) = token.as_deref() {
+        negotiate = negotiate.bearer_auth(token);
+    }
+    let negotiate_response = negotiate.send().with_context(|| {
+        format!(
+            "Failed to negotiate v3 payload sync via {}",
+            negotiate_endpoint
+        )
+    })?;
+    if is_sync_not_supported_status(negotiate_response.status()) {
+        return Ok(());
+    }
+    if !negotiate_response.status().is_success() {
+        let status = negotiate_response.status();
+        let body = negotiate_response.text().unwrap_or_default();
+        bail!(
+            "v3 sync negotiate failed ({}): {}",
+            status.as_u16(),
+            body.trim()
+        );
+    }
+    let negotiate_body = negotiate_response
+        .json::<SyncNegotiateResponse>()
+        .context("Invalid v3 sync negotiate response")?;
+
+    for chunk in payload.manifest.chunks.iter().filter(|chunk| {
+        negotiate_body
+            .missing_chunks
+            .iter()
+            .any(|hash| hash == &chunk.raw_hash)
+    }) {
+        let chunk_path = cas
+            .chunk_path(&chunk.raw_hash)
+            .with_context(|| format!("Failed to resolve local CAS chunk {}", chunk.raw_hash))?;
+        let bytes = std::fs::read(&chunk_path)
+            .with_context(|| format!("Failed to read local CAS chunk {}", chunk.raw_hash))?;
+        let chunk_endpoint = format!(
+            "{}/v1/chunks/{}",
+            base_url,
+            urlencoding::encode(&chunk.raw_hash)
+        );
+        let mut request = client
+            .put(&chunk_endpoint)
+            .header("content-type", "application/zstd")
+            .header("x-raw-size", chunk.raw_size.to_string())
+            .body(bytes);
+        if let Some(token) = token.as_deref() {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().with_context(|| {
+            format!(
+                "Failed to upload v3 chunk {} via {}",
+                chunk.raw_hash, chunk_endpoint
+            )
+        })?;
+        if is_sync_not_supported_status(response.status()) {
+            return Ok(());
+        }
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
+            bail!(
+                "v3 chunk upload failed for {} ({}) : {}",
+                chunk.raw_hash,
+                status.as_u16(),
+                body.trim()
+            );
+        }
+        response
+            .json::<ChunkUploadResponse>()
+            .context("Invalid v3 chunk upload response")?;
+    }
+
+    let commit_endpoint = format!("{}/v1/sync/commit", base_url);
+    let mut commit = client.post(&commit_endpoint).json(&SyncCommitRequest {
+        publisher: payload.publisher.clone(),
+        slug: payload.slug.clone(),
+        version: payload.version.clone(),
+        manifest: payload.manifest.clone(),
+    });
+    if let Some(token) = token.as_deref() {
+        commit = commit.bearer_auth(token);
+    }
+    let commit_response = commit
+        .send()
+        .with_context(|| format!("Failed to commit v3 payload sync via {}", commit_endpoint))?;
+    if is_sync_not_supported_status(commit_response.status()) {
+        return Ok(());
+    }
+    if !commit_response.status().is_success() {
+        let status = commit_response.status();
+        let body = commit_response.text().unwrap_or_default();
+        bail!(
+            "v3 sync commit failed ({}): {}",
+            status.as_u16(),
+            body.trim()
+        );
+    }
+    commit_response
+        .json::<SyncCommitResponse>()
+        .context("Invalid v3 sync commit response")?;
+
+    Ok(())
+}
+
+fn is_sync_not_supported_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED
+    )
 }
 
 fn normalize_registry_url(raw: &str) -> Result<String> {
@@ -453,6 +598,7 @@ fn compute_sha256(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::ffi::{OsStr, OsString};
     use std::io::Write;
     use std::sync::atomic::{AtomicUsize, Ordering};

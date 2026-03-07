@@ -262,27 +262,6 @@ fn collect_lockfile_packages_from_inputs(files: &[SbomFileInput]) -> Vec<SpdxPac
     packages.into_values().collect()
 }
 
-fn collect_lockfile_packages_from_inputs(files: &[SbomFileInput]) -> Vec<SpdxPackage> {
-    let mut packages = BTreeMap::<String, SpdxPackage>::new();
-    for file in files {
-        let Some(disk_path) = file.disk_path.as_deref() else {
-            continue;
-        };
-        let file_name = file
-            .archive_path
-            .rsplit('/')
-            .next()
-            .unwrap_or(file.archive_path.as_str());
-        match file_name {
-            "package-lock.json" => parse_package_lock(disk_path, &mut packages),
-            "deno.lock" => parse_deno_lock(disk_path, &mut packages),
-            "uv.lock" => parse_uv_lock(disk_path, &mut packages),
-            _ => {}
-        }
-    }
-    packages.into_values().collect()
-}
-
 fn parse_package_lock(path: &Path, packages: &mut BTreeMap<String, SpdxPackage>) {
     let Ok(text) = fs::read_to_string(path) else {
         return;
