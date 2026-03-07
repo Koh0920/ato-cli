@@ -5,6 +5,12 @@ import { CapsuleListCard } from "../components/CapsuleListCard";
 import { CapsuleRow } from "../components/CapsuleRow";
 import { Toolbar } from "../components/Toolbar";
 
+function latestProcessForCapsule(processes: Process[], capsuleId: string): Process | undefined {
+  return [...processes]
+    .filter((process) => process.capsuleId === capsuleId)
+    .sort((left, right) => right.startedAt.localeCompare(left.startedAt))[0];
+}
+
 interface CatalogPageProps {
   capsules: Capsule[];
   processes: Process[];
@@ -64,13 +70,13 @@ export function CatalogPage({
       ) : viewMode === "list" && isMobile ? (
         <div className="mobile-list">
           {capsules.map((capsule) => {
-            const activeProcess = processes.find((process) => process.capsuleId === capsule.id && process.active);
+            const process = latestProcessForCapsule(processes, capsule.id);
             return (
               <CapsuleListCard
                 key={capsule.id}
                 capsule={capsule}
-                activeProcess={activeProcess}
-                openReady={isOpenReady(activeProcess)}
+                process={process}
+                openReady={isOpenReady(process)}
                 platform={platform}
                 onRun={onRun}
                 onStop={onStop}
@@ -96,13 +102,13 @@ export function CatalogPage({
             </thead>
             <tbody>
               {capsules.map((capsule) => {
-                const activeProcess = processes.find((process) => process.capsuleId === capsule.id && process.active);
+                const process = latestProcessForCapsule(processes, capsule.id);
                 return (
                   <CapsuleRow
                     key={capsule.id}
                     capsule={capsule}
-                    activeProcess={activeProcess}
-                    openReady={isOpenReady(activeProcess)}
+                    process={process}
+                    openReady={isOpenReady(process)}
                     platform={platform}
                     onRun={onRun}
                     onStop={onStop}

@@ -111,6 +111,45 @@
   border-color: var(--border);
 }
 
+.badge-current {
+  background: var(--accent-lt);
+  color: var(--accent);
+  border-color: var(--accent-md);
+}
+
+.badge-yanked {
+  background: var(--red-lt);
+  color: var(--red);
+  border-color: var(--red-border);
+}
+
+.status-badge.status-starting {
+  background: var(--yellow-lt);
+  color: var(--yellow);
+  border-color: var(--border);
+}
+
+.status-badge.status-ready,
+.status-badge.status-running {
+  background: var(--green-lt);
+  color: var(--green);
+  border-color: var(--green-border);
+}
+
+.status-badge.status-failed {
+  background: var(--red-lt);
+  color: var(--red);
+  border-color: var(--red-border);
+}
+
+.status-badge.status-exited,
+.status-badge.status-stopped,
+.status-badge.status-unknown {
+  background: var(--bg);
+  color: var(--text-3);
+  border-color: var(--border);
+}
+
 .input {
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -341,6 +380,14 @@
 
 .process-drawer-meta {
   margin-bottom: 6px;
+}
+
+.process-drawer-meta-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
 }
 
 .process-drawer-actions {

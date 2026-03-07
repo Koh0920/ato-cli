@@ -172,8 +172,26 @@
   background: var(--border-md);
 }
 
-.table-dot.active {
+.table-dot.status-starting {
+  background: var(--yellow);
+}
+
+.table-dot.status-ready,
+.table-dot.status-running {
   background: var(--green);
+}
+
+.table-dot.status-failed {
+  background: var(--red);
+}
+
+.table-dot.status-exited,
+.table-dot.status-stopped,
+.table-dot.status-unknown {
+  background: var(--border-md);
+}
+
+.table-dot.active {
   animation: pulse-dot 1.1s infinite;
 }
 
@@ -216,6 +234,14 @@
   text-overflow: ellipsis;
   white-space: nowrap;
   max-width: 520px;
+}
+
+.row-status-wrap {
+  margin-top: 6px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
 }
 
 .compat-list,

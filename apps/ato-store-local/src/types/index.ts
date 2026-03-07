@@ -1,5 +1,48 @@
 export type TrustLevel = "verified" | "unverified" | "signed";
 
+export type ProcessStatus =
+  | "starting"
+  | "ready"
+  | "running"
+  | "exited"
+  | "failed"
+  | "stopped"
+  | "unknown";
+
+export interface ProcessStatusMeta {
+  label: string;
+  tone: ProcessStatus;
+  active: boolean;
+}
+
+export interface CapsuleRelease {
+  version: string;
+  manifestHash?: string;
+  contentHash: string;
+  signatureStatus: string;
+  isCurrent: boolean;
+  yankedAt?: string;
+}
+
+export function getProcessStatusMeta(status: ProcessStatus): ProcessStatusMeta {
+  switch (status) {
+    case "starting":
+      return { label: "Starting", tone: "starting", active: true };
+    case "ready":
+      return { label: "Ready", tone: "ready", active: true };
+    case "running":
+      return { label: "Running", tone: "running", active: true };
+    case "exited":
+      return { label: "Exited", tone: "exited", active: false };
+    case "failed":
+      return { label: "Failed", tone: "failed", active: false };
+    case "stopped":
+      return { label: "Stopped", tone: "stopped", active: false };
+    default:
+      return { label: "Unknown", tone: "unknown", active: false };
+  }
+}
+
 export interface StoreMetadata {
   iconPath?: string;
   text?: string;
@@ -32,6 +75,7 @@ export interface Capsule {
   rawToml?: string;
   manifest?: unknown;
   targets: CapsuleTarget[];
+  releases: CapsuleRelease[];
   defaultTarget?: string;
   detailLoaded?: boolean;
   localPath: string;
@@ -47,7 +91,7 @@ export interface Process {
   capsuleId: string;
   scopedId: string;
   active: boolean;
-  status: "running" | "stopped" | "unknown";
+  status: ProcessStatus;
   startedAt: string;
   lastSeenAt: string;
   runtime: string;

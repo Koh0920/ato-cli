@@ -9,11 +9,13 @@ import { DetailPage } from "./pages/DetailPage";
 import { LogsPage } from "./pages/LogsPage";
 import type {
   Capsule,
+  CapsuleRelease,
   CapsuleTarget,
   CatalogViewMode,
   OsFilter,
   Process,
   ProcessLogLine,
+  ProcessStatus,
 } from "./types";
 import { detectPlatform, toOsFilterLabel } from "./utils/platform";
 import {
@@ -47,6 +49,16 @@ type ConfirmState =
       kind: "save-config";
       capsule: Capsule;
       runtimeConfig: CapsuleRuntimeOverride | undefined;
+    }
+  | {
+      kind: "rollback-release";
+      capsule: Capsule;
+      release: CapsuleRelease;
+    }
+  | {
+      kind: "yank-release";
+      capsule: Capsule;
+      release: CapsuleRelease;
     };
 
 function nowIso(): string {
@@ -100,6 +112,7 @@ interface ApiDetailResponse {
   description?: string;
   latestVersion?: string;
   latest_version?: string;
+  releases?: ApiReleaseRow[];
   manifest?: unknown;
   manifestToml?: string;
   manifest_toml?: string;
@@ -125,11 +138,25 @@ interface ApiRuntimeTargetConfig {
   env?: Record<string, string>;
 }
 
+interface ApiReleaseRow {
+  version: string;
+  manifest_hash?: string;
+  manifestHash?: string;
+  content_hash?: string;
+  contentHash?: string;
+  signature_status?: string;
+  signatureStatus?: string;
+  is_current?: boolean;
+  isCurrent?: boolean;
+  yanked_at?: string;
+  yankedAt?: string;
+}
+
 interface ApiProcessRow {
   id: string;
   name: string;
   pid: number;
-  status: "running" | "stopped" | "unknown";
+  status: ProcessStatus;
   active: boolean;
   runtime: string;
   started_at: string;
@@ -164,6 +191,23 @@ interface ApiStoreMetadataResponse {
   scoped_id?: string;
   store_metadata?: ApiStoreMetadata;
   storeMetadata?: ApiStoreMetadata;
+}
+
+interface ApiRollbackResponse {
+  scoped_id?: string;
+  manifest_hash?: string;
+  target_manifest_hash?: string;
+  to_epoch?: number;
+  pointer?: {
+    manifest_hash?: string;
+    epoch?: number;
+  };
+}
+
+interface ApiYankResponse {
+  scoped_id?: string;
+  target_manifest_hash?: string;
+  yanked?: boolean;
 }
 
 interface ApiWellKnownResponse {
@@ -252,6 +296,17 @@ function formatSizeLabel(sizeBytes: unknown): string {
   return `${Math.floor(sizeBytes)} B`;
 }
 
+function mapReleaseRow(row: ApiReleaseRow): CapsuleRelease {
+  return {
+    version: row.version,
+    manifestHash: row.manifestHash ?? row.manifest_hash,
+    contentHash: row.contentHash ?? row.content_hash ?? "-",
+    signatureStatus: row.signatureStatus ?? row.signature_status ?? "unknown",
+    isCurrent: row.isCurrent ?? row.is_current ?? false,
+    yankedAt: row.yankedAt ?? row.yanked_at,
+  };
+}
+
 function baseReadme(scopedId: string, description: string): string {
   return `# ${scopedId}\n\n${description || "No description"}\n`;
 }
@@ -278,6 +333,7 @@ function mapSearchRowToCapsule(row: ApiSearchCapsuleRow, platform: string): Caps
     envHints: {},
     readme: baseReadme(scopedId, description),
     targets: [],
+    releases: [],
     detailLoaded: false,
     localPath: "-",
     appUrl: null,
@@ -590,7 +646,7 @@ function toApiProcess(row: ApiProcessRow, catalogCapsules: Capsule[]): Process {
     pid: row.pid,
     capsuleId: matchedCapsule?.id ?? scopedId,
     scopedId,
-    active: row.active || row.status === "running",
+    active: row.active,
     status: row.status,
     startedAt: row.started_at,
     lastSeenAt: nowIso(),
@@ -774,7 +830,7 @@ export default function App(): JSX.Element {
   const loadCatalogCapsules = useCallback(async (): Promise<void> => {
     setIsLoadingCapsules(true);
     try {
-      const response = await fetch("/v1/capsules?limit=200");
+      const response = await fetch("/v1/manifest/capsules?limit=200");
       const payload = (await response.json()) as ApiSearchResponse;
       const rows = Array.isArray(payload.capsules) ? payload.capsules : [];
       setCatalogCapsules(rows.map((row) => mapSearchRowToCapsule(row, platform)));
@@ -974,6 +1030,14 @@ export default function App(): JSX.Element {
 
   const requestDelete = (capsule: Capsule): void => {
     setConfirmState({ kind: "delete", capsule });
+  };
+
+  const requestRollbackRelease = (capsule: Capsule, release: CapsuleRelease): void => {
+    setConfirmState({ kind: "rollback-release", capsule, release });
+  };
+
+  const requestYankRelease = (capsule: Capsule, release: CapsuleRelease): void => {
+    setConfirmState({ kind: "yank-release", capsule, release });
   };
 
   const openLogs = (processId: string): void => {
@@ -1189,6 +1253,68 @@ export default function App(): JSX.Element {
     [createWriteHeaders, loadCatalogCapsules, loadProcesses, navigate, route],
   );
 
+  const rollbackReleaseConfirmed = useCallback(
+    async (state: Extract<ConfirmState, { kind: "rollback-release" }>): Promise<void> => {
+      if (!state.release.manifestHash) {
+        throw createActionFailure("rollback target is missing a manifest hash");
+      }
+      const response = await fetch("/v1/manifest/rollback", {
+        method: "POST",
+        headers: createWriteHeaders("application/json"),
+        body: JSON.stringify({
+          scoped_id: state.capsule.scopedId,
+          target_manifest_hash: state.release.manifestHash,
+        }),
+      });
+      if (!response.ok) {
+        if (response.status === 401) {
+          setWriteAuthRequired(true);
+        }
+        const text = await response.text();
+        const parsedError = parseActionErrorResponse(text, `rollback failed: ${response.status}`);
+        throw createActionFailure(parsedError.message, parsedError.copyText);
+      }
+      const payload = (await response.json()) as ApiRollbackResponse;
+      if (!payload.target_manifest_hash && !payload.manifest_hash && !payload.pointer?.manifest_hash) {
+        throw createActionFailure("rollback was not accepted");
+      }
+      await loadCatalogCapsules();
+      await loadProcesses();
+    },
+    [createWriteHeaders, loadCatalogCapsules, loadProcesses],
+  );
+
+  const yankReleaseConfirmed = useCallback(
+    async (state: Extract<ConfirmState, { kind: "yank-release" }>): Promise<void> => {
+      if (!state.release.manifestHash) {
+        throw createActionFailure("yank target is missing a manifest hash");
+      }
+      const response = await fetch("/v1/manifest/yank", {
+        method: "POST",
+        headers: createWriteHeaders("application/json"),
+        body: JSON.stringify({
+          scoped_id: state.capsule.scopedId,
+          target_manifest_hash: state.release.manifestHash,
+        }),
+      });
+      if (!response.ok) {
+        if (response.status === 401) {
+          setWriteAuthRequired(true);
+        }
+        const text = await response.text();
+        const parsedError = parseActionErrorResponse(text, `yank failed: ${response.status}`);
+        throw createActionFailure(parsedError.message, parsedError.copyText);
+      }
+      const payload = (await response.json()) as ApiYankResponse;
+      if (payload.yanked !== true) {
+        throw createActionFailure("yank was not accepted");
+      }
+      await loadCatalogCapsules();
+      await loadProcesses();
+    },
+    [createWriteHeaders, loadCatalogCapsules, loadProcesses],
+  );
+
   const persistRuntimeConfig = useCallback(
     async (capsuleId: string, runtimeConfig: CapsuleRuntimeOverride | undefined): Promise<void> => {
       const capsule = catalogCapsules.find((entry) => entry.id === capsuleId);
@@ -1309,6 +1435,12 @@ export default function App(): JSX.Element {
       } else if (action.kind === "save-config") {
         await saveRuntimeConfigConfirmed(action);
         showSuccessToast("Configurationを保存しました");
+      } else if (action.kind === "rollback-release") {
+        await rollbackReleaseConfirmed(action);
+        showSuccessToast(`Rollbackを受け付けました: ${action.release.version}`);
+      } else if (action.kind === "yank-release") {
+        await yankReleaseConfirmed(action);
+        showSuccessToast(`Yankを受け付けました: ${action.release.version}`);
       } else {
         await deleteConfirmed(action);
         showSuccessToast("Capsuleを削除しました");
@@ -1332,11 +1464,13 @@ export default function App(): JSX.Element {
     deleteConfirmed,
     isSubmittingConfirm,
     loadProcesses,
+    rollbackReleaseConfirmed,
     runConfirmed,
     saveRuntimeConfigConfirmed,
     showErrorToast,
     showSuccessToast,
     stopConfirmed,
+    yankReleaseConfirmed,
   ]);
 
   const updateTargetSelection = (capsuleId: string, target: string): void => {
@@ -1432,7 +1566,7 @@ export default function App(): JSX.Element {
       const [publisher, slug] = parts;
       try {
         const response = await fetch(
-          `/v1/capsules/by/${encodeURIComponent(publisher)}/${encodeURIComponent(slug)}`,
+          `/v1/manifest/capsules/by/${encodeURIComponent(publisher)}/${encodeURIComponent(slug)}`,
         );
         if (!response.ok) {
           return;
@@ -1453,6 +1587,7 @@ export default function App(): JSX.Element {
         const readmeSource = detail.readmeSource ?? detail.readme_source;
         const readme = readmeFromApi ?? baseReadme(capsule.scopedId, detail.description ?? capsule.description);
         const version = detail.latestVersion ?? detail.latest_version ?? capsule.version;
+        const releases = Array.isArray(detail.releases) ? detail.releases.map(mapReleaseRow) : capsule.releases;
         const manifestToml = detail.manifestToml ?? detail.manifest_toml;
         const storeMetadata = mapStoreMetadata(detail.storeMetadata ?? detail.store_metadata);
         const description = storeMetadata?.text ?? detail.description ?? capsule.description;
@@ -1472,6 +1607,7 @@ export default function App(): JSX.Element {
                   manifest: detail.manifest,
                   envHints: Object.keys(firstTargetEnv).length > 0 ? firstTargetEnv : entry.envHints,
                   targets,
+                  releases,
                   defaultTarget,
                   detailLoaded: true,
                   storeMetadata,
@@ -1650,6 +1786,8 @@ export default function App(): JSX.Element {
           onOpen={openRunningTarget}
           openReady={isOpenReady(process)}
           onDelete={requestDelete}
+          onRollbackRelease={requestRollbackRelease}
+          onYankRelease={requestYankRelease}
           onSaveStoreMetadata={saveStoreMetadata}
           onClearLogs={() => {
             if (!process) {
@@ -1700,6 +1838,10 @@ export default function App(): JSX.Element {
       ? "Run confirmation"
       : confirmState.kind === "stop"
         ? "Stop confirmation"
+        : confirmState.kind === "rollback-release"
+          ? "Rollback confirmation"
+          : confirmState.kind === "yank-release"
+            ? "Yank confirmation"
         : confirmState.kind === "save-config"
           ? "Save configuration"
           : "Delete confirmation";
@@ -1722,6 +1864,24 @@ export default function App(): JSX.Element {
             `Capsule: ${confirmState.process.scopedId}`,
             `PID: ${confirmState.process.pid}`,
           ]
+        : confirmState.kind === "rollback-release"
+          ? [
+              `Capsule: ${confirmState.capsule.scopedId}`,
+              `Action: Roll back registry pointer`,
+              `Version: ${confirmState.release.version}`,
+              `Manifest hash: ${confirmState.release.manifestHash ?? "-"}`,
+              `Content hash: ${confirmState.release.contentHash}`,
+              `Signature: ${confirmState.release.signatureStatus}`,
+            ]
+          : confirmState.kind === "yank-release"
+            ? [
+                `Capsule: ${confirmState.capsule.scopedId}`,
+                `Action: Yank release from resolution history`,
+                `Version: ${confirmState.release.version}`,
+                `Manifest hash: ${confirmState.release.manifestHash ?? "-"}`,
+                `Content hash: ${confirmState.release.contentHash}`,
+                `Signature: ${confirmState.release.signatureStatus}`,
+              ]
         : confirmState.kind === "save-config"
           ? [
               `Capsule: ${confirmState.capsule.scopedId}`,
@@ -1781,7 +1941,17 @@ export default function App(): JSX.Element {
         authRequired={confirmAuthRequired}
         authToken={registryAuthToken}
         isSubmitting={isSubmittingConfirm}
-        confirmLabel={confirmState?.kind === "delete" ? "Delete" : "Confirm"}
+        confirmLabel={
+          !confirmState
+            ? "Confirm"
+            : confirmState.kind === "delete"
+              ? "Delete"
+              : confirmState.kind === "rollback-release"
+                ? "Rollback"
+                : confirmState.kind === "yank-release"
+                  ? "Yank"
+                  : "Confirm"
+        }
         onAuthTokenChange={updateRegistryAuthToken}
         onClose={() => setConfirmState(null)}
         onConfirm={() => {

@@ -1,10 +1,11 @@
 import { Box, ExternalLink, Globe, Package, Play, Search, Square, Trash2, Zap } from "lucide-react";
 
+import { getProcessStatusMeta } from "../types";
 import type { Capsule, Process } from "../types";
 
 interface CapsuleListCardProps {
   capsule: Capsule;
-  activeProcess: Process | undefined;
+  process: Process | undefined;
   openReady: boolean;
   platform: string;
   onRun: (capsule: Capsule) => void;
@@ -30,7 +31,7 @@ function IconForCapsule({ iconKey }: { iconKey: Capsule["iconKey"] }): JSX.Eleme
 
 export function CapsuleListCard({
   capsule,
-  activeProcess,
+  process,
   openReady,
   platform,
   onRun,
@@ -39,7 +40,8 @@ export function CapsuleListCard({
   onInspect,
   onDelete,
 }: CapsuleListCardProps): JSX.Element {
-  const isRunning = Boolean(activeProcess?.active);
+  const status = getProcessStatusMeta(process?.status ?? "stopped");
+  const isRunning = Boolean(process?.active);
   return (
     <article
       className="capsule-list-card"
@@ -53,7 +55,10 @@ export function CapsuleListCard({
       }}
     >
       <div className="capsule-list-header">
-        <span className={`table-dot ${isRunning ? "active" : ""}`} aria-label={isRunning ? "Running" : "Stopped"} />
+        <span
+          className={`table-dot status-${status.tone} ${status.active ? "active" : ""}`}
+          aria-label={status.label}
+        />
         <div className="capsule-cell-icon">
           {capsule.storeMetadata?.iconUrl ? (
             <img
@@ -68,6 +73,10 @@ export function CapsuleListCard({
         <div className="capsule-list-title-wrap">
           <div className="row-id">{capsule.scopedId}</div>
           <div className="row-desc capsule-list-desc">{capsule.description}</div>
+          <div className="row-status-wrap">
+            <span className={`badge status-badge status-${status.tone}`}>{status.label}</span>
+            {process?.targetLabel ? <span className="row-meta">target={process.targetLabel}</span> : null}
+          </div>
         </div>
       </div>
 
@@ -98,7 +107,7 @@ export function CapsuleListCard({
           <button
             className="btn btn-ghost"
             type="button"
-            onClick={() => onOpen(capsule, activeProcess)}
+            onClick={() => onOpen(capsule, process)}
             disabled={!openReady}
           >
             <ExternalLink size={14} strokeWidth={1.5} /> Open

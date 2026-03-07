@@ -1,9 +1,10 @@
 import { Box, ExternalLink, Globe, Package, Play, Search, Square, Trash2, Zap } from "lucide-react";
+import { getProcessStatusMeta } from "../types";
 import type { Capsule, Process } from "../types";
 
 interface CapsuleRowProps {
   capsule: Capsule;
-  activeProcess: Process | undefined;
+  process: Process | undefined;
   openReady: boolean;
   platform: string;
   onRun: (capsule: Capsule) => void;
@@ -29,7 +30,7 @@ function IconForCapsule({ iconKey }: { iconKey: Capsule["iconKey"] }): JSX.Eleme
 
 export function CapsuleRow({
   capsule,
-  activeProcess,
+  process,
   openReady,
   platform,
   onRun,
@@ -38,7 +39,8 @@ export function CapsuleRow({
   onInspect,
   onDelete,
 }: CapsuleRowProps): JSX.Element {
-  const isRunning = Boolean(activeProcess?.active);
+  const status = getProcessStatusMeta(process?.status ?? "stopped");
+  const isRunning = Boolean(process?.active);
 
   return (
     <tr
@@ -53,7 +55,10 @@ export function CapsuleRow({
       }}
     >
       <td className="table-status">
-        <span className={`table-dot ${isRunning ? "active" : ""}`} aria-label={isRunning ? "Running" : "Stopped"} />
+        <span
+          className={`table-dot status-${status.tone} ${status.active ? "active" : ""}`}
+          aria-label={status.label}
+        />
       </td>
       <td>
         <div className="capsule-cell">
@@ -71,6 +76,10 @@ export function CapsuleRow({
           <div>
             <div className="row-id">{capsule.scopedId}</div>
             <div className="row-desc">{capsule.description}</div>
+            <div className="row-status-wrap">
+              <span className={`badge status-badge status-${status.tone}`}>{status.label}</span>
+              {process?.targetLabel ? <span className="row-meta">target={process.targetLabel}</span> : null}
+            </div>
           </div>
         </div>
       </td>
@@ -100,7 +109,7 @@ export function CapsuleRow({
             <button
               className="btn btn-ghost"
               type="button"
-              onClick={() => onOpen(capsule, activeProcess)}
+              onClick={() => onOpen(capsule, process)}
               disabled={!openReady}
             >
               <ExternalLink size={14} strokeWidth={1.5} /> Open

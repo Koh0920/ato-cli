@@ -3,6 +3,7 @@ import {
   Box,
   ChevronDown,
   ChevronLeft,
+  Shield,
   FileText,
   Globe,
   Hash,
@@ -19,7 +20,8 @@ import {
 } from "lucide-react";
 import { ReadmeRenderer } from "../components/ReadmeRenderer";
 import { TomlViewer } from "../components/TomlViewer";
-import type { Capsule, Process, ProcessLogLine } from "../types";
+import { getProcessStatusMeta } from "../types";
+import type { Capsule, CapsuleRelease, Process, ProcessLogLine } from "../types";
 
 interface DetailPageProps {
   capsule: Capsule;
@@ -42,6 +44,8 @@ interface DetailPageProps {
   onStop: (capsule: Capsule) => void;
   onOpen: (capsule: Capsule, process?: Process) => void;
   onDelete: (capsule: Capsule) => void;
+  onRollbackRelease: (capsule: Capsule, release: CapsuleRelease) => void;
+  onYankRelease: (capsule: Capsule, release: CapsuleRelease) => void;
   onSaveStoreMetadata: (capsule: Capsule, iconPath: string, text: string) => Promise<void>;
   onClearLogs: () => void;
   onEnvChange: (capsuleId: string, target: string, key: string, value: string) => void;
@@ -52,7 +56,7 @@ interface DetailPageProps {
   onSaveRuntimeConfig: (capsule: Capsule) => void;
 }
 
-type DetailTab = "logs" | "docs" | "config";
+type DetailTab = "logs" | "docs" | "config" | "releases";
 
 function logTextClass(level: string): string {
   const normalized = level.toLowerCase();
@@ -89,6 +93,20 @@ function renderFallbackToml(capsule: Capsule, envValues: Record<string, string>)
   return `[capsule]\nname = "${capsule.name}"\nversion = "${capsule.version.replace(/^v/i, "")}"\npublisher = "${capsule.publisher}"\n\n[env]\n${env}`;
 }
 
+function signatureTone(signatureStatus: string): string {
+  const normalized = signatureStatus.trim().toLowerCase();
+  if (normalized === "verified" || normalized === "signed") {
+    return "ready";
+  }
+  if (normalized.includes("warn") || normalized.includes("pending")) {
+    return "starting";
+  }
+  if (normalized.includes("invalid") || normalized.includes("fail") || normalized.includes("error")) {
+    return "failed";
+  }
+  return "unknown";
+}
+
 export function DetailPage({
   capsule,
   isMobile,
@@ -110,6 +128,8 @@ export function DetailPage({
   onStop,
   onOpen,
   onDelete,
+  onRollbackRelease,
+  onYankRelease,
   onSaveStoreMetadata,
   onClearLogs,
   onEnvChange,
@@ -125,6 +145,7 @@ export function DetailPage({
     runtime: true,
   });
   const logScrollRef = useRef<HTMLDivElement | null>(null);
+  const status = getProcessStatusMeta(process?.status ?? "stopped");
   const isRunning = Boolean(process?.active);
   const rawToml = useMemo(
     () => capsule.rawToml ?? renderFallbackToml(capsule, envValues),
@@ -206,9 +227,9 @@ export function DetailPage({
         <div>
           <div className="detail-title-row">
             <span className="detail-title">{capsule.scopedId}</span>
-            <span className={`status-pill ${isRunning ? "running" : "stopped"}`}>
-              <span className={`status-pill-dot ${isRunning ? "active" : ""}`} />
-              {isRunning ? "Running" : "Idle"}
+            <span className={`status-pill status-${status.tone}`}>
+              <span className={`status-pill-dot ${status.active ? "active" : ""}`} />
+              {status.label}
             </span>
           </div>
           <div className="detail-meta">
@@ -261,6 +282,13 @@ export function DetailPage({
           onClick={() => setTab("config")}
         >
           <Settings2 size={13} strokeWidth={1.5} /> Configuration
+        </button>
+        <button
+          className={`tab ${tab === "releases" ? "active" : ""}`}
+          type="button"
+          onClick={() => setTab("releases")}
+        >
+          <Shield size={13} strokeWidth={1.5} /> Releases &amp; Security
         </button>
         <button
           className={`tab ${tab === "logs" ? "active" : ""}`}
@@ -486,6 +514,86 @@ export function DetailPage({
               </div>
             ) : null}
           </section>
+        </div>
+      ) : null}
+
+      {tab === "releases" ? (
+        <div className="docs-pane" role="tabpanel" aria-label="Releases and Security">
+          <div className="docs-card releases-card">
+            <div className="releases-summary-grid">
+              <div className="release-summary-tile">
+                <span className="section-title">Latest</span>
+                <strong>{capsule.version}</strong>
+              </div>
+              <div className="release-summary-tile">
+                <span className="section-title">Tracked releases</span>
+                <strong>{capsule.releases.length}</strong>
+              </div>
+              <div className="release-summary-tile">
+                <span className="section-title">Trust</span>
+                <strong>{capsule.trustLevel === "verified" || capsule.trustLevel === "signed" ? "Verified" : "Unverified"}</strong>
+              </div>
+            </div>
+
+            {capsule.releases.length === 0 ? (
+              <div className="release-empty">No release history is available for this capsule yet.</div>
+            ) : (
+              <div className="release-table-wrap">
+                <table className="release-table">
+                  <thead>
+                    <tr>
+                      <th>Version</th>
+                      <th>Content Hash</th>
+                      <th>Signature</th>
+                      <th style={{ textAlign: "right" }}>Operations</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {capsule.releases.map((release) => {
+                      const tone = signatureTone(release.signatureStatus);
+                      const actionable = Boolean(release.manifestHash);
+                      return (
+                        <tr key={`${release.version}-${release.contentHash}`}>
+                          <td className="mono">
+                            <div className="release-version-cell">
+                              <span>{release.version}</span>
+                              {release.isCurrent ? <span className="badge badge-current">Current</span> : null}
+                              {release.yankedAt ? <span className="badge badge-yanked">Yanked</span> : null}
+                            </div>
+                            {release.yankedAt ? <div className="row-meta">yanked at {new Date(release.yankedAt).toLocaleString()}</div> : null}
+                          </td>
+                          <td className="mono release-hash-cell">{release.contentHash}</td>
+                          <td>
+                            <span className={`badge status-badge status-${tone}`}>{release.signatureStatus}</span>
+                          </td>
+                          <td>
+                            <div className="release-actions">
+                              <button
+                                className="btn btn-ghost"
+                                type="button"
+                                disabled={!actionable}
+                                onClick={() => onRollbackRelease(capsule, release)}
+                              >
+                                Rollback
+                              </button>
+                              <button
+                                className="btn btn-danger"
+                                type="button"
+                                disabled={!actionable || Boolean(release.yankedAt)}
+                                onClick={() => onYankRelease(capsule, release)}
+                              >
+                                Yank
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
         </div>
       ) : null}
     </div>

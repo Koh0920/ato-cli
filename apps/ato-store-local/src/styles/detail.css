@@ -58,13 +58,28 @@
   font-size: 11px;
 }
 
-.status-pill.running {
+.status-pill.status-ready,
+.status-pill.status-running {
   border-color: var(--green-border);
   background: var(--green-lt);
   color: var(--green);
 }
 
-.status-pill.stopped {
+.status-pill.status-starting {
+  border-color: var(--border);
+  background: var(--yellow-lt);
+  color: var(--yellow);
+}
+
+.status-pill.status-failed {
+  border-color: var(--red-border);
+  background: var(--red-lt);
+  color: var(--red);
+}
+
+.status-pill.status-exited,
+.status-pill.status-stopped,
+.status-pill.status-unknown {
   background: var(--bg);
   color: var(--text-3);
 }
@@ -220,6 +235,95 @@
   border-radius: 10px;
   background: var(--surface);
   padding: 24px;
+}
+
+.releases-card {
+  display: grid;
+  gap: 18px;
+}
+
+.releases-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.release-summary-tile {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+  padding: 14px;
+  display: grid;
+  gap: 8px;
+}
+
+.release-summary-tile strong {
+  font-family: "DM Mono", monospace;
+  font-size: 14px;
+  color: var(--text-1);
+}
+
+.release-empty {
+  border: 1px dashed var(--border-md);
+  border-radius: 10px;
+  background: var(--bg);
+  padding: 24px;
+  color: var(--text-3);
+  text-align: center;
+}
+
+.release-table-wrap {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: auto;
+}
+
+.release-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.release-table thead tr {
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.release-table th,
+.release-table td {
+  padding: 12px 14px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.release-table th {
+  font-family: "DM Mono", monospace;
+  font-size: 11px;
+  color: var(--text-3);
+  text-transform: uppercase;
+}
+
+.release-table tbody tr + tr {
+  border-top: 1px solid var(--border);
+}
+
+.release-hash-cell {
+  max-width: 420px;
+  word-break: break-all;
+  color: var(--text-2);
+}
+
+.release-version-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.release-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .readme-body {
@@ -483,6 +587,10 @@
 
   .docs-card {
     padding: 14px;
+  }
+
+  .releases-summary-grid {
+    grid-template-columns: 1fr;
   }
 
   .config-pane {
