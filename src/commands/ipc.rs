@@ -22,7 +22,9 @@ use capsule_core::execution_plan::error::AtoExecutionError;
 use serde_json::Value;
 
 use crate::ipc::broker::IpcBroker;
-use crate::ipc::jsonrpc::{InvokeParams, JsonRpcError, JsonRpcRequest, JsonRpcResponse};
+use crate::ipc::jsonrpc::{InvokeParams, JsonRpcError, JsonRpcRequest};
+#[cfg(unix)]
+use crate::ipc::jsonrpc::JsonRpcResponse;
 use crate::ipc::types::{IpcMethodDescriptor, IpcRuntimeKind, IpcServiceInfo, IpcTransport};
 
 /// Run `ato ipc status`.
@@ -398,53 +400,57 @@ pub fn run_ipc_invoke(
     }
 
     #[cfg(unix)]
-    let response: JsonRpcResponse = match &target.endpoint {
-        IpcTransport::UnixSocket(socket_path) => {
-            invoke_over_unix_socket(socket_path, &request)
-                .unwrap_or_else(|err| exit_with_invoke_error(request_id.clone(), err, json_output))
+    {
+        let response: JsonRpcResponse = match &target.endpoint {
+            IpcTransport::UnixSocket(socket_path) => invoke_over_unix_socket(socket_path, &request)
+                .unwrap_or_else(|err| {
+                    exit_with_invoke_error(request_id.clone(), err, json_output)
+                }),
+            transport => exit_with_invoke_error(
+                request_id,
+                JsonRpcError::service_unavailable(&format!(
+                    "Transport '{}' is not supported by `ato ipc invoke` yet.",
+                    transport.endpoint_display()
+                )),
+                json_output,
+            ),
+        };
+
+        if let Some(error) = response.error.clone() {
+            exit_with_invoke_error(response.id.clone(), error, json_output);
         }
-        transport => exit_with_invoke_error(
-            request_id,
-            JsonRpcError::service_unavailable(&format!(
-                "Transport '{}' is not supported by `ato ipc invoke` yet.",
-                transport.endpoint_display()
-            )),
-            json_output,
-        ),
-    };
+
+        if json_output {
+            println!("{}", serde_json::to_string_pretty(&response)?);
+        } else if let Some(result) = response.result {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        } else {
+            println!("{}", serde_json::to_string_pretty(&response)?);
+        }
+
+        Ok(())
+    }
 
     #[cfg(not(unix))]
-    match &target.endpoint {
-        IpcTransport::UnixSocket(_) => exit_with_invoke_error(
-            request_id,
-            JsonRpcError::service_unavailable(
-                "Unix socket transport is unavailable on this platform.",
+    {
+        match &target.endpoint {
+            IpcTransport::UnixSocket(_) => exit_with_invoke_error(
+                request_id,
+                JsonRpcError::service_unavailable(
+                    "Unix socket transport is unavailable on this platform.",
+                ),
+                json_output,
             ),
-            json_output,
-        ),
-        transport => exit_with_invoke_error(
-            request_id,
-            JsonRpcError::service_unavailable(&format!(
-                "Transport '{}' is not supported by `ato ipc invoke` yet.",
-                transport.endpoint_display()
-            )),
-            json_output,
-        ),
-    };
-
-    if let Some(error) = response.error.clone() {
-        exit_with_invoke_error(response.id.clone(), error, json_output);
+            transport => exit_with_invoke_error(
+                request_id,
+                JsonRpcError::service_unavailable(&format!(
+                    "Transport '{}' is not supported by `ato ipc invoke` yet.",
+                    transport.endpoint_display()
+                )),
+                json_output,
+            ),
+        }
     }
-
-    if json_output {
-        println!("{}", serde_json::to_string_pretty(&response)?);
-    } else if let Some(result) = response.result {
-        println!("{}", serde_json::to_string_pretty(&result)?);
-    } else {
-        println!("{}", serde_json::to_string_pretty(&response)?);
-    }
-
-    Ok(())
 }
 
 /// Parse the `[ipc]` section from a raw TOML value.
