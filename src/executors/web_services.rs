@@ -15,7 +15,7 @@ use capsule_core::types::ServiceSpec;
 use crate::runtime_manager;
 use crate::runtime_overrides;
 
-use super::source::IpcEnvVars;
+use super::launch_context::RuntimeLaunchContext;
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 const READINESS_INTERVAL: Duration = Duration::from_millis(250);
@@ -37,7 +37,7 @@ struct RunningService {
     stderr_thread: Option<JoinHandle<std::io::Result<()>>>,
 }
 
-pub fn execute(plan: &ManifestData, ipc_env: Option<&IpcEnvVars>) -> Result<i32> {
+pub fn execute(plan: &ManifestData, launch_ctx: &RuntimeLaunchContext) -> Result<i32> {
     if !plan.is_web_services_mode() {
         return Err(AtoExecutionError::policy_violation(
             "web services executor requires runtime=web driver=deno with top-level [services]",
@@ -80,7 +80,7 @@ pub fn execute(plan: &ManifestData, ipc_env: Option<&IpcEnvVars>) -> Result<i32>
             }
         }
 
-        let env = build_service_env(plan, service_name, spec, ipc_env)?;
+        let env = build_service_env(plan, service_name, spec, launch_ctx)?;
         let mut cmd = build_service_command(&runtime_dir, spec, &runtime_bins)?;
         cmd.current_dir(&runtime_dir)
             .stdin(Stdio::null())
@@ -196,7 +196,7 @@ fn build_service_env(
     plan: &ManifestData,
     service_name: &str,
     service: &ServiceSpec,
-    ipc_env: Option<&IpcEnvVars>,
+    launch_ctx: &RuntimeLaunchContext,
 ) -> Result<HashMap<String, String>> {
     let mut env = runtime_overrides::merged_env(plan.execution_env());
     if let Some(extra) = service.env.as_ref() {
@@ -208,7 +208,7 @@ fn build_service_env(
         }
     }
 
-    if let Some(ipc_env) = ipc_env {
+    if let Some(ipc_env) = launch_ctx.ipc_env_vars() {
         for (key, value) in ipc_env {
             if key.starts_with("CAPSULE_IPC_") || key == "ATO_BRIDGE_TOKEN" {
                 env.insert(key.clone(), value.clone());
@@ -221,6 +221,8 @@ fn build_service_env(
             .into());
         }
     }
+
+    env.extend(launch_ctx.injected_env().clone());
 
     Ok(env)
 }
@@ -657,20 +659,24 @@ mod tests {
             "main".to_string(),
             ServiceSpec {
                 entrypoint: "node server.js".to_string(),
+                target: None,
                 depends_on: Some(vec!["api".to_string()]),
                 expose: None,
                 env: None,
                 readiness_probe: None,
+                network: None,
             },
         );
         services.insert(
             "api".to_string(),
             ServiceSpec {
                 entrypoint: "python api.py".to_string(),
+                target: None,
                 depends_on: None,
                 expose: None,
                 env: None,
                 readiness_probe: None,
+                network: None,
             },
         );
 
@@ -687,20 +693,24 @@ mod tests {
             "main".to_string(),
             ServiceSpec {
                 entrypoint: "node server.js".to_string(),
+                target: None,
                 depends_on: Some(vec!["api".to_string()]),
                 expose: None,
                 env: None,
                 readiness_probe: None,
+                network: None,
             },
         );
         services.insert(
             "api".to_string(),
             ServiceSpec {
                 entrypoint: "python api.py".to_string(),
+                target: None,
                 depends_on: Some(vec!["main".to_string()]),
                 expose: None,
                 env: None,
                 readiness_probe: None,
+                network: None,
             },
         );
 

@@ -200,11 +200,11 @@ fn load_artifact_payload(path: &Path, scoped_id: &str) -> Result<ArtifactPayload
 
 fn extract_manifest_from_capsule(bytes: &[u8]) -> Result<String> {
     let mut archive = tar::Archive::new(Cursor::new(bytes));
-    let entries = archive
+    let mut entries = archive
         .entries()
         .context("Failed to read .capsule archive entries")?;
 
-    for entry in entries {
+    while let Some(entry) = entries.next() {
         let mut entry = entry.context("Invalid .capsule entry")?;
         let entry_path = entry
             .path()
@@ -398,7 +398,9 @@ entrypoint = "main.ts"
         let path = tmp.path().join("sample-capsule.capsule");
         std::fs::write(&path, test_capsule_bytes("sample-capsule", "1.0.0")).expect("write");
 
-        let err = load_artifact_payload(&path, "koh0920/another-slug").expect_err("must fail");
+        let err = load_artifact_payload(&path, "koh0920/another-slug")
+            .err()
+            .expect("must fail");
         assert!(err
             .to_string()
             .contains("must match artifact manifest.name"));

@@ -20,39 +20,52 @@ struct ConsentRecord {
     approved_at: String,
 }
 
-pub fn require_consent(plan: &ExecutionPlan, assume_yes: bool) -> Result<(), AtoExecutionError> {
-    if is_zero_permission_plan(plan) {
-        return Ok(());
-    }
-
-    let store = ConsentStore::new()?;
-    let record = ConsentRecord {
+fn consent_record_for_plan(plan: &ExecutionPlan) -> ConsentRecord {
+    ConsentRecord {
         scoped_id: plan.consent.key.scoped_id.clone(),
         version: plan.consent.key.version.clone(),
         target_label: plan.consent.key.target_label.clone(),
         policy_segment_hash: plan.consent.policy_segment_hash.clone(),
         provisioning_policy_hash: plan.consent.provisioning_policy_hash.clone(),
         approved_at: String::new(),
-    };
+    }
+}
+
+pub fn require_consent(plan: &ExecutionPlan, _assume_yes: bool) -> Result<(), AtoExecutionError> {
+    if is_zero_permission_plan(plan) {
+        return Ok(());
+    }
+
+    let store = ConsentStore::new()?;
+    let record = consent_record_for_plan(plan);
 
     if store.is_consented(&record)? {
         return Ok(());
     }
 
-    if assume_yes {
-        store.append_consent(record)?;
-        return Ok(());
-    }
-
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Err(AtoExecutionError::policy_violation(
-            "ExecutionPlan consent missing in non-interactive mode. Re-run with -y/--yes to auto-approve.",
+            "ExecutionPlan consent missing in non-interactive mode. Seed consent from an interactive run first; --yes does not bypass execution consent.",
         ));
     }
 
     prompt_consent(plan)?;
     store.append_consent(record)?;
     Ok(())
+}
+
+pub fn seed_consent(plan: &ExecutionPlan) -> Result<(), AtoExecutionError> {
+    if is_zero_permission_plan(plan) {
+        return Ok(());
+    }
+
+    let store = ConsentStore::new()?;
+    let record = consent_record_for_plan(plan);
+    if store.is_consented(&record)? {
+        return Ok(());
+    }
+
+    store.append_consent(record)
 }
 
 fn is_zero_permission_plan(plan: &ExecutionPlan) -> bool {

@@ -12,13 +12,13 @@
 //! 4. **Monitor**: Track refcounts and idle timeouts.
 //! 5. **Shutdown**: Stop services gracefully on teardown.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tracing::{debug, info, warn};
 
 use super::registry::IpcRegistry;
 use super::token::TokenManager;
-use super::types::{IpcRuntimeKind, IpcServiceInfo, IpcTransport};
+use super::types::{IpcConfig, IpcRuntimeKind, IpcServiceInfo, IpcTransport, SharingMode};
 
 /// IPC Broker — the central IPC coordinator.
 ///
@@ -40,10 +40,7 @@ pub enum ResolvedService {
     /// Service is already running (found in registry).
     Running(IpcServiceInfo),
     /// Service found in local store but not yet started.
-    LocalStore {
-        /// Detected runtime kind.
-        runtime_kind: IpcRuntimeKind,
-    },
+    LocalStore(LocalServiceMetadata),
     /// Service not found anywhere.
     NotFound {
         /// Original `from` specifier.
@@ -51,6 +48,14 @@ pub enum ResolvedService {
         /// Suggested action for the user.
         suggestion: String,
     },
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalServiceMetadata {
+    pub manifest_path: PathBuf,
+    pub runtime_kind: IpcRuntimeKind,
+    pub capabilities: Vec<String>,
+    pub sharing_mode: SharingMode,
 }
 
 impl IpcBroker {
@@ -88,14 +93,14 @@ impl IpcBroker {
         // 2. Check local store
         let store_path = self.local_store_path(from);
         if store_path.exists() {
-            let runtime_kind = detect_runtime_kind(&store_path);
+            let metadata = load_local_service_metadata(&store_path);
             debug!(
                 service = from,
                 path = %store_path.display(),
-                runtime = %runtime_kind,
+                runtime = %metadata.runtime_kind,
                 "IPC service found in local store"
             );
-            return ResolvedService::LocalStore { runtime_kind };
+            return ResolvedService::LocalStore(metadata);
         }
 
         // 3. Not found
@@ -151,9 +156,14 @@ impl IpcBroker {
         // Handle different `from` formats:
         // - "greeter-service" → ~/.ato/store/greeter-service/
         // - "@scope/name:1.0" → ~/.ato/store/@scope/name/
-        // - "./relative/path" → relative path as-is
-        if from.starts_with("./") || from.starts_with("../") {
+        // - "./relative/path" / "/absolute/path" / "~/path" → filesystem path
+        if from.starts_with("./") || from.starts_with("../") || Path::new(from).is_absolute() {
             return PathBuf::from(from);
+        }
+
+        if let Some(path) = from.strip_prefix("~/") {
+            let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+            return home.join(path);
         }
 
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
@@ -172,7 +182,7 @@ impl IpcBroker {
 
 /// Detect the runtime kind by examining the capsule directory.
 fn detect_runtime_kind(capsule_root: &std::path::Path) -> IpcRuntimeKind {
-    let manifest_path = capsule_root.join("capsule.toml");
+    let manifest_path = resolve_manifest_path(capsule_root);
     if let Ok(content) = std::fs::read_to_string(&manifest_path) {
         if let Ok(raw) = content.parse::<toml::Value>() {
             if let Some(default_target) = raw
@@ -200,6 +210,47 @@ fn detect_runtime_kind(capsule_root: &std::path::Path) -> IpcRuntimeKind {
         }
     }
     IpcRuntimeKind::Source
+}
+
+fn load_local_service_metadata(capsule_root: &Path) -> LocalServiceMetadata {
+    let manifest_path = resolve_manifest_path(capsule_root);
+    let runtime_kind = detect_runtime_kind(capsule_root);
+    let mut capabilities = Vec::new();
+    let mut sharing_mode = SharingMode::default();
+
+    if let Ok(content) = std::fs::read_to_string(&manifest_path) {
+        if let Ok(raw) = content.parse::<toml::Value>() {
+            if let Some(ipc_table) = raw.get("ipc") {
+                if let Ok(ipc_str) = toml::to_string(ipc_table) {
+                    if let Ok(config) = toml::from_str::<IpcConfig>(&ipc_str) {
+                        if let Some(exports) = config.exports {
+                            capabilities = exports
+                                .methods
+                                .into_iter()
+                                .map(|method| method.name)
+                                .collect();
+                            sharing_mode = exports.sharing.mode;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    LocalServiceMetadata {
+        manifest_path,
+        runtime_kind,
+        capabilities,
+        sharing_mode,
+    }
+}
+
+fn resolve_manifest_path(capsule_root: &Path) -> PathBuf {
+    if capsule_root.is_file() {
+        capsule_root.to_path_buf()
+    } else {
+        capsule_root.join("capsule.toml")
+    }
 }
 
 /// Sanitize a service name for use in file paths.

@@ -10,6 +10,7 @@ use std::path::Path;
 
 use super::error::CapsuleError;
 use super::utils::parse_memory_string;
+use crate::orchestration::startup_order_from_dependencies;
 use crate::schema_registry::SchemaRegistry;
 
 /// Capsule Type - defines the fundamental nature of the Capsule
@@ -300,8 +301,13 @@ pub struct ServiceSpec {
     ///
     /// Accept both `entrypoint` (preferred) and `command` (alias) for compatibility
     /// with early drafts.
+    #[serde(default)]
     #[serde(alias = "command")]
     pub entrypoint: String,
+
+    /// Reference to a target under [targets.<label>].
+    #[serde(default)]
+    pub target: Option<String>,
 
     /// Service dependencies by name.
     #[serde(default)]
@@ -318,9 +324,28 @@ pub struct ServiceSpec {
     /// Readiness probe (Step 2/3).
     #[serde(default)]
     pub readiness_probe: Option<ReadinessProbe>,
+
+    /// Service-to-service network exposure controls.
+    #[serde(default)]
+    pub network: Option<ServiceNetworkSpec>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ServiceNetworkSpec {
+    /// Additional DNS aliases for this service inside the orchestration network.
+    #[serde(default)]
+    pub aliases: Vec<String>,
+
+    /// Whether this service should be reachable from the host network.
+    #[serde(default)]
+    pub publish: bool,
+
+    /// Restrict which services may receive connection metadata for this service.
+    #[serde(default)]
+    pub allow_from: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReadinessProbe {
     #[serde(default)]
     pub http_get: Option<String>,
@@ -870,6 +895,10 @@ pub struct NamedTarget {
     #[serde(default)]
     pub entrypoint: String,
 
+    /// OCI image reference (preferred for runtime=oci).
+    #[serde(default)]
+    pub image: Option<String>,
+
     /// Optional command arguments.
     #[serde(default)]
     pub cmd: Vec<String>,
@@ -877,6 +906,10 @@ pub struct NamedTarget {
     /// Optional environment variables.
     #[serde(default)]
     pub env: HashMap<String, String>,
+
+    /// Required environment variable names.
+    #[serde(default)]
+    pub required_env: Vec<String>,
 
     /// Legacy public asset allowlist (deprecated for runtime=web; rejected by validation).
     #[serde(default)]
@@ -1239,6 +1272,19 @@ impl CapsuleManifest {
             .as_ref()
             .map(|services| !services.is_empty())
             .unwrap_or(false);
+        let has_target_services = self
+            .services
+            .as_ref()
+            .map(|services| {
+                services.values().any(|service| {
+                    service
+                        .target
+                        .as_ref()
+                        .map(|target| !target.trim().is_empty())
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
         let mut requires_web_services_validation = false;
 
         for (label, target) in named_targets {
@@ -1358,7 +1404,13 @@ impl CapsuleManifest {
                 continue;
             }
 
-            if entrypoint.is_empty() {
+            if runtime == "oci" {
+                let image = target.image.as_deref().map(str::trim).unwrap_or("");
+                if entrypoint.is_empty() && image.is_empty() {
+                    errors.push(ValidationError::InvalidTarget(label));
+                    continue;
+                }
+            } else if entrypoint.is_empty() {
                 errors.push(ValidationError::InvalidTarget(label));
                 continue;
             }
@@ -1385,7 +1437,197 @@ impl CapsuleManifest {
             }
         }
 
-        if requires_web_services_validation {
+        if has_target_services {
+            let services = self.services.as_ref().cloned().unwrap_or_default();
+            if services.is_empty() {
+                errors.push(ValidationError::InvalidService(
+                    "main".to_string(),
+                    "top-level [services] must define at least one service for orchestration mode"
+                        .to_string(),
+                ));
+            } else {
+                if !services.contains_key("main") {
+                    errors.push(ValidationError::InvalidService(
+                        "main".to_string(),
+                        "services.main is required for orchestration mode".to_string(),
+                    ));
+                }
+
+                let mut dependencies = HashMap::new();
+                let mut resolved_runtimes = HashMap::new();
+
+                for (name, service) in &services {
+                    let target_name = service.target.as_deref().map(str::trim).unwrap_or("");
+                    let has_target = !target_name.is_empty();
+                    let has_entrypoint = !service.entrypoint.trim().is_empty();
+
+                    if has_target && has_entrypoint {
+                        errors.push(ValidationError::InvalidService(
+                            name.to_string(),
+                            "target and entrypoint are mutually exclusive".to_string(),
+                        ));
+                    }
+
+                    let effective_target = if has_target {
+                        Some(target_name.to_string())
+                    } else if name == "main" && !has_entrypoint {
+                        Some(self.default_target.trim().to_string())
+                    } else {
+                        None
+                    };
+
+                    let target_label = match effective_target {
+                        Some(target_label) => target_label,
+                        None => {
+                            errors.push(ValidationError::InvalidService(
+                                name.to_string(),
+                                "target is required for orchestration mode".to_string(),
+                            ));
+                            dependencies.insert(
+                                name.to_string(),
+                                service.depends_on.clone().unwrap_or_default(),
+                            );
+                            continue;
+                        }
+                    };
+
+                    let Some(target) = self
+                        .targets
+                        .as_ref()
+                        .and_then(|targets| targets.named_target(&target_label))
+                    else {
+                        errors.push(ValidationError::InvalidService(
+                            name.to_string(),
+                            format!("target '{}' does not exist under [targets]", target_label),
+                        ));
+                        dependencies.insert(
+                            name.to_string(),
+                            service.depends_on.clone().unwrap_or_default(),
+                        );
+                        continue;
+                    };
+
+                    let runtime = target.runtime.trim().to_ascii_lowercase();
+                    if runtime == "wasm" {
+                        errors.push(ValidationError::InvalidService(
+                            name.to_string(),
+                            "runtime=wasm is not supported in orchestration mode".to_string(),
+                        ));
+                    }
+
+                    if service
+                        .network
+                        .as_ref()
+                        .map(|network| {
+                            network.aliases.iter().any(|alias| alias.trim().is_empty())
+                                || network
+                                    .allow_from
+                                    .iter()
+                                    .any(|value| value.trim().is_empty())
+                        })
+                        .unwrap_or(false)
+                    {
+                        errors.push(ValidationError::InvalidService(
+                            name.to_string(),
+                            "network aliases and allow_from must not contain empty values"
+                                .to_string(),
+                        ));
+                    }
+
+                    if let Some(probe) = service.readiness_probe.as_ref() {
+                        if probe.port.trim().is_empty() {
+                            errors.push(ValidationError::InvalidService(
+                                name.to_string(),
+                                "readiness_probe.port must be a non-empty placeholder name"
+                                    .to_string(),
+                            ));
+                        }
+                        let has_http_get = probe
+                            .http_get
+                            .as_ref()
+                            .map(|v| !v.trim().is_empty())
+                            .unwrap_or(false);
+                        let has_tcp_connect = probe
+                            .tcp_connect
+                            .as_ref()
+                            .map(|v| !v.trim().is_empty())
+                            .unwrap_or(false);
+                        if !has_http_get && !has_tcp_connect {
+                            errors.push(ValidationError::InvalidService(
+                                name.to_string(),
+                                "readiness_probe must define http_get or tcp_connect".to_string(),
+                            ));
+                        }
+                    }
+
+                    let deps = service.depends_on.clone().unwrap_or_default();
+                    for dep in &deps {
+                        if !services.contains_key(dep) {
+                            errors.push(ValidationError::InvalidService(
+                                name.to_string(),
+                                format!("depends_on references unknown service '{}'", dep),
+                            ));
+                        }
+                    }
+
+                    if let Some(network) = service.network.as_ref() {
+                        for allowed in &network.allow_from {
+                            if !services.contains_key(allowed) {
+                                errors.push(ValidationError::InvalidService(
+                                    name.to_string(),
+                                    format!("allow_from references unknown service '{}'", allowed),
+                                ));
+                            }
+                        }
+                    }
+
+                    dependencies.insert(name.to_string(), deps);
+                    resolved_runtimes.insert(name.to_string(), runtime);
+                }
+
+                for (name, service) in &services {
+                    let Some(runtime) = resolved_runtimes.get(name) else {
+                        continue;
+                    };
+                    for dep in service.depends_on.clone().unwrap_or_default() {
+                        let Some(dep_runtime) = resolved_runtimes.get(&dep) else {
+                            continue;
+                        };
+                        if runtime == "oci" && dep_runtime != "oci" {
+                            errors.push(ValidationError::InvalidService(
+                                name.to_string(),
+                                format!(
+                                    "OCI service '{}' cannot depend on non-OCI service '{}'",
+                                    name, dep
+                                ),
+                            ));
+                        }
+                        if let Some(network) =
+                            services.get(&dep).and_then(|svc| svc.network.as_ref())
+                        {
+                            if !network.allow_from.is_empty()
+                                && !network.allow_from.iter().any(|value| value == name)
+                            {
+                                errors.push(ValidationError::InvalidService(
+                                    name.to_string(),
+                                    format!(
+                                        "service '{}' is not allowed to connect to '{}'",
+                                        name, dep
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                }
+
+                if let Err(err) = startup_order_from_dependencies(&dependencies) {
+                    errors.push(ValidationError::InvalidService(
+                        "services".to_string(),
+                        err.to_string(),
+                    ));
+                }
+            }
+        } else if requires_web_services_validation {
             let services = self.services.as_ref().cloned().unwrap_or_default();
             if services.is_empty() {
                 errors.push(ValidationError::InvalidService(
@@ -2243,6 +2485,152 @@ entrypoint = "main.py"
         assert!(error
             .to_string()
             .contains("legacy [execution] section is not supported in schema_version=0.2"));
+    }
+
+    #[test]
+    fn test_validate_orchestration_services_target_mode() {
+        let toml = r#"
+schema_version = "0.2"
+name = "multi-runtime-app"
+version = "0.1.0"
+type = "app"
+default_target = "web"
+
+[targets.web]
+runtime = "web"
+driver = "node"
+entrypoint = "server.js"
+port = 3000
+
+[targets.db]
+runtime = "oci"
+image = "mysql:8"
+port = 3306
+
+[services.main]
+target = "web"
+depends_on = ["db"]
+
+[services.db]
+target = "db"
+network = { allow_from = ["main"] }
+"#;
+
+        let manifest = CapsuleManifest::from_toml(toml).unwrap();
+        assert!(manifest.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_orchestration_rejects_unknown_target() {
+        let toml = r#"
+schema_version = "0.2"
+name = "multi-runtime-app"
+version = "0.1.0"
+type = "app"
+default_target = "web"
+
+[targets.web]
+runtime = "web"
+driver = "node"
+entrypoint = "server.js"
+port = 3000
+
+[services.main]
+target = "missing"
+"#;
+
+        let manifest = CapsuleManifest::from_toml(toml).unwrap();
+        let errors = manifest.validate().unwrap_err();
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            ValidationError::InvalidService(name, msg)
+                if name == "main" && msg.contains("target 'missing' does not exist")
+        )));
+    }
+
+    #[test]
+    fn test_validate_orchestration_rejects_target_and_entrypoint_mix() {
+        let toml = r#"
+schema_version = "0.2"
+name = "multi-runtime-app"
+version = "0.1.0"
+type = "app"
+default_target = "web"
+
+[targets.web]
+runtime = "web"
+driver = "node"
+entrypoint = "server.js"
+port = 3000
+
+[services.main]
+target = "web"
+entrypoint = "node server.js"
+"#;
+
+        let manifest = CapsuleManifest::from_toml(toml).unwrap();
+        let errors = manifest.validate().unwrap_err();
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            ValidationError::InvalidService(name, msg)
+                if name == "main" && msg.contains("mutually exclusive")
+        )));
+    }
+
+    #[test]
+    fn test_validate_oci_target_accepts_image_without_entrypoint() {
+        let toml = r#"
+schema_version = "0.2"
+name = "oci-app"
+version = "0.1.0"
+type = "app"
+default_target = "db"
+
+[targets.db]
+runtime = "oci"
+image = "mysql:8"
+"#;
+
+        let manifest = CapsuleManifest::from_toml(toml).unwrap();
+        assert!(manifest.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_orchestration_rejects_unknown_allow_from() {
+        let toml = r#"
+schema_version = "0.2"
+name = "multi-runtime-app"
+version = "0.1.0"
+type = "app"
+default_target = "web"
+
+[targets.web]
+runtime = "web"
+driver = "node"
+entrypoint = "server.js"
+port = 3000
+
+[targets.db]
+runtime = "oci"
+image = "mysql:8"
+port = 3306
+
+[services.main]
+target = "web"
+depends_on = ["db"]
+
+[services.db]
+target = "db"
+network = { allow_from = ["api"] }
+"#;
+
+        let manifest = CapsuleManifest::from_toml(toml).unwrap();
+        let errors = manifest.validate().unwrap_err();
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            ValidationError::InvalidService(name, msg)
+                if name == "db" && msg.contains("allow_from references unknown service")
+        )));
     }
 
     #[test]

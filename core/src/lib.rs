@@ -11,6 +11,7 @@ pub mod lockfile;
 pub mod mag_uri;
 pub mod manifest;
 pub mod metrics;
+pub mod orchestration;
 pub mod packers;
 pub mod policy;
 pub mod r3_config;

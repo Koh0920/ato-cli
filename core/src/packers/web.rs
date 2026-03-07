@@ -173,6 +173,16 @@ pub fn pack(
         "payload.tar.zst",
         reproducible_mtime_epoch(),
     )?;
+    if let Some((readme_path, archive_name)) =
+        crate::packers::capsule::find_nearest_readme_candidate(&opts.manifest_dir)
+    {
+        append_regular_file_normalized(
+            &mut outer,
+            &readme_path,
+            &archive_name,
+            reproducible_mtime_epoch(),
+        )?;
+    }
     outer.finish().map_err(CapsuleError::Io)?;
 
     Ok(output_path)

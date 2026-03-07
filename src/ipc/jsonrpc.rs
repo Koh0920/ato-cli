@@ -21,6 +21,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::ipc::schema::SchemaError;
+
 /// JSON-RPC version string.
 pub const JSONRPC_VERSION: &str = "2.0";
 
@@ -29,6 +31,7 @@ pub const JSONRPC_VERSION: &str = "2.0";
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Standard JSON-RPC 2.0 error codes.
+#[allow(dead_code)]
 pub mod error_codes {
     /// Parse error — invalid JSON was received.
     pub const PARSE_ERROR: i64 = -32700;
@@ -122,6 +125,7 @@ pub struct JsonRpcResponse {
 
 impl JsonRpcResponse {
     /// Create a successful response.
+    #[allow(dead_code)]
     pub fn success(id: Value, result: Value) -> Self {
         Self {
             jsonrpc: JSONRPC_VERSION.to_string(),
@@ -196,12 +200,39 @@ impl JsonRpcError {
     }
 
     /// Create a "permission denied" (-32001).
+    #[allow(dead_code)]
     pub fn permission_denied(reason: &str) -> Self {
         Self::new(
             error_codes::PERMISSION_DENIED,
             format!("Permission denied: {}", reason),
             Some("Check that your token has the required capability".to_string()),
         )
+    }
+
+    /// Create a "service unavailable" (-32002).
+    pub fn service_unavailable(reason: &str) -> Self {
+        Self::new(
+            error_codes::SERVICE_UNAVAILABLE,
+            format!("Service unavailable: {}", reason),
+            Some(
+                "Start the service with `ato ipc start <capsule-dir>` and ensure its socket is reachable."
+                    .to_string(),
+            ),
+        )
+    }
+
+    /// Create an "invalid params" (-32602).
+    pub fn invalid_params(message: &str, hint: &str) -> Self {
+        Self::new(
+            error_codes::INVALID_PARAMS,
+            message.to_string(),
+            Some(hint.to_string()),
+        )
+    }
+
+    /// Convert a schema validation failure into a JSON-RPC error object.
+    pub fn from_schema_error(error: &SchemaError) -> Self {
+        Self::new(error.error_code(), error.to_string(), Some(error.hint()))
     }
 }
 
@@ -210,6 +241,7 @@ impl JsonRpcError {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// JSON-RPC 2.0 Notification (no id, no response expected).
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcNotification {
     /// Must be "2.0".
@@ -223,6 +255,7 @@ pub struct JsonRpcNotification {
 
 impl JsonRpcNotification {
     /// Create a new notification.
+    #[allow(dead_code)]
     pub fn new(method: impl Into<String>, params: Option<Value>) -> Self {
         Self {
             jsonrpc: JSONRPC_VERSION.to_string(),
@@ -232,6 +265,7 @@ impl JsonRpcNotification {
     }
 
     /// Create a token-revoked notification.
+    #[allow(dead_code)]
     pub fn token_revoked(reason: &str) -> Self {
         Self::new(
             "capsule/internal.tokenRevoked",
@@ -241,6 +275,7 @@ impl JsonRpcNotification {
 }
 
 /// Parameters for `capsule/initialize`.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InitializeParams {
     /// Client capsule name.

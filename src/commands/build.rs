@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use capsule_core::execution_plan::error::AtoExecutionError;
 use capsule_core::CapsuleReporter;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -76,6 +77,22 @@ pub fn execute_pack_command(
         &manifest,
         decision.plan.selected_target_label(),
     )?;
+    let ipc_diagnostics = crate::ipc::validate::validate_manifest(
+        &decision.plan.manifest,
+        &decision.plan.manifest_dir,
+    )
+    .map_err(|err| AtoExecutionError::policy_violation(format!("IPC validation failed: {err}")))?;
+    if crate::ipc::validate::has_errors(&ipc_diagnostics) {
+        return Err(
+            AtoExecutionError::policy_violation(crate::ipc::validate::format_diagnostics(
+                &ipc_diagnostics,
+            ))
+            .into(),
+        );
+    }
+    for diagnostic in ipc_diagnostics {
+        futures::executor::block_on(reporter.warn(diagnostic.to_string()))?;
+    }
 
     futures::executor::block_on(reporter.notify(format!(
         "📦 Packing capsule \"{}\" (v{})...",

@@ -19,6 +19,8 @@ use crate::packers::payload::{
 use crate::packers::sbom::{generate_embedded_sbom_from_inputs_async, SbomFileInput, SBOM_PATH};
 use crate::r3_config;
 
+const README_CANDIDATES: [&str; 4] = ["README.md", "README.mdx", "README.txt", "README"];
+
 /// Capsule PAX TAR Archive Structure:
 /// ```text
 /// my-app.capsule (PAX TAR)
@@ -317,6 +319,15 @@ pub async fn pack(
         "payload.tar.zst",
         reproducible_mtime_epoch(),
     )?;
+
+    if let Some((readme_path, archive_name)) = find_nearest_readme_candidate(&opts.manifest_dir) {
+        append_regular_file_normalized(
+            &mut outer_ar,
+            &readme_path,
+            &archive_name,
+            reproducible_mtime_epoch(),
+        )?;
+    }
 
     outer_ar.finish()?;
     drop(outer_ar);
@@ -650,6 +661,20 @@ fn reproducible_mtime_epoch() -> u64 {
         .unwrap_or(DEFAULT_REPRO_MTIME)
 }
 
+pub(crate) fn find_nearest_readme_candidate(start_dir: &Path) -> Option<(PathBuf, String)> {
+    let mut current = Some(start_dir);
+    while let Some(dir) = current {
+        for candidate in README_CANDIDATES {
+            let path = dir.join(candidate);
+            if path.is_file() {
+                return Some((path, candidate.to_string()));
+            }
+        }
+        current = dir.parent();
+    }
+    None
+}
+
 fn select_payload_source_root(manifest_dir: &Path) -> (PathBuf, Option<&'static str>) {
     let source_dir = manifest_dir.join("source");
     if !source_dir.exists() {
@@ -746,6 +771,19 @@ mod tests {
         let (selected, warning) = select_payload_source_root(tmp.path());
         assert_eq!(selected.as_path(), source_dir.as_path());
         assert!(warning.is_none());
+    }
+
+    #[test]
+    fn find_nearest_readme_candidate_walks_up_to_parent_dirs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let app_dir = tmp.path().join("apps/file2api");
+        std::fs::create_dir_all(&app_dir).expect("mkdir app dir");
+        std::fs::write(tmp.path().join("README.md"), "# monorepo readme")
+            .expect("write root readme");
+
+        let found = find_nearest_readme_candidate(&app_dir).expect("find readme");
+        assert_eq!(found.0, tmp.path().join("README.md"));
+        assert_eq!(found.1, "README.md");
     }
 
     #[tokio::test]

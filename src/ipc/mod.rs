@@ -27,17 +27,13 @@
 //! - **Process Boundary Pattern**: JSON-RPC 2.0 over Unix Domain Sockets.
 
 pub mod broker;
-#[cfg(test)]
 pub mod dag;
 pub mod inject;
-#[cfg(test)]
-pub mod jsonrpc;
+pub(crate) mod jsonrpc;
 #[cfg(test)]
 pub mod refcount;
 pub mod registry;
-#[cfg(test)]
 pub mod schema;
 pub mod token;
 pub mod types;
-#[cfg(test)]
 pub mod validate;

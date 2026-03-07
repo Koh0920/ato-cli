@@ -1189,6 +1189,14 @@ impl RegistryStore {
                 }
             }
         }
+        crate::process_manager::ProcessManager::new()?
+            .cleanup_scoped_processes(scoped_id, true)
+            .with_context(|| {
+                format!(
+                    "Failed to clean up existing processes before rollback for {}",
+                    scoped_id
+                )
+            })?;
         let current_epoch: Option<u64> = tx
             .query_row(
                 "SELECT current_epoch FROM capsules WHERE scoped_id=?1",

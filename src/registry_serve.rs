@@ -229,6 +229,16 @@ struct RunCapsuleResponse {
     requested_port: Option<u16>,
 }
 
+#[derive(Debug, Serialize)]
+struct RollbackResponsePayload {
+    scoped_id: String,
+    target_manifest_hash: String,
+    manifest_hash: String,
+    to_epoch: u64,
+    pointer: capsule_core::types::EpochPointer,
+    public_key: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct StopProcessRequest {
     confirmed: bool,
@@ -351,8 +361,13 @@ struct CapsuleDetailResponse {
 #[derive(Debug, Serialize)]
 struct CapsuleReleaseRow {
     version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manifest_hash: Option<String>,
     content_hash: String,
     signature_status: String,
+    is_current: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    yanked_at: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -398,6 +413,7 @@ pub async fn serve(config: RegistryServerConfig) -> Result<()> {
 
     let mut app = Router::new()
         .route("/.well-known/capsule.json", get(handle_well_known))
+        .route("/v1/capsules", get(handle_search_capsules))
         .route("/v1/manifest/capsules", get(handle_search_capsules))
         .route(
             "/v1/manifest/capsules/by/:publisher/:slug",
@@ -783,13 +799,22 @@ async fn handle_get_capsule(
     let runtime_config = load_runtime_config(&state.data_dir)
         .ok()
         .and_then(|index| get_runtime_config_entry(&index, &publisher, &slug).cloned());
+    let scoped_id = format!("{}/{}", capsule.publisher, capsule.slug);
+    let store = RegistryStore::open(&state.data_dir).ok();
+    let current_manifest_hash = store.as_ref().and_then(|store| {
+        store
+            .resolve_epoch_pointer(&scoped_id)
+            .ok()
+            .flatten()
+            .map(|response| response.pointer.manifest_hash)
+    });
 
     let (manifest, repository, manifest_toml, capsule_lock, readme_markdown, readme_source) =
         load_capsule_detail_manifest(&state.data_dir, capsule);
     let readme_markdown = append_store_metadata_section(readme_markdown, metadata);
     let detail = CapsuleDetailResponse {
         id: capsule.id.clone(),
-        scoped_id: format!("{}/{}", capsule.publisher, capsule.slug),
+        scoped_id: scoped_id.clone(),
         slug: capsule.slug.clone(),
         name: capsule.name.clone(),
         description: metadata
@@ -803,10 +828,24 @@ async fn handle_get_capsule(
         releases: capsule
             .releases
             .iter()
-            .map(|release| CapsuleReleaseRow {
-                version: release.version.clone(),
-                content_hash: release.blake3.clone(),
-                signature_status: release.signature_status.clone(),
+            .map(|release| {
+                let resolved = store.as_ref().and_then(|store| {
+                    store
+                        .resolve_release_version(&publisher, &slug, &release.version)
+                        .ok()
+                        .flatten()
+                });
+                let manifest_hash = resolved.as_ref().map(|record| record.manifest_hash.clone());
+                let is_current = manifest_hash.as_deref() == current_manifest_hash.as_deref();
+                let yanked_at = resolved.and_then(|record| record.yanked_at);
+                CapsuleReleaseRow {
+                    version: release.version.clone(),
+                    manifest_hash,
+                    content_hash: release.blake3.clone(),
+                    signature_status: release.signature_status.clone(),
+                    is_current,
+                    yanked_at,
+                }
             })
             .collect(),
         publisher: publisher_info(&capsule.publisher),
@@ -1270,7 +1309,18 @@ async fn handle_manifest_rollback(
         }
     };
     match store.rollback_to_manifest(&request.scoped_id, &request.target_manifest_hash) {
-        Ok(Some(response)) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(Some(response)) => (
+            StatusCode::OK,
+            Json(RollbackResponsePayload {
+                scoped_id: request.scoped_id.clone(),
+                target_manifest_hash: request.target_manifest_hash.clone(),
+                manifest_hash: response.pointer.manifest_hash.clone(),
+                to_epoch: response.pointer.epoch,
+                pointer: response.pointer,
+                public_key: response.public_key,
+            }),
+        )
+            .into_response(),
         Ok(None) => json_error(
             StatusCode::NOT_FOUND,
             "not_found",
@@ -2024,6 +2074,80 @@ async fn handle_run_local_capsule(
     let run_target = local_artifact
         .canonicalize()
         .unwrap_or_else(|_| local_artifact.clone());
+    let mut consent_manifest_tmpdir = None;
+    let consent_manifest_path = if run_target
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("capsule"))
+    {
+        let bytes = match std::fs::read(&run_target) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "run_plan_invalid",
+                    &format!(
+                        "failed to read local artifact for consent planning: {}",
+                        err
+                    ),
+                );
+            }
+        };
+        let manifest_raw = match extract_manifest_from_capsule(&bytes) {
+            Ok(raw) => raw,
+            Err(err) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "run_plan_invalid",
+                    &format!("failed to extract capsule.toml from artifact: {}", err),
+                );
+            }
+        };
+        let temp_dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(err) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "run_plan_invalid",
+                    &format!("failed to create consent planning workspace: {}", err),
+                );
+            }
+        };
+        let manifest_path = temp_dir.path().join("capsule.toml");
+        if let Err(err) = std::fs::write(&manifest_path, manifest_raw) {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "run_plan_invalid",
+                &format!("failed to prepare consent planning manifest: {}", err),
+            );
+        }
+        consent_manifest_tmpdir = Some(temp_dir);
+        manifest_path
+    } else {
+        run_target.clone()
+    };
+    let compiled = match capsule_core::execution_plan::derive::compile_execution_plan(
+        &consent_manifest_path,
+        capsule_core::router::ExecutionProfile::Dev,
+        effective_target.as_deref(),
+    ) {
+        Ok(compiled) => compiled,
+        Err(err) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "run_plan_invalid",
+                &format!("failed to prepare execution plan: {}", err),
+            );
+        }
+    };
+    let _ = consent_manifest_tmpdir.as_ref();
+    if let Err(err) = crate::consent_store::seed_consent(&compiled.execution_plan) {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "run_consent_seed_failed",
+            &format!("failed to seed execution consent: {}", err),
+        );
+    }
     let mut cmd = std::process::Command::new(ato_path);
     cmd.arg("run")
         .arg(&run_target)
@@ -2118,15 +2242,21 @@ async fn handle_run_local_capsule(
 
     let pid = child.id() as i32;
     let process_info = ProcessInfo {
-        id: process_id,
+        id: process_id.clone(),
         name: slug.clone(),
         pid,
+        workload_pid: None,
         status: ProcessStatus::Running,
         runtime: "ato-run".to_string(),
         start_time: std::time::SystemTime::now(),
         manifest_path: Some(run_target.clone()),
         scoped_id: Some(scoped_id.clone()),
         target_label: effective_target.clone(),
+        log_path: Some(process_log_path(&process_id)),
+        ready_at: Some(std::time::SystemTime::now()),
+        last_event: Some("spawned".to_string()),
+        last_error: None,
+        exit_code: None,
     };
     let process_manager = match ProcessManager::new() {
         Ok(manager) => manager,
@@ -2216,8 +2346,7 @@ async fn handle_delete_local_capsule(
         }
     };
     if processes.iter().any(|process| {
-        process.status == ProcessStatus::Running
-            && process.scoped_id.as_deref() == Some(scoped_id.as_str())
+        process.status.is_active() && process.scoped_id.as_deref() == Some(scoped_id.as_str())
     }) {
         return json_error(
             StatusCode::CONFLICT,
@@ -2330,7 +2459,7 @@ async fn handle_list_local_processes() -> impl IntoResponse {
             name: process.name,
             pid: process.pid,
             status: process_status_label(process.status).to_string(),
-            active: process.status == ProcessStatus::Running,
+            active: process.status.is_active(),
             runtime: process.runtime,
             started_at: chrono::DateTime::<Utc>::from(process.start_time).to_rfc3339(),
             scoped_id: process.scoped_id,
@@ -2490,7 +2619,11 @@ async fn handle_clear_process_logs(AxumPath(id): AxumPath<String>) -> impl IntoR
 
 fn process_status_label(status: ProcessStatus) -> &'static str {
     match status {
+        ProcessStatus::Starting => "starting",
+        ProcessStatus::Ready => "ready",
         ProcessStatus::Running => "running",
+        ProcessStatus::Exited => "exited",
+        ProcessStatus::Failed => "failed",
         ProcessStatus::Stopped => "stopped",
         ProcessStatus::Unknown => "unknown",
     }
@@ -2984,15 +3117,25 @@ fn extract_capsule_lock_from_capsule(bytes: &[u8]) -> Option<String> {
     None
 }
 
-fn extract_readme_from_capsule(bytes: &[u8]) -> Option<String> {
-    let mut archive = tar::Archive::new(Cursor::new(bytes));
-    let entries = archive.entries().ok()?;
-    let mut candidates: HashMap<String, Vec<u8>> = HashMap::new();
+fn collect_readme_candidates<R: Read>(archive: &mut tar::Archive<R>) -> HashMap<String, Vec<u8>> {
+    let mut candidates = HashMap::new();
+    let Ok(entries) = archive.entries() else {
+        return candidates;
+    };
 
     for entry in entries {
-        let mut entry = entry.ok()?;
-        let entry_path = entry.path().ok()?.to_string_lossy().to_string();
-        let file_name = entry_path.rsplit('/').next()?.to_string();
+        let mut entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let entry_path = match entry.path() {
+            Ok(path) => path.to_string_lossy().to_string(),
+            Err(_) => continue,
+        };
+        let file_name = match entry_path.rsplit('/').next() {
+            Some(name) => name.to_string(),
+            None => continue,
+        };
         if !README_CANDIDATES
             .iter()
             .any(|candidate| candidate.eq_ignore_ascii_case(file_name.as_str()))
@@ -3007,7 +3150,42 @@ fn extract_readme_from_capsule(bytes: &[u8]) -> Option<String> {
         if buf.len() > README_MAX_BYTES {
             buf.truncate(README_MAX_BYTES);
         }
-        candidates.insert(file_name, buf);
+        candidates.entry(file_name).or_insert(buf);
+    }
+
+    candidates
+}
+
+fn extract_readme_from_capsule(bytes: &[u8]) -> Option<String> {
+    let mut archive = tar::Archive::new(Cursor::new(bytes));
+    let mut candidates = collect_readme_candidates(&mut archive);
+
+    if candidates.is_empty() {
+        let mut archive = tar::Archive::new(Cursor::new(bytes));
+        let entries = archive.entries().ok()?;
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => continue,
+            };
+            let entry_path = match entry.path() {
+                Ok(path) => path.to_string_lossy().to_string(),
+                Err(_) => continue,
+            };
+            if entry_path != "payload.tar.zst" {
+                continue;
+            }
+
+            let decoder = match zstd::stream::Decoder::new(entry) {
+                Ok(decoder) => decoder,
+                Err(_) => continue,
+            };
+            let mut payload_archive = tar::Archive::new(decoder);
+            candidates = collect_readme_candidates(&mut payload_archive);
+            if !candidates.is_empty() {
+                break;
+            }
+        }
     }
 
     for candidate in README_CANDIDATES {
@@ -3497,7 +3675,77 @@ mod tests {
         out
     }
 
+    fn build_capsule_bytes_with_payload_files(
+        manifest: &str,
+        payload_files: &[(&str, &[u8])],
+    ) -> Vec<u8> {
+        let payload_tar = build_payload_tar_with_files(payload_files).expect("build payload tar");
+        let parsed_manifest =
+            capsule_core::types::CapsuleManifest::from_toml(manifest).expect("parse manifest");
+        let (distribution_manifest, _) =
+            capsule_core::packers::payload::build_distribution_manifest(
+                &parsed_manifest,
+                &payload_tar,
+            )
+            .expect("build distribution manifest");
+        let mut raw_manifest: toml::Value = toml::from_str(manifest).expect("parse raw manifest");
+        let raw_manifest_table = raw_manifest
+            .as_table_mut()
+            .expect("raw manifest must be a table");
+        raw_manifest_table.insert(
+            "schema_version".to_string(),
+            toml::Value::String(distribution_manifest.schema_version.clone()),
+        );
+        raw_manifest_table.insert(
+            "distribution".to_string(),
+            toml::Value::try_from(
+                distribution_manifest
+                    .distribution
+                    .expect("distribution metadata"),
+            )
+            .expect("distribution value"),
+        );
+        let manifest_bytes = toml::to_string_pretty(&raw_manifest).expect("serialize manifest");
+        let payload_zst =
+            zstd::stream::encode_all(Cursor::new(payload_tar), 1).expect("encode payload");
+
+        let mut out = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut out);
+            let mut header = tar::Header::new_gnu();
+            header.set_path("capsule.toml").expect("set path");
+            header.set_mode(0o644);
+            header.set_size(manifest_bytes.len() as u64);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "capsule.toml", Cursor::new(manifest_bytes))
+                .expect("append manifest");
+
+            let mut payload_header = tar::Header::new_gnu();
+            payload_header
+                .set_path("payload.tar.zst")
+                .expect("set payload path");
+            payload_header.set_mode(0o644);
+            payload_header.set_size(payload_zst.len() as u64);
+            payload_header.set_cksum();
+            builder
+                .append_data(
+                    &mut payload_header,
+                    "payload.tar.zst",
+                    Cursor::new(payload_zst),
+                )
+                .expect("append payload");
+            builder.finish().expect("finish archive");
+        }
+        out.flush().expect("flush vec");
+        out
+    }
+
     fn build_payload_tar() -> Result<Vec<u8>> {
+        build_payload_tar_with_files(&[])
+    }
+
+    fn build_payload_tar_with_files(files: &[(&str, &[u8])]) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         {
             let mut builder = tar::Builder::new(&mut out);
@@ -3509,6 +3757,15 @@ mod tests {
             header.set_mtime(0);
             header.set_cksum();
             builder.append_data(&mut header, "main.py", Cursor::new(source))?;
+            for (path, bytes) in files {
+                let mut extra_header = tar::Header::new_gnu();
+                extra_header.set_path(path)?;
+                extra_header.set_mode(0o644);
+                extra_header.set_size(bytes.len() as u64);
+                extra_header.set_mtime(0);
+                extra_header.set_cksum();
+                builder.append_data(&mut extra_header, *path, Cursor::new(*bytes))?;
+            }
             builder.finish()?;
         }
         out.flush().expect("flush payload vec");
@@ -3881,6 +4138,22 @@ default_target = "cli"
         let bytes = build_capsule_bytes_with_files(manifest, &[("README.md", &large)]);
         let extracted = extract_readme_from_capsule(&bytes).expect("extract readme");
         assert_eq!(extracted.len(), README_MAX_BYTES);
+    }
+
+    #[test]
+    fn extract_readme_from_capsule_reads_payload_tar_zst_contents() {
+        let manifest = r#"schema_version = "0.2"
+name = "sample"
+version = "1.0.0"
+type = "app"
+default_target = "cli"
+"#;
+        let bytes = build_capsule_bytes_with_payload_files(
+            manifest,
+            &[("README.md", b"payload readme markdown")],
+        );
+        let extracted = extract_readme_from_capsule(&bytes);
+        assert_eq!(extracted.as_deref(), Some("payload readme markdown"));
     }
 
     #[test]

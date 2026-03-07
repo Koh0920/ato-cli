@@ -8,12 +8,12 @@ use capsule_core::CapsuleReporter;
 
 use crate::common::proxy;
 
-use super::source::IpcEnvVars;
+use super::launch_context::RuntimeLaunchContext;
 
 pub fn execute(
     plan: &ManifestData,
     reporter: std::sync::Arc<crate::reporters::CliReporter>,
-    ipc_env: Option<&IpcEnvVars>,
+    launch_ctx: &RuntimeLaunchContext,
 ) -> Result<i32> {
     let component = resolve_component(plan)?;
     let component_path = plan.resolve_path(&component);
@@ -48,7 +48,7 @@ pub fn execute(
         cmd.env(k, v);
     }
 
-    super::source::apply_allowlisted_session_env(&mut cmd, ipc_env)?;
+    launch_ctx.apply_allowlisted_env(&mut cmd)?;
 
     if let Some(proxy_env) = proxy::proxy_env_from_env(&[])? {
         proxy::apply_proxy_env(&mut cmd, &proxy_env);
