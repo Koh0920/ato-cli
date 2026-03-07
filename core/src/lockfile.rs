@@ -157,6 +157,46 @@ struct OpenLockfileInput {
     file: fs::File,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RuntimePlatform {
+    os: &'static str,
+    arch: &'static str,
+    target_triple: &'static str,
+}
+
+const SUPPORTED_RUNTIME_PLATFORMS: &[RuntimePlatform] = &[
+    RuntimePlatform {
+        os: "macos",
+        arch: "x86_64",
+        target_triple: "x86_64-apple-darwin",
+    },
+    RuntimePlatform {
+        os: "macos",
+        arch: "aarch64",
+        target_triple: "aarch64-apple-darwin",
+    },
+    RuntimePlatform {
+        os: "linux",
+        arch: "x86_64",
+        target_triple: "x86_64-unknown-linux-gnu",
+    },
+    RuntimePlatform {
+        os: "linux",
+        arch: "aarch64",
+        target_triple: "aarch64-unknown-linux-gnu",
+    },
+    RuntimePlatform {
+        os: "windows",
+        arch: "x86_64",
+        target_triple: "x86_64-pc-windows-msvc",
+    },
+    RuntimePlatform {
+        os: "windows",
+        arch: "aarch64",
+        target_triple: "aarch64-pc-windows-msvc",
+    },
+];
+
 pub async fn generate_and_write_lockfile(
     manifest_path: &Path,
     manifest_raw: &toml::Value,
@@ -440,6 +480,7 @@ async fn generate_lockfile(
     let allowlist = read_allowlist(manifest_raw);
     let target_key = platform_target_key()?;
     let target_triple = platform_triple()?;
+    let runtime_platforms = lockfile_runtime_platforms(manifest_raw)?;
     let required_runtime_version = required_runtime_version(manifest_raw)?;
     let runtime_tools = read_runtime_tools(manifest_raw);
 
@@ -465,7 +506,7 @@ async fn generate_lockfile(
             let python_lockfile =
                 generate_uv_lock(manifest_dir, manifest_raw, reporter.clone()).await?;
             let runtime =
-                resolve_python_runtime(&version, &target_triple, reporter.clone()).await?;
+                resolve_python_runtime(&version, &runtime_platforms, reporter.clone()).await?;
             runtimes.python = Some(runtime);
             if python_lockfile.is_some() {
                 let python_artifacts = match prepare_python_artifacts(
@@ -491,18 +532,8 @@ async fn generate_lockfile(
                 if let Some(artifacts) = python_artifacts {
                     target_entry.artifacts.extend(artifacts);
                 }
-                let uv_url = format!(
-                    "https://github.com/astral-sh/uv/releases/download/{0}/uv-{1}.tar.gz",
-                    UV_VERSION, target_triple
-                );
-                let uv_sha256 =
-                    resolve_url_sha256(&(uv_url.clone() + ".sha256"), reporter.clone()).await?;
-                tools.uv = Some(tool_targets_for(
-                    uv_url,
-                    UV_VERSION,
-                    &target_triple,
-                    Some(uv_sha256),
-                ));
+                tools.uv =
+                    Some(resolve_uv_tool_targets(&runtime_platforms, reporter.clone()).await?);
             }
         } else if lang == "node" {
             let version = required_runtime_version
@@ -510,12 +541,14 @@ async fn generate_lockfile(
                 .unwrap_or_else(|| read_language_version(manifest_raw, "node", "20"));
             let node_lockfile =
                 generate_pnpm_lock(manifest_dir, manifest_raw, &version, reporter.clone()).await?;
-            let runtime = resolve_node_runtime(&version, &target_triple, reporter.clone()).await?;
+            let runtime =
+                resolve_node_runtime(&version, &runtime_platforms, reporter.clone()).await?;
             runtimes.node = Some(runtime);
             if runtimes.deno.is_none() {
                 let deno_version = read_language_version(manifest_raw, "deno", "1.46.3");
                 let deno_runtime =
-                    resolve_deno_runtime(&deno_version, &target_triple, reporter.clone()).await?;
+                    resolve_deno_runtime(&deno_version, &runtime_platforms, reporter.clone())
+                        .await?;
                 runtimes.deno = Some(deno_runtime);
             }
             if node_lockfile.is_some() {
@@ -556,32 +589,24 @@ async fn generate_lockfile(
             let version = required_runtime_version
                 .clone()
                 .unwrap_or_else(|| read_language_version(manifest_raw, "deno", "1.46.3"));
-            let runtime = resolve_deno_runtime(&version, &target_triple, reporter.clone()).await?;
+            let runtime =
+                resolve_deno_runtime(&version, &runtime_platforms, reporter.clone()).await?;
             runtimes.deno = Some(runtime);
 
             if let Some(node_version) = runtime_tools.get("node") {
                 let runtime =
-                    resolve_node_runtime(node_version, &target_triple, reporter.clone()).await?;
+                    resolve_node_runtime(node_version, &runtime_platforms, reporter.clone())
+                        .await?;
                 runtimes.node = Some(runtime);
             }
             if let Some(python_version) = runtime_tools.get("python") {
                 let runtime =
-                    resolve_python_runtime(python_version, &target_triple, reporter.clone())
+                    resolve_python_runtime(python_version, &runtime_platforms, reporter.clone())
                         .await?;
                 runtimes.python = Some(runtime);
 
-                let uv_url = format!(
-                    "https://github.com/astral-sh/uv/releases/download/{0}/uv-{1}.tar.gz",
-                    UV_VERSION, target_triple
-                );
-                let uv_sha256 =
-                    resolve_url_sha256(&(uv_url.clone() + ".sha256"), reporter.clone()).await?;
-                tools.uv = Some(tool_targets_for(
-                    uv_url,
-                    UV_VERSION,
-                    &target_triple,
-                    Some(uv_sha256),
-                ));
+                tools.uv =
+                    Some(resolve_uv_tool_targets(&runtime_platforms, reporter.clone()).await?);
             }
 
             // runtime=web/static は静的配信用途であり、Deno runtime 自体は必要だが
@@ -1452,15 +1477,19 @@ fn required_env_keys_from_manifest(manifest: &toml::Value) -> Vec<String> {
 
 async fn resolve_python_runtime(
     version: &str,
-    target_triple: &str,
+    platforms: &[RuntimePlatform],
     reporter: Arc<dyn CapsuleReporter + 'static>,
 ) -> Result<RuntimeEntry> {
     let fetcher = RuntimeFetcher::new_with_reporter(reporter)?;
-    let (os, arch) = RuntimeFetcher::detect_platform()?;
-    let url = RuntimeFetcher::get_python_download_url(version, &os, &arch)?;
-    let sha256 = resolve_python_sha256(&fetcher, &url).await?;
     let mut targets = HashMap::new();
-    targets.insert(target_triple.to_string(), RuntimeArtifact { url, sha256 });
+    for platform in platforms {
+        let url = RuntimeFetcher::get_python_download_url(version, platform.os, platform.arch)?;
+        let sha256 = resolve_python_sha256(&fetcher, &url).await?;
+        targets.insert(
+            platform.target_triple.to_string(),
+            RuntimeArtifact { url, sha256 },
+        );
+    }
     Ok(RuntimeEntry {
         provider: "python-build-standalone".to_string(),
         version: version.to_string(),
@@ -1503,22 +1532,25 @@ async fn resolve_python_sha256(fetcher: &RuntimeFetcher, artifact_url: &str) -> 
 
 async fn resolve_node_runtime(
     version: &str,
-    target_triple: &str,
+    platforms: &[RuntimePlatform],
     reporter: Arc<dyn CapsuleReporter + 'static>,
 ) -> Result<RuntimeEntry> {
     let fetcher = RuntimeFetcher::new_with_reporter(reporter)?;
-    let (os, arch) = RuntimeFetcher::detect_platform()?;
     let full_version = RuntimeFetcher::resolve_node_full_version(version).await?;
-    let (filename, _is_zip) = RuntimeFetcher::node_artifact_filename(&full_version, &os, &arch)?;
-    let url = format!("https://nodejs.org/dist/v{}/{}", full_version, filename);
-    let sha256 = fetcher
-        .fetch_expected_sha256(
-            &format!("https://nodejs.org/dist/v{}/SHASUMS256.txt", full_version),
-            Some(&filename),
-        )
-        .await?;
     let mut targets = HashMap::new();
-    targets.insert(target_triple.to_string(), RuntimeArtifact { url, sha256 });
+    let checksum_url = format!("https://nodejs.org/dist/v{}/SHASUMS256.txt", full_version);
+    for platform in platforms {
+        let (filename, _is_zip) =
+            RuntimeFetcher::node_artifact_filename(&full_version, platform.os, platform.arch)?;
+        let url = format!("https://nodejs.org/dist/v{}/{}", full_version, filename);
+        let sha256 = fetcher
+            .fetch_expected_sha256(&checksum_url, Some(&filename))
+            .await?;
+        targets.insert(
+            platform.target_triple.to_string(),
+            RuntimeArtifact { url, sha256 },
+        );
+    }
     Ok(RuntimeEntry {
         provider: "official".to_string(),
         version: full_version,
@@ -1528,19 +1560,23 @@ async fn resolve_node_runtime(
 
 async fn resolve_deno_runtime(
     version: &str,
-    target_triple: &str,
+    platforms: &[RuntimePlatform],
     reporter: Arc<dyn CapsuleReporter + 'static>,
 ) -> Result<RuntimeEntry> {
     let fetcher = RuntimeFetcher::new_with_reporter(reporter)?;
-    let (os, arch) = RuntimeFetcher::detect_platform()?;
-    let filename = deno_artifact_filename(&os, &arch)?;
-    let url = format!(
-        "https://github.com/denoland/deno/releases/download/v{}/{}",
-        version, filename
-    );
-    let sha256 = resolve_deno_sha256(&fetcher, version, &filename).await?;
     let mut targets = HashMap::new();
-    targets.insert(target_triple.to_string(), RuntimeArtifact { url, sha256 });
+    for platform in platforms {
+        let filename = deno_artifact_filename(platform.os, platform.arch)?;
+        let url = format!(
+            "https://github.com/denoland/deno/releases/download/v{}/{}",
+            version, filename
+        );
+        let sha256 = resolve_deno_sha256(&fetcher, version, &filename).await?;
+        targets.insert(
+            platform.target_triple.to_string(),
+            RuntimeArtifact { url, sha256 },
+        );
+    }
     Ok(RuntimeEntry {
         provider: "official".to_string(),
         version: version.to_string(),
@@ -1702,12 +1738,30 @@ fn tool_targets_for(
     ToolTargets { targets }
 }
 
-async fn resolve_url_sha256(
-    checksum_url: &str,
+async fn resolve_uv_tool_targets(
+    platforms: &[RuntimePlatform],
     reporter: Arc<dyn CapsuleReporter + 'static>,
-) -> Result<String> {
+) -> Result<ToolTargets> {
     let fetcher = RuntimeFetcher::new_with_reporter(reporter)?;
-    fetcher.fetch_expected_sha256(checksum_url, None).await
+    let mut targets = HashMap::new();
+    for platform in platforms {
+        let url = format!(
+            "https://github.com/astral-sh/uv/releases/download/{0}/uv-{1}.tar.gz",
+            UV_VERSION, platform.target_triple
+        );
+        let sha256 = fetcher
+            .fetch_expected_sha256(&(url.clone() + ".sha256"), None)
+            .await?;
+        targets.insert(
+            platform.target_triple.to_string(),
+            ToolArtifact {
+                url,
+                sha256: Some(sha256),
+                version: Some(UV_VERSION.to_string()),
+            },
+        );
+    }
+    Ok(ToolTargets { targets })
 }
 
 fn detect_tool(cmd: &str) -> Option<String> {
@@ -1926,6 +1980,26 @@ fn selected_target_table(manifest: &toml::Value) -> Option<&toml::Value> {
         .or_else(|| targets.get("source"))
 }
 
+fn lockfile_runtime_platforms(manifest: &toml::Value) -> Result<Vec<RuntimePlatform>> {
+    if selected_target_runtime(manifest).as_deref() == Some("web") {
+        return Ok(SUPPORTED_RUNTIME_PLATFORMS.to_vec());
+    }
+    Ok(vec![current_runtime_platform()?])
+}
+
+fn current_runtime_platform() -> Result<RuntimePlatform> {
+    let (os, arch) = RuntimeFetcher::detect_platform()?;
+    runtime_platform(&os, &arch)
+}
+
+fn runtime_platform(os: &str, arch: &str) -> Result<RuntimePlatform> {
+    SUPPORTED_RUNTIME_PLATFORMS
+        .iter()
+        .copied()
+        .find(|platform| platform.os == os && platform.arch == arch)
+        .ok_or_else(|| CapsuleError::Pack(format!("Unsupported platform: {} {}", os, arch)))
+}
+
 fn read_target_entrypoint(manifest: &toml::Value) -> Option<String> {
     selected_target_table(manifest)
         .and_then(|t| t.get("entrypoint"))
@@ -2132,6 +2206,44 @@ runtime_version = "1.46.3"
 
         let version = required_runtime_version(&manifest).unwrap();
         assert_eq!(version.as_deref(), Some("1.46.3"));
+    }
+
+    #[test]
+    fn web_targets_include_all_supported_runtime_platforms_in_lockfile() {
+        let manifest: toml::Value = toml::from_str(
+            r#"
+default_target = "default"
+[targets.default]
+runtime = "web"
+driver = "deno"
+runtime_version = "1.46.3"
+"#,
+        )
+        .unwrap();
+
+        let platforms = lockfile_runtime_platforms(&manifest).unwrap();
+        assert_eq!(platforms.len(), SUPPORTED_RUNTIME_PLATFORMS.len());
+        for expected in SUPPORTED_RUNTIME_PLATFORMS {
+            assert!(platforms.contains(expected));
+        }
+    }
+
+    #[test]
+    fn source_targets_keep_current_runtime_platform_only() {
+        let manifest: toml::Value = toml::from_str(
+            r#"
+default_target = "default"
+[targets.default]
+runtime = "source"
+driver = "deno"
+runtime_version = "1.46.3"
+"#,
+        )
+        .unwrap();
+
+        let platforms = lockfile_runtime_platforms(&manifest).unwrap();
+        assert_eq!(platforms.len(), 1);
+        assert_eq!(platforms[0].target_triple, platform_triple().unwrap());
     }
 
     #[test]
