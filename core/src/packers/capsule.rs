@@ -10,6 +10,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 use tracing::debug;
 use zstd::stream::write::Encoder as ZstdEncoder;
 
+use crate::capsule_v3::{CasStore, FastCdcWriter, FastCdcWriterConfig, V3_PAYLOAD_MANIFEST_PATH};
 use crate::error::{CapsuleError, Result as CapsuleResult};
 use crate::packers::pack_filter::PackFilter;
 use crate::packers::payload::{
@@ -247,6 +248,7 @@ pub async fn pack(
         "Generated manifest hash={}",
         manifest_hash(&distribution_manifest)?
     );
+    let payload_v3_manifest_bytes = maybe_build_payload_v3_manifest(&payload_tar_bytes)?;
 
     // Step 4: Create final .capsule archive
     debug!("Phase 3: creating final .capsule archive");
@@ -319,6 +321,17 @@ pub async fn pack(
         "payload.tar.zst",
         reproducible_mtime_epoch(),
     )?;
+
+    if let Some(payload_v3_manifest_bytes) = payload_v3_manifest_bytes {
+        let payload_v3_manifest_path = temp_dir.path().join(V3_PAYLOAD_MANIFEST_PATH);
+        fs::write(&payload_v3_manifest_path, payload_v3_manifest_bytes)?;
+        append_regular_file_normalized(
+            &mut outer_ar,
+            &payload_v3_manifest_path,
+            V3_PAYLOAD_MANIFEST_PATH,
+            reproducible_mtime_epoch(),
+        )?;
+    }
 
     if let Some((readme_path, archive_name)) = find_nearest_readme_candidate(&opts.manifest_dir) {
         append_regular_file_normalized(
@@ -729,9 +742,74 @@ fn read_payload_tar_bytes_from_zst(payload_zst_path: &Path) -> CapsuleResult<Vec
     Ok(out)
 }
 
+fn maybe_build_payload_v3_manifest(payload_tar_bytes: &[u8]) -> CapsuleResult<Option<Vec<u8>>> {
+    if !experimental_v3_pack_enabled()? {
+        return Ok(None);
+    }
+
+    let cas = CasStore::from_env()?;
+    let manifest_bytes = build_payload_v3_manifest_bytes_with_cas(
+        payload_tar_bytes,
+        cas,
+        FastCdcWriterConfig::default(),
+    )?;
+    Ok(Some(manifest_bytes))
+}
+
+fn build_payload_v3_manifest_bytes_with_cas(
+    payload_tar_bytes: &[u8],
+    cas: CasStore,
+    config: FastCdcWriterConfig,
+) -> CapsuleResult<Vec<u8>> {
+    let mut writer = FastCdcWriter::new(config, cas)?;
+    writer.write_bytes(payload_tar_bytes)?;
+    let report = writer.finalize()?;
+    debug!(
+        chunks = report.manifest.chunks.len(),
+        inserted = report.chunks_inserted,
+        reused = report.chunks_reused,
+        total_raw_size = report.total_raw_size,
+        "Generated payload v3 manifest and populated CAS"
+    );
+
+    serde_jcs::to_vec(&report.manifest).map_err(|err| {
+        CapsuleError::Pack(format!(
+            "Failed to serialize payload.v3.manifest.json (JCS): {err}"
+        ))
+    })
+}
+
+fn experimental_v3_pack_enabled() -> CapsuleResult<bool> {
+    let raw = match std::env::var("ATO_EXPERIMENTAL_V3_PACK") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(false),
+        Err(err) => {
+            return Err(CapsuleError::Config(format!(
+                "Failed to read ATO_EXPERIMENTAL_V3_PACK: {}",
+                err
+            )))
+        }
+    };
+
+    parse_bool_env("ATO_EXPERIMENTAL_V3_PACK", &raw)
+}
+
+fn parse_bool_env(key: &str, raw: &str) -> CapsuleResult<bool> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" | "" => Ok(false),
+        _ => Err(CapsuleError::Config(format!(
+            "Invalid {} value '{}'; expected one of 1,true,yes,on,0,false,no,off",
+            key, raw
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capsule_v3::{verify_artifact_hash, CapsuleManifestV3};
     use crate::packers::payload::reconstruct_from_chunks;
     use crate::reporter::NoOpReporter;
     use crate::router::ExecutionProfile;
@@ -785,6 +863,48 @@ mod tests {
         let found = find_nearest_readme_candidate(&app_dir).expect("find readme");
         assert_eq!(found.0, tmp.path().join("README.md"));
         assert_eq!(found.1, "README.md");
+    }
+
+    #[test]
+    fn parse_bool_env_accepts_truthy_values() {
+        for value in ["1", "true", "TRUE", "yes", "on"] {
+            let parsed = parse_bool_env("TEST", value).expect("parse env");
+            assert!(parsed, "value should be true: {}", value);
+        }
+    }
+
+    #[test]
+    fn parse_bool_env_accepts_falsey_values() {
+        for value in ["0", "false", "FALSE", "no", "off", ""] {
+            let parsed = parse_bool_env("TEST", value).expect("parse env");
+            assert!(!parsed, "value should be false: {}", value);
+        }
+    }
+
+    #[test]
+    fn parse_bool_env_rejects_unknown_value() {
+        let err = parse_bool_env("TEST", "maybe").expect_err("must reject unknown");
+        assert!(err.to_string().contains("Invalid TEST value"));
+    }
+
+    #[test]
+    fn build_payload_v3_manifest_populates_cas_and_produces_valid_manifest() {
+        let cas_root = tempfile::tempdir().expect("cas tempdir");
+        let cas = CasStore::new(cas_root.path()).expect("cas store");
+
+        let manifest_bytes = build_payload_v3_manifest_bytes_with_cas(
+            b"payload bytes for v3",
+            cas.clone(),
+            FastCdcWriterConfig::default(),
+        )
+        .expect("build payload v3 manifest");
+
+        let manifest: CapsuleManifestV3 =
+            serde_json::from_slice(&manifest_bytes).expect("parse v3 manifest");
+        verify_artifact_hash(&manifest).expect("verify artifact hash");
+        let fsck = cas.fsck_manifest(&manifest).expect("fsck manifest");
+        assert!(fsck.is_ok(), "fsck report should be clean: {fsck:?}");
+        assert!(!manifest.chunks.is_empty(), "manifest should contain chunks");
     }
 
     #[tokio::test]
