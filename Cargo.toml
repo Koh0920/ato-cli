@@ -74,7 +74,7 @@ crossterm = "0.29"
 tui-input = "0.12"
 tower-http = { version = "0.6", features = ["cors"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
-serde_jcs = "0.1"
+
 
 [dev-dependencies]
 tempfile = "3"
