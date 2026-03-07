@@ -576,7 +576,7 @@ fn execute_wasm(
     let timeout_secs = std::env::var("GUEST_CPU_LIMIT_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .map(|ms| (ms + 999) / 1000)
+        .map(|ms| ms.div_ceil(1000))
         .unwrap_or(manifest.policy.timeout);
 
     if timeout_secs > 0 {
@@ -602,7 +602,7 @@ fn execute_wasm(
 
     drop(store);
 
-    if let Err(_) = result {
+    if result.is_err() {
         return Err(GuestError::new(
             GuestErrorCode::ExecutionFailed,
             "Wasm execution panicked",

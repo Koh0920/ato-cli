@@ -1,55 +1,53 @@
 use anyhow::{Context, Result};
 use rand::Rng;
+use serde::Deserialize;
+use serde_json::json;
+use std::fs;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
+use tracing::debug;
 
 use capsule_core::runtime::native::NativeHandle;
 use capsule_core::{RuntimeMetadata, SessionRunner, SessionRunnerConfig};
 
+use super::launch_context::RuntimeLaunchContext;
+use crate::common::proxy;
 use crate::reporters::CliReporter;
+use crate::runtime_manager;
+use crate::runtime_overrides;
 
 use capsule_core::engine;
-use capsule_core::packers::bundle::{build_bundle, PackBundleArgs};
 use capsule_core::r3_config;
 use capsule_core::router::ManifestData;
 
-use crate::common::proxy;
-use crate::runtime_manager;
-
-/// Additional IPC environment variables to inject into the child process.
-pub type IpcEnvVars = std::collections::HashMap<String, String>;
-
 pub struct CapsuleProcess {
     pub child: Child,
-    pub bundle_path: PathBuf,
+    pub cleanup_paths: Vec<PathBuf>,
+    pub event_rx: Option<Receiver<NacelleExecEvent>>,
+    pub workload_pid: Option<u32>,
+    pub log_path: Option<PathBuf>,
 }
 
+#[derive(Clone, Copy)]
 pub enum ExecuteMode {
     Foreground,
     Background,
+    Piped,
 }
 
 pub fn execute(
     plan: &ManifestData,
     nacelle_override: Option<PathBuf>,
-    reporter: std::sync::Arc<CliReporter>,
+    _reporter: std::sync::Arc<CliReporter>,
     enforcement: &str,
     mode: ExecuteMode,
-    ipc_env: Option<&IpcEnvVars>,
+    launch_ctx: &RuntimeLaunchContext,
 ) -> Result<CapsuleProcess> {
-    let force_python_no_bytecode = plan
-        .execution_entrypoint()
-        .map(|entry| entry.trim().to_ascii_lowercase().ends_with(".py"))
-        .unwrap_or(false);
-    let injected_port = plan
-        .execution_runtime()
-        .map(|runtime| runtime.trim().eq_ignore_ascii_case("web"))
-        .unwrap_or(false)
-        .then(|| plan.execution_port().map(|port| port.to_string()))
-        .flatten();
-
     let nacelle = engine::discover_nacelle(engine::EngineRequest {
-        explicit_path: nacelle_override.clone(),
+        explicit_path: nacelle_override,
         manifest_path: Some(plan.manifest_path.clone()),
     })?;
 
@@ -59,84 +57,24 @@ pub fn execute(
         false,
     )?;
 
-    // Create a Tokio runtime for async pack/bundle operations.
-    // Note: this function is sync, but it needs to run async code.
-    // - If we're already inside a Tokio runtime, we must NOT create another runtime.
-    // - Otherwise, create a fresh runtime.
-    enum Rt<'a> {
-        Handle(tokio::runtime::Handle),
-        Owned(&'a tokio::runtime::Runtime),
-    }
+    let adapter = NacelleExecAdapter::for_plan(plan, mode, launch_ctx)?;
+    let (child, event_rx, exec_meta) =
+        spawn_internal_exec(&nacelle, &plan.manifest_dir, &adapter.payload, mode)?;
 
-    let owned_rt;
-    let rt = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        Rt::Handle(handle)
-    } else {
-        owned_rt = tokio::runtime::Runtime::new()?;
-        Rt::Owned(&owned_rt)
-    };
-
-    let bundle_path = {
-        let mut rng = rand::thread_rng();
-        let suffix: u64 = rng.gen();
-        let output = std::env::temp_dir().join(format!("capsule-dev-{}.bundle", suffix));
-
-        let reporter = reporter.clone();
-        match &rt {
-            Rt::Handle(h) => tokio::task::block_in_place(|| {
-                h.block_on(build_bundle(
-                    PackBundleArgs {
-                        manifest_path: plan.manifest_path.clone(),
-                        runtime_path: None,
-                        output: Some(output),
-                        nacelle_path: Some(nacelle),
-                    },
-                    reporter,
-                ))
-            })?,
-            Rt::Owned(runtime) => runtime.block_on(build_bundle(
-                PackBundleArgs {
-                    manifest_path: plan.manifest_path.clone(),
-                    runtime_path: None,
-                    output: Some(output),
-                    nacelle_path: Some(nacelle),
-                },
-                reporter,
-            ))?,
-        }
-    };
-
-    let child = match &rt {
-        Rt::Handle(h) => tokio::task::block_in_place(|| {
-            h.block_on(run_bundle(
-                &bundle_path,
-                &plan.manifest_dir,
-                reporter.clone(),
-                mode,
-                ipc_env,
-                force_python_no_bytecode,
-                injected_port.as_deref(),
-            ))
-        })?,
-        Rt::Owned(runtime) => runtime.block_on(run_bundle(
-            &bundle_path,
-            &plan.manifest_dir,
-            reporter.clone(),
-            mode,
-            ipc_env,
-            force_python_no_bytecode,
-            injected_port.as_deref(),
-        ))?,
-    };
-
-    Ok(CapsuleProcess { child, bundle_path })
+    Ok(CapsuleProcess {
+        child,
+        cleanup_paths: adapter.cleanup_paths,
+        event_rx: Some(event_rx),
+        workload_pid: exec_meta.pid,
+        log_path: exec_meta.log_path,
+    })
 }
 
 pub fn execute_host(
     plan: &ManifestData,
     _reporter: std::sync::Arc<CliReporter>,
     mode: ExecuteMode,
-    ipc_env: Option<&IpcEnvVars>,
+    launch_ctx: &RuntimeLaunchContext,
 ) -> Result<CapsuleProcess> {
     let entrypoint = plan
         .execution_entrypoint()
@@ -154,12 +92,8 @@ pub fn execute_host(
         runtime_dir.join(&entrypoint)
     };
     let force_python_no_bytecode = is_python_entrypoint(plan, &entrypoint);
-    let injected_port = plan
-        .execution_runtime()
-        .map(|runtime| runtime.trim().eq_ignore_ascii_case("web"))
-        .unwrap_or(false)
-        .then(|| plan.execution_port().map(|port| port.to_string()))
-        .flatten();
+    let injected_port =
+        runtime_overrides::override_port(plan.execution_port()).map(|port| port.to_string());
 
     let mut cmd = if force_python_no_bytecode {
         let python_bin = runtime_manager::ensure_python_binary(plan)?;
@@ -174,15 +108,15 @@ pub fn execute_host(
     if let Some(proxy_env) = proxy::proxy_env_from_env(&[])? {
         proxy::apply_proxy_env(&mut cmd, &proxy_env);
     }
-    apply_allowlisted_session_env(&mut cmd, ipc_env)?;
     apply_python_runtime_hardening(&mut cmd, force_python_no_bytecode);
 
-    for (key, value) in plan.execution_env() {
+    for (key, value) in runtime_overrides::merged_env(plan.execution_env()) {
         cmd.env(key, value);
     }
     if let Some(port) = injected_port {
         cmd.env("PORT", port);
     }
+    launch_ctx.apply_allowlisted_env(&mut cmd)?;
 
     let args = plan.targets_oci_cmd();
     if !args.is_empty() {
@@ -191,14 +125,19 @@ pub fn execute_host(
 
     match mode {
         ExecuteMode::Foreground => {
-            cmd.stdin(std::process::Stdio::inherit());
-            cmd.stdout(std::process::Stdio::inherit());
-            cmd.stderr(std::process::Stdio::inherit());
+            cmd.stdin(Stdio::inherit());
+            cmd.stdout(Stdio::inherit());
+            cmd.stderr(Stdio::inherit());
         }
         ExecuteMode::Background => {
-            cmd.stdin(std::process::Stdio::null());
-            cmd.stdout(std::process::Stdio::null());
-            cmd.stderr(std::process::Stdio::null());
+            cmd.stdin(Stdio::null());
+            cmd.stdout(Stdio::null());
+            cmd.stderr(Stdio::null());
+        }
+        ExecuteMode::Piped => {
+            cmd.stdin(Stdio::null());
+            cmd.stdout(Stdio::piped());
+            cmd.stderr(Stdio::piped());
         }
     }
 
@@ -208,7 +147,10 @@ pub fn execute_host(
 
     Ok(CapsuleProcess {
         child,
-        bundle_path: PathBuf::new(),
+        cleanup_paths: Vec::new(),
+        event_rx: None,
+        workload_pid: None,
+        log_path: None,
     })
 }
 
@@ -232,82 +174,279 @@ fn is_python_entrypoint(plan: &ManifestData, entrypoint: &str) -> bool {
     entrypoint.trim().to_ascii_lowercase().ends_with(".py")
 }
 
-async fn run_bundle(
-    bundle_path: &Path,
-    manifest_dir: &Path,
-    _reporter: std::sync::Arc<CliReporter>,
-    mode: ExecuteMode,
-    ipc_env: Option<&IpcEnvVars>,
-    force_python_no_bytecode: bool,
-    injected_port: Option<&str>,
-) -> Result<Child> {
-    let mut cmd = Command::new(bundle_path);
-    cmd.current_dir(manifest_dir);
-    if let Some(proxy_env) = proxy::proxy_env_from_env(&[])? {
-        proxy::apply_proxy_env(&mut cmd, &proxy_env);
-    }
-
-    apply_allowlisted_session_env(&mut cmd, ipc_env)?;
-    apply_python_runtime_hardening(&mut cmd, force_python_no_bytecode);
-    if let Some(port) = injected_port {
-        cmd.env("PORT", port);
-    }
-
-    match mode {
-        ExecuteMode::Foreground => {
-            cmd.stdin(std::process::Stdio::inherit());
-            cmd.stdout(std::process::Stdio::inherit());
-            cmd.stderr(std::process::Stdio::inherit());
-        }
-        ExecuteMode::Background => {
-            cmd.stdin(std::process::Stdio::null());
-            cmd.stdout(std::process::Stdio::null());
-            cmd.stderr(std::process::Stdio::null());
-        }
-    }
-
-    let child = cmd
-        .spawn()
-        .with_context(|| format!("Failed to execute bundle: {}", bundle_path.display()))?;
-
-    Ok(child)
-}
-
 fn apply_python_runtime_hardening(cmd: &mut Command, force_python_no_bytecode: bool) {
     if force_python_no_bytecode {
         cmd.env("PYTHONDONTWRITEBYTECODE", "1");
     }
 }
 
-pub fn apply_allowlisted_session_env(
-    cmd: &mut Command,
-    ipc_env: Option<&IpcEnvVars>,
-) -> Result<()> {
-    let Some(env) = ipc_env else {
-        return Ok(());
-    };
+struct NacelleExecAdapter {
+    payload: serde_json::Value,
+    cleanup_paths: Vec<PathBuf>,
+}
 
-    for (key, value) in env {
-        if key.starts_with("CAPSULE_IPC_") || key == "ATO_BRIDGE_TOKEN" {
-            cmd.env(key, value);
-            continue;
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NacelleExecMeta {
+    pid: Option<u32>,
+    log_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum NacelleExecEvent {
+    IpcReady {
+        service: String,
+        endpoint: String,
+        #[serde(default)]
+        port: Option<u16>,
+    },
+    ServiceExited {
+        service: String,
+        #[serde(default)]
+        exit_code: Option<i32>,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+struct NacelleExecResponse {
+    ok: bool,
+    #[serde(default)]
+    pid: Option<u32>,
+    #[serde(default)]
+    log_path: Option<String>,
+    #[serde(default)]
+    error: Option<NacelleExecError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NacelleExecError {
+    message: String,
+}
+
+impl NacelleExecAdapter {
+    fn for_plan(
+        plan: &ManifestData,
+        mode: ExecuteMode,
+        launch_ctx: &RuntimeLaunchContext,
+    ) -> Result<Self> {
+        let normalized_manifest_path = write_normalized_manifest(plan)?;
+        let mut env = runtime_overrides::merged_env(plan.execution_env())
+            .into_iter()
+            .collect::<Vec<_>>();
+        if let Some(port) = runtime_overrides::override_port(plan.execution_port()) {
+            env.push(("PORT".to_string(), port.to_string()));
+        }
+        if plan
+            .execution_entrypoint()
+            .map(|entry| entry.trim().to_ascii_lowercase().ends_with(".py"))
+            .unwrap_or(false)
+        {
+            env.push(("PYTHONDONTWRITEBYTECODE".to_string(), "1".to_string()));
         }
 
-        return Err(
-            capsule_core::execution_plan::error::AtoExecutionError::policy_violation(format!(
-                "session_token env '{}' is not allowlisted",
-                key
-            ))
-            .into(),
-        );
+        for (key, value) in launch_ctx.injected_env() {
+            env.push((key.clone(), value.clone()));
+        }
+
+        let ipc_env = launch_ctx
+            .ipc_env_vars()
+            .map(|env| {
+                env.iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .filter(|env| !env.is_empty());
+        let ipc_socket_paths = launch_ctx
+            .socket_paths()
+            .map(|paths| {
+                paths
+                    .values()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|paths| !paths.is_empty());
+
+        Ok(Self {
+            payload: json!({
+                "spec_version": "0.1.0",
+                "interactive": matches!(mode, ExecuteMode::Foreground),
+                "workload": {
+                    "type": "source",
+                    "manifest": normalized_manifest_path.display().to_string(),
+                },
+                "env": env,
+                "ipc_env": ipc_env,
+                "ipc_socket_paths": ipc_socket_paths,
+            }),
+            cleanup_paths: vec![normalized_manifest_path],
+        })
+    }
+}
+
+fn write_normalized_manifest(plan: &ManifestData) -> Result<PathBuf> {
+    let entrypoint = plan
+        .execution_entrypoint()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            capsule_core::execution_plan::error::AtoExecutionError::policy_violation(
+                "source/native target requires entrypoint",
+            )
+        })?;
+    let cmd_args = plan.targets_oci_cmd();
+    let command = (!cmd_args.is_empty()).then(|| cmd_args.join(" "));
+
+    let mut manifest = toml::map::Map::new();
+    manifest.insert(
+        "name".to_string(),
+        plan.manifest
+            .get("name")
+            .cloned()
+            .unwrap_or_else(|| toml::Value::String("capsule".to_string())),
+    );
+    manifest.insert(
+        "version".to_string(),
+        plan.manifest
+            .get("version")
+            .cloned()
+            .unwrap_or_else(|| toml::Value::String("0.0.0".to_string())),
+    );
+
+    let mut execution = toml::map::Map::new();
+    execution.insert("entrypoint".to_string(), toml::Value::String(entrypoint));
+    if let Some(command) = command {
+        execution.insert("command".to_string(), toml::Value::String(command));
+    }
+    manifest.insert("execution".to_string(), toml::Value::Table(execution));
+
+    if let Some(isolation) = plan.manifest.get("isolation").cloned() {
+        manifest.insert("isolation".to_string(), isolation);
     }
 
-    Ok(())
+    let language_name = plan
+        .execution_language()
+        .or_else(|| plan.execution_driver())
+        .or_else(|| plan.execution_runtime());
+    let language_version = plan.execution_runtime_version();
+    if language_name.is_some() || language_version.is_some() {
+        let mut language = toml::map::Map::new();
+        if let Some(name) = language_name {
+            language.insert("language".to_string(), toml::Value::String(name));
+        }
+        if let Some(version) = language_version {
+            language.insert("version".to_string(), toml::Value::String(version));
+        }
+        manifest.insert("language".to_string(), toml::Value::Table(language));
+    }
+
+    let path = plan.manifest_dir.join(format!(
+        ".ato-nacelle-{}.toml",
+        rand::thread_rng().gen::<u64>()
+    ));
+    fs::write(&path, toml::to_string(&toml::Value::Table(manifest))?)
+        .with_context(|| format!("Failed to write normalized manifest: {}", path.display()))?;
+    Ok(path)
+}
+
+fn spawn_internal_exec(
+    nacelle: &Path,
+    manifest_dir: &Path,
+    payload: &serde_json::Value,
+    mode: ExecuteMode,
+) -> Result<(Child, Receiver<NacelleExecEvent>, NacelleExecMeta)> {
+    let mut cmd = Command::new(nacelle);
+    cmd.arg("internal")
+        .arg("--input")
+        .arg("-")
+        .arg("exec")
+        .current_dir(manifest_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
+
+    if let Some(proxy_env) = proxy::proxy_env_from_env(&[])? {
+        proxy::apply_proxy_env(&mut cmd, &proxy_env);
+    }
+
+    match mode {
+        ExecuteMode::Foreground => {
+            cmd.stderr(Stdio::inherit());
+        }
+        ExecuteMode::Background => {
+            cmd.stderr(Stdio::null());
+        }
+        ExecuteMode::Piped => {
+            cmd.stderr(Stdio::piped());
+        }
+    }
+
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("Failed to spawn nacelle: {}", nacelle.display()))?;
+
+    {
+        let mut stdin = child.stdin.take().context("Failed to open nacelle stdin")?;
+        let bytes = serde_json::to_vec(payload).context("Failed to serialize exec payload")?;
+        stdin
+            .write_all(&bytes)
+            .context("Failed to write exec payload to nacelle")?;
+    }
+
+    let stdout = child
+        .stdout
+        .take()
+        .context("Failed to capture nacelle stdout")?;
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    let read = reader
+        .read_line(&mut line)
+        .context("Failed to read nacelle exec response")?;
+    if read == 0 || line.trim().is_empty() {
+        anyhow::bail!("nacelle exec returned an empty initial response");
+    }
+
+    let response: NacelleExecResponse = serde_json::from_str(line.trim())
+        .with_context(|| format!("Failed to parse nacelle exec response: {}", line.trim()))?;
+    if !response.ok {
+        let message = response
+            .error
+            .map(|error| error.message)
+            .unwrap_or_else(|| "nacelle exec failed".to_string());
+        anyhow::bail!(message);
+    }
+
+    let exec_meta = NacelleExecMeta {
+        pid: response.pid,
+        log_path: response.log_path.map(PathBuf::from),
+    };
+
+    let (event_tx, event_rx) = mpsc::channel();
+    thread::spawn(move || {
+        for maybe_line in reader.lines() {
+            let Ok(line) = maybe_line else {
+                break;
+            };
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<NacelleExecEvent>(trimmed) {
+                Ok(event) => {
+                    let _ = event_tx.send(event);
+                }
+                Err(_) => {
+                    debug!(event = trimmed, "nacelle exec event");
+                }
+            }
+        }
+    });
+
+    Ok((child, event_rx, exec_meta))
 }
 
 pub async fn wait_for_exit(child: &mut Child) -> Result<i32> {
-    let pid = child.id();
+    wait_for_pid_exit(child.id()).await
+}
 
+pub async fn wait_for_pid_exit(pid: u32) -> Result<i32> {
     let session_id = format!("dev-{}", rand::thread_rng().gen::<u64>());
     let handle = NativeHandle::new(session_id, pid);
     let config = SessionRunnerConfig::default();
@@ -331,6 +470,8 @@ fn extract_exit_code(metrics: &capsule_core::UnifiedMetrics) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::inject::{IpcContext, SessionActivationMode};
+    use tempfile::tempdir;
 
     #[test]
     fn test_apply_python_runtime_hardening_sets_env() {
@@ -361,5 +502,108 @@ mod tests {
             .any(|(key, _)| key == "PYTHONDONTWRITEBYTECODE");
 
         assert!(!has_var, "PYTHONDONTWRITEBYTECODE must not be set");
+    }
+
+    #[test]
+    fn test_write_normalized_manifest_uses_selected_target() {
+        let dir = tempdir().unwrap();
+        let manifest_path = dir.path().join("capsule.toml");
+        let plan = ManifestData {
+            manifest: toml::from_str(
+                r#"
+                name = "demo"
+                version = "1.2.3"
+
+                [targets.dev]
+                runtime = "source"
+                language = "python"
+                runtime_version = "3.12"
+                entrypoint = "main.py"
+                cmd = ["--flag", "value"]
+
+                [isolation]
+                sandbox = true
+                "#,
+            )
+            .unwrap(),
+            manifest_path,
+            manifest_dir: dir.path().to_path_buf(),
+            profile: capsule_core::router::ExecutionProfile::Dev,
+            selected_target: "dev".to_string(),
+        };
+
+        let normalized_path = write_normalized_manifest(&plan).unwrap();
+        let normalized = fs::read_to_string(&normalized_path).unwrap();
+
+        assert!(normalized.contains("entrypoint = \"main.py\""));
+        assert!(normalized.contains("command = \"--flag value\""));
+        assert!(normalized.contains("language = \"python\""));
+        assert!(normalized.contains("version = \"3.12\""));
+    }
+
+    #[test]
+    fn test_adapter_includes_ipc_socket_paths() {
+        let dir = tempdir().unwrap();
+        let manifest_path = dir.path().join("capsule.toml");
+        let plan = ManifestData {
+            manifest: toml::from_str(
+                r#"
+                name = "demo"
+                version = "1.2.3"
+
+                [targets.dev]
+                runtime = "source"
+                entrypoint = "main.py"
+                "#,
+            )
+            .unwrap(),
+            manifest_path,
+            manifest_dir: dir.path().to_path_buf(),
+            profile: capsule_core::router::ExecutionProfile::Dev,
+            selected_target: "dev".to_string(),
+        };
+        let launch_ctx = RuntimeLaunchContext::from_ipc(IpcContext {
+            env_vars: std::collections::HashMap::from([(
+                "CAPSULE_IPC_GREETER_SOCKET".to_string(),
+                "/tmp/capsule-ipc/greeter.sock".to_string(),
+            )]),
+            resolved_count: 1,
+            socket_paths: std::collections::HashMap::from([(
+                "greeter".to_string(),
+                PathBuf::from("/tmp/capsule-ipc/greeter.sock"),
+            )]),
+            resolved_services: std::collections::HashMap::new(),
+            activation_mode: SessionActivationMode::Lazy,
+            warnings: vec![],
+        });
+
+        let adapter =
+            NacelleExecAdapter::for_plan(&plan, ExecuteMode::Foreground, &launch_ctx).unwrap();
+
+        assert_eq!(
+            adapter.payload["ipc_socket_paths"][0].as_str(),
+            Some("/tmp/capsule-ipc/greeter.sock")
+        );
+        assert_eq!(
+            adapter.payload["ipc_env"][0][0].as_str(),
+            Some("CAPSULE_IPC_GREETER_SOCKET")
+        );
+    }
+
+    #[test]
+    fn test_nacelle_exec_event_deserialization() {
+        let event: NacelleExecEvent = serde_json::from_str(
+            r#"{"event":"ipc_ready","service":"main","endpoint":"unix:///tmp/main.sock"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            event,
+            NacelleExecEvent::IpcReady {
+                service: "main".to_string(),
+                endpoint: "unix:///tmp/main.sock".to_string(),
+                port: None,
+            }
+        );
     }
 }

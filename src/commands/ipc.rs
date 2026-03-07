@@ -5,14 +5,23 @@
 //! - `ato ipc status` — List running IPC services and their status.
 //! - `ato ipc start`  — Start an IPC service from a capsule directory.
 //! - `ato ipc stop`   — Stop a running IPC service by name.
+//! - `ato ipc invoke` — Validate and send a JSON-RPC invoke request.
 
+#[cfg(unix)]
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::net::Shutdown;
+use std::path::Path;
 use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use capsule_core::execution_plan::error::AtoExecutionError;
+use serde_json::Value;
 
 use crate::ipc::broker::IpcBroker;
-use crate::ipc::types::{ActivationMode, IpcRuntimeKind, IpcServiceInfo, IpcTransport};
+use crate::ipc::jsonrpc::{InvokeParams, JsonRpcError, JsonRpcRequest, JsonRpcResponse};
+use crate::ipc::types::{IpcMethodDescriptor, IpcRuntimeKind, IpcServiceInfo, IpcTransport};
 
 /// Run `ato ipc status`.
 ///
@@ -95,6 +104,18 @@ pub fn run_ipc_start(path: PathBuf, json_output: bool) -> Result<()> {
         .with_context(|| format!("Failed to read {}", manifest_path.display()))?;
     let raw: toml::Value = toml::from_str(&raw_text)
         .with_context(|| format!("Failed to parse {}", manifest_path.display()))?;
+    let diagnostics =
+        crate::ipc::validate::validate_manifest(&raw, &capsule_root).map_err(|err| {
+            AtoExecutionError::policy_violation(format!("IPC validation failed: {err}"))
+        })?;
+    if crate::ipc::validate::has_errors(&diagnostics) {
+        return Err(
+            AtoExecutionError::policy_violation(crate::ipc::validate::format_diagnostics(
+                &diagnostics,
+            ))
+            .into(),
+        );
+    }
 
     let ipc_config = parse_ipc_section(&raw)?;
 
@@ -148,9 +169,6 @@ pub fn run_ipc_start(path: PathBuf, json_output: bool) -> Result<()> {
             .and_then(|c| c.exports.as_ref())
             .map(|e| e.sharing.mode)
             .unwrap_or_default(),
-        activation: ActivationMode::Eager,
-        capsule_root: capsule_root.clone(),
-        port: None,
     };
     broker.registry.register(info);
 
@@ -161,12 +179,19 @@ pub fn run_ipc_start(path: PathBuf, json_output: bool) -> Result<()> {
                 "status": "registered",
                 "service": service_name,
                 "capsule_root": capsule_root.display().to_string(),
+                "warnings": diagnostics
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect::<Vec<_>>(),
             })
         );
     } else {
         println!("🚀 IPC service '{}' registered.", service_name);
         println!("   Capsule: {}", capsule_root.display());
         println!("   Note: Full process launch requires `ato open` with IPC integration.");
+        for diagnostic in diagnostics {
+            println!("   {}", diagnostic.to_string().replace('\n', "\n   "));
+        }
     }
 
     Ok(())
@@ -280,9 +305,6 @@ pub fn run_ipc_stop(name: String, force: bool, json_output: bool) -> Result<()> 
     // Remove from registry
     broker.registry.unregister(&name);
 
-    // Revoke associated tokens
-    broker.token_manager.revoke_all();
-
     // Clean up socket file
     let socket_path = broker.socket_path(&name);
     if socket_path.exists() {
@@ -296,6 +318,122 @@ pub fn run_ipc_stop(name: String, force: bool, json_output: bool) -> Result<()> 
         );
     } else {
         println!("⏹  Service '{}' stopped.", name);
+    }
+
+    Ok(())
+}
+
+/// Run `ato ipc invoke`.
+///
+/// Performs JSON-RPC request validation, input schema validation, and message
+/// size enforcement before attempting transport.
+pub fn run_ipc_invoke(
+    path: PathBuf,
+    service: Option<String>,
+    method: String,
+    args: String,
+    id: String,
+    max_message_size: Option<usize>,
+    json_output: bool,
+) -> Result<()> {
+    let request_id = Value::String(id);
+    let target = load_invoke_target(&path, service.as_deref(), &method)?;
+    let args_value: Value = match serde_json::from_str(&args) {
+        Ok(value) => value,
+        Err(err) => exit_with_invoke_error(
+            request_id.clone(),
+            JsonRpcError::invalid_params(
+                &format!("Invalid JSON for --args: {}", err),
+                "Pass a valid JSON object/string to --args.",
+            ),
+            json_output,
+        ),
+    };
+
+    if let Some(schema_path) = &target.method.input_schema {
+        if let Err(err) =
+            crate::ipc::schema::validate_input(schema_path, &target.capsule_root, &args_value)
+        {
+            exit_with_invoke_error(
+                request_id,
+                JsonRpcError::from_schema_error(&err),
+                json_output,
+            );
+        }
+    }
+
+    let broker = IpcBroker::new(default_socket_dir());
+    let token = broker
+        .token_manager
+        .generate(target.capabilities.clone())
+        .value;
+    let params = InvokeParams {
+        service: target.service_name.clone(),
+        method,
+        token,
+        args: args_value,
+    };
+    let request = JsonRpcRequest::new(
+        "capsule/invoke",
+        Some(serde_json::to_value(&params)?),
+        request_id.clone(),
+    );
+
+    if let Err(err) = request.validate() {
+        exit_with_invoke_error(request_id, err, json_output);
+    }
+
+    let request_bytes = serde_json::to_vec(&request)?;
+    if let Err(err) = crate::ipc::schema::check_message_size(
+        &request_bytes,
+        max_message_size.unwrap_or(crate::ipc::schema::DEFAULT_MAX_MESSAGE_SIZE),
+    ) {
+        exit_with_invoke_error(
+            request_id,
+            JsonRpcError::from_schema_error(&err),
+            json_output,
+        );
+    }
+
+    let response = match &target.endpoint {
+        IpcTransport::UnixSocket(socket_path) => {
+            #[cfg(unix)]
+            {
+                invoke_over_unix_socket(socket_path, &request).unwrap_or_else(|err| {
+                    exit_with_invoke_error(request_id.clone(), err, json_output)
+                })
+            }
+            #[cfg(not(unix))]
+            {
+                exit_with_invoke_error(
+                    request_id,
+                    JsonRpcError::service_unavailable(
+                        "Unix socket transport is unavailable on this platform.",
+                    ),
+                    json_output,
+                );
+            }
+        }
+        transport => exit_with_invoke_error(
+            request_id,
+            JsonRpcError::service_unavailable(&format!(
+                "Transport '{}' is not supported by `ato ipc invoke` yet.",
+                transport.endpoint_display()
+            )),
+            json_output,
+        ),
+    };
+
+    if let Some(error) = response.error.clone() {
+        exit_with_invoke_error(response.id.clone(), error, json_output);
+    }
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&response)?);
+    } else if let Some(result) = response.result {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        println!("{}", serde_json::to_string_pretty(&response)?);
     }
 
     Ok(())
@@ -336,6 +474,170 @@ fn truncate(s: &str, max: usize) -> String {
 /// Default IPC socket directory.
 fn default_socket_dir() -> PathBuf {
     std::env::temp_dir().join("capsule-ipc")
+}
+
+#[derive(Debug, Clone)]
+struct InvokeTarget {
+    capsule_root: PathBuf,
+    service_name: String,
+    endpoint: IpcTransport,
+    capabilities: Vec<String>,
+    method: IpcMethodDescriptor,
+}
+
+fn load_invoke_target(
+    path: &Path,
+    service_override: Option<&str>,
+    method_name: &str,
+) -> Result<InvokeTarget> {
+    let manifest_path = if path.is_file() {
+        path.to_path_buf()
+    } else {
+        path.join("capsule.toml")
+    };
+    if !manifest_path.exists() {
+        anyhow::bail!(
+            "capsule.toml not found at {}. Pass a capsule directory or manifest path.",
+            manifest_path.display()
+        );
+    }
+
+    let raw_text = std::fs::read_to_string(&manifest_path)
+        .with_context(|| format!("Failed to read {}", manifest_path.display()))?;
+    let raw: toml::Value = toml::from_str(&raw_text)
+        .with_context(|| format!("Failed to parse {}", manifest_path.display()))?;
+    let ipc_config = parse_ipc_section(&raw)?.ok_or_else(|| {
+        anyhow::anyhow!("`ato ipc invoke` requires [ipc.exports] in capsule.toml")
+    })?;
+    let exports = ipc_config.exports.ok_or_else(|| {
+        anyhow::anyhow!("`ato ipc invoke` requires [ipc.exports] in capsule.toml")
+    })?;
+
+    let service_name = service_override
+        .map(ToOwned::to_owned)
+        .or(exports.name.clone())
+        .or_else(|| {
+            manifest_path
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|name| name.to_str())
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| "unnamed".to_string());
+
+    let method = exports
+        .methods
+        .iter()
+        .find(|descriptor| descriptor.name == method_name)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!(JsonRpcError::method_not_found(method_name).message))?;
+
+    let broker = IpcBroker::new(default_socket_dir());
+    let endpoint = broker
+        .registry
+        .lookup(&service_name)
+        .map(|info| info.endpoint)
+        .unwrap_or_else(|| IpcTransport::UnixSocket(broker.socket_path(&service_name)));
+    let capsule_root = manifest_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    Ok(InvokeTarget {
+        capsule_root,
+        service_name,
+        endpoint,
+        capabilities: exports.methods.into_iter().map(|m| m.name).collect(),
+        method,
+    })
+}
+
+#[cfg(unix)]
+fn invoke_over_unix_socket(
+    socket_path: &Path,
+    request: &JsonRpcRequest,
+) -> std::result::Result<JsonRpcResponse, JsonRpcError> {
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    if !socket_path.exists() {
+        return Err(JsonRpcError::service_unavailable(&format!(
+            "Socket not found at {}",
+            socket_path.display()
+        )));
+    }
+
+    let mut stream = UnixStream::connect(socket_path).map_err(|err| {
+        JsonRpcError::service_unavailable(&format!(
+            "Failed to connect to {}: {}",
+            socket_path.display(),
+            err
+        ))
+    })?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+
+    let payload = serde_json::to_vec(request).map_err(|err| {
+        JsonRpcError::invalid_params(
+            &format!("Failed to serialize JSON-RPC request: {}", err),
+            "Check that request parameters are JSON-serializable.",
+        )
+    })?;
+
+    stream.write_all(&payload).map_err(|err| {
+        JsonRpcError::service_unavailable(&format!(
+            "Failed to write request to {}: {}",
+            socket_path.display(),
+            err
+        ))
+    })?;
+    stream.write_all(b"\n").map_err(|err| {
+        JsonRpcError::service_unavailable(&format!(
+            "Failed to finalize request to {}: {}",
+            socket_path.display(),
+            err
+        ))
+    })?;
+    let _ = stream.shutdown(Shutdown::Write);
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response).map_err(|err| {
+        JsonRpcError::service_unavailable(&format!(
+            "Failed to read response from {}: {}",
+            socket_path.display(),
+            err
+        ))
+    })?;
+
+    if response.trim().is_empty() {
+        return Err(JsonRpcError::service_unavailable(
+            "Service closed the connection without a JSON-RPC response.",
+        ));
+    }
+
+    serde_json::from_str(response.trim()).map_err(|err| {
+        JsonRpcError::service_unavailable(&format!(
+            "Service returned an invalid JSON-RPC payload: {}",
+            err
+        ))
+    })
+}
+
+fn exit_with_invoke_error(id: Value, error: JsonRpcError, json_output: bool) -> ! {
+    let response = JsonRpcResponse::error(id, error.clone());
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&response)
+                .unwrap_or_else(|_| "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32603,\"message\":\"Failed to render JSON-RPC error\"},\"id\":null}".to_string())
+        );
+    } else {
+        eprintln!("capsule/invoke failed ({}): {}", error.code, error.message);
+        if let Some(data) = error.data {
+            eprintln!("hint: {}", data.hint);
+        }
+    }
+    std::process::exit(1);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

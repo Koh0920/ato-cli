@@ -1,5 +1,5 @@
 use capsule_core::schema_registry::SchemaRegistry;
-use capsule_core::types::capsule_v1::{CapsuleManifestV1, PolymorphismConfig};
+use capsule_core::types::{CapsuleManifest, PolymorphismConfig};
 use serde_json::json;
 
 #[test]
@@ -8,7 +8,7 @@ fn implements_schema_resolves_aliases() {
     let schema_hash = SchemaRegistry::hash_schema_value(&json!({"type":"todo"})).unwrap();
     registry.register_alias("std.todo.v1", &schema_hash);
 
-    let mut manifest = CapsuleManifestV1::from_json(
+    let mut manifest = CapsuleManifest::from_json(
         r#"{
         "schema_version":"0.2",
         "name":"todo-app",

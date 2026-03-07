@@ -25,6 +25,31 @@ pub struct SourcePackOptions {
     pub skip_validation: bool,
     pub nacelle_override: Option<PathBuf>,
     pub standalone: bool,
+    pub strict_manifest: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedSourceConfig {
+    pub config_json: Arc<r3_config::ConfigJson>,
+    pub config_path: PathBuf,
+}
+
+pub fn prepare_source_config(
+    manifest_path: &Path,
+    enforcement: String,
+    standalone: bool,
+) -> Result<PreparedSourceConfig> {
+    let config_json = Arc::new(r3_config::generate_config(
+        manifest_path,
+        Some(enforcement),
+        standalone,
+    )?);
+    let config_path = r3_config::write_config(manifest_path, config_json.as_ref())?;
+
+    Ok(PreparedSourceConfig {
+        config_json,
+        config_path,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -57,20 +82,36 @@ pub fn pack(
     reporter: std::sync::Arc<dyn crate::reporter::CapsuleReporter + 'static>,
 ) -> Result<PathBuf> {
     let rt = tokio::runtime::Runtime::new()?;
+    let strict_manifest = opts.strict_manifest || strict_manifest_from_env()?;
 
     let loaded = manifest::load_manifest(&opts.manifest_path)?;
-    if let Some(targets) = loaded.model.targets.as_ref() {
-        if let Some(digest) = targets.source_digest.as_ref() {
-            debug!("Phase 0: checking CAS for source_digest");
-            let cas = create_cas_client_from_env()?;
-            let exists = rt.block_on(cas.exists(digest))?;
-            if !exists {
-                return Err(CapsuleError::NotFound(format!(
-                    "CAS blob not found for source_digest: {}",
+    let source_digest = loaded
+        .model
+        .targets
+        .as_ref()
+        .and_then(|targets| targets.source_digest.as_deref());
+    if let Some(digest) = source_digest {
+        debug!("Phase 0: checking CAS for source_digest");
+        let cas = create_cas_client_from_env()?;
+        let exists = rt.block_on(cas.exists(digest))?;
+        if !exists {
+            if strict_manifest {
+                return Err(CapsuleError::StrictManifestFallbackNotAllowed(format!(
+                    "CAS blob not found for source_digest {}",
                     digest
                 )));
             }
+            let message = format!(
+                "⚠️  source_digest {} is not available in CAS; falling back to local source packaging",
+                digest
+            );
+            futures::executor::block_on(reporter.warn(message))?;
         }
+    } else if strict_manifest {
+        return Err(CapsuleError::StrictManifestFallbackNotAllowed(
+            "source_digest is missing; strict-manifest forbids fallback to local source packaging"
+                .to_string(),
+        ));
     }
 
     if !opts.skip_validation && !opts.skip_l1 {
@@ -169,7 +210,34 @@ pub fn pack(
     }
 }
 
-fn validate_entrypoint(manifest_path: &PathBuf, manifest_dir: &PathBuf) -> Result<()> {
+fn strict_manifest_from_env() -> Result<bool> {
+    let raw = match std::env::var("ATO_STRICT_MANIFEST") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(false),
+        Err(err) => {
+            return Err(CapsuleError::Config(format!(
+                "Failed to read ATO_STRICT_MANIFEST: {}",
+                err
+            )));
+        }
+    };
+
+    parse_bool_env("ATO_STRICT_MANIFEST", &raw)
+}
+
+fn parse_bool_env(key: &str, raw: &str) -> Result<bool> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" | "" => Ok(false),
+        _ => Err(CapsuleError::Config(format!(
+            "Invalid {} value '{}'; expected one of 1,true,yes,on,0,false,no,off",
+            key, raw
+        ))),
+    }
+}
+
+fn validate_entrypoint(manifest_path: &Path, manifest_dir: &Path) -> Result<()> {
     use std::fs;
 
     let manifest_content = fs::read_to_string(manifest_path)?;
@@ -230,4 +298,31 @@ fn validate_entrypoint(manifest_path: &PathBuf, manifest_dir: &PathBuf) -> Resul
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_bool_env;
+
+    #[test]
+    fn parse_bool_env_accepts_truthy_values() {
+        for value in ["1", "true", "TRUE", "yes", "on"] {
+            let parsed = parse_bool_env("TEST", value).expect("parse env");
+            assert!(parsed, "value should be true: {}", value);
+        }
+    }
+
+    #[test]
+    fn parse_bool_env_accepts_falsey_values() {
+        for value in ["0", "false", "FALSE", "no", "off", ""] {
+            let parsed = parse_bool_env("TEST", value).expect("parse env");
+            assert!(!parsed, "value should be false: {}", value);
+        }
+    }
+
+    #[test]
+    fn parse_bool_env_rejects_unknown_value() {
+        let err = parse_bool_env("TEST", "maybe").expect_err("must reject unknown");
+        assert!(err.to_string().contains("Invalid TEST value"));
+    }
 }

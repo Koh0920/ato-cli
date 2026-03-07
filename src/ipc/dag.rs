@@ -45,6 +45,7 @@ pub struct DagNode {
     /// Dependencies (names of nodes that must start first).
     pub depends_on: Vec<String>,
     /// Whether this is an IPC service node (vs. a user-defined service).
+    #[allow(dead_code)]
     pub is_ipc: bool,
 }
 
@@ -200,6 +201,7 @@ fn detect_cycles(nodes: &[DagNode]) -> Result<Vec<String>, DagError> {
 }
 
 /// Compute the startup order (topological sort).
+#[allow(dead_code)]
 pub fn startup_order(nodes: &[DagNode]) -> Result<Vec<String>, DagError> {
     detect_cycles(nodes)
 }

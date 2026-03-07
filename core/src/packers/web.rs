@@ -10,6 +10,9 @@ use zstd::stream::write::Encoder as ZstdEncoder;
 use crate::error::{CapsuleError, Result};
 use crate::lockfile;
 use crate::manifest;
+use crate::packers::payload::{
+    build_distribution_manifest, normalize_relative_utf8_path, reconstruct_from_chunks,
+};
 use crate::packers::sbom::{generate_embedded_sbom, SBOM_PATH};
 use crate::router::ManifestData;
 
@@ -74,6 +77,22 @@ pub fn pack(
     )?;
     payload_builder.finish().map_err(CapsuleError::Io)?;
     drop(payload_builder);
+    let payload_tar_bytes = fs::read(&payload_tar_path).map_err(CapsuleError::Io)?;
+    let (distribution_manifest, manifest_toml_bytes) =
+        build_distribution_manifest(&loaded.model, &payload_tar_bytes)?;
+    let rebuilt_payload = reconstruct_from_chunks(
+        &payload_tar_bytes,
+        &distribution_manifest
+            .distribution
+            .as_ref()
+            .expect("distribution metadata")
+            .chunk_list,
+    )?;
+    if rebuilt_payload != payload_tar_bytes {
+        return Err(CapsuleError::Pack(
+            "failed to reconstruct payload.tar from chunk_list".to_string(),
+        ));
+    }
 
     let mut zst_encoder = ZstdEncoder::new(
         fs::File::create(&payload_zst_path).map_err(CapsuleError::Io)?,
@@ -99,7 +118,7 @@ pub fn pack(
     let mut capsule_file = fs::File::create(&output_path).map_err(CapsuleError::Io)?;
     let mut outer = Builder::new(&mut capsule_file);
     let manifest_tmp = temp_dir.path().join("capsule.toml");
-    fs::write(&manifest_tmp, &loaded.raw_text).map_err(CapsuleError::Io)?;
+    fs::write(&manifest_tmp, &manifest_toml_bytes).map_err(CapsuleError::Io)?;
     let lockfile_path = ensure_lockfile(
         &opts.manifest_path,
         &loaded.raw,
@@ -112,9 +131,13 @@ pub fn pack(
         "capsule.toml",
         reproducible_mtime_epoch(),
     )?;
+    let packaged_lockfile_bytes =
+        crate::lockfile::render_lockfile_for_manifest(&lockfile_path, &distribution_manifest)?;
+    let packaged_lockfile_path = temp_dir.path().join("capsule.lock");
+    fs::write(&packaged_lockfile_path, packaged_lockfile_bytes).map_err(CapsuleError::Io)?;
     append_regular_file_normalized(
         &mut outer,
-        &lockfile_path,
+        &packaged_lockfile_path,
         "capsule.lock",
         reproducible_mtime_epoch(),
     )?;
@@ -150,6 +173,16 @@ pub fn pack(
         "payload.tar.zst",
         reproducible_mtime_epoch(),
     )?;
+    if let Some((readme_path, archive_name)) =
+        crate::packers::capsule::find_nearest_readme_candidate(&opts.manifest_dir)
+    {
+        append_regular_file_normalized(
+            &mut outer,
+            &readme_path,
+            &archive_name,
+            reproducible_mtime_epoch(),
+        )?;
+    }
     outer.finish().map_err(CapsuleError::Io)?;
 
     Ok(output_path)
@@ -235,7 +268,8 @@ fn append_directory_tree(
     mtime: u64,
 ) -> Result<()> {
     if !tar_prefix.as_os_str().is_empty() {
-        append_directory_normalized(builder, tar_prefix, 0o755, mtime)?;
+        let prefix = normalize_relative_utf8_path(tar_prefix)?;
+        append_directory_normalized(builder, &prefix, 0o755, mtime)?;
     }
     append_directory_tree_recursive(
         builder,
@@ -283,9 +317,10 @@ fn append_directory_tree_recursive(
         } else {
             tar_prefix.join(rel)
         };
+        let archive_path_normalized = normalize_relative_utf8_path(&archive_path)?;
 
         if metadata.is_dir() {
-            append_directory_normalized(builder, &archive_path, 0o755, mtime)?;
+            append_directory_normalized(builder, &archive_path_normalized, 0o755, mtime)?;
             append_directory_tree_recursive(
                 builder,
                 source_root,
@@ -298,15 +333,8 @@ fn append_directory_tree_recursive(
         }
 
         if metadata.is_file() {
-            append_regular_file_normalized(
-                builder,
-                &path,
-                archive_path.to_string_lossy().as_ref(),
-                mtime,
-            )?;
-            // SPDX identifiers/filenames are string based; we intentionally normalize
-            // path bytes lossily for non-UTF8 files for compatibility.
-            sbom_files.push((archive_path.to_string_lossy().to_string(), path.clone()));
+            append_regular_file_normalized(builder, &path, &archive_path_normalized, mtime)?;
+            sbom_files.push((archive_path_normalized, path.clone()));
         }
     }
 
@@ -389,7 +417,7 @@ fn append_regular_file_normalized(
 
 fn append_directory_normalized(
     builder: &mut Builder<&mut fs::File>,
-    archive_path: &Path,
+    archive_path: &str,
     mode: u32,
     mtime: u64,
 ) -> Result<()> {
@@ -402,11 +430,7 @@ fn append_directory_normalized(
     header.set_mtime(mtime);
     header.set_cksum();
     builder
-        .append_data(
-            &mut header,
-            archive_path.to_string_lossy().as_ref(),
-            std::io::empty(),
-        )
+        .append_data(&mut header, archive_path, std::io::empty())
         .map_err(CapsuleError::Io)
 }
 
@@ -441,6 +465,7 @@ mod tests {
     use super::*;
     use crate::reporter::NoOpReporter;
     use crate::router::ExecutionProfile;
+    use crate::types::CapsuleManifest;
     use sha2::{Digest, Sha256};
     use std::io::Read;
 
@@ -508,12 +533,18 @@ port = 8080
         let mut has_payload = false;
         let mut has_signature = false;
         let mut has_sbom = false;
+        let mut has_manifest_toml = false;
         let mut payload_bytes = Vec::new();
+        let mut manifest_toml_bytes = Vec::new();
         for entry in outer.entries().expect("entries") {
             let mut entry = entry.expect("entry");
             let path = entry.path().expect("path").to_string_lossy().to_string();
             if path == "capsule.toml" {
                 has_capsule_toml = true;
+                has_manifest_toml = true;
+                entry
+                    .read_to_end(&mut manifest_toml_bytes)
+                    .expect("read manifest TOML");
             } else if path == "capsule.lock" {
                 has_lock = true;
             } else if path == "signature.json" {
@@ -530,14 +561,15 @@ port = 8080
         assert!(has_lock);
         assert!(has_signature);
         assert!(has_sbom);
+        assert!(has_manifest_toml);
         assert!(has_payload);
 
         let embedded = crate::packers::sbom::extract_and_verify_embedded_sbom(&out)
             .expect("verify embedded sbom");
         assert!(embedded.contains("\"fileName\": \"dist/index.html\""));
 
-        let decoder =
-            zstd::stream::Decoder::new(std::io::Cursor::new(payload_bytes)).expect("decoder");
+        let decoder = zstd::stream::Decoder::new(std::io::Cursor::new(payload_bytes.clone()))
+            .expect("decoder");
         let mut payload = tar::Archive::new(decoder);
         let mut files = Vec::new();
         for entry in payload.entries().expect("payload entries") {
@@ -556,6 +588,26 @@ port = 8080
         assert!(files.iter().any(|p| p == "dist/assets/app.js"));
         assert!(!files.iter().any(|p| p == "capsule.lock"));
         assert!(!files.iter().any(|p| p == "config.json"));
+
+        let manifest_toml: CapsuleManifest =
+            toml::from_str(std::str::from_utf8(&manifest_toml_bytes).expect("manifest utf8"))
+                .expect("manifest parse");
+        let mut payload_decoder = zstd::stream::Decoder::new(std::io::Cursor::new(payload_bytes))
+            .expect("payload decoder");
+        let mut payload_tar_bytes = Vec::new();
+        payload_decoder
+            .read_to_end(&mut payload_tar_bytes)
+            .expect("payload tar bytes");
+        let reconstructed = crate::packers::payload::reconstruct_from_chunks(
+            &payload_tar_bytes,
+            &manifest_toml
+                .distribution
+                .as_ref()
+                .expect("distribution metadata")
+                .chunk_list,
+        )
+        .expect("reconstruct");
+        assert_eq!(reconstructed, payload_tar_bytes);
     }
 
     #[cfg(unix)]

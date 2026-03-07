@@ -57,18 +57,21 @@ impl IpcRegistry {
     }
 
     /// List all registered services.
+    #[cfg(test)]
     pub fn list(&self) -> Vec<IpcServiceInfo> {
         let inner = self.inner.lock().expect("registry lock poisoned");
         inner.services.values().cloned().collect()
     }
 
     /// Return the number of registered services.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         let inner = self.inner.lock().expect("registry lock poisoned");
         inner.services.len()
     }
 
     /// Check if the registry is empty.
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -76,6 +79,7 @@ impl IpcRegistry {
     /// Update the reference count for a service.
     ///
     /// Returns `true` if the service was found and updated.
+    #[cfg(test)]
     pub fn update_ref_count(&self, name: &str, ref_count: u32) -> bool {
         let mut inner = self.inner.lock().expect("registry lock poisoned");
         if let Some(svc) = inner.services.get_mut(name) {
@@ -133,7 +137,7 @@ impl Default for IpcRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::types::{ActivationMode, IpcRuntimeKind, SharingMode};
+    use crate::ipc::types::{IpcRuntimeKind, SharingMode};
     use std::path::PathBuf;
 
     fn make_service(name: &str) -> IpcServiceInfo {
@@ -149,9 +153,6 @@ mod tests {
             started_at: Some(Instant::now()),
             runtime_kind: IpcRuntimeKind::Source,
             sharing_mode: SharingMode::Singleton,
-            activation: ActivationMode::Eager,
-            capsule_root: PathBuf::from("/app/capsules/greeter"),
-            port: None,
         }
     }
 

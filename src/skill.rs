@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
@@ -22,6 +21,7 @@ struct SkillFrontmatter {
     version: Option<String>,
     runtime: Option<String>,
     driver: Option<String>,
+    runtime_version: Option<String>,
     entrypoint: Option<String>,
     permissions: Option<SkillPermissions>,
 }
@@ -77,6 +77,13 @@ pub fn materialize_skill_capsule(skill_path: &Path) -> Result<GeneratedSkillCaps
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| source_kind.default_entrypoint().to_string());
+    let runtime_version = parsed
+        .frontmatter
+        .runtime_version
+        .as_deref()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| source_kind.default_runtime_version().to_string());
 
     let name = parsed
         .frontmatter
@@ -130,6 +137,7 @@ pub fn materialize_skill_capsule(skill_path: &Path) -> Result<GeneratedSkillCaps
         &version,
         &runtime,
         &driver,
+        &runtime_version,
         &entrypoint,
         &allow_hosts,
         &read_only,
@@ -282,6 +290,13 @@ impl SourceKind {
             SourceKind::NativePython => "main.py",
         }
     }
+
+    fn default_runtime_version(&self) -> &'static str {
+        match self {
+            SourceKind::Deno => "1.46.3",
+            SourceKind::NativePython => "3.11.9",
+        }
+    }
 }
 
 fn decide_source_kind(parsed: &ParsedSkill) -> SourceKind {
@@ -316,11 +331,13 @@ fn sanitize_manifest_name(raw: &str) -> String {
         .to_string()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_capsule_manifest(
     name: &str,
     version: &str,
     runtime: &str,
     driver: &str,
+    runtime_version: &str,
     entrypoint: &str,
     allow_hosts: &[String],
     read_only: &[String],
@@ -331,8 +348,8 @@ fn render_capsule_manifest(
     let rw = render_toml_array(read_write);
 
     format!(
-        "schema_version = \"0.2\"\nname = \"{}\"\nversion = \"{}\"\ntype = \"app\"\ndefault_target = \"cli\"\n\n[network]\negress_allow = {}\n\n[sandbox.filesystem]\nread_only = {}\nread_write = {}\n\n[targets.cli]\nruntime = \"{}\"\ndriver = \"{}\"\nentrypoint = \"{}\"\n",
-        name, version, hosts, ro, rw, runtime, driver, entrypoint
+        "schema_version = \"0.2\"\nname = \"{}\"\nversion = \"{}\"\ntype = \"app\"\ndefault_target = \"cli\"\n\n[network]\negress_allow = {}\n\n[sandbox.filesystem]\nread_only = {}\nread_write = {}\n\n[targets.cli]\nruntime = \"{}\"\ndriver = \"{}\"\nruntime_version = \"{}\"\nentrypoint = \"{}\"\n",
+        name, version, hosts, ro, rw, runtime, driver, runtime_version, entrypoint
     )
 }
 
@@ -356,9 +373,10 @@ fn write_capsule_lock(root: &Path, manifest_path: &Path) -> Result<()> {
             manifest_path.display()
         )
     })?;
-    let mut hasher = Sha256::new();
-    hasher.update(manifest_text.as_bytes());
-    let hash = format!("sha256:{:x}", hasher.finalize());
+    let manifest = capsule_core::types::CapsuleManifest::from_toml(&manifest_text)
+        .context("failed to parse generated manifest schema")?;
+    let hash = capsule_core::packers::payload::compute_manifest_hash_without_signatures(&manifest)
+        .context("failed to compute generated manifest hash")?;
 
     let lock = format!(
         "version = \"1\"\n\n[meta]\ncreated_at = \"2026-02-24T00:00:00Z\"\nmanifest_hash = \"{}\"\n\n[targets]\n",
@@ -401,6 +419,7 @@ mod tests {
 
         assert!(manifest.contains("name = \"test-skill\""));
         assert!(manifest.contains("egress_allow = [\"api.example.com\"]"));
+        assert!(manifest.contains("runtime_version = \"1.46.3\""));
         assert!(generated
             .manifest_path()
             .parent()

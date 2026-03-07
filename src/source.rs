@@ -6,8 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::auth::AuthManager;
 use crate::registry::RegistryResolver;
 
-const ENV_SESSION_TOKEN: &str = "ATO_SESSION_TOKEN";
-const LEGACY_ENV_SESSION_TOKEN: &str = "CAPSULE_SESSION_TOKEN";
+const ENV_SESSION_TOKEN: &str = "ATO_TOKEN";
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SourceSyncRunStatus {
@@ -68,8 +67,7 @@ async fn resolve_registry_url(registry_url: Option<&str>) -> Result<String> {
 }
 
 fn resolve_auth_tokens() -> Result<(Option<String>, Option<String>)> {
-    let session_token = read_env_non_empty(ENV_SESSION_TOKEN)
-        .or_else(|| read_env_non_empty(LEGACY_ENV_SESSION_TOKEN));
+    let session_token = read_env_non_empty(ENV_SESSION_TOKEN);
     if let Some(token) = session_token {
         return Ok((Some(token), None));
     }
