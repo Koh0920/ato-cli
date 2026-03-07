@@ -15,6 +15,7 @@
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+use std::fs;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
@@ -31,6 +32,13 @@ fn fixture_dir(name: &str) -> PathBuf {
         .join("tests")
         .join("fixtures")
         .join(name)
+}
+
+fn write_file(path: &std::path::Path, contents: &str) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    fs::write(path, contents).unwrap();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -194,7 +202,7 @@ fn ipc_start_with_no_ipc_section_uses_fallback_name() {
     std::fs::write(
         temp.path().join("capsule.toml"),
         r#"
-schema_version = "1.0"
+schema_version = "1"
 name = "no-ipc"
 version = "0.1.0"
 type = "app"
@@ -212,4 +220,90 @@ entrypoint = "echo hello"
         .assert()
         .success()
         .stdout(predicate::str::contains("registered").or(predicate::str::contains("no-ipc")));
+}
+
+#[test]
+fn run_fails_closed_when_required_ipc_import_is_missing() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    write_file(
+        &temp.path().join("capsule.toml"),
+        r#"
+schema_version = "1"
+name = "ipc-fail-closed"
+version = "0.1.0"
+type = "app"
+default_target = "cli"
+
+[targets.cli]
+runtime = "source"
+driver = "deno"
+runtime_version = "1.46.3"
+entrypoint = "main.ts"
+
+[ipc.imports.greeter]
+from = "missing-service"
+"#,
+    );
+    write_file(
+        &temp.path().join("main.ts"),
+        r#"console.log("should not run");"#,
+    );
+
+    capsule()
+        .current_dir(temp.path())
+        .env("HOME", &home)
+        .args(["run", ".", "--yes"])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("ATO_ERR_POLICY_VIOLATION")
+                .and(predicate::str::contains("IPC-006"))
+                .and(predicate::str::contains("missing-service")),
+        );
+}
+
+#[test]
+fn build_fails_when_ipc_schema_reference_is_invalid() {
+    let temp = TempDir::new().unwrap();
+
+    write_file(
+        &temp.path().join("capsule.toml"),
+        r#"
+schema_version = "1"
+name = "ipc-schema-invalid"
+version = "0.1.0"
+type = "app"
+default_target = "cli"
+
+[targets.cli]
+runtime = "source"
+driver = "deno"
+runtime_version = "1.46.3"
+entrypoint = "main.ts"
+
+[ipc.exports]
+name = "schema-service"
+
+[[ipc.exports.methods]]
+name = "ping"
+input_schema = "schemas/missing.json"
+"#,
+    );
+    write_file(
+        &temp.path().join("main.ts"),
+        r#"console.log("build should fail first");"#,
+    );
+
+    capsule()
+        .args(["build"])
+        .arg(temp.path())
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("ATO_ERR_POLICY_VIOLATION")
+                .and(predicate::str::contains("IPC-008")),
+        );
 }
