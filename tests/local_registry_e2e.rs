@@ -492,6 +492,143 @@ entrypoint = "main.ts"
 }
 
 #[test]
+fn e2e_publish_artifact_without_cwd_manifest() -> Result<()> {
+    let ato = assert_cmd::cargo::cargo_bin("ato");
+    let tmp = TempDir::new().context("create temp dir")?;
+    let home_dir = tmp.path().join("home");
+    std::fs::create_dir_all(&home_dir)?;
+    let data_dir = tmp.path().join("registry-data");
+    let build_dir = tmp.path().join("build-project");
+    let publish_cwd = tmp.path().join("publish-cwd");
+    std::fs::create_dir_all(&build_dir)?;
+    std::fs::create_dir_all(&publish_cwd)?;
+
+    std::fs::write(
+        build_dir.join("capsule.toml"),
+        r#"schema_version = "0.2"
+name = "test-artifact-cwdless"
+version = "1.0.0"
+type = "app"
+default_target = "cli"
+
+[targets.cli]
+runtime = "source"
+driver = "deno"
+runtime_version = "1.46.3"
+entrypoint = "main.ts"
+"#,
+    )?;
+    std::fs::write(
+        build_dir.join("main.ts"),
+        r#"console.log("cwdless publish")"#,
+    )?;
+    std::fs::write(
+        build_dir.join("deno.lock"),
+        r#"{"version":"5","specifiers":{},"packages":{}}"#,
+    )?;
+
+    let build = run_ato_with_home(&ato, &["build", "."], &build_dir, &home_dir)?;
+    assert!(
+        build.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let artifact_path = build_dir.join("test-artifact-cwdless.capsule");
+    assert!(artifact_path.exists(), "artifact not found");
+
+    let Some((_guard, base_url)) =
+        start_local_registry_or_skip(&ato, &data_dir, "e2e_publish_artifact_without_cwd_manifest")?
+    else {
+        return Ok(());
+    };
+
+    let artifact_str = artifact_path.to_string_lossy().to_string();
+    let scoped_id = "team-x/test-artifact-cwdless";
+
+    let first_publish = run_ato_with_home(
+        &ato,
+        &[
+            "publish",
+            "--deploy",
+            "--registry",
+            &base_url,
+            "--artifact",
+            &artifact_str,
+            "--scoped-id",
+            scoped_id,
+            "--json",
+        ],
+        &publish_cwd,
+        &home_dir,
+    )?;
+    assert!(
+        first_publish.status.success(),
+        "first publish failed: {}",
+        String::from_utf8_lossy(&first_publish.stderr)
+    );
+
+    let second_publish = run_ato_with_home(
+        &ato,
+        &[
+            "publish",
+            "--deploy",
+            "--registry",
+            &base_url,
+            "--artifact",
+            &artifact_str,
+            "--scoped-id",
+            scoped_id,
+            "--json",
+        ],
+        &publish_cwd,
+        &home_dir,
+    )?;
+    assert!(
+        !second_publish.status.success(),
+        "second publish without --allow-existing must fail"
+    );
+    let second_stdout = String::from_utf8_lossy(&second_publish.stdout);
+    let second_stderr = String::from_utf8_lossy(&second_publish.stderr);
+    assert!(
+        second_stderr.contains("E202") || second_stdout.contains("\"code\":\"E202\""),
+        "expected E202 for version conflict; stdout={} stderr={}",
+        second_stdout,
+        second_stderr
+    );
+
+    let third_publish = run_ato_with_home(
+        &ato,
+        &[
+            "publish",
+            "--deploy",
+            "--registry",
+            &base_url,
+            "--artifact",
+            &artifact_str,
+            "--scoped-id",
+            scoped_id,
+            "--allow-existing",
+        ],
+        &publish_cwd,
+        &home_dir,
+    )?;
+    assert!(
+        third_publish.status.success(),
+        "third publish with --allow-existing failed: {}",
+        String::from_utf8_lossy(&third_publish.stderr)
+    );
+    let third_stdout = String::from_utf8_lossy(&third_publish.stdout);
+    assert_eq!(
+        third_stdout.contains("Existing release reused (same sha256, no new upload)."),
+        true,
+        "expected reused-release message in allow-existing path; stdout={}",
+        third_stdout
+    );
+
+    Ok(())
+}
+
+#[test]
 fn e2e_local_registry_build_publish_install_search_download() -> Result<()> {
     let ato = assert_cmd::cargo::cargo_bin("ato");
     let tmp = TempDir::new().context("create temp dir")?;

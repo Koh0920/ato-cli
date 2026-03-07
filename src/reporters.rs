@@ -115,7 +115,11 @@ impl CapsuleReporter for StdoutReporter {
         } else if let Some(total) = total {
             println!("{} ({} bytes)", label, total);
         } else {
-            println!("{}", label);
+            if let Some(total) = total {
+                println!("{} ({} bytes)", label, total);
+            } else {
+                println!("{}", label);
+            }
         }
         Ok(())
     }

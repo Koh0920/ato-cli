@@ -502,6 +502,23 @@ pub async fn install_app(
         }
     }
 
+    if let Some(v3_manifest) = extract_payload_v3_manifest_from_capsule(&bytes)? {
+        let sync_result = sync_v3_chunks_from_manifest(&client, &registry, &v3_manifest).await?;
+        match sync_result {
+            V3SyncOutcome::Synced => {}
+            V3SyncOutcome::SkippedUnsupportedRegistry => {
+                if !json_output {
+                    eprintln!(
+                        "ℹ️  Registry does not expose v3 chunk sync endpoint; falling back to embedded payload"
+                    );
+                }
+            }
+            V3SyncOutcome::SkippedDisabledCas(reason) => {
+                emit_cas_disabled_performance_warning_once(&reason, json_output);
+            }
+        }
+    }
+
     let store_root = output_dir.unwrap_or_else(|| {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))

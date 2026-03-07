@@ -252,11 +252,11 @@ fn build_runtime_command(
                 ));
             }
 
-            let mut allow_read = execution_plan.runtime.policy.filesystem.read_only.clone();
-            allow_read.extend(execution_plan.runtime.policy.filesystem.read_write.clone());
-            if !allow_read.is_empty() {
-                cmd.arg(format!("--allow-read={}", allow_read.join(",")));
-            }
+        let mut allow_read = execution_plan.runtime.policy.filesystem.read_only.clone();
+        allow_read.extend(execution_plan.runtime.policy.filesystem.read_write.clone());
+        if !allow_read.is_empty() {
+            cmd.arg(format!("--allow-read={}", allow_read.join(",")));
+        }
 
             let allow_write = execution_plan.runtime.policy.filesystem.read_write.clone();
             if !allow_write.is_empty() {

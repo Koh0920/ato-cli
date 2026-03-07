@@ -4233,6 +4233,12 @@ mod tests {
         encoder.finish().expect("finish")
     }
 
+    fn compress(data: &[u8]) -> Vec<u8> {
+        let mut encoder = zstd::Encoder::new(Vec::new(), 3).expect("encoder");
+        encoder.write_all(data).expect("write");
+        encoder.finish().expect("finish")
+    }
+
     #[test]
     fn initialize_storage_creates_index() {
         let tmp = tempfile::tempdir().expect("tempdir");
