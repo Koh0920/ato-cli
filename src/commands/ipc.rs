@@ -22,9 +22,7 @@ use capsule_core::execution_plan::error::AtoExecutionError;
 use serde_json::Value;
 
 use crate::ipc::broker::IpcBroker;
-use crate::ipc::jsonrpc::{InvokeParams, JsonRpcError, JsonRpcRequest};
-#[cfg(unix)]
-use crate::ipc::jsonrpc::JsonRpcResponse;
+use crate::ipc::jsonrpc::{InvokeParams, JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 use crate::ipc::types::{IpcMethodDescriptor, IpcRuntimeKind, IpcServiceInfo, IpcTransport};
 
 /// Run `ato ipc status`.
