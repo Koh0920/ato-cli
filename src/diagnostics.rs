@@ -384,10 +384,10 @@ fn from_capsule_error(core_err: &capsule_core::CapsuleError, causes: Vec<String>
             CliDiagnosticCode::E102,
             detail,
             Some(
-                "strict-manifest を無効化するか、source_digest をCASに登録して manifest 経路を成功させてください。",
+                "--strict-v3 を無効化するか、source_digest をCASに登録して manifest 経路を成功させてください。",
             ),
             None,
-            Some("strict-manifest"),
+            Some("strict-v3"),
             causes,
         ),
         capsule_core::CapsuleError::AuthRequired(detail) => CliDiagnostic::new(
@@ -520,6 +520,12 @@ mod tests {
         );
         let diagnostic = from_anyhow(&err, CommandContext::Build);
         assert_eq!(diagnostic.code, CliDiagnosticCode::E102);
+        assert_eq!(diagnostic.field.as_deref(), Some("strict-v3"));
+        assert!(diagnostic
+            .hint
+            .as_deref()
+            .unwrap_or_default()
+            .contains("--strict-v3"));
     }
 
     #[test]

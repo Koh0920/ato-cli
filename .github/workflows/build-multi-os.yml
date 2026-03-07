@@ -341,7 +341,7 @@ jobs:
             cat "${tmp_dir}/stderr.log" >&2 || true
             exit 1
           fi
-          if ! grep -qiE "strict-v3|Strict v3 fallback is not allowed" "${tmp_dir}/stderr.log"; then
+          if ! grep -qiE "strict-v3|Strict v3 fallback is not allowed|strict-manifest|source_digest is missing|E102" "${tmp_dir}/stderr.log"; then
             echo "strict-v3 failure message not found in stderr" >&2
             cat "${tmp_dir}/stderr.log" >&2 || true
             exit 1
