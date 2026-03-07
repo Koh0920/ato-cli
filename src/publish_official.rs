@@ -122,7 +122,7 @@ pub fn diagnose_official(cwd: &Path, registry_url: &str) -> OfficialPublishDiagn
         if manifest_raw.is_empty() {
             false
         } else {
-            match capsule_core::types::capsule_v1::CapsuleManifestV1::from_toml(&manifest_raw) {
+            match capsule_core::types::CapsuleManifest::from_toml(&manifest_raw) {
                 Ok(manifest) => {
                     capsule_name = Some(manifest.name.clone());
                     version = Some(manifest.version.clone());

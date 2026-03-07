@@ -140,7 +140,7 @@
 - `--skip-l1` and `--skip-validation` are dangerous; use sparingly.
 
 ## Useful Paths
-- `~/.capsule/config.toml` holds engine registrations.
+- `~/.ato/config.toml` holds engine registrations.
 - `capsule.toml` is the project manifest used by the CLI.
 - `.capsuleignore` controls bundle inclusion.
 

@@ -1,9 +1,10 @@
-use std::io::Write;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 #[cfg(unix)]
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
+    io::Write,
     os::{
         fd::{AsRawFd, FromRawFd},
         unix::process::CommandExt,
@@ -21,13 +22,20 @@ use capsule_core::router::ManifestData;
 
 use crate::common::proxy;
 use crate::runtime_manager;
+use crate::runtime_overrides;
 
-use super::source::IpcEnvVars;
+use super::launch_context::RuntimeLaunchContext;
+
+struct PreparedCommand {
+    cmd: Command,
+    #[cfg(unix)]
+    _secret_fd_guard: Option<std::fs::File>,
+}
 
 pub fn execute(
     plan: &ManifestData,
     execution_plan: &ExecutionPlan,
-    ipc_env: Option<&IpcEnvVars>,
+    launch_ctx: &RuntimeLaunchContext,
     dangerously_skip_permissions: bool,
 ) -> Result<i32> {
     let deno_bin = runtime_manager::ensure_deno_binary(plan)?;
@@ -53,24 +61,87 @@ pub fn execute(
 
     let use_compat_flag = deno_supports_compat_flag(&deno_bin)?;
 
-    run_provisioning(&deno_bin, &runtime_dir, &entrypoint, ipc_env)?;
-    run_runtime(
+    run_provisioning(&deno_bin, &runtime_dir, &entrypoint, launch_ctx)?;
+    let PreparedCommand {
+        mut cmd,
+        #[cfg(unix)]
+        _secret_fd_guard,
+    } = build_runtime_command(
         &deno_bin,
         plan,
         execution_plan,
         &runtime_dir,
         &entrypoint,
-        ipc_env,
+        launch_ctx,
         use_compat_flag,
         dangerously_skip_permissions,
-    )
+    )?;
+    let status = cmd
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .context("Failed to execute deno run for node compat")?;
+
+    Ok(status.code().unwrap_or(1))
+}
+
+pub fn spawn(
+    plan: &ManifestData,
+    execution_plan: &ExecutionPlan,
+    launch_ctx: &RuntimeLaunchContext,
+    dangerously_skip_permissions: bool,
+) -> Result<Child> {
+    let deno_bin = runtime_manager::ensure_deno_binary(plan)?;
+
+    verify_execution_plan_hashes(execution_plan)?;
+
+    let entrypoint = plan
+        .execution_entrypoint()
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| {
+            AtoExecutionError::policy_violation("source/node target requires entrypoint")
+        })?;
+
+    let runtime_dir = resolve_runtime_dir(&plan.manifest_dir, &entrypoint);
+    let package_lock = resolve_package_lock_path(&plan.manifest_dir, &runtime_dir);
+    let Some(_) = package_lock else {
+        return Err(AtoExecutionError::lock_incomplete(
+            "package-lock.json is required for source/node Tier1 execution",
+            Some("package-lock.json"),
+        )
+        .into());
+    };
+
+    let use_compat_flag = deno_supports_compat_flag(&deno_bin)?;
+
+    run_provisioning(&deno_bin, &runtime_dir, &entrypoint, launch_ctx)?;
+    let PreparedCommand {
+        mut cmd,
+        #[cfg(unix)]
+        _secret_fd_guard,
+    } = build_runtime_command(
+        &deno_bin,
+        plan,
+        execution_plan,
+        &runtime_dir,
+        &entrypoint,
+        launch_ctx,
+        use_compat_flag,
+        dangerously_skip_permissions,
+    )?;
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd.spawn()
+        .context("Failed to spawn node compat runtime for orchestration")
 }
 
 fn run_provisioning(
     deno_bin: &Path,
     runtime_dir: &Path,
     entrypoint: &str,
-    ipc_env: Option<&IpcEnvVars>,
+    launch_ctx: &RuntimeLaunchContext,
 ) -> Result<()> {
     let mut cmd = Command::new(deno_bin);
     cmd.current_dir(runtime_dir)
@@ -81,7 +152,7 @@ fn run_provisioning(
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
-    apply_session_tokens(&mut cmd, ipc_env)?;
+    launch_ctx.apply_allowlisted_env(&mut cmd)?;
     if let Some(proxy_env) = proxy::proxy_env_from_env(&[])? {
         proxy::apply_proxy_env(&mut cmd, &proxy_env);
     }
@@ -103,16 +174,17 @@ fn run_provisioning(
     }
 }
 
-fn run_runtime(
+#[allow(clippy::too_many_arguments)]
+fn build_runtime_command(
     deno_bin: &Path,
     plan: &ManifestData,
     execution_plan: &ExecutionPlan,
     runtime_dir: &Path,
     entrypoint: &str,
-    ipc_env: Option<&IpcEnvVars>,
+    launch_ctx: &RuntimeLaunchContext,
     use_compat_flag: bool,
     dangerously_skip_permissions: bool,
-) -> Result<i32> {
+) -> Result<PreparedCommand> {
     let mut cmd = Command::new(deno_bin);
     cmd.current_dir(runtime_dir)
         .arg("run")
@@ -157,11 +229,11 @@ fn run_runtime(
         }
     }
 
-    for (key, value) in plan.execution_env() {
+    for (key, value) in runtime_overrides::merged_env(plan.execution_env()) {
         cmd.env(key, value);
     }
     if execution_plan.target.runtime == ExecutionRuntime::Web {
-        if let Some(port) = plan.execution_port() {
+        if let Some(port) = runtime_overrides::override_port(plan.execution_port()) {
             cmd.env("PORT", port.to_string());
         }
         if !dangerously_skip_permissions {
@@ -172,18 +244,18 @@ fn run_runtime(
     }
 
     #[cfg(unix)]
-    let mut _secret_fd_guard: Option<std::fs::File> = None;
+    let mut secret_fd_guard: Option<std::fs::File> = None;
 
     #[cfg(unix)]
     {
         let secrets = collect_runtime_secrets(execution_plan);
         if !secrets.is_empty() {
-            _secret_fd_guard = Some(inject_secrets_via_fd3(&mut cmd, &secrets)?);
-            cmd.arg("--allow-env");
+            secret_fd_guard = Some(inject_secrets_via_fd3(&mut cmd, &secrets)?);
         }
     }
 
-    apply_session_tokens(&mut cmd, ipc_env)?;
+    append_allow_env_permission(&mut cmd, plan, launch_ctx);
+    launch_ctx.apply_allowlisted_env(&mut cmd)?;
 
     if let Some(proxy_env) = proxy::proxy_env_from_env(&[])? {
         proxy::apply_proxy_env(&mut cmd, &proxy_env);
@@ -195,16 +267,11 @@ fn run_runtime(
         cmd.args(args);
     }
 
-    let status = cmd
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .context("Failed to execute deno run for node compat")?;
-
-    let exit_code = status.code().unwrap_or(1);
-
-    Ok(exit_code)
+    Ok(PreparedCommand {
+        cmd,
+        #[cfg(unix)]
+        _secret_fd_guard: secret_fd_guard,
+    })
 }
 
 fn deno_supports_compat_flag(deno_bin: &Path) -> Result<bool> {
@@ -241,6 +308,32 @@ fn resolve_package_lock_path(manifest_dir: &Path, runtime_dir: &Path) -> Option<
     candidates.into_iter().find(|path| path.exists())
 }
 
+fn append_allow_env_permission(
+    cmd: &mut Command,
+    plan: &ManifestData,
+    launch_ctx: &RuntimeLaunchContext,
+) {
+    let has_allow_env = cmd
+        .get_args()
+        .any(|arg| arg.to_string_lossy().starts_with("--allow-env"));
+    if has_allow_env {
+        return;
+    }
+
+    let mut keys = BTreeSet::new();
+    keys.extend(runtime_overrides::merged_env(plan.execution_env()).into_keys());
+    keys.extend(launch_ctx.env_permission_keys());
+    if keys.is_empty() {
+        return;
+    }
+
+    cmd.arg(format!(
+        "--allow-env={}",
+        keys.into_iter().collect::<Vec<_>>().join(",")
+    ));
+}
+
+#[cfg(test)]
 fn map_deno_permission_error(stderr: &[u8]) -> Option<AtoExecutionError> {
     let text = String::from_utf8_lossy(stderr);
     let lower = text.to_ascii_lowercase();
@@ -265,6 +358,7 @@ fn map_deno_permission_error(stderr: &[u8]) -> Option<AtoExecutionError> {
     ))
 }
 
+#[cfg(test)]
 fn map_node_compat_error(stderr: &[u8]) -> Option<AtoExecutionError> {
     let text = String::from_utf8_lossy(stderr);
     let lower = text.to_ascii_lowercase();
@@ -283,6 +377,7 @@ fn map_node_compat_error(stderr: &[u8]) -> Option<AtoExecutionError> {
     ))
 }
 
+#[cfg(test)]
 fn extract_deno_net_target(stderr: &str) -> Option<String> {
     let marker = "Requires net access to \"";
     let start = stderr.find(marker)? + marker.len();
@@ -390,27 +485,6 @@ fn verify_execution_plan_hashes(execution_plan: &ExecutionPlan) -> Result<()> {
             "provisioning_policy_hash mismatch detected before node compat runtime",
             Some("provisioning_policy_hash"),
         )
-        .into());
-    }
-
-    Ok(())
-}
-
-fn apply_session_tokens(cmd: &mut Command, ipc_env: Option<&IpcEnvVars>) -> Result<()> {
-    let Some(ipc_env) = ipc_env else {
-        return Ok(());
-    };
-
-    for (key, value) in ipc_env {
-        if key.starts_with("CAPSULE_IPC_") || key == "ATO_BRIDGE_TOKEN" {
-            cmd.env(key, value);
-            continue;
-        }
-
-        return Err(AtoExecutionError::policy_violation(format!(
-            "session_token env '{}' is not allowlisted",
-            key
-        ))
         .into());
     }
 

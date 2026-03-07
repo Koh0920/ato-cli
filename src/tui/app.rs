@@ -16,6 +16,7 @@ pub struct App {
     pub hint: Option<String>,
     pub should_quit: bool,
     pub accepted_scoped_id: Option<String>,
+    pub has_user_interaction: bool,
     pub query_dirty: bool,
     pub last_query_change_at: Instant,
     pub active_seq: u64,
@@ -43,6 +44,7 @@ impl App {
             hint: None,
             should_quit: false,
             accepted_scoped_id: None,
+            has_user_interaction: false,
             query_dirty: true,
             last_query_change_at: Instant::now(),
             active_seq: 0,
@@ -95,5 +97,13 @@ impl App {
         self.manifest_cache.clear();
         self.manifest_errors.clear();
         self.manifest_inflight.clear();
+    }
+
+    pub fn mark_user_interaction(&mut self) {
+        self.has_user_interaction = true;
+    }
+
+    pub fn can_accept_enter_selection(&self) -> bool {
+        self.has_user_interaction && !self.loading && !self.items.is_empty()
     }
 }

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::sync::Arc;
 
-use crate::process_manager::{ProcessManager, ProcessStatus};
+use crate::process_manager::ProcessManager;
 use crate::reporters::CliReporter;
 use capsule_core::CapsuleReporter;
 
@@ -17,18 +17,15 @@ pub fn execute(args: CloseArgs, reporter: Arc<CliReporter>) -> Result<()> {
 
     if args.all && args.name.is_none() && args.id.is_none() {
         let processes = pm.list_processes()?;
-        let running: Vec<_> = processes
-            .iter()
-            .filter(|p| p.status == ProcessStatus::Running)
-            .collect();
+        let running: Vec<_> = processes.iter().filter(|p| p.status.is_active()).collect();
 
         if running.is_empty() {
-            futures::executor::block_on(reporter.notify("No running capsules.".to_string()))?;
+            futures::executor::block_on(reporter.notify("No active capsules.".to_string()))?;
             return Ok(());
         }
 
         futures::executor::block_on(
-            reporter.notify(format!("Stopping {} running capsule(s)...", running.len())),
+            reporter.notify(format!("Stopping {} active capsule(s)...", running.len())),
         )?;
 
         let mut stopped = 0;
@@ -80,10 +77,7 @@ pub fn execute(args: CloseArgs, reporter: Arc<CliReporter>) -> Result<()> {
             anyhow::bail!("No capsule found with name: {}", name);
         }
 
-        let running: Vec<_> = processes
-            .iter()
-            .filter(|p| p.status == ProcessStatus::Running)
-            .collect();
+        let running: Vec<_> = processes.iter().filter(|p| p.status.is_active()).collect();
 
         if running.is_empty() {
             futures::executor::block_on(

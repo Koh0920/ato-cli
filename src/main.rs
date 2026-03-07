@@ -79,8 +79,6 @@ impl Drop for SidecarCleanup {
 
 mod ato_error_jsonl;
 mod auth;
-#[cfg(feature = "manifest-signing")]
-mod capsule_capnp;
 mod commands;
 mod common;
 mod consent_store;
@@ -96,7 +94,6 @@ mod install;
 mod ipc;
 mod keygen;
 mod new;
-mod observability;
 mod payload_guard;
 mod process_manager;
 mod profile;
@@ -107,11 +104,15 @@ mod publish_official;
 mod publish_preflight;
 mod publish_prepare;
 mod publish_private;
-mod publish_tui;
 mod registry;
+mod registry_delete;
 mod registry_serve;
+mod registry_store;
+mod registry_yank;
 mod reporters;
 mod runtime_manager;
+mod runtime_overrides;
+mod runtime_tree;
 mod scaffold;
 mod search;
 mod sign;
@@ -158,7 +159,7 @@ Auth:
 Advanced Commands:
   key      Manage signing keys
   config   Manage configuration (registry, engine, source)
-  publish  Publish capsule (official: CI-first, private: direct upload)
+  publish  Publish capsule (Dock/private: direct upload, official: CI-first)
   gen-ci   Generate GitHub Actions workflow for OIDC CI publish
   registry Manage registry commands (resolve/list/cache/serve)
 
@@ -280,7 +281,7 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         allow_unverified: bool,
 
-        /// Output directory (default: ~/.capsule/store/)
+        /// Output directory (default: ~/.ato/store/)
         #[arg(long)]
         output: Option<PathBuf>,
 
@@ -334,6 +335,10 @@ enum Commands {
         /// Keep failed build artifacts when smoke test fails
         #[arg(long, default_value_t = false)]
         keep_failed_artifacts: bool,
+
+        /// Disallow fallback when source_digest/CAS(v3 path) is unavailable
+        #[arg(long, default_value_t = false)]
+        strict_v3: bool,
     },
 
     #[command(
@@ -434,6 +439,10 @@ enum Commands {
         /// GitHub Personal Access Token (legacy fallback, scope: read:user)
         #[arg(long)]
         token: Option<String>,
+
+        /// Do not open browser automatically; print activation URL for another device/session
+        #[arg(long, default_value_t = false)]
+        headless: bool,
     },
 
     #[command(next_help_heading = "Auth", about = "Logout")]
@@ -462,7 +471,7 @@ enum Commands {
 
     #[command(
         next_help_heading = "Advanced Commands",
-        about = "Publish capsule (official registry: CI-first, private registry: direct upload)"
+        about = "Publish capsule (Dock/private registry: direct upload, official registry: CI-first)"
     )]
     Publish {
         /// Registry URL override (default: https://api.ato.run)
@@ -672,6 +681,10 @@ enum Commands {
         /// Keep failed build artifacts when smoke test fails
         #[arg(long, hide = true, default_value_t = false)]
         keep_failed_artifacts: bool,
+
+        /// Disallow fallback when source_digest/CAS(v3 path) is unavailable
+        #[arg(long, hide = true, default_value_t = false)]
+        strict_v3: bool,
     },
 
     #[command(hide = true)]
@@ -836,7 +849,7 @@ enum ConfigEngineCommands {
     /// Show engine capabilities (JSON)
     Features,
 
-    /// Register a nacelle engine binary (writes ~/.capsule/config.toml)
+    /// Register a nacelle engine binary (writes ~/.ato/config.toml)
     Register {
         /// Registration name (e.g. "default" or "my-custom-nacelle")
         #[arg(long)]
@@ -1002,7 +1015,7 @@ enum EngineCommands {
     /// Show engine capabilities (JSON)
     Features,
 
-    /// Register a nacelle engine binary (writes ~/.capsule/config.toml)
+    /// Register a nacelle engine binary (writes ~/.ato/config.toml)
     Register {
         /// Registration name (e.g. "default" or "my-custom-nacelle")
         #[arg(long)]
@@ -1047,7 +1060,7 @@ enum RegistryCommands {
         port: u16,
 
         /// Data directory for local registry state
-        #[arg(long, default_value = "~/.capsule/local-registry")]
+        #[arg(long, default_value = "~/.ato/local-registry")]
         data_dir: String,
 
         /// Listen host (non-loopback requires --auth-token)
@@ -1294,6 +1307,7 @@ fn run() -> Result<()> {
             force_large_payload,
             enforcement,
             keep_failed_artifacts,
+            strict_v3,
         } => commands::build::execute_pack_command(
             dir,
             init,
@@ -1301,6 +1315,7 @@ fn run() -> Result<()> {
             standalone,
             force_large_payload,
             keep_failed_artifacts,
+            strict_v3,
             enforcement.as_str().to_string(),
             reporter.clone(),
             cli.json,
@@ -1342,6 +1357,7 @@ fn run() -> Result<()> {
             force_large_payload,
             enforcement,
             keep_failed_artifacts,
+            strict_v3,
         } => {
             eprintln!("⚠️  'ato pack' is deprecated. Use 'ato build' instead.");
             commands::build::execute_pack_command(
@@ -1351,6 +1367,7 @@ fn run() -> Result<()> {
                 standalone,
                 force_large_payload,
                 keep_failed_artifacts,
+                strict_v3,
                 enforcement.as_str().to_string(),
                 reporter.clone(),
                 cli.json,
@@ -1478,6 +1495,7 @@ fn run() -> Result<()> {
                     default,
                     allow_unverified,
                     json,
+                    false,
                 )
                 .await?;
 
@@ -1701,11 +1719,11 @@ fn run() -> Result<()> {
             command: IpcCommands::Stop { name, force, json },
         } => commands::ipc::run_ipc_stop(name, force, json),
 
-        Commands::Login { token } => {
+        Commands::Login { token, headless } => {
             let rt = tokio::runtime::Runtime::new()?;
             match token {
                 Some(token) => rt.block_on(auth::login_with_token(token)),
-                None => rt.block_on(auth::login_with_store_device_flow()),
+                None => rt.block_on(auth::login_with_store_device_flow(headless)),
             }
         }
 
@@ -1937,6 +1955,7 @@ fn execute_publish_dry_run_command(
     })
 }
 
+#[allow(dead_code)]
 fn execute_publish_guidance_command(json_output: bool, registry_url: &str) -> Result<()> {
     if json_output {
         let payload = serde_json::json!({
@@ -2453,7 +2472,7 @@ fn build_capsule_artifact_for_publish(cwd: &std::path::Path) -> Result<PathBuf> 
     let manifest_path = cwd.join("capsule.toml");
     let manifest_raw = std::fs::read_to_string(&manifest_path)
         .with_context(|| format!("Failed to read {}", manifest_path.display()))?;
-    let manifest = capsule_core::types::capsule_v1::CapsuleManifestV1::from_toml(&manifest_raw)
+    let manifest = capsule_core::types::CapsuleManifest::from_toml(&manifest_raw)
         .map_err(|err| anyhow::anyhow!("Failed to parse capsule.toml: {}", err))?;
     crate::publish_ci::build_capsule_artifact(&manifest_path, &manifest.name, &manifest.version)
         .with_context(|| "Failed to build artifact for publish")
@@ -2633,66 +2652,6 @@ fn is_official_publish_registry(url: &str) -> bool {
     host.eq_ignore_ascii_case("api.ato.run") || host.eq_ignore_ascii_case("staging.api.ato.run")
 }
 
-fn execute_publish_tui_command(reporter: std::sync::Arc<reporters::CliReporter>) -> Result<()> {
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
-        let outcome = publish_tui::execute().await?;
-        match outcome {
-            publish_tui::PublishTuiOutcome::Success(summary) => {
-                println!("✅ Ato publish completed successfully.");
-                println!("   Capsule: {} v{}", summary.capsule, summary.version);
-                println!("   Run URL: {}", summary.run_url);
-                futures::executor::block_on(
-                    reporter.notify("Interactive publish orchestration completed.".to_string()),
-                )?;
-                Ok(())
-            }
-            publish_tui::PublishTuiOutcome::Failure(summary) => {
-                println!("❌ Ato publish failed.");
-                println!("   {}", summary.message);
-                if let Some(conclusion) = summary.conclusion {
-                    println!("   Conclusion: {}", conclusion);
-                }
-                if let Some(run_url) = summary.run_url {
-                    println!("   Run URL: {}", run_url);
-                }
-                if !summary.details.is_empty() {
-                    println!();
-                    println!("Failure details:");
-                    for job in summary.details {
-                        println!(" - Job: {} ({})", job.name, job.status);
-                        if job.failed_steps.is_empty() {
-                            println!("   Failed steps: (not available)");
-                        } else {
-                            println!("   Failed steps: {}", job.failed_steps.join(", "));
-                        }
-                        if let Some(excerpt) = job.log_excerpt {
-                            for line in excerpt.lines().take(12) {
-                                println!("   {}", line);
-                            }
-                            if excerpt.lines().count() > 12 {
-                                println!("   ... (truncated)");
-                            }
-                        }
-                    }
-                }
-                if let Some(tag) = summary.tag {
-                    println!();
-                    println!("💡 Recovery:");
-                    println!("   git tag -d {}", tag);
-                    println!("   git push --delete origin {}", tag);
-                    println!("   fix and run `ato publish` again");
-                }
-                anyhow::bail!(summary.message)
-            }
-            publish_tui::PublishTuiOutcome::Cancelled => {
-                println!("Publish was cancelled.");
-                Ok(())
-            }
-        }
-    })
-}
-
 fn execute_setup_command(
     engine: String,
     version: Option<String>,
@@ -2865,6 +2824,7 @@ fn is_sha256_hex(value: &str) -> bool {
     value.len() == 64 && value.as_bytes().iter().all(|b| b.is_ascii_hexdigit())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_run_like_command(
     path: PathBuf,
     target: Option<String>,
@@ -3011,9 +2971,49 @@ async fn resolve_run_target_or_install(
         }
     };
 
-    if let Some(installed_capsule) =
-        resolve_installed_capsule_archive(&scoped_ref, registry).await?
-    {
+    let installed_capsule = resolve_installed_capsule_archive(&scoped_ref, registry, None).await?;
+    let mut registry_detail = None;
+    let mut registry_installable_version = None;
+
+    if let Some(explicit_registry) = registry {
+        match install::fetch_capsule_detail(&scoped_ref.scoped_id, Some(explicit_registry)).await {
+            Ok(detail) => {
+                registry_installable_version = detail
+                    .latest_version
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string);
+
+                if let Some(version) = registry_installable_version.as_deref() {
+                    if let Some(installed_capsule) =
+                        resolve_installed_capsule_archive(&scoped_ref, registry, Some(version))
+                            .await?
+                    {
+                        debug!(
+                            capsule = %installed_capsule.display(),
+                            version = version,
+                            "Using installed capsule matching registry current version"
+                        );
+                        return Ok(installed_capsule);
+                    }
+                }
+
+                registry_detail = Some(detail);
+            }
+            Err(error) => {
+                if let Some(installed_capsule) = installed_capsule {
+                    debug!(
+                        capsule = %installed_capsule.display(),
+                        error = %error,
+                        "Falling back to installed capsule after registry detail lookup failed"
+                    );
+                    return Ok(installed_capsule);
+                }
+                return Err(error);
+            }
+        }
+    } else if let Some(installed_capsule) = installed_capsule {
         debug!(
             capsule = %installed_capsule.display(),
             "Using installed capsule"
@@ -3040,20 +3040,27 @@ async fn resolve_run_target_or_install(
     }
 
     let effective_registry = registry.unwrap_or(DEFAULT_RUN_REGISTRY_URL);
-    let detail =
-        install::fetch_capsule_detail(&scoped_ref.scoped_id, Some(effective_registry)).await?;
-    let installable_version = detail
-        .latest_version
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Cannot auto-install '{}': no installable version is published.",
-                detail.scoped_id
-            )
-        })?
-        .to_string();
+    let detail = if let Some(detail) = registry_detail {
+        detail
+    } else {
+        install::fetch_capsule_detail(&scoped_ref.scoped_id, Some(effective_registry)).await?
+    };
+    let installable_version = if let Some(version) = registry_installable_version {
+        version
+    } else {
+        detail
+            .latest_version
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Cannot auto-install '{}': no installable version is published.",
+                    detail.scoped_id
+                )
+            })?
+            .to_string()
+    };
 
     if !yes {
         let approved = prompt_install_confirmation(&detail, &installable_version)?;
@@ -3075,6 +3082,7 @@ async fn resolve_run_target_or_install(
         false,
         allow_unverified,
         json_mode,
+        false,
     )
     .await?;
     Ok(install_result.path)
@@ -3119,14 +3127,16 @@ fn expand_explicit_local_path(raw: &str) -> PathBuf {
 async fn resolve_installed_capsule_archive(
     scoped_ref: &install::ScopedCapsuleRef,
     registry: Option<&str>,
+    preferred_version: Option<&str>,
 ) -> Result<Option<PathBuf>> {
     let store_root = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join(".capsule")
+        .join(".ato")
         .join("store");
     if let Some(path) = resolve_installed_capsule_archive_in_store(
         &store_root.join(&scoped_ref.publisher),
         &scoped_ref.slug,
+        preferred_version,
     )? {
         return Ok(Some(path));
     }
@@ -3143,6 +3153,7 @@ async fn resolve_installed_capsule_archive(
         return resolve_installed_capsule_archive_in_store(
             &store_root.join(&scoped_ref.publisher),
             &scoped_ref.slug,
+            preferred_version,
         );
     }
 
@@ -3187,16 +3198,29 @@ async fn resolve_installed_capsule_archive(
     resolve_installed_capsule_archive_in_store(
         &store_root.join(&scoped_ref.publisher),
         &scoped_ref.slug,
+        preferred_version,
     )
 }
 
 fn resolve_installed_capsule_archive_in_store(
     store_root: &std::path::Path,
     slug: &str,
+    preferred_version: Option<&str>,
 ) -> Result<Option<PathBuf>> {
     let slug_dir = store_root.join(slug);
     if !slug_dir.exists() || !slug_dir.is_dir() {
         return Ok(None);
+    }
+
+    if let Some(version) = preferred_version
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let version_dir = slug_dir.join(version);
+        if !version_dir.exists() || !version_dir.is_dir() {
+            return Ok(None);
+        }
+        return select_capsule_file_in_version(&version_dir);
     }
 
     let mut version_dirs: Vec<(ParsedSemver, PathBuf)> = Vec::new();
@@ -3342,7 +3366,7 @@ fn print_permission_summary(permissions: Option<&install::CapsulePermissions>) {
 }
 
 fn can_prompt_interactively(stdin_is_tty: bool, stdout_is_tty: bool) -> bool {
-    stdin_is_tty && stdout_is_tty
+    tui::can_launch_tui(stdin_is_tty, stdout_is_tty)
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -3436,6 +3460,7 @@ fn enforce_sandbox_mode_flags(
     Ok(enforcement)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_open_command(
     path: PathBuf,
     target: Option<String>,
@@ -3513,6 +3538,7 @@ fn execute_source_rebuild_command(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_search_command(
     query: Option<String>,
     category: Option<String>,
@@ -3524,7 +3550,12 @@ fn execute_search_command(
     no_tui: bool,
     show_manifest: bool,
 ) -> Result<()> {
-    if std::io::stdout().is_terminal() && !json && !no_tui {
+    if should_use_search_tui(
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+        json,
+        no_tui,
+    ) {
         let selected = tui::run_search_tui(tui::SearchTuiArgs {
             query: query.clone(),
             category: category.clone(),
@@ -3558,6 +3589,15 @@ fn execute_search_command(
         }
         Ok(())
     })
+}
+
+fn should_use_search_tui(
+    stdin_is_tty: bool,
+    stdout_is_tty: bool,
+    json: bool,
+    no_tui: bool,
+) -> bool {
+    tui::can_launch_tui(stdin_is_tty, stdout_is_tty) && !json && !no_tui
 }
 
 #[cfg(test)]
@@ -3631,7 +3671,7 @@ mod tests {
         std::fs::write(slug_dir.join("1.2.0-rc1/preview.capsule"), b"preview").unwrap();
         std::fs::write(slug_dir.join("1.2.0/new.capsule"), b"new").unwrap();
 
-        let resolved = resolve_installed_capsule_archive_in_store(tmp.path(), slug)
+        let resolved = resolve_installed_capsule_archive_in_store(tmp.path(), slug, None)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -3641,11 +3681,40 @@ mod tests {
     }
 
     #[test]
+    fn resolve_installed_capsule_can_target_exact_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let slug = "demo-app";
+        let slug_dir = tmp.path().join(slug);
+        std::fs::create_dir_all(slug_dir.join("1.0.0")).unwrap();
+        std::fs::create_dir_all(slug_dir.join("2.0.0")).unwrap();
+
+        std::fs::write(slug_dir.join("1.0.0/rolled-back.capsule"), b"old").unwrap();
+        std::fs::write(slug_dir.join("2.0.0/current.capsule"), b"new").unwrap();
+
+        let resolved = resolve_installed_capsule_archive_in_store(tmp.path(), slug, Some("1.0.0"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            resolved.file_name().and_then(|name| name.to_str()),
+            Some("rolled-back.capsule")
+        );
+    }
+
+    #[test]
     fn tty_prompt_gate_requires_both_streams() {
         assert!(can_prompt_interactively(true, true));
         assert!(!can_prompt_interactively(true, false));
         assert!(!can_prompt_interactively(false, true));
         assert!(!can_prompt_interactively(false, false));
+    }
+
+    #[test]
+    fn search_tui_gate_requires_tty_and_flags_allowing_tui() {
+        assert!(should_use_search_tui(true, true, false, false));
+        assert!(!should_use_search_tui(false, true, false, false));
+        assert!(!should_use_search_tui(true, false, false, false));
+        assert!(!should_use_search_tui(true, true, true, false));
+        assert!(!should_use_search_tui(true, true, false, true));
     }
 
     #[test]

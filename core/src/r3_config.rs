@@ -433,7 +433,7 @@ fn read_health_check(manifest: &toml::Value) -> Option<HealthCheck> {
     })
 }
 
-fn selected_target_table<'a>(manifest: &'a toml::Value) -> Option<&'a toml::value::Table> {
+fn selected_target_table(manifest: &toml::Value) -> Option<&toml::value::Table> {
     let default_target = manifest
         .get("default_target")
         .and_then(|v| v.as_str())

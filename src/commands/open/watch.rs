@@ -65,14 +65,6 @@ impl CapsuleHandle {
         }
         Ok(())
     }
-
-    pub fn is_running(&self) -> bool {
-        let guard = self.process_handle.lock().unwrap();
-        match guard.as_ref() {
-            Some(_) => true,
-            None => false,
-        }
-    }
 }
 
 pub fn watch_directory(
@@ -231,11 +223,13 @@ fn is_symlink_path(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(test)]
 fn should_watch(path: &Path, watch_patterns: &[String]) -> bool {
     let compiled = compile_patterns(watch_patterns);
     should_watch_compiled(path, &compiled)
 }
 
+#[cfg(test)]
 fn should_ignore(path: &Path, ignore_patterns: &[String]) -> bool {
     let compiled = compile_patterns(ignore_patterns);
     should_ignore_compiled(path, &compiled)

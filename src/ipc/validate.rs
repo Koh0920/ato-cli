@@ -9,7 +9,10 @@
 
 use std::path::Path;
 
+use anyhow::{Context, Result};
+
 use super::dag::{self, DagError, RESERVED_PREFIXES};
+use super::schema;
 use super::types::IpcConfig;
 
 /// A single IPC validation diagnostic.
@@ -78,7 +81,37 @@ pub fn validate_ipc(
     // Rule 6: Empty exports validation
     check_empty_exports(ipc_config, &mut diagnostics);
 
+    // Rule 7: Referenced JSON Schema files
+    check_schema_files(ipc_config, capsule_root, &mut diagnostics);
+
     diagnostics
+}
+
+/// Parse the manifest-level `[ipc]` section and run all IPC validators.
+pub fn validate_manifest(
+    raw_toml: &toml::Value,
+    capsule_root: &Path,
+) -> Result<Vec<IpcDiagnostic>> {
+    let Some(ipc_table) = raw_toml.get("ipc") else {
+        return Ok(Vec::new());
+    };
+
+    let ipc_str = toml::to_string(ipc_table).context("Failed to serialize [ipc] section")?;
+    let config: IpcConfig =
+        toml::from_str(&ipc_str).context("Failed to parse [ipc] section for validation")?;
+
+    let service_names = raw_toml
+        .get("services")
+        .and_then(|value| value.as_table())
+        .map(|table| table.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    Ok(validate_ipc(
+        &config,
+        raw_toml,
+        capsule_root,
+        &service_names,
+    ))
 }
 
 /// IPC-001: `[ipc.exports.sharing]` and `[lifecycle]` shortcut cannot coexist.
@@ -288,11 +321,9 @@ fn check_import_resolvability(
             let store_path = if from.starts_with('@') {
                 let without_at = from.strip_prefix('@').unwrap_or(from);
                 let name = without_at.split(':').next().unwrap_or(without_at);
-                home.join(".capsule")
-                    .join("store")
-                    .join(format!("@{}", name))
+                home.join(".ato").join("store").join(format!("@{}", name))
             } else {
-                home.join(".capsule").join("store").join(from)
+                home.join(".ato").join("store").join(from)
             };
 
             if !store_path.exists() {
@@ -333,6 +364,62 @@ fn check_empty_exports(ipc_config: &IpcConfig, diagnostics: &mut Vec<IpcDiagnost
                     .to_string(),
             });
         }
+    }
+}
+
+/// IPC-008: Referenced JSON Schema files must exist and compile.
+fn check_schema_files(
+    ipc_config: &IpcConfig,
+    capsule_root: &Path,
+    diagnostics: &mut Vec<IpcDiagnostic>,
+) {
+    let Some(exports) = ipc_config.exports.as_ref() else {
+        return;
+    };
+
+    for method in &exports.methods {
+        if let Some(schema_path) = method.input_schema.as_deref() {
+            check_single_schema_file(
+                method,
+                "input_schema",
+                schema_path,
+                capsule_root,
+                diagnostics,
+            );
+        }
+        if let Some(schema_path) = method.output_schema.as_deref() {
+            check_single_schema_file(
+                method,
+                "output_schema",
+                schema_path,
+                capsule_root,
+                diagnostics,
+            );
+        }
+    }
+}
+
+fn check_single_schema_file(
+    method: &super::types::IpcMethodDescriptor,
+    field: &'static str,
+    schema_path: &str,
+    capsule_root: &Path,
+    diagnostics: &mut Vec<IpcDiagnostic>,
+) {
+    match schema::load_schema_value(schema_path, capsule_root)
+        .and_then(|value| schema::validate_schema_definition(&value, schema_path))
+    {
+        Ok(()) => {}
+        Err(err) => diagnostics.push(IpcDiagnostic {
+            severity: Severity::Error,
+            code: "IPC-008",
+            message: format!(
+                "Method '{}' references invalid {} '{}': {}",
+                method.name, field, schema_path, err
+            ),
+            location: format!("[ipc.exports.methods.{}.{}]", method.name, field),
+            hint: "Provide a readable JSON Schema file relative to the capsule root.".to_string(),
+        }),
     }
 }
 
@@ -568,6 +655,58 @@ mod tests {
         let diagnostics = validate_ipc(&config, &empty_toml(), Path::new("/tmp"), &[]);
         assert!(diagnostics.iter().any(|d| d.code == "IPC-007"));
         assert!(!has_errors(&diagnostics));
+    }
+
+    #[test]
+    fn test_ipc_008_missing_schema_file_is_error() {
+        let config = IpcConfig {
+            exports: Some(IpcExportsConfig {
+                name: Some("schema-service".to_string()),
+                methods: vec![IpcMethodDescriptor {
+                    name: "ping".to_string(),
+                    description: String::new(),
+                    input_schema: Some("schemas/missing.json".to_string()),
+                    output_schema: None,
+                }],
+                sharing: IpcSharingConfig::default(),
+            }),
+            imports: HashMap::new(),
+        };
+
+        let diagnostics = validate_ipc(&config, &empty_toml(), Path::new("/tmp"), &[]);
+        assert!(diagnostics.iter().any(|d| d.code == "IPC-008"));
+        assert!(has_errors(&diagnostics));
+    }
+
+    #[test]
+    fn test_validate_manifest_reports_compilable_schema() {
+        let temp = tempfile::tempdir().unwrap();
+        let schema_dir = temp.path().join("schemas");
+        std::fs::create_dir_all(&schema_dir).unwrap();
+        std::fs::write(
+            schema_dir.join("input.json"),
+            r#"{"type":"object","properties":{"name":{"type":"string"}}}"#,
+        )
+        .unwrap();
+
+        let manifest: toml::Value = toml::from_str(
+            r#"
+            [ipc.exports]
+            name = "schema-service"
+
+            [[ipc.exports.methods]]
+            name = "ping"
+            input_schema = "schemas/input.json"
+            "#,
+        )
+        .unwrap();
+
+        let diagnostics = validate_manifest(&manifest, temp.path()).unwrap();
+        assert!(
+            diagnostics.is_empty(),
+            "expected no diagnostics, got: {}",
+            format_diagnostics(&diagnostics)
+        );
     }
 
     #[test]

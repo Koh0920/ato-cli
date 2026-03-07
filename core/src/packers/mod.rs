@@ -3,6 +3,7 @@ pub mod capsule;
 pub mod lockfile;
 pub mod oci;
 pub mod pack_filter;
+pub mod payload;
 pub mod runtime_fetcher;
 pub mod sbom;
 pub mod source;

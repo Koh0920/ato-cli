@@ -136,7 +136,7 @@ pub fn to_did_key(internal: &str) -> Result<String> {
 /// Internal format string (e.g., `ed25519:dGVzdC4uLg==`)
 pub fn from_did_key(did: &str) -> Result<String> {
     let public_key = did_to_public_key(did)?;
-    Ok(format!("ed25519:{}", BASE64.encode(&public_key)))
+    Ok(format!("ed25519:{}", BASE64.encode(public_key)))
 }
 
 /// Parse internal key format (`ed25519:base64`) to raw bytes.
@@ -202,7 +202,7 @@ fn base58_encode(data: &[u8]) -> String {
     let mut result = Vec::new();
     let mut num = data.to_vec();
 
-    while !num.is_empty() && !(num.len() == 1 && num[0] == 0) {
+    while !(num.is_empty() || num.len() == 1 && num[0] == 0) {
         let mut remainder = 0u32;
         let mut new_num = Vec::new();
 
@@ -221,9 +221,7 @@ fn base58_encode(data: &[u8]) -> String {
     }
 
     // Add leading '1's for leading zeros
-    for _ in 0..zeros {
-        result.push(b'1');
-    }
+    result.extend(std::iter::repeat_n(b'1', zeros));
 
     result.reverse();
     String::from_utf8(result).expect("base58 alphabet is valid UTF-8")

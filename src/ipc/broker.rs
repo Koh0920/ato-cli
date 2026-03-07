@@ -12,14 +12,13 @@
 //! 4. **Monitor**: Track refcounts and idle timeouts.
 //! 5. **Shutdown**: Stop services gracefully on teardown.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use anyhow::Result;
 use tracing::{debug, info, warn};
 
 use super::registry::IpcRegistry;
 use super::token::TokenManager;
-use super::types::{IpcConfig, IpcRuntimeKind, IpcServiceInfo, IpcTransport};
+use super::types::{IpcConfig, IpcRuntimeKind, IpcServiceInfo, IpcTransport, SharingMode};
 
 /// IPC Broker — the central IPC coordinator.
 ///
@@ -41,12 +40,7 @@ pub enum ResolvedService {
     /// Service is already running (found in registry).
     Running(IpcServiceInfo),
     /// Service found in local store but not yet started.
-    LocalStore {
-        /// Path to the capsule root.
-        capsule_root: PathBuf,
-        /// Detected runtime kind.
-        runtime_kind: IpcRuntimeKind,
-    },
+    LocalStore(LocalServiceMetadata),
     /// Service not found anywhere.
     NotFound {
         /// Original `from` specifier.
@@ -54,6 +48,14 @@ pub enum ResolvedService {
         /// Suggested action for the user.
         suggestion: String,
     },
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalServiceMetadata {
+    pub manifest_path: PathBuf,
+    pub runtime_kind: IpcRuntimeKind,
+    pub capabilities: Vec<String>,
+    pub sharing_mode: SharingMode,
 }
 
 impl IpcBroker {
@@ -79,7 +81,7 @@ impl IpcBroker {
     ///
     /// Resolution order:
     /// 1. Local Registry (already running)
-    /// 2. Local Store (`~/.capsule/store/`)
+    /// 2. Local Store (`~/.ato/store/`)
     /// 3. Error (suggest `ato install`)
     pub fn resolve(&self, from: &str) -> ResolvedService {
         // 1. Check if already running
@@ -91,17 +93,14 @@ impl IpcBroker {
         // 2. Check local store
         let store_path = self.local_store_path(from);
         if store_path.exists() {
-            let runtime_kind = detect_runtime_kind(&store_path);
+            let metadata = load_local_service_metadata(&store_path);
             debug!(
                 service = from,
                 path = %store_path.display(),
-                runtime = %runtime_kind,
+                runtime = %metadata.runtime_kind,
                 "IPC service found in local store"
             );
-            return ResolvedService::LocalStore {
-                capsule_root: store_path,
-                runtime_kind,
-            };
+            return ResolvedService::LocalStore(metadata);
         }
 
         // 3. Not found
@@ -152,64 +151,23 @@ impl IpcBroker {
         env
     }
 
-    /// Collect all IPC socket paths for sandbox policy injection.
-    ///
-    /// Returns paths that nacelle should allow in the Landlock/Seatbelt sandbox.
-    pub fn collect_ipc_socket_paths(&self, config: &IpcConfig) -> Vec<PathBuf> {
-        let mut paths = Vec::new();
-        for import_name in config.imports.keys() {
-            paths.push(self.socket_path(import_name));
-        }
-        // Also allow the socket directory itself
-        if !config.imports.is_empty() {
-            paths.push(self.socket_dir.clone());
-        }
-        paths
-    }
-
-    /// Shutdown all running services.
-    pub fn shutdown_all(&self) -> Result<()> {
-        let services = self.registry.list();
-        info!(count = services.len(), "Shutting down all IPC services");
-
-        for svc in &services {
-            if let Some(pid) = svc.pid {
-                debug!(service = %svc.name, pid, "Sending SIGTERM to IPC service");
-                #[cfg(unix)]
-                {
-                    let ret = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-                    if ret != 0 {
-                        let errno = std::io::Error::last_os_error();
-                        warn!(
-                            service = %svc.name,
-                            pid,
-                            error = %errno,
-                            "Failed to send SIGTERM to IPC service"
-                        );
-                    }
-                }
-            }
-            self.registry.unregister(&svc.name);
-        }
-
-        // Revoke all tokens
-        self.token_manager.revoke_all();
-
-        Ok(())
-    }
-
     /// Compute the local store path for a service.
     fn local_store_path(&self, from: &str) -> PathBuf {
         // Handle different `from` formats:
-        // - "greeter-service" → ~/.capsule/store/greeter-service/
-        // - "@scope/name:1.0" → ~/.capsule/store/@scope/name/
-        // - "./relative/path" → relative path as-is
-        if from.starts_with("./") || from.starts_with("../") {
+        // - "greeter-service" → ~/.ato/store/greeter-service/
+        // - "@scope/name:1.0" → ~/.ato/store/@scope/name/
+        // - "./relative/path" / "/absolute/path" / "~/path" → filesystem path
+        if from.starts_with("./") || from.starts_with("../") || Path::new(from).is_absolute() {
             return PathBuf::from(from);
         }
 
+        if let Some(path) = from.strip_prefix("~/") {
+            let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+            return home.join(path);
+        }
+
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-        let store_dir = home.join(".capsule").join("store");
+        let store_dir = home.join(".ato").join("store");
 
         if from.starts_with('@') {
             // @scope/name:version → scope/name
@@ -224,7 +182,7 @@ impl IpcBroker {
 
 /// Detect the runtime kind by examining the capsule directory.
 fn detect_runtime_kind(capsule_root: &std::path::Path) -> IpcRuntimeKind {
-    let manifest_path = capsule_root.join("capsule.toml");
+    let manifest_path = resolve_manifest_path(capsule_root);
     if let Ok(content) = std::fs::read_to_string(&manifest_path) {
         if let Ok(raw) = content.parse::<toml::Value>() {
             if let Some(default_target) = raw
@@ -254,6 +212,47 @@ fn detect_runtime_kind(capsule_root: &std::path::Path) -> IpcRuntimeKind {
     IpcRuntimeKind::Source
 }
 
+fn load_local_service_metadata(capsule_root: &Path) -> LocalServiceMetadata {
+    let manifest_path = resolve_manifest_path(capsule_root);
+    let runtime_kind = detect_runtime_kind(capsule_root);
+    let mut capabilities = Vec::new();
+    let mut sharing_mode = SharingMode::default();
+
+    if let Ok(content) = std::fs::read_to_string(&manifest_path) {
+        if let Ok(raw) = content.parse::<toml::Value>() {
+            if let Some(ipc_table) = raw.get("ipc") {
+                if let Ok(ipc_str) = toml::to_string(ipc_table) {
+                    if let Ok(config) = toml::from_str::<IpcConfig>(&ipc_str) {
+                        if let Some(exports) = config.exports {
+                            capabilities = exports
+                                .methods
+                                .into_iter()
+                                .map(|method| method.name)
+                                .collect();
+                            sharing_mode = exports.sharing.mode;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    LocalServiceMetadata {
+        manifest_path,
+        runtime_kind,
+        capabilities,
+        sharing_mode,
+    }
+}
+
+fn resolve_manifest_path(capsule_root: &Path) -> PathBuf {
+    if capsule_root.is_file() {
+        capsule_root.to_path_buf()
+    } else {
+        capsule_root.join("capsule.toml")
+    }
+}
+
 /// Sanitize a service name for use in file paths.
 fn sanitize_name(name: &str) -> String {
     name.chars()
@@ -274,10 +273,9 @@ fn sanitize_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use std::time::Instant;
 
-    use crate::ipc::types::{ActivationMode, IpcImportConfig, SharingMode};
+    use crate::ipc::types::SharingMode;
 
     fn test_broker() -> IpcBroker {
         let dir = std::env::temp_dir().join("capsule-ipc-test");
@@ -308,9 +306,6 @@ mod tests {
             started_at: Some(Instant::now()),
             runtime_kind: IpcRuntimeKind::Source,
             sharing_mode: SharingMode::Singleton,
-            activation: ActivationMode::Eager,
-            capsule_root: PathBuf::from("/app/greeter"),
-            port: None,
         });
 
         match broker.resolve("greeter") {
@@ -341,9 +336,6 @@ mod tests {
             started_at: None,
             runtime_kind: IpcRuntimeKind::Source,
             sharing_mode: SharingMode::Singleton,
-            activation: ActivationMode::Eager,
-            capsule_root: PathBuf::from("/app/llm"),
-            port: None,
         };
 
         let env = broker.generate_ipc_env("llm-service", &info, "token123");
@@ -355,29 +347,6 @@ mod tests {
         assert!(env
             .iter()
             .any(|(k, _)| k == "CAPSULE_IPC_LLM_SERVICE_SOCKET"));
-    }
-
-    #[test]
-    fn test_collect_ipc_socket_paths() {
-        let broker = test_broker();
-        let mut imports = HashMap::new();
-        imports.insert(
-            "greeter".to_string(),
-            IpcImportConfig {
-                from: "greeter-service".to_string(),
-                activation: ActivationMode::Eager,
-                optional: false,
-            },
-        );
-
-        let config = IpcConfig {
-            exports: None,
-            imports,
-        };
-
-        let paths = broker.collect_ipc_socket_paths(&config);
-        // Should include the socket file + the socket directory
-        assert_eq!(paths.len(), 2);
     }
 
     #[test]
@@ -394,7 +363,7 @@ mod tests {
         assert!(path
             .to_str()
             .unwrap()
-            .contains(".capsule/store/greeter-service"));
+            .contains(".ato/store/greeter-service"));
     }
 
     #[test]
@@ -404,7 +373,7 @@ mod tests {
         assert!(path
             .to_str()
             .unwrap()
-            .contains(".capsule/store/@ato/llm-service"));
+            .contains(".ato/store/@ato/llm-service"));
     }
 
     #[test]

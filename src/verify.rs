@@ -46,8 +46,6 @@ struct JsonSignature {
     signature: String,
     content_hash: String,
     public_key: String,
-    #[allow(dead_code)]
-    signer: String,
     signed_at: u64,
 }
 

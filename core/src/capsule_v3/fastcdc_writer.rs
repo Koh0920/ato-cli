@@ -345,11 +345,6 @@ impl FastCdcWriter {
         }
         Ok(())
     }
-
-    #[cfg(test)]
-    pub(crate) fn inject_sticky_error_for_test(&mut self, message: &str) {
-        self.sticky_error = Some(message.to_string());
-    }
 }
 
 fn validate_config(config: &FastCdcWriterConfig) -> Result<()> {

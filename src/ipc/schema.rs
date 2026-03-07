@@ -16,9 +16,11 @@ use thiserror::Error;
 use tracing::debug;
 
 /// Maximum message size in bytes (default: 1 MB).
+#[allow(dead_code)]
 pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 1_024 * 1_024;
 
 /// Schema validation error with developer-facing hint.
+#[allow(dead_code)]
 #[derive(Debug, Error)]
 pub enum SchemaError {
     /// Input does not conform to the JSON Schema.
@@ -38,6 +40,7 @@ pub enum SchemaError {
 
 impl SchemaError {
     /// JSON-RPC error code for this error.
+    #[allow(dead_code)]
     pub fn error_code(&self) -> i64 {
         match self {
             SchemaError::ValidationFailed { .. } => -32003,
@@ -47,6 +50,7 @@ impl SchemaError {
     }
 
     /// Developer-facing hint.
+    #[allow(dead_code)]
     pub fn hint(&self) -> String {
         match self {
             SchemaError::ValidationFailed { hint, .. } => hint.clone(),
@@ -75,11 +79,18 @@ impl SchemaError {
 ///
 /// Returns `SchemaError::ValidationFailed` if the input does not match the schema.
 /// Returns `SchemaError::SchemaLoadError` if the schema file cannot be read.
+#[allow(dead_code)]
 pub fn validate_input(
     schema_path: &str,
     capsule_root: &Path,
     input: &Value,
 ) -> Result<(), SchemaError> {
+    let schema_value = load_schema_value(schema_path, capsule_root)?;
+    validate_against_schema(&schema_value, input, schema_path)
+}
+
+/// Load and parse a schema file relative to the capsule root.
+pub fn load_schema_value(schema_path: &str, capsule_root: &Path) -> Result<Value, SchemaError> {
     let resolved = capsule_root.join(schema_path);
     let schema_content = std::fs::read_to_string(&resolved).map_err(|e| {
         SchemaError::SchemaLoadError(format!(
@@ -89,19 +100,20 @@ pub fn validate_input(
         ))
     })?;
 
-    let schema_value: Value = serde_json::from_str(&schema_content).map_err(|e| {
+    serde_json::from_str(&schema_content).map_err(|e| {
         SchemaError::SchemaLoadError(format!("Invalid JSON in schema {}: {}", schema_path, e))
-    })?;
-
-    validate_against_schema(&schema_value, input, schema_path)
+    })
 }
 
 /// Validate input JSON against an already-parsed schema value.
+#[allow(dead_code)]
 pub fn validate_against_schema(
     schema: &Value,
     input: &Value,
     schema_name: &str,
 ) -> Result<(), SchemaError> {
+    validate_schema_definition(schema, schema_name)?;
+
     let compiled = jsonschema::JSONSchema::compile(schema).map_err(|e| {
         SchemaError::SchemaLoadError(format!("Failed to compile schema '{}': {}", schema_name, e))
     })?;
@@ -121,12 +133,22 @@ pub fn validate_against_schema(
     Ok(())
 }
 
+/// Validate that a schema definition is itself valid JSON Schema.
+pub fn validate_schema_definition(schema: &Value, schema_name: &str) -> Result<(), SchemaError> {
+    let compiled = jsonschema::JSONSchema::compile(schema).map_err(|e| {
+        SchemaError::SchemaLoadError(format!("Failed to compile schema '{}': {}", schema_name, e))
+    })?;
+    let _ = compiled;
+    Ok(())
+}
+
 /// Check that a serialized message does not exceed the size limit.
 ///
 /// # Arguments
 ///
 /// * `data` — Serialized message bytes.
 /// * `max_size` — Maximum allowed size (use `DEFAULT_MAX_MESSAGE_SIZE` for default).
+#[allow(dead_code)]
 pub fn check_message_size(data: &[u8], max_size: usize) -> Result<(), SchemaError> {
     if data.len() > max_size {
         return Err(SchemaError::MessageTooLarge {
