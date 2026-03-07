@@ -66,6 +66,7 @@ fn run_lockfile_measurement() -> (
 schema_version = "0.2"
 name = "alloc-gate-demo"
 version = "0.1.0"
+type = "app"
 default_target = "default"
 
 [targets.default]

@@ -2,8 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 
-use super::capsule_v1::{CapsuleManifestV1, RuntimeType};
-use super::error::CapsuleError;
+use super::{CapsuleError, CapsuleManifest, RuntimeType};
 
 const DEFAULT_STORAGE_MOUNT_BASE: &str = "/var/lib/gumball/volumes";
 
@@ -11,7 +10,7 @@ fn default_storage_mount_base() -> String {
     std::env::var("GUMBALL_STORAGE_BASE").unwrap_or_else(|_| DEFAULT_STORAGE_MOUNT_BASE.to_string())
 }
 
-/// Normalized execution plan produced from capsule_v1 manifests.
+/// Normalized execution plan produced from manifests.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunPlan {
     pub capsule_id: String,
@@ -108,8 +107,8 @@ pub struct Mount {
     pub readonly: bool,
 }
 
-impl CapsuleManifestV1 {
-    /// Convert a validated capsule_v1 manifest into a normalized RunPlan.
+impl CapsuleManifest {
+    /// Convert a validated manifest into a normalized RunPlan.
     pub fn to_run_plan(&self) -> Result<RunPlan, CapsuleError> {
         let target = self.resolve_default_target()?;
         if target.entrypoint.trim().is_empty() {
@@ -210,7 +209,7 @@ impl CapsuleManifestV1 {
             }),
         };
 
-        // storage validation is handled by CapsuleManifestV1::validate(); keep to_run_plan focused.
+        // storage validation is handled by CapsuleManifest::validate(); keep to_run_plan focused.
 
         let memory_bytes = self.requirements.vram_min_bytes()?;
 
@@ -232,8 +231,8 @@ fn ordered_env(env: &HashMap<String, String>) -> BTreeMap<String, String> {
 }
 
 fn merged_target_env(
-    manifest: &CapsuleManifestV1,
-    target: &super::capsule_v1::NamedTarget,
+    manifest: &CapsuleManifest,
+    target: &super::NamedTarget,
 ) -> HashMap<String, String> {
     let mut env = manifest
         .targets
@@ -304,7 +303,7 @@ entrypoint = "ghcr.io/example/hello:latest"
 
     #[test]
     fn runplan_from_source_manifest() {
-        let manifest = CapsuleManifestV1::from_toml(SAMPLE_PYTHON_TOML).unwrap();
+        let manifest = CapsuleManifest::from_toml(SAMPLE_PYTHON_TOML).unwrap();
         manifest.validate().unwrap();
         let plan = manifest.to_run_plan().unwrap();
 
@@ -328,7 +327,7 @@ entrypoint = "ghcr.io/example/hello:latest"
 
     #[test]
     fn runplan_from_docker_manifest() {
-        let manifest = CapsuleManifestV1::from_toml(SAMPLE_DOCKER_TOML).unwrap();
+        let manifest = CapsuleManifest::from_toml(SAMPLE_DOCKER_TOML).unwrap();
         manifest.validate().unwrap();
         let plan = manifest.to_run_plan().unwrap();
 

@@ -6,23 +6,44 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 
-const RUN_DIR: &str = ".capsule/run";
+const RUN_DIR: &str = ".ato/run";
 const PID_FILE_EXT: &str = ".pid";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProcessInfo {
     pub id: String,
     pub name: String,
     pub pid: i32,
+    #[serde(default)]
+    pub workload_pid: Option<i32>,
     pub status: ProcessStatus,
     pub runtime: String,
     pub start_time: SystemTime,
+    #[serde(default)]
     pub manifest_path: Option<PathBuf>,
+    #[serde(default)]
+    pub scoped_id: Option<String>,
+    #[serde(default)]
+    pub target_label: Option<String>,
+    #[serde(default)]
+    pub log_path: Option<PathBuf>,
+    #[serde(default)]
+    pub ready_at: Option<SystemTime>,
+    #[serde(default)]
+    pub last_event: Option<String>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProcessStatus {
+    Starting,
+    Ready,
     Running,
+    Exited,
+    Failed,
     Stopped,
     Unknown,
 }
@@ -30,10 +51,23 @@ pub enum ProcessStatus {
 impl std::fmt::Display for ProcessStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ProcessStatus::Starting => write!(f, "starting"),
+            ProcessStatus::Ready => write!(f, "ready"),
             ProcessStatus::Running => write!(f, "running"),
+            ProcessStatus::Exited => write!(f, "exited"),
+            ProcessStatus::Failed => write!(f, "failed"),
             ProcessStatus::Stopped => write!(f, "stopped"),
             ProcessStatus::Unknown => write!(f, "unknown"),
         }
+    }
+}
+
+impl ProcessStatus {
+    pub fn is_active(self) -> bool {
+        matches!(
+            self,
+            ProcessStatus::Starting | ProcessStatus::Ready | ProcessStatus::Running
+        )
     }
 }
 
@@ -76,8 +110,31 @@ impl ProcessManager {
         let pid_path = self.pid_file_path(id);
         let content = fs::read_to_string(&pid_path)
             .with_context(|| format!("Failed to read PID file: {}", pid_path.display()))?;
-        toml::from_str(&content)
-            .with_context(|| format!("Failed to parse PID file: {}", pid_path.display()))
+        let info: ProcessInfo = toml::from_str(&content)
+            .with_context(|| format!("Failed to parse PID file: {}", pid_path.display()))?;
+        let updated = self.update_process_status(&info);
+        if updated != info {
+            let serialized =
+                toml::to_string(&updated).with_context(|| "Failed to serialize process info")?;
+            fs::write(&pid_path, serialized)
+                .with_context(|| format!("Failed to write PID file: {}", pid_path.display()))?;
+            Ok(updated)
+        } else {
+            Ok(info)
+        }
+    }
+
+    pub fn update_pid<F>(&self, id: &str, updater: F) -> Result<ProcessInfo>
+    where
+        F: FnOnce(&mut ProcessInfo),
+    {
+        let pid_path = self.pid_file_path(id);
+        let mut info = self.read_pid(id)?;
+        updater(&mut info);
+        let serialized = toml::to_string(&info).with_context(|| "Failed to serialize process info")?;
+        fs::write(&pid_path, serialized)
+            .with_context(|| format!("Failed to write PID file: {}", pid_path.display()))?;
+        Ok(info)
     }
 
     pub fn delete_pid(&self, id: &str) -> Result<()> {
@@ -109,13 +166,7 @@ impl ProcessManager {
                 if let Some(filename) = path.file_stem() {
                     if let Some(id) = filename.to_str() {
                         if let Ok(info) = self.read_pid(id) {
-                            let updated_info = self.update_process_status(&info);
-                            if updated_info.status == ProcessStatus::Stopped
-                                && info.status != ProcessStatus::Stopped
-                            {
-                                let _ = self.write_pid(&updated_info);
-                            }
-                            processes.push(updated_info);
+                            processes.push(info);
                         }
                     }
                 }
@@ -126,16 +177,36 @@ impl ProcessManager {
     }
 
     fn update_process_status(&self, info: &ProcessInfo) -> ProcessInfo {
-        if info.status == ProcessStatus::Stopped {
+        if matches!(
+            info.status,
+            ProcessStatus::Stopped | ProcessStatus::Exited | ProcessStatus::Failed
+        ) {
             return info.clone();
         }
 
         let is_alive = is_process_alive(info.pid) && process_identity_matches(info);
+        if is_alive {
+            return info.clone();
+        }
+
         ProcessInfo {
-            status: if is_alive {
-                ProcessStatus::Running
+            status: match info.status {
+                ProcessStatus::Starting => ProcessStatus::Failed,
+                ProcessStatus::Ready | ProcessStatus::Running => ProcessStatus::Exited,
+                ProcessStatus::Stopped => ProcessStatus::Stopped,
+                ProcessStatus::Exited => ProcessStatus::Exited,
+                ProcessStatus::Failed => ProcessStatus::Failed,
+                ProcessStatus::Unknown => ProcessStatus::Unknown,
+            },
+            exit_code: if info.exit_code.is_some() {
+                info.exit_code
             } else {
-                ProcessStatus::Stopped
+                Some(-1)
+            },
+            last_error: if matches!(info.status, ProcessStatus::Starting) && info.last_error.is_none() {
+                Some("process exited before readiness".to_string())
+            } else {
+                info.last_error.clone()
             },
             ..info.clone()
         }
@@ -149,13 +220,46 @@ impl ProcessManager {
             .collect())
     }
 
+    pub fn cleanup_scoped_processes(&self, scoped_id: &str, force: bool) -> Result<usize> {
+        let mut cleaned = 0usize;
+        let mut failures = Vec::new();
+
+        for process in self.list_processes()?.into_iter().filter(|process| {
+            process.scoped_id.as_deref() == Some(scoped_id)
+        }) {
+            if process.status.is_active() {
+                match self.stop_process(&process.id, force) {
+                    Ok(_) => {
+                        cleaned += 1;
+                    }
+                    Err(err) => {
+                        failures.push(format!("{}: {}", process.id, err));
+                    }
+                }
+            } else {
+                self.delete_pid(&process.id)?;
+                cleaned += 1;
+            }
+        }
+
+        if failures.is_empty() {
+            Ok(cleaned)
+        } else {
+            anyhow::bail!(
+                "Failed to clean up process state for '{}': {}",
+                scoped_id,
+                failures.join(", ")
+            );
+        }
+    }
+
     pub fn stop_process(&self, id: &str, force: bool) -> Result<bool> {
         let info = match self.read_pid(id) {
             Ok(i) => i,
             Err(_) => return Ok(false),
         };
 
-        if info.status == ProcessStatus::Stopped {
+        if !info.status.is_active() {
             return Ok(false);
         }
 
@@ -194,8 +298,8 @@ impl ProcessManager {
                 if let Some(filename) = path.file_stem() {
                     if let Some(id) = filename.to_str() {
                         if let Ok(info) = self.read_pid(id) {
-                            if info.status == ProcessStatus::Stopped
-                                || (info.status == ProcessStatus::Running
+                            if !info.status.is_active()
+                                || (info.status.is_active()
                                     && (!is_process_alive(info.pid)
                                         || !process_identity_matches(&info)))
                             {
@@ -453,7 +557,11 @@ mod tests {
 
     #[test]
     fn test_process_status_display() {
+        assert_eq!(ProcessStatus::Starting.to_string(), "starting");
+        assert_eq!(ProcessStatus::Ready.to_string(), "ready");
         assert_eq!(ProcessStatus::Running.to_string(), "running");
+        assert_eq!(ProcessStatus::Exited.to_string(), "exited");
+        assert_eq!(ProcessStatus::Failed.to_string(), "failed");
         assert_eq!(ProcessStatus::Stopped.to_string(), "stopped");
         assert_eq!(ProcessStatus::Unknown.to_string(), "unknown");
     }
@@ -479,10 +587,18 @@ mod tests {
             id: "test-123".to_string(),
             name: "my-capsule".to_string(),
             pid: 12345,
+            workload_pid: Some(12346),
             status: ProcessStatus::Running,
             runtime: "nacelle".to_string(),
             start_time: SystemTime::UNIX_EPOCH,
             manifest_path: Some(PathBuf::from("/path/to/capsule.toml")),
+            scoped_id: Some("dev/test".to_string()),
+            target_label: Some("default".to_string()),
+            log_path: Some(PathBuf::from("/tmp/test.log")),
+            ready_at: Some(SystemTime::UNIX_EPOCH),
+            last_event: Some("spawned".to_string()),
+            last_error: None,
+            exit_code: None,
         };
 
         let serialized = toml::to_string(&info).expect("Failed to serialize");
@@ -491,9 +607,17 @@ mod tests {
         assert_eq!(info.id, deserialized.id);
         assert_eq!(info.name, deserialized.name);
         assert_eq!(info.pid, deserialized.pid);
+        assert_eq!(info.workload_pid, deserialized.workload_pid);
         assert_eq!(info.status, deserialized.status);
         assert_eq!(info.runtime, deserialized.runtime);
         assert_eq!(info.manifest_path, deserialized.manifest_path);
+        assert_eq!(info.scoped_id, deserialized.scoped_id);
+        assert_eq!(info.target_label, deserialized.target_label);
+        assert_eq!(info.log_path, deserialized.log_path);
+        assert_eq!(info.ready_at, deserialized.ready_at);
+        assert_eq!(info.last_event, deserialized.last_event);
+        assert_eq!(info.last_error, deserialized.last_error);
+        assert_eq!(info.exit_code, deserialized.exit_code);
     }
 
     #[test]
@@ -502,10 +626,18 @@ mod tests {
             id: "test-456".to_string(),
             name: "another-capsule".to_string(),
             pid: 67890,
+            workload_pid: None,
             status: ProcessStatus::Stopped,
             runtime: "nacelle".to_string(),
             start_time: SystemTime::UNIX_EPOCH,
             manifest_path: None,
+            scoped_id: None,
+            target_label: None,
+            log_path: None,
+            ready_at: None,
+            last_event: None,
+            last_error: None,
+            exit_code: None,
         };
 
         let serialized = toml::to_string(&info).expect("Failed to serialize");
@@ -513,6 +645,59 @@ mod tests {
 
         assert_eq!(info.id, deserialized.id);
         assert!(deserialized.manifest_path.is_none());
+    }
+
+    #[test]
+    fn cleanup_scoped_processes_removes_matching_records() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let run_dir = tmp.path().join("run");
+        fs::create_dir_all(&run_dir).expect("create run dir");
+        let pm = ProcessManager { run_dir };
+
+        let matching = ProcessInfo {
+            id: "match-1".to_string(),
+            name: "demo".to_string(),
+            pid: 0,
+            workload_pid: None,
+            status: ProcessStatus::Running,
+            runtime: "host".to_string(),
+            start_time: SystemTime::UNIX_EPOCH,
+            manifest_path: None,
+            scoped_id: Some("dev/demo".to_string()),
+            target_label: None,
+            log_path: None,
+            ready_at: None,
+            last_event: None,
+            last_error: None,
+            exit_code: None,
+        };
+        let other = ProcessInfo {
+            id: "other-1".to_string(),
+            name: "other".to_string(),
+            pid: 0,
+            workload_pid: None,
+            status: ProcessStatus::Stopped,
+            runtime: "host".to_string(),
+            start_time: SystemTime::UNIX_EPOCH,
+            manifest_path: None,
+            scoped_id: Some("dev/other".to_string()),
+            target_label: None,
+            log_path: None,
+            ready_at: None,
+            last_event: None,
+            last_error: None,
+            exit_code: None,
+        };
+
+        pm.write_pid(&matching).expect("write matching");
+        pm.write_pid(&other).expect("write other");
+
+        let cleaned = pm
+            .cleanup_scoped_processes("dev/demo", true)
+            .expect("cleanup");
+        assert_eq!(cleaned, 1);
+        assert!(!pm.pid_file_path("match-1").exists());
+        assert!(pm.pid_file_path("other-1").exists());
     }
 
     #[test]

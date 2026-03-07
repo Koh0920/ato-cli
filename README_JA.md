@@ -69,6 +69,17 @@ cargo build -p ato-cli
 - `--legacy-full-publish`（official専用）は旧既定（`prepare -> build -> deploy`）へ一時的に戻す互換フラグです。非推奨で、次回メジャーリリースで削除予定です。
 - `--ci` / `--dry-run` とフェーズ指定は併用不可
 
+## Dock-first フロー（Personal Dock）
+
+Dock-first では既存コマンドだけで運用します（新サブコマンドなし）。
+
+1. Store Web の `/publish` で Dock を作成/接続
+2. ローカルで artifact 作成: `ato build .`
+3. Dock endpoint へ publish:
+   `ATO_TOKEN=... ato publish --registry <dock-endpoint> --artifact ./<name>.capsule`
+4. 公開 Dock ページ `/d/<handle>` を共有
+5. 準備できたら Dock Control Tower から `Submit to Official Marketplace` を実行
+
 ```bash
 # 事前ビルド + private registry へ直接 publish（推奨）
 ato build .
@@ -264,7 +275,7 @@ ato run --from-skill /path/to/SKILL.md
 - `ATO_TOKEN`: ローカル/私設レジストリへの publish 認証トークン
 - `ATO_STORE_API_URL`: `ato search` / install 系で使う API ベースURL（default: `https://api.ato.run`）
 - `ATO_STORE_SITE_URL`: ストアWebのベースURL（default: `https://store.ato.run`）
-- `ATO_SESSION_TOKEN`: セッション認証トークン（`CAPSULE_SESSION_TOKEN` は互換）
+- `ATO_TOKEN`: ヘッドレス/CI 用のセッション認証トークン
 
 ## 検索・認証
 
@@ -277,7 +288,7 @@ ato whoami
 既定API:
 - `ATO_STORE_API_URL` (default: `https://api.ato.run`)
 - `ATO_STORE_SITE_URL` (default: `https://store.ato.run`)
-- `ATO_SESSION_TOKEN` (`CAPSULE_SESSION_TOKEN` は互換)
+- `ATO_TOKEN`
 
 ## 開発用テスト
 

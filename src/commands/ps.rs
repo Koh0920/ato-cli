@@ -11,14 +11,14 @@ pub struct PsArgs {
 }
 
 pub fn execute(args: PsArgs, reporter: Arc<CliReporter>) -> Result<()> {
-    futures::executor::block_on(reporter.notify("📋 Listing running capsules...".to_string()))?;
+    futures::executor::block_on(reporter.notify("📋 Listing capsule sessions...".to_string()))?;
 
     let pm = ProcessManager::new()?;
     pm.cleanup_dead_processes()?;
     let mut processes = pm.list_processes()?;
 
     if !args.all {
-        processes.retain(|p| p.status == ProcessStatus::Running);
+        processes.retain(|p| p.status.is_active());
     }
 
     if processes.is_empty() {
@@ -38,10 +38,16 @@ pub fn execute(args: PsArgs, reporter: Arc<CliReporter>) -> Result<()> {
                     "id": p.id,
                     "name": p.name,
                     "pid": p.pid,
+                    "workload_pid": p.workload_pid,
                     "status": p.status.to_string(),
                     "runtime": p.runtime,
                     "uptime": uptime,
-                    "manifest": p.manifest_path.as_ref().map(|m| m.display().to_string())
+                    "manifest": p.manifest_path.as_ref().map(|m| m.display().to_string()),
+                    "log_path": p.log_path.as_ref().map(|m| m.display().to_string()),
+                    "ready_at": p.ready_at,
+                    "last_event": p.last_event,
+                    "last_error": p.last_error,
+                    "exit_code": p.exit_code
                 })
             })
             .collect();
@@ -49,7 +55,7 @@ pub fn execute(args: PsArgs, reporter: Arc<CliReporter>) -> Result<()> {
         let output = serde_json::to_string_pretty(&json_output)?;
         futures::executor::block_on(reporter.notify(output))?;
     } else {
-        futures::executor::block_on(reporter.notify(format!("{}", "-".repeat(100))))?;
+        futures::executor::block_on(reporter.notify("-".repeat(100)))?;
         futures::executor::block_on(reporter.notify(format!(
             "{:>8} {:>8} {:>12} {:>15} {:>20} {}",
             "PID", "ID", "NAME", "STATUS", "RUNTIME", "UPTIME"
@@ -67,8 +73,12 @@ pub fn execute(args: PsArgs, reporter: Arc<CliReporter>) -> Result<()> {
                 .unwrap_or_else(|_| "unknown".to_string());
 
             let status_str = match p.status {
+                ProcessStatus::Starting => "🟡 starting",
+                ProcessStatus::Ready => "🟢 ready",
                 ProcessStatus::Running => "🟢 running",
-                ProcessStatus::Stopped => "🔴 stopped",
+                ProcessStatus::Exited => "⚪ exited",
+                ProcessStatus::Failed => "🔴 failed",
+                ProcessStatus::Stopped => "⚪ stopped",
                 ProcessStatus::Unknown => "🟡 unknown",
             };
 
@@ -86,7 +96,7 @@ pub fn execute(args: PsArgs, reporter: Arc<CliReporter>) -> Result<()> {
             )))?;
         }
 
-        futures::executor::block_on(reporter.notify(format!("{}", "-".repeat(100))))?;
+        futures::executor::block_on(reporter.notify("-".repeat(100)))?;
         futures::executor::block_on(
             reporter.notify(format!("Total: {} capsule(s)", processes.len())),
         )?;

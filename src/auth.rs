@@ -1,13 +1,17 @@
 //! Authentication module for Ato Store
 //!
 //! Manages authentication credentials for the ato CLI.
-//! Stores credentials in `~/.capsule/credentials.json`.
+//! Stores credentials in `~/.ato/credentials.json`.
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use ed25519_dalek::Signer;
+use keyring::{Entry, Error as KeyringError};
+use rand::rngs::OsRng;
+use rand::RngCore;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -17,6 +21,10 @@ const DEFAULT_STORE_API_URL: &str = "https://api.ato.run";
 const DEFAULT_STORE_SITE_URL: &str = "https://store.ato.run";
 const ENV_STORE_API_URL: &str = "ATO_STORE_API_URL";
 const ENV_STORE_SITE_URL: &str = "ATO_STORE_SITE_URL";
+const ENV_ATO_TOKEN: &str = "ATO_TOKEN";
+const KEYRING_SERVICE_NAME: &str = "run.ato.cli";
+const KEYRING_SESSION_ACCOUNT: &str = "current_session";
+const KEYRING_GITHUB_ACCOUNT: &str = "github_token";
 const GITHUB_APP_INSTALL_TIMEOUT_SECS: u64 = 5 * 60;
 const GITHUB_APP_INSTALL_POLL_SECS: u64 = 3;
 const GITHUB_APP_INSTALL_NOTICE_INTERVAL_SECS: u64 = 12;
@@ -61,19 +69,38 @@ pub struct Credentials {
 /// Manages authentication credentials
 pub struct AuthManager {
     credentials_path: PathBuf,
+    keyring_service: String,
+    keyring_session_account: String,
+    keyring_github_account: String,
 }
 
 impl AuthManager {
     /// Create a new AuthManager with default credentials path
     pub fn new() -> Result<Self> {
         let home = dirs::home_dir().context("Cannot determine home directory")?;
-        let credentials_path = home.join(".capsule").join("credentials.json");
-        Ok(Self { credentials_path })
+        let credentials_path = home.join(".ato").join("credentials.json");
+        Ok(Self {
+            credentials_path,
+            keyring_service: KEYRING_SERVICE_NAME.to_string(),
+            keyring_session_account: KEYRING_SESSION_ACCOUNT.to_string(),
+            keyring_github_account: KEYRING_GITHUB_ACCOUNT.to_string(),
+        })
     }
 
     /// Create AuthManager with custom credentials path (for testing)
+    #[cfg(test)]
     pub fn with_path(credentials_path: PathBuf) -> Self {
-        Self { credentials_path }
+        let suffix =
+            hex::encode(blake3::hash(credentials_path.to_string_lossy().as_bytes()).as_bytes())
+                .chars()
+                .take(8)
+                .collect::<String>();
+        Self {
+            credentials_path,
+            keyring_service: format!("{}.test", KEYRING_SERVICE_NAME),
+            keyring_session_account: format!("{}-{}", KEYRING_SESSION_ACCOUNT, suffix),
+            keyring_github_account: format!("{}-{}", KEYRING_GITHUB_ACCOUNT, suffix),
+        }
     }
 
     /// Load credentials from disk
@@ -96,7 +123,11 @@ impl AuthManager {
             )
         })?;
 
-        Ok(Some(creds))
+        let mut sanitized = creds;
+        sanitized.session_token = None;
+        sanitized.github_token = None;
+
+        Ok(Some(sanitized))
     }
 
     /// Save credentials to disk
@@ -106,8 +137,11 @@ impl AuthManager {
                 .with_context(|| format!("Failed to create directory {:?}", parent))?;
         }
 
-        let json =
-            serde_json::to_string_pretty(creds).context("Failed to serialize credentials")?;
+        let mut persistable = creds.clone();
+        persistable.session_token = None;
+        persistable.github_token = None;
+        let json = serde_json::to_string_pretty(&persistable)
+            .context("Failed to serialize credentials")?;
 
         fs::write(&self.credentials_path, json).with_context(|| {
             format!("Failed to write credentials to {:?}", self.credentials_path)
@@ -118,12 +152,9 @@ impl AuthManager {
 
     /// Load credentials or return an error if not authenticated
     pub fn require(&self) -> Result<Credentials> {
-        let creds = self.load()?.with_context(|| {
-            format!(
-                "Not authenticated. Run:\n  ato login\n\nCredentials file not found: {:?}",
-                self.credentials_path
-            )
-        })?;
+        let mut creds = self.load()?.unwrap_or_default();
+        creds.session_token = self.resolve_session_token()?;
+        creds.github_token = self.load_keyring_token(&self.keyring_github_account)?;
 
         if creds.session_token.is_none() && creds.github_token.is_none() {
             anyhow::bail!(
@@ -137,6 +168,9 @@ impl AuthManager {
 
     /// Delete stored credentials (logout)
     pub fn delete(&self) -> Result<()> {
+        self.delete_keyring_token(&self.keyring_session_account)?;
+        self.delete_keyring_token(&self.keyring_github_account)?;
+
         if self.credentials_path.exists() {
             fs::remove_file(&self.credentials_path).with_context(|| {
                 format!(
@@ -152,6 +186,74 @@ impl AuthManager {
     pub fn credentials_path(&self) -> &PathBuf {
         &self.credentials_path
     }
+
+    fn resolve_session_token(&self) -> Result<Option<String>> {
+        if let Some(token) = read_env_non_empty(ENV_ATO_TOKEN) {
+            return Ok(Some(token));
+        }
+        self.load_keyring_token(&self.keyring_session_account)
+    }
+
+    async fn save_session_token_async(&self, token: String) -> Result<()> {
+        let service = self.keyring_service.clone();
+        let account = self.keyring_session_account.clone();
+        tokio::task::spawn_blocking(move || {
+            let entry = Entry::new(&service, &account)
+                .with_context(|| "Failed to initialize OS keyring entry")?;
+            entry.set_password(&token).map_err(|err| {
+                anyhow::anyhow!(
+                    "Failed to save token in OS keyring ({err}). Security requirements prohibit plaintext fallback. Use ATO_TOKEN for this environment."
+                )
+            })
+        })
+        .await
+        .map_err(|err| anyhow::anyhow!("Keyring worker failed: {err}"))?
+    }
+
+    async fn save_github_token_async(&self, token: String) -> Result<()> {
+        let service = self.keyring_service.clone();
+        let account = self.keyring_github_account.clone();
+        tokio::task::spawn_blocking(move || {
+            let entry = Entry::new(&service, &account)
+                .with_context(|| "Failed to initialize OS keyring entry")?;
+            entry.set_password(&token).map_err(|err| {
+                anyhow::anyhow!(
+                    "Failed to save token in OS keyring ({err}). Security requirements prohibit plaintext fallback. Use ATO_TOKEN for this environment."
+                )
+            })
+        })
+        .await
+        .map_err(|err| anyhow::anyhow!("Keyring worker failed: {err}"))?
+    }
+
+    fn keyring_entry(&self, account: &str) -> Result<Entry> {
+        Entry::new(&self.keyring_service, account)
+            .with_context(|| "Failed to initialize OS keyring entry")
+    }
+
+    fn load_keyring_token(&self, account: &str) -> Result<Option<String>> {
+        let entry = self.keyring_entry(account)?;
+        match entry.get_password() {
+            Ok(value) => Ok(Some(value)),
+            Err(KeyringError::NoEntry) => Ok(None),
+            Err(err) => Err(self.keyring_error(err, "load")),
+        }
+    }
+
+    fn delete_keyring_token(&self, account: &str) -> Result<()> {
+        let entry = self.keyring_entry(account)?;
+        match entry.delete_password() {
+            Ok(_) | Err(KeyringError::NoEntry) => Ok(()),
+            Err(err) => Err(self.keyring_error(err, "delete")),
+        }
+    }
+
+    fn keyring_error(&self, err: KeyringError, action: &str) -> anyhow::Error {
+        anyhow::anyhow!(
+            "Failed to {} token in OS keyring ({err}). Security requirements prohibit plaintext fallback. Use ATO_TOKEN for this environment.",
+            action
+        )
+    }
 }
 
 /// GitHub user information
@@ -161,27 +263,28 @@ struct GitHubUser {
 }
 
 #[derive(Debug, Deserialize)]
-struct DeviceStartResponse {
-    device_code: String,
+struct BridgeInitResponse {
+    session_id: String,
     user_code: String,
-    activate_url: String,
     expires_in: u64,
     #[serde(default)]
-    interval: Option<u64>,
-}
-
-#[derive(Debug, Serialize)]
-struct DevicePollRequest<'a> {
-    device_code: &'a str,
+    poll_interval_sec: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
-struct DevicePollResponse {
-    status: String,
+struct BridgePollResponse {
+    code: String,
     #[serde(default)]
-    session_token: Option<String>,
-    #[serde(default, alias = "githubUsername")]
-    github_username: Option<String>,
+    poll_interval_sec: Option<u64>,
+    #[serde(default)]
+    auth_code: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BridgeExchangeResponse {
+    access_token: String,
+    #[serde(default)]
+    handle: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -264,6 +367,27 @@ fn read_env_non_empty(key: &str) -> Option<String> {
 
 fn trim_trailing_slash(value: &str) -> String {
     value.trim_end_matches('/').to_string()
+}
+
+fn to_base64_url(bytes: &[u8]) -> String {
+    BASE64_STANDARD
+        .encode(bytes)
+        .replace('+', "-")
+        .replace('/', "_")
+        .trim_end_matches('=')
+        .to_string()
+}
+
+fn generate_pkce_verifier() -> String {
+    let mut bytes = [0u8; 64];
+    OsRng.fill_bytes(&mut bytes);
+    to_base64_url(&bytes)
+}
+
+fn generate_pkce_challenge_s256(verifier: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(verifier.as_bytes());
+    to_base64_url(&hasher.finalize())
 }
 
 fn store_api_base_url() -> String {
@@ -436,7 +560,7 @@ fn prompt_yes_no(prompt: &str, default_yes: bool) -> Result<bool> {
 fn publisher_signing_key_path() -> Result<PathBuf> {
     let home = dirs::home_dir().context("Cannot determine home directory")?;
     Ok(home
-        .join(".capsule")
+        .join(".ato")
         .join("keys")
         .join("publisher-signing-key.json"))
 }
@@ -900,8 +1024,8 @@ pub async fn login_with_token(token: String) -> Result<()> {
     let username = verify_github_token(&token).await?;
 
     let manager = AuthManager::new()?;
+    manager.save_github_token_async(token).await?;
     let mut creds = manager.load()?.unwrap_or_default();
-    creds.github_token = Some(token);
     creds.github_username = Some(username.clone());
     manager.save(&creds)?;
 
@@ -912,51 +1036,86 @@ pub async fn login_with_token(token: String) -> Result<()> {
 }
 
 /// Login with Store Device Flow
-pub async fn login_with_store_device_flow() -> Result<()> {
+pub async fn login_with_store_device_flow(headless: bool) -> Result<()> {
     let api_base = store_api_base_url();
     let site_base = store_site_base_url();
     let client = reqwest::Client::new();
+    let code_verifier = generate_pkce_verifier();
+    let code_challenge = generate_pkce_challenge_s256(&code_verifier);
 
     let start_response = client
-        .post(format!("{}/v1/auth/device/start", api_base))
-        .json(&serde_json::json!({}))
+        .post(format!("{}/v1/auth/bridge/init", api_base))
+        .json(&serde_json::json!({
+            "code_challenge": code_challenge,
+            "method": "S256",
+            "device_info": format!("ato-cli/{}", env!("CARGO_PKG_VERSION")),
+        }))
         .send()
         .await
-        .with_context(|| "Failed to start Store device authentication")?;
+        .with_context(|| "Failed to start Store bridge authentication")?;
 
     if !start_response.status().is_success() {
         let status = start_response.status();
         let body = start_response.text().await.unwrap_or_default();
-        anyhow::bail!("Device auth start failed ({}): {}", status, body);
+        anyhow::bail!("Bridge auth init failed ({}): {}", status, body);
     }
 
-    let start: DeviceStartResponse = start_response
+    let start: BridgeInitResponse = start_response
         .json()
         .await
-        .context("Invalid device auth start response")?;
+        .context("Invalid bridge auth init response")?;
+
+    let session_id = start.session_id.clone();
+    let activate_url = format!(
+        "{}/v1/auth/bridge/activate?session_id={}",
+        api_base, session_id
+    );
 
     let login_url = format!(
         "{}/auth?next={}",
         site_base,
-        urlencoding::encode(&start.activate_url)
+        urlencoding::encode(&activate_url)
     );
 
-    println!("🌐 Opening browser for Ato sign-in...");
-    println!("   URL: {}", login_url);
-    println!("🔑 Verification code: {}", start.user_code);
+    if headless {
+        println!("🧩 Headless login mode");
+        println!("   Open this URL on another authenticated browser session:");
+        println!("   {}", login_url);
+        println!("🔑 Verification code: {}", start.user_code);
+        println!("⏳ Waiting for remote approval...");
+    } else {
+        println!("🌐 Opening browser for Ato sign-in...");
+        println!("   URL: {}", login_url);
+        println!("🔑 Verification code: {}", start.user_code);
 
-    if let Err(error) = try_open_browser(&login_url) {
-        eprintln!("⚠️  Could not open browser automatically: {}", error);
-        eprintln!("   Open the URL manually to continue sign-in.");
+        if let Err(error) = try_open_browser(&login_url) {
+            eprintln!("⚠️  Could not open browser automatically: {}", error);
+            eprintln!("   Open the URL manually to continue sign-in.");
+        }
+
+        println!("⏳ Waiting for browser authentication...");
     }
 
-    println!("⏳ Waiting for browser authentication...");
-
     let poll_timeout_secs = start.expires_in.min(300);
-    let poll_interval_secs = start.interval.unwrap_or(3).max(3);
+    let mut poll_interval_secs = start.poll_interval_sec.unwrap_or(2).max(1);
     let started_at = Instant::now();
 
     loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                let _ = client
+                    .post(format!("{}/v1/auth/bridge/cancel", api_base))
+                    .json(&serde_json::json!({
+                        "session_id": &session_id,
+                        "reason": "cli_interrupted",
+                    }))
+                    .send()
+                    .await;
+                anyhow::bail!("Authentication cancelled by user (Ctrl+C)");
+            }
+            _ = tokio::time::sleep(Duration::from_secs(poll_interval_secs)) => {}
+        }
+
         if started_at.elapsed() >= Duration::from_secs(poll_timeout_secs) {
             anyhow::bail!(
                 "Authentication timed out after {} seconds. Run `ato login` again.",
@@ -965,13 +1124,14 @@ pub async fn login_with_store_device_flow() -> Result<()> {
         }
 
         let poll_response = client
-            .post(format!("{}/v1/auth/device/poll", api_base))
-            .json(&DevicePollRequest {
-                device_code: &start.device_code,
-            })
+            .post(format!("{}/v1/auth/bridge/poll", api_base))
+            .json(&serde_json::json!({
+                "session_id": &session_id,
+                "code_verifier": &code_verifier,
+            }))
             .send()
             .await
-            .with_context(|| "Failed to poll device authentication state")?;
+            .with_context(|| "Failed to poll bridge authentication state")?;
 
         if poll_response.status() == StatusCode::TOO_MANY_REQUESTS {
             let body =
@@ -986,32 +1146,69 @@ pub async fn login_with_store_device_flow() -> Result<()> {
             continue;
         }
 
+        if poll_response.status() == StatusCode::CONFLICT {
+            anyhow::bail!("Authentication denied or cancelled. Run `ato login` again.");
+        }
+
+        if poll_response.status() == StatusCode::GONE {
+            anyhow::bail!("Authentication expired. Run `ato login` again.");
+        }
+
+        if poll_response.status() == StatusCode::BAD_REQUEST {
+            let body = poll_response.text().await.unwrap_or_default();
+            anyhow::bail!("Authentication failed: {}", body);
+        }
+
         if !poll_response.status().is_success() {
             let status = poll_response.status();
             let body = poll_response.text().await.unwrap_or_default();
-            anyhow::bail!("Device auth poll failed ({}): {}", status, body);
+            anyhow::bail!("Bridge auth poll failed ({}): {}", status, body);
         }
 
-        let poll: DevicePollResponse = poll_response
+        let poll: BridgePollResponse = poll_response
             .json()
             .await
-            .context("Invalid device auth poll response")?;
+            .context("Invalid bridge auth poll response")?;
 
-        match poll.status.as_str() {
-            "pending" => {
-                tokio::time::sleep(Duration::from_secs(poll_interval_secs)).await;
+        match poll.code.as_str() {
+            "PENDING" => {
+                poll_interval_secs = poll.poll_interval_sec.unwrap_or(poll_interval_secs).max(1);
             }
-            "approved" => {
-                let session_token = poll
-                    .session_token
-                    .context("Device auth approved but no session token was returned")?;
+            "SUCCESS" => {
+                let auth_code = poll
+                    .auth_code
+                    .context("Bridge auth approved but no auth code was returned")?;
+
+                let exchange_response = client
+                    .post(format!("{}/v1/auth/bridge/exchange", api_base))
+                    .json(&serde_json::json!({
+                        "session_id": &session_id,
+                        "auth_code": auth_code,
+                        "code_verifier": &code_verifier,
+                    }))
+                    .send()
+                    .await
+                    .context("Failed to exchange bridge auth code")?;
+
+                if !exchange_response.status().is_success() {
+                    let status = exchange_response.status();
+                    let body = exchange_response.text().await.unwrap_or_default();
+                    anyhow::bail!("Bridge auth exchange failed ({}): {}", status, body);
+                }
+
+                let exchange: BridgeExchangeResponse = exchange_response
+                    .json()
+                    .await
+                    .context("Invalid bridge auth exchange response")?;
+
+                let session_token = exchange.access_token;
 
                 let manager = AuthManager::new()?;
+                manager
+                    .save_session_token_async(session_token.clone())
+                    .await?;
                 let mut creds = manager.load()?.unwrap_or_default();
-                creds.session_token = Some(session_token);
-                if let Some(username) = poll.github_username {
-                    creds.github_username = Some(username);
-                }
+                creds.publisher_handle = exchange.handle.clone();
                 manager.save(&creds)?;
 
                 let session_token_for_setup = creds
@@ -1043,15 +1240,6 @@ pub async fn login_with_store_device_flow() -> Result<()> {
                 println!("   Credentials saved to: {:?}", manager.credentials_path());
                 return Ok(());
             }
-            "expired" => {
-                anyhow::bail!("Authentication request expired. Run `ato login` again.");
-            }
-            "consumed" => {
-                anyhow::bail!("Authentication token already consumed. Run `ato login` again.");
-            }
-            "denied" => {
-                anyhow::bail!("Authentication denied. Run `ato login` again.");
-            }
             other => {
                 anyhow::bail!("Unexpected authentication status: {}", other);
             }
@@ -1082,8 +1270,8 @@ pub fn logout() -> Result<()> {
 pub fn status() -> Result<()> {
     let manager = AuthManager::new()?;
 
-    match manager.load()? {
-        Some(creds) if creds.session_token.is_some() || creds.github_token.is_some() => {
+    match manager.require() {
+        Ok(creds) => {
             println!("✅ Authenticated");
             if let Some(session_token) = &creds.session_token {
                 println!("   Store session: configured");
@@ -1125,12 +1313,12 @@ pub fn status() -> Result<()> {
             }
             println!("   Credentials: {:?}", manager.credentials_path());
         }
-        _ => {
+        Err(_) => {
             println!("❌ Not authenticated");
             println!("   Run: ato login");
             println!();
             println!("   Legacy fallback:");
-            println!("   ato login --token <github-personal-access-token>");
+            println!("   Set ATO_TOKEN for headless environments");
         }
     }
 
@@ -1163,8 +1351,8 @@ mod tests {
         manager.save(&original).unwrap();
         let loaded = manager.load().unwrap().unwrap();
 
-        assert_eq!(original.github_token, loaded.github_token);
-        assert_eq!(original.session_token, loaded.session_token);
+        assert_eq!(loaded.github_token, None);
+        assert_eq!(loaded.session_token, None);
         assert_eq!(original.publisher_did, loaded.publisher_did);
         assert_eq!(original.publisher_id, loaded.publisher_id);
         assert_eq!(original.publisher_handle, loaded.publisher_handle);
@@ -1197,7 +1385,7 @@ mod tests {
         let manager = AuthManager::with_path(creds_path);
         let loaded = manager.load().unwrap().unwrap();
 
-        assert_eq!(loaded.github_token.as_deref(), Some("ghp_legacy123"));
+        assert_eq!(loaded.github_token, None);
         assert_eq!(loaded.session_token, None);
         assert_eq!(loaded.publisher_did.as_deref(), Some("did:key:z6MkLegacy"));
         assert_eq!(loaded.publisher_id, None);

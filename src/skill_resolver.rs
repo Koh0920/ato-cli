@@ -43,9 +43,9 @@ fn resolve_skill_path_with_roots(skill_name: &str, cwd: &Path, home: &Path) -> R
         return Ok(store);
     }
 
-    return Err(AtoExecutionError::skill_not_found(
+    Err(AtoExecutionError::skill_not_found(
         format!(
-            "Skill '{}' not found. Searched in:\n  - {}\n  - {}\n  - {}\n  - {}/.capsule/store/*/{}/<version>/source/SKILL.md",
+            "Skill '{}' not found. Searched in:\n  - {}\n  - {}\n  - {}\n  - {}/.ato/store/*/{}/<version>/source/SKILL.md",
             skill_name,
             workspace.display(),
             mcp_workspace.display(),
@@ -55,11 +55,11 @@ fn resolve_skill_path_with_roots(skill_name: &str, cwd: &Path, home: &Path) -> R
         ),
         Some(skill_name),
     )
-    .into());
+    .into())
 }
 
 fn resolve_from_capsule_store(skill_name: &str, home: &Path) -> Result<Option<PathBuf>> {
-    let store_root = home.join(".capsule").join("store");
+    let store_root = home.join(".ato").join("store");
     if !store_root.is_dir() {
         return Ok(None);
     }
@@ -198,7 +198,7 @@ mod tests {
         let home = tempdir().unwrap();
         let v1 = home
             .path()
-            .join(".capsule")
+            .join(".ato")
             .join("store")
             .join("alice")
             .join("demo")
@@ -207,7 +207,7 @@ mod tests {
             .join("SKILL.md");
         let v2 = home
             .path()
-            .join(".capsule")
+            .join(".ato")
             .join("store")
             .join("alice")
             .join("demo")

@@ -263,11 +263,6 @@ jobs:
     )
 }
 
-#[allow(dead_code)]
-fn workflow_path_for(base_dir: &Path) -> PathBuf {
-    base_dir.join(WORKFLOW_REL_PATH)
-}
-
 #[cfg(test)]
 mod tests {
     use super::parse_checksum_line;

@@ -7,6 +7,7 @@ use capsule_core::router::ManifestData;
 
 use crate::reporters::CliReporter;
 use crate::runtime_manager;
+use crate::runtime_overrides;
 
 const STATIC_SERVER_SCRIPT: &str = include_str!("../assets/static_file_server.ts");
 
@@ -59,7 +60,7 @@ fn build_static_server_command(plan: &ManifestData) -> Result<(PathBuf, Vec<Stri
         .execution_entrypoint()
         .filter(|v| !v.trim().is_empty())
         .ok_or_else(|| anyhow::anyhow!("runtime=web target requires entrypoint"))?;
-    let port = plan.execution_port().ok_or_else(|| {
+    let port = runtime_overrides::override_port(plan.execution_port()).ok_or_else(|| {
         anyhow::anyhow!(
             "runtime=web target '{}' requires targets.<label>.port",
             plan.selected_target_label()
@@ -102,7 +103,7 @@ fn ensure_static_server_script() -> Result<PathBuf> {
     let home =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Failed to resolve home directory"))?;
     let script_path = home
-        .join(".capsule")
+        .join(".ato")
         .join("cache")
         .join("scripts")
         .join("static_file_server.ts");

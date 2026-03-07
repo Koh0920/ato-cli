@@ -67,9 +67,9 @@ impl RuntimeHandle for NativeHandle {
             if res == 0 {
                 return Ok(());
             }
-            return Err(CapsuleError::Runtime(
+            Err(CapsuleError::Runtime(
                 io::Error::last_os_error().to_string(),
-            ));
+            ))
         }
 
         #[cfg(not(unix))]

@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 //! Guest E2E tests
 //!
 //! These tests verify the Guest protocol implementation for `.sync` file operations.
@@ -8,7 +10,7 @@ use base64::{engine::general_purpose, Engine as _};
 use serde_json::{json, Value};
 use std::fs::File;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 use wat::parse_str as wat_parse;
 use zip::{write::FileOptions, ZipArchive, ZipWriter};
@@ -20,7 +22,7 @@ fn encode_payload_base64(payload: &[u8]) -> String {
 }
 
 fn create_test_sync_file(
-    temp_dir: &PathBuf,
+    temp_dir: &Path,
     payload: &[u8],
     write_allowed: bool,
     wasm_bytes: Option<Vec<u8>>,
@@ -79,7 +81,7 @@ write_allowed = {}
 }
 
 fn build_request(
-    sync_path: &PathBuf,
+    sync_path: &Path,
     request_id: &str,
     action: &str,
     role: &str,
@@ -101,7 +103,7 @@ fn build_request(
     })
 }
 
-fn run_guest(sync_path: &PathBuf, request: &Value) -> Value {
+fn run_guest(sync_path: &Path, request: &Value) -> Value {
     let request_json = serde_json::to_string(request).unwrap();
     let mut cmd = Command::cargo_bin("ato").unwrap();
     let output = cmd
@@ -151,12 +153,7 @@ fn guest_read_payload_returns_base64() {
         )"#,
     )
     .unwrap();
-    let sync_path = create_test_sync_file(
-        &temp_dir.path().to_path_buf(),
-        &payload,
-        false,
-        Some(wasm_bytes),
-    );
+    let sync_path = create_test_sync_file(temp_dir.path(), &payload, false, Some(wasm_bytes));
 
     let request = build_request(
         &sync_path,
@@ -194,12 +191,7 @@ fn guest_write_payload_accepts_base64() {
         )"#,
     )
     .unwrap();
-    let sync_path = create_test_sync_file(
-        &temp_dir.path().to_path_buf(),
-        &payload,
-        true,
-        Some(wasm_bytes),
-    );
+    let sync_path = create_test_sync_file(temp_dir.path(), &payload, true, Some(wasm_bytes));
 
     let new_payload = vec![9, 8, 7, 6, 5];
     let payload_b64 = encode_payload_base64(&new_payload);
@@ -247,12 +239,7 @@ fn guest_execute_wasm_runs_sync_module() {
 "#;
     let wasm_bytes = wat_parse(wat).unwrap();
 
-    let sync_path = create_test_sync_file(
-        &temp_dir.path().to_path_buf(),
-        &payload,
-        true,
-        Some(wasm_bytes),
-    );
+    let sync_path = create_test_sync_file(temp_dir.path(), &payload, true, Some(wasm_bytes));
 
     let request = build_request(
         &sync_path,
@@ -276,7 +263,7 @@ fn guest_execute_wasm_runs_sync_module() {
 fn guest_update_payload_requires_write_allowed() {
     let temp_dir = TempDir::new().unwrap();
     let payload = vec![1, 2, 3];
-    let sync_path = create_test_sync_file(&temp_dir.path().to_path_buf(), &payload, false, None);
+    let sync_path = create_test_sync_file(temp_dir.path(), &payload, false, None);
 
     let new_payload = vec![9, 9, 9];
     let payload_b64 = encode_payload_base64(&new_payload);
@@ -311,12 +298,7 @@ fn guest_read_context_respects_permissions() {
         )"#,
     )
     .unwrap();
-    let sync_path = create_test_sync_file(
-        &temp_dir.path().to_path_buf(),
-        b"payload",
-        false,
-        Some(wasm_bytes),
-    );
+    let sync_path = create_test_sync_file(temp_dir.path(), b"payload", false, Some(wasm_bytes));
 
     let request = build_request(
         &sync_path,
@@ -361,12 +343,7 @@ fn guest_write_context_respects_permissions() {
         )"#,
     )
     .unwrap();
-    let sync_path = create_test_sync_file(
-        &temp_dir.path().to_path_buf(),
-        b"payload",
-        false,
-        Some(wasm_bytes),
-    );
+    let sync_path = create_test_sync_file(temp_dir.path(), b"payload", false, Some(wasm_bytes));
 
     let request = build_request(
         &sync_path,
@@ -413,12 +390,7 @@ fn guest_execute_wasm_requires_owner_and_permission() {
 "#;
     let wasm_bytes = wat_parse(wat).unwrap();
 
-    let sync_path = create_test_sync_file(
-        &temp_dir.path().to_path_buf(),
-        &payload,
-        true,
-        Some(wasm_bytes),
-    );
+    let sync_path = create_test_sync_file(temp_dir.path(), &payload, true, Some(wasm_bytes));
 
     let request = build_request(
         &sync_path,

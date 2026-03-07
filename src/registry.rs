@@ -51,12 +51,6 @@ impl Default for DnsResolver {
 
 impl DnsResolver {
     /// Create a new DNS resolver with custom prefix
-    pub fn with_prefix(prefix: &str) -> Self {
-        Self {
-            prefix: prefix.to_string(),
-        }
-    }
-
     /// Resolve registry URL from a domain's DNS TXT record
     ///
     /// Example: _capsule-registry.example.com TXT "v=1 url=https://registry.example.com"
@@ -217,6 +211,7 @@ impl Default for RegistryResolver {
 
 impl RegistryResolver {
     /// Add a fallback registry
+    #[cfg(test)]
     pub fn with_fallback(mut self, info: RegistryInfo) -> Self {
         self.fallbacks.push(info);
         self
@@ -289,11 +284,13 @@ impl RegistryCache {
     }
 
     /// Create a cache with a custom path (used for tests)
+    #[cfg(test)]
     pub fn with_path(path: std::path::PathBuf) -> Self {
         Self { path }
     }
 
     /// Cache a registry info
+    #[cfg(test)]
     pub fn put(&self, domain: &str, info: &RegistryInfo) -> Result<()> {
         std::fs::create_dir_all(&self.path)?;
         let file = self.path.join(format!("{}.json", domain.replace('.', "_")));
@@ -303,6 +300,7 @@ impl RegistryCache {
     }
 
     /// Get cached registry info
+    #[cfg(test)]
     pub fn get(&self, domain: &str) -> Option<RegistryInfo> {
         let file = self.path.join(format!("{}.json", domain.replace('.', "_")));
         let content = std::fs::read_to_string(file).ok()?;

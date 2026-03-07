@@ -122,12 +122,6 @@ pub struct IpcServiceInfo {
     pub runtime_kind: IpcRuntimeKind,
     /// Sharing mode
     pub sharing_mode: SharingMode,
-    /// Activation mode
-    pub activation: ActivationMode,
-    /// Path to the capsule root (for re-launch)
-    pub capsule_root: PathBuf,
-    /// Allocated port (for TCP-based transports)
-    pub port: Option<u16>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

@@ -1,5 +1,5 @@
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{self as crossterm_event, Event};
@@ -9,6 +9,7 @@ use ratatui::Terminal;
 use tokio::sync::mpsc;
 
 mod app;
+pub mod common;
 mod event;
 mod handler;
 mod network;
@@ -20,6 +21,10 @@ use self::event::AppEvent;
 use self::network::SearchRequest;
 
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
+const STARTUP_INPUT_DRAIN_WINDOW: Duration = Duration::from_millis(120);
+const STARTUP_ENTER_GUARD_WINDOW: Duration = Duration::from_millis(200);
+
+pub use self::common::can_launch_tui;
 
 pub struct SearchTuiArgs {
     pub query: Option<String>,
@@ -42,10 +47,12 @@ pub fn run_search_tui(args: SearchTuiArgs) -> Result<Option<String>> {
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+    common::drain_startup_input_events(STARTUP_INPUT_DRAIN_WINDOW)?;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
+    let tui_started_at = Instant::now();
 
     let (tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
     let mut app = App::new(args.query.as_deref(), args.show_manifest);
@@ -152,6 +159,13 @@ pub fn run_search_tui(args: SearchTuiArgs) -> Result<Option<String>> {
 
         if crossterm_event::poll(Duration::from_millis(40))? {
             if let Event::Key(key) = crossterm_event::read()? {
+                if common::should_ignore_startup_enter(
+                    &key,
+                    tui_started_at,
+                    STARTUP_ENTER_GUARD_WINDOW,
+                ) {
+                    continue;
+                }
                 let _ = tx.send(AppEvent::Input(key));
             }
         } else {
