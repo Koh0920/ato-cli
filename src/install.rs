@@ -564,11 +564,11 @@ fn extract_payload_v3_manifest_from_capsule(
     bytes: &[u8],
 ) -> Result<Option<capsule_core::capsule_v3::CapsuleManifestV3>> {
     let mut archive = tar::Archive::new(std::io::Cursor::new(bytes));
-    let mut entries = archive
+    let entries = archive
         .entries()
         .context("Failed to read .capsule archive entries")?;
 
-    while let Some(entry) = entries.next() {
+    for entry in entries {
         let mut entry = entry.context("Invalid .capsule entry")?;
         let entry_path = entry
             .path()

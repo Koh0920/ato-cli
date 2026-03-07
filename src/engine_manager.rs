@@ -31,6 +31,7 @@ pub struct EngineInfo {
     pub os: String,
 }
 
+#[allow(dead_code)]
 pub(crate) struct EngineInstallResult {
     pub version: String,
     pub path: PathBuf,
@@ -237,6 +238,7 @@ impl EngineManager {
         let lock_path = lock_dir.join(format!("{}-{}.lock", name, version));
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&lock_path)
@@ -256,6 +258,7 @@ fn acquire_config_lock() -> Result<ConfigUpdateLock> {
     let lock_path = config_dir.join("config.lock");
     let file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&lock_path)
@@ -266,6 +269,7 @@ fn acquire_config_lock() -> Result<ConfigUpdateLock> {
     Ok(ConfigUpdateLock { _file: file })
 }
 
+#[allow(dead_code)]
 pub(crate) fn install_engine_release(
     engine: &str,
     requested_version: Option<&str>,
@@ -414,6 +418,7 @@ pub(crate) fn extract_first_sha256_hex(raw: &str) -> Option<String> {
         .map(|value| value.to_ascii_lowercase())
 }
 
+#[allow(dead_code)]
 fn install_nacelle_release(
     requested_version: Option<&str>,
     skip_verify: bool,

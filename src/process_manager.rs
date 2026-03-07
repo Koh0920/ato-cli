@@ -90,6 +90,7 @@ impl ProcessManager {
         Ok(Self { run_dir })
     }
 
+    #[allow(dead_code)]
     pub fn get_run_dir(&self) -> &Path {
         &self.run_dir
     }
@@ -162,7 +163,7 @@ impl ProcessManager {
 
             if path
                 .extension()
-                .map_or(false, |ext| ext == PID_FILE_EXT.trim_start_matches('.'))
+                .is_some_and(|ext| ext == PID_FILE_EXT.trim_start_matches('.'))
             {
                 if let Some(filename) = path.file_stem() {
                     if let Some(id) = filename.to_str() {
@@ -298,7 +299,7 @@ impl ProcessManager {
 
             if path
                 .extension()
-                .map_or(false, |ext| ext == PID_FILE_EXT.trim_start_matches('.'))
+                .is_some_and(|ext| ext == PID_FILE_EXT.trim_start_matches('.'))
             {
                 if let Some(filename) = path.file_stem() {
                     if let Some(id) = filename.to_str() {
@@ -327,8 +328,8 @@ fn is_process_alive(pid: i32) -> bool {
 
     #[cfg(unix)]
     unsafe {
-        let result = libc::kill(pid as i32, 0);
-        return result == 0 || errno() != libc::ESRCH;
+        let result = libc::kill(pid, 0);
+        result == 0 || errno() != libc::ESRCH
     }
 
     #[cfg(windows)]

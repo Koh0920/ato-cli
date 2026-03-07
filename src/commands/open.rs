@@ -765,7 +765,7 @@ fn wait_for_background_native_startup(
     let Some(event_rx) = process.event_rx.take() else {
         return Ok((BackgroundStartupOutcome::TimedOut, None));
     };
-    let mut event_rx = Some(event_rx);
+    let event_rx = Some(event_rx);
 
     let deadline = Instant::now() + background_ready_wait_timeout();
 
@@ -814,7 +814,6 @@ fn wait_for_background_native_startup(
             }
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => {
-                event_rx = None;
                 let _ = process_manager.update_pid(process_id, |info| {
                     if matches!(info.status, crate::process_manager::ProcessStatus::Starting) {
                         info.status = crate::process_manager::ProcessStatus::Unknown;

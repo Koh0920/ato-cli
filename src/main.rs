@@ -1955,6 +1955,7 @@ fn execute_publish_dry_run_command(
     })
 }
 
+#[allow(dead_code)]
 fn execute_publish_guidance_command(json_output: bool, registry_url: &str) -> Result<()> {
     if json_output {
         let payload = serde_json::json!({
@@ -2823,6 +2824,7 @@ fn is_sha256_hex(value: &str) -> bool {
     value.len() == 64 && value.as_bytes().iter().all(|b| b.is_ascii_hexdigit())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_run_like_command(
     path: PathBuf,
     target: Option<String>,
@@ -3458,6 +3460,7 @@ fn enforce_sandbox_mode_flags(
     Ok(enforcement)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_open_command(
     path: PathBuf,
     target: Option<String>,
@@ -3535,6 +3538,7 @@ fn execute_source_rebuild_command(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_search_command(
     query: Option<String>,
     category: Option<String>,

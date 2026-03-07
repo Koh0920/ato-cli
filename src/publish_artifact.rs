@@ -270,11 +270,11 @@ fn load_artifact_payload(path: &Path, scoped_id: &str) -> Result<ArtifactPayload
 
 fn extract_manifest_from_capsule(bytes: &[u8]) -> Result<String> {
     let mut archive = tar::Archive::new(Cursor::new(bytes));
-    let mut entries = archive
+    let entries = archive
         .entries()
         .context("Failed to read .capsule archive entries")?;
 
-    while let Some(entry) = entries.next() {
+    for entry in entries {
         let mut entry = entry.context("Invalid .capsule entry")?;
         let entry_path = entry
             .path()
@@ -297,11 +297,11 @@ fn extract_payload_v3_manifest_from_capsule(
     bytes: &[u8],
 ) -> Result<Option<capsule_core::capsule_v3::CapsuleManifestV3>> {
     let mut archive = tar::Archive::new(Cursor::new(bytes));
-    let mut entries = archive
+    let entries = archive
         .entries()
         .context("Failed to read .capsule archive entries")?;
 
-    while let Some(entry) = entries.next() {
+    for entry in entries {
         let mut entry = entry.context("Invalid .capsule entry")?;
         let entry_path = entry
             .path()
@@ -597,6 +597,8 @@ fn compute_sha256(data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![allow(dead_code)]
+
     use super::*;
     use std::collections::HashMap;
     use std::ffi::{OsStr, OsString};
@@ -892,8 +894,8 @@ entrypoint = "main.ts"
         {
             let mut builder = Builder::new(&mut rebuilt);
             let mut archive = tar::Archive::new(Cursor::new(bytes));
-            let mut entries = archive.entries().expect("entries");
-            while let Some(entry) = entries.next() {
+            let entries = archive.entries().expect("entries");
+            for entry in entries {
                 let mut entry = entry.expect("entry");
                 let path = entry.path().expect("path").to_string_lossy().to_string();
                 let mut content = Vec::new();
@@ -938,9 +940,7 @@ entrypoint = "main.ts"
         let path = tmp.path().join("sample-capsule.capsule");
         std::fs::write(&path, test_capsule_bytes("sample-capsule", "1.0.0")).expect("write");
 
-        let err = load_artifact_payload(&path, "koh0920/another-slug")
-            .err()
-            .expect("must fail");
+        let err = load_artifact_payload(&path, "koh0920/another-slug").expect_err("must fail");
         assert!(err
             .to_string()
             .contains("must match artifact manifest.name"));

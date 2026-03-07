@@ -18,6 +18,8 @@
 //! | -32003 | Schema validation error|
 //! | -32004 | Message too large      |
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

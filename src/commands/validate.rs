@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use anyhow::{Context, Result};
 use capsule_core::execution_plan::error::AtoExecutionError;
 use serde::Serialize;

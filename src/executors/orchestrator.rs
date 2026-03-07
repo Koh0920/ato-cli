@@ -189,6 +189,7 @@ enum LocalReadinessState {
     Exited(i32),
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_service<C: OciRuntimeClient>(
     plan: &ManifestData,
     orchestration: &OrchestrationPlan,
@@ -593,7 +594,7 @@ async fn monitor_until_exit<C: OciRuntimeClient>(
         tokio::select! {
             signal_code = &mut shutdown_signal => {
                 shutdown_all(orchestration, running, client, network_name).await;
-                return Ok(signal_code?);
+                return signal_code;
             }
             _ = tokio::time::sleep(SHUTDOWN_POLL_INTERVAL) => {
                 let mut exited = None;
