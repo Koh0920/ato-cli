@@ -34,6 +34,7 @@ const SMART_DEFAULT_EXCLUDES: &[&str] = &[
     "config.json",
     "capsule.lock",
     "signature.json",
+    "payload.v3.manifest.json",
     "payload.tar",
     "payload.tar.zst",
 ];

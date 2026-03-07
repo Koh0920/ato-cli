@@ -485,6 +485,23 @@ pub async fn install_app(
 
     let computed_blake3 = compute_blake3(&bytes);
 
+    if let Some(v3_manifest) = extract_payload_v3_manifest_from_capsule(&bytes)? {
+        let sync_result = sync_v3_chunks_from_manifest(&client, &registry, &v3_manifest).await?;
+        match sync_result {
+            V3SyncOutcome::Synced => {}
+            V3SyncOutcome::SkippedUnsupportedRegistry => {
+                if !json_output {
+                    eprintln!(
+                        "ℹ️  Registry does not expose v3 chunk sync endpoint; falling back to embedded payload"
+                    );
+                }
+            }
+            V3SyncOutcome::SkippedDisabledCas(reason) => {
+                emit_cas_disabled_performance_warning_once(&reason, json_output);
+            }
+        }
+    }
+
     let store_root = output_dir.unwrap_or_else(|| {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -525,6 +542,264 @@ pub async fn install_app(
         path: output_path,
         content_hash: computed_blake3,
     })
+}
+
+fn extract_payload_v3_manifest_from_capsule(
+    bytes: &[u8],
+) -> Result<Option<capsule_core::capsule_v3::CapsuleManifestV3>> {
+    let mut archive = tar::Archive::new(std::io::Cursor::new(bytes));
+    let mut entries = archive
+        .entries()
+        .context("Failed to read .capsule archive entries")?;
+
+    while let Some(entry) = entries.next() {
+        let mut entry = entry.context("Invalid .capsule entry")?;
+        let entry_path = entry
+            .path()
+            .context("Failed to read archive entry path")?
+            .to_string_lossy()
+            .to_string();
+        if entry_path != capsule_core::capsule_v3::V3_PAYLOAD_MANIFEST_PATH {
+            continue;
+        }
+
+        let mut manifest_bytes = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut manifest_bytes)
+            .context("Failed to read payload.v3.manifest.json from artifact")?;
+        let manifest: capsule_core::capsule_v3::CapsuleManifestV3 =
+            serde_json::from_slice(&manifest_bytes)
+                .context("Failed to parse payload.v3.manifest.json from artifact")?;
+        capsule_core::capsule_v3::verify_artifact_hash(&manifest)
+            .context("Invalid payload.v3.manifest.json artifact_hash")?;
+        return Ok(Some(manifest));
+    }
+
+    Ok(None)
+}
+
+async fn sync_v3_chunks_from_manifest(
+    client: &reqwest::Client,
+    registry: &str,
+    manifest: &capsule_core::capsule_v3::CapsuleManifestV3,
+) -> Result<V3SyncOutcome> {
+    let cas = match capsule_core::capsule_v3::CasProvider::from_env() {
+        capsule_core::capsule_v3::CasProvider::Enabled(store) => store,
+        capsule_core::capsule_v3::CasProvider::Disabled(reason) => {
+            capsule_core::capsule_v3::CasProvider::log_disabled_once(
+                "install_v3_chunk_sync",
+                &reason,
+            );
+            return Ok(V3SyncOutcome::SkippedDisabledCas(reason));
+        }
+    };
+    let token = read_ato_token();
+    let concurrency = sync_concurrency_limit();
+    sync_v3_chunks_from_manifest_with_options(client, registry, manifest, cas, token, concurrency)
+        .await
+}
+
+fn emit_cas_disabled_performance_warning_once(
+    reason: &capsule_core::capsule_v3::CasDisableReason,
+    json_output: bool,
+) {
+    if json_output {
+        return;
+    }
+    static STDERR_WARN_ONCE: Once = Once::new();
+    STDERR_WARN_ONCE.call_once(|| {
+        eprintln!(
+            "⚠️  Performance warning: CAS is disabled (reason: {}). Falling back to v2 legacy mode.",
+            reason
+        );
+    });
+}
+
+async fn sync_v3_chunks_from_manifest_with_options(
+    client: &reqwest::Client,
+    registry: &str,
+    manifest: &capsule_core::capsule_v3::CapsuleManifestV3,
+    cas: capsule_core::capsule_v3::CasStore,
+    token: Option<String>,
+    concurrency: usize,
+) -> Result<V3SyncOutcome> {
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let mut downloads = FuturesUnordered::new();
+
+    for chunk in &manifest.chunks {
+        if cas
+            .has_chunk(&chunk.raw_hash)
+            .with_context(|| format!("Failed to check local CAS chunk {}", chunk.raw_hash))?
+        {
+            continue;
+        }
+        let client = client.clone();
+        let cas = cas.clone();
+        let registry = registry.to_string();
+        let token = token.clone();
+        let raw_hash = chunk.raw_hash.clone();
+        let raw_size = chunk.raw_size;
+        let semaphore = Arc::clone(&semaphore);
+
+        downloads.push(async move {
+            let _permit = semaphore
+                .acquire_owned()
+                .await
+                .map_err(|_| anyhow::anyhow!("v3 pull semaphore was closed"))?;
+            download_chunk_to_cas_with_retry(
+                &client,
+                &registry,
+                &cas,
+                &raw_hash,
+                raw_size,
+                token.as_deref(),
+            )
+            .await
+        });
+    }
+
+    while let Some(result) = downloads.next().await {
+        match result? {
+            ChunkDownloadOutcome::Stored => {}
+            ChunkDownloadOutcome::UnsupportedRegistry => {
+                return Ok(V3SyncOutcome::SkippedUnsupportedRegistry);
+            }
+        }
+    }
+
+    Ok(V3SyncOutcome::Synced)
+}
+
+async fn download_chunk_to_cas_with_retry(
+    client: &reqwest::Client,
+    registry: &str,
+    cas: &capsule_core::capsule_v3::CasStore,
+    raw_hash: &str,
+    raw_size: u32,
+    token: Option<&str>,
+) -> Result<ChunkDownloadOutcome> {
+    let endpoint = format!("{}/v1/chunks/{}", registry, urlencoding::encode(raw_hash));
+    const MAX_RETRIES: usize = 4;
+
+    for attempt in 0..=MAX_RETRIES {
+        let mut req = client.get(&endpoint);
+        if let Some(token) = token {
+            req = req.bearer_auth(token);
+        }
+
+        match req.send().await {
+            Ok(resp) if resp.status().is_success() => {
+                let bytes = resp.bytes().await.with_context(|| {
+                    format!("Failed to read downloaded chunk body {}", raw_hash)
+                })?;
+                verify_downloaded_chunk(raw_hash, raw_size, bytes.as_ref())?;
+                cas.put_chunk_zstd(raw_hash, bytes.as_ref())
+                    .with_context(|| format!("Failed to store downloaded chunk {}", raw_hash))?;
+                return Ok(ChunkDownloadOutcome::Stored);
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                if is_sync_not_supported_status(status) {
+                    return Ok(ChunkDownloadOutcome::UnsupportedRegistry);
+                }
+                if is_transient_status(status) && attempt < MAX_RETRIES {
+                    tokio::time::sleep(backoff_duration(attempt)).await;
+                    continue;
+                }
+                bail!(
+                    "v3 chunk download failed for {} ({}): {}",
+                    raw_hash,
+                    status.as_u16(),
+                    body.trim()
+                );
+            }
+            Err(err) => {
+                if is_transient_reqwest_error(&err) && attempt < MAX_RETRIES {
+                    tokio::time::sleep(backoff_duration(attempt)).await;
+                    continue;
+                }
+                return Err(err).with_context(|| {
+                    format!(
+                        "v3 chunk download request failed for {} via {}",
+                        raw_hash, endpoint
+                    )
+                });
+            }
+        }
+    }
+
+    bail!("v3 chunk download exhausted retries for {}", raw_hash)
+}
+
+fn verify_downloaded_chunk(raw_hash: &str, raw_size: u32, zstd_bytes: &[u8]) -> Result<()> {
+    let cursor = std::io::Cursor::new(zstd_bytes);
+    let mut decoder = zstd::Decoder::new(cursor)
+        .with_context(|| format!("Failed to decode downloaded chunk {}", raw_hash))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut total: u64 = 0;
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        let n = std::io::Read::read(&mut decoder, &mut buf)
+            .with_context(|| format!("Failed to read decoded bytes for {}", raw_hash))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        total = total.saturating_add(n as u64);
+    }
+
+    if total != raw_size as u64 {
+        bail!(
+            "downloaded chunk raw_size mismatch for {}: expected {} got {}",
+            raw_hash,
+            raw_size,
+            total
+        );
+    }
+
+    let got = format!("blake3:{}", hex::encode(hasher.finalize().as_bytes()));
+    if !equals_hash(raw_hash, &got) {
+        bail!(
+            "downloaded chunk hash mismatch for {}: expected {} got {}",
+            raw_hash,
+            raw_hash,
+            got
+        );
+    }
+
+    Ok(())
+}
+
+fn sync_concurrency_limit() -> usize {
+    std::env::var("ATO_SYNC_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|v| v.clamp(1, 128))
+        .unwrap_or(8)
+}
+
+fn is_sync_not_supported_status(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::NOT_FOUND
+            | reqwest::StatusCode::METHOD_NOT_ALLOWED
+            | reqwest::StatusCode::NOT_IMPLEMENTED
+    )
+}
+
+fn is_transient_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+fn is_transient_reqwest_error(err: &reqwest::Error) -> bool {
+    err.is_timeout() || err.is_connect() || err.is_request()
+}
+
+fn backoff_duration(attempt: usize) -> Duration {
+    let base_ms = 200u64.saturating_mul(1u64 << attempt.min(4));
+    Duration::from_millis(base_ms.min(2_000))
 }
 
 pub async fn fetch_capsule_detail(

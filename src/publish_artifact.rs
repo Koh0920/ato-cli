@@ -1,5 +1,8 @@
+use std::collections::HashMap;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use reqwest::StatusCode;
@@ -37,6 +40,75 @@ struct ArtifactPayload {
     bytes: Vec<u8>,
     sha256: String,
     blake3: String,
+    v3_manifest: Option<capsule_core::capsule_v3::CapsuleManifestV3>,
+}
+
+#[derive(Debug, Clone)]
+struct V3SyncPayload {
+    publisher: String,
+    slug: String,
+    version: String,
+    manifest: capsule_core::capsule_v3::CapsuleManifestV3,
+}
+
+impl ArtifactPayload {
+    fn v3_sync_payload(&self) -> Option<V3SyncPayload> {
+        self.v3_manifest.as_ref().map(|manifest| V3SyncPayload {
+            publisher: self.publisher.clone(),
+            slug: self.slug.clone(),
+            version: self.version.clone(),
+            manifest: manifest.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ArtifactManifestInfo {
+    pub name: String,
+    pub version: String,
+    pub repository_owner: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegistryErrorPayload {
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SyncChunkDescriptor {
+    raw_hash: String,
+    raw_size: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct SyncNegotiateRequest {
+    artifact_hash: String,
+    schema_version: u32,
+    chunks: Vec<SyncChunkDescriptor>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SyncNegotiateResponse {
+    missing_chunks: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SyncCommitRequest {
+    publisher: String,
+    slug: String,
+    version: String,
+    manifest: capsule_core::capsule_v3::CapsuleManifestV3,
+}
+
+#[derive(Debug, Error)]
+pub enum PublishArtifactError {
+    #[error("Artifact upload conflict (409 version_exists): {message}")]
+    VersionExists { message: String },
+    #[error("Artifact upload failed ({status}): {message}")]
+    UploadFailed { status: u16, message: String },
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +178,8 @@ pub fn publish_artifact(args: PublishArtifactArgs) -> Result<PublishArtifactResu
     let result = response
         .json::<PublishArtifactResult>()
         .context("Invalid local registry upload response")?;
+    sync_v3_chunks_if_present(&base_url, v3_sync_payload.as_ref())
+        .with_context(|| "Failed to finalize payload v3 metadata for uploaded release")?;
     Ok(result)
 }
 
@@ -195,6 +269,7 @@ fn load_artifact_payload(path: &Path, scoped_id: &str) -> Result<ArtifactPayload
         sha256: compute_sha256(&bytes),
         blake3: compute_blake3(&bytes),
         bytes,
+        v3_manifest,
     })
 }
 
@@ -221,6 +296,40 @@ fn extract_manifest_from_capsule(bytes: &[u8]) -> Result<String> {
     }
 
     bail!("Invalid artifact: capsule.toml not found in .capsule archive")
+}
+
+fn extract_payload_v3_manifest_from_capsule(
+    bytes: &[u8],
+) -> Result<Option<capsule_core::capsule_v3::CapsuleManifestV3>> {
+    let mut archive = tar::Archive::new(Cursor::new(bytes));
+    let mut entries = archive
+        .entries()
+        .context("Failed to read .capsule archive entries")?;
+
+    while let Some(entry) = entries.next() {
+        let mut entry = entry.context("Invalid .capsule entry")?;
+        let entry_path = entry
+            .path()
+            .context("Failed to read archive entry path")?
+            .to_string_lossy()
+            .to_string();
+        if entry_path != capsule_core::capsule_v3::V3_PAYLOAD_MANIFEST_PATH {
+            continue;
+        }
+
+        let mut manifest_bytes = Vec::new();
+        entry
+            .read_to_end(&mut manifest_bytes)
+            .context("Failed to read payload.v3.manifest.json from artifact")?;
+        let manifest: capsule_core::capsule_v3::CapsuleManifestV3 =
+            serde_json::from_slice(&manifest_bytes)
+                .context("Failed to parse payload.v3.manifest.json from artifact")?;
+        capsule_core::capsule_v3::verify_artifact_hash(&manifest)
+            .context("Invalid payload.v3.manifest.json artifact_hash")?;
+        return Ok(Some(manifest));
+    }
+
+    Ok(None)
 }
 
 fn normalize_registry_url(raw: &str) -> Result<String> {
@@ -344,7 +453,243 @@ fn compute_sha256(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::{OsStr, OsString};
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Duration;
+
+    use axum::extract::{Path as AxumPath, State};
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use axum::routing::{post, put};
+    use axum::{Json, Router};
+    use capsule_core::capsule_v3::{set_artifact_hash, CapsuleManifestV3, ChunkMeta};
     use tar::Builder;
+    use tokio::sync::Mutex as AsyncMutex;
+    use tokio::time::sleep;
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn env_lock() -> &'static Mutex<()> {
+        ENV_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: Option<&OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct SyncMockState {
+        missing_chunks: Vec<String>,
+        fixed_put_status: Option<StatusCode>,
+        per_hash_transient_failures: Arc<AsyncMutex<HashMap<String, usize>>>,
+        uploaded_hashes: Arc<AsyncMutex<Vec<String>>>,
+        put_attempts: Arc<AsyncMutex<HashMap<String, usize>>>,
+        negotiate_calls: Arc<AtomicUsize>,
+        commit_calls: Arc<AtomicUsize>,
+        put_calls: Arc<AtomicUsize>,
+        inflight_puts: Arc<AtomicUsize>,
+        max_inflight_puts: Arc<AtomicUsize>,
+        put_delay: Duration,
+    }
+
+    impl SyncMockState {
+        fn new(missing_chunks: Vec<String>) -> Self {
+            Self {
+                missing_chunks,
+                fixed_put_status: None,
+                per_hash_transient_failures: Arc::new(AsyncMutex::new(HashMap::new())),
+                uploaded_hashes: Arc::new(AsyncMutex::new(Vec::new())),
+                put_attempts: Arc::new(AsyncMutex::new(HashMap::new())),
+                negotiate_calls: Arc::new(AtomicUsize::new(0)),
+                commit_calls: Arc::new(AtomicUsize::new(0)),
+                put_calls: Arc::new(AtomicUsize::new(0)),
+                inflight_puts: Arc::new(AtomicUsize::new(0)),
+                max_inflight_puts: Arc::new(AtomicUsize::new(0)),
+                put_delay: Duration::from_millis(0),
+            }
+        }
+
+        fn with_fixed_put_status(mut self, status: StatusCode) -> Self {
+            self.fixed_put_status = Some(status);
+            self
+        }
+
+        fn with_put_delay(mut self, delay: Duration) -> Self {
+            self.put_delay = delay;
+            self
+        }
+    }
+
+    struct InflightGuard {
+        state: SyncMockState,
+    }
+
+    impl Drop for InflightGuard {
+        fn drop(&mut self) {
+            self.state.inflight_puts.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    async fn sync_mock_negotiate(
+        State(state): State<SyncMockState>,
+        _body: axum::body::Bytes,
+    ) -> impl IntoResponse {
+        state.negotiate_calls.fetch_add(1, Ordering::SeqCst);
+        Json(serde_json::json!({
+            "missing_chunks": state.missing_chunks,
+        }))
+    }
+
+    async fn sync_mock_put_chunk(
+        State(state): State<SyncMockState>,
+        AxumPath(raw_hash): AxumPath<String>,
+        _body: axum::body::Bytes,
+    ) -> impl IntoResponse {
+        state.put_calls.fetch_add(1, Ordering::SeqCst);
+        let current = state.inflight_puts.fetch_add(1, Ordering::SeqCst) + 1;
+        let _guard = InflightGuard {
+            state: state.clone(),
+        };
+        update_max(&state.max_inflight_puts, current);
+
+        let attempt = {
+            let mut attempts = state.put_attempts.lock().await;
+            let entry = attempts.entry(raw_hash.clone()).or_insert(0);
+            *entry += 1;
+            *entry
+        };
+
+        if !state.put_delay.is_zero() {
+            sleep(state.put_delay).await;
+        }
+
+        if let Some(status) = state.fixed_put_status {
+            return (status, Json(serde_json::json!({"error":"forced"}))).into_response();
+        }
+
+        let should_fail = {
+            let mut failures = state.per_hash_transient_failures.lock().await;
+            if let Some(remaining) = failures.get_mut(&raw_hash) {
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        if should_fail {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error":"transient","attempt":attempt})),
+            )
+                .into_response();
+        }
+
+        state.uploaded_hashes.lock().await.push(raw_hash);
+        Json(serde_json::json!({"ok": true})).into_response()
+    }
+
+    async fn sync_mock_commit(
+        State(state): State<SyncMockState>,
+        _body: axum::body::Bytes,
+    ) -> impl IntoResponse {
+        state.commit_calls.fetch_add(1, Ordering::SeqCst);
+        Json(serde_json::json!({"ok": true}))
+    }
+
+    fn update_max(max: &AtomicUsize, candidate: usize) {
+        let mut current = max.load(Ordering::SeqCst);
+        while candidate > current {
+            match max.compare_exchange(current, candidate, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    async fn start_sync_mock_server(state: SyncMockState) -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route("/v1/sync/negotiate", post(sync_mock_negotiate))
+            .route("/v1/chunks/:raw_hash", put(sync_mock_put_chunk))
+            .route("/v1/sync/commit", post(sync_mock_commit))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve mock");
+        });
+        (format!("http://{}", addr), handle)
+    }
+
+    fn compress_chunk(data: &[u8]) -> Vec<u8> {
+        let mut encoder = zstd::Encoder::new(Vec::new(), 3).expect("encoder");
+        encoder.write_all(data).expect("write");
+        encoder.finish().expect("finish")
+    }
+
+    fn build_v3_sync_test_payload(
+        cas: &capsule_core::capsule_v3::CasStore,
+        chunk_count: usize,
+    ) -> (V3SyncPayload, Vec<String>) {
+        let mut chunks = Vec::new();
+        let mut hashes = Vec::new();
+
+        for i in 0..chunk_count {
+            let raw = vec![(i % 251) as u8; 2_048 + (i % 7) * 13];
+            let raw_hash = capsule_core::capsule_v3::manifest::blake3_digest(&raw);
+            let zstd = compress_chunk(&raw);
+            cas.put_chunk_zstd(&raw_hash, &zstd)
+                .expect("write local CAS chunk");
+            hashes.push(raw_hash.clone());
+            chunks.push(ChunkMeta {
+                raw_hash,
+                raw_size: raw.len() as u32,
+                zstd_size_hint: Some(zstd.len() as u32),
+            });
+        }
+
+        let mut manifest = CapsuleManifestV3::new(chunks);
+        set_artifact_hash(&mut manifest).expect("artifact hash");
+
+        (
+            V3SyncPayload {
+                publisher: "local".to_string(),
+                slug: "sync-app".to_string(),
+                version: "1.0.0".to_string(),
+                manifest,
+            },
+            hashes,
+        )
+    }
 
     fn test_capsule_bytes(name: &str, version: &str) -> Vec<u8> {
         let manifest = format!(
@@ -382,6 +727,55 @@ entrypoint = "main.ts"
             builder.finish().expect("finish tar");
         }
         buf
+    }
+
+    fn test_capsule_bytes_with_v3_manifest(name: &str, version: &str) -> Vec<u8> {
+        let bytes = test_capsule_bytes(name, version);
+        let mut v3 = CapsuleManifestV3::new(vec![ChunkMeta {
+            raw_hash: "blake3:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .to_string(),
+            raw_size: 0,
+            zstd_size_hint: Some(0),
+        }]);
+        // Keep valid non-zero chunk size for validation path.
+        v3.chunks[0].raw_size = 1;
+        v3.total_raw_size = 1;
+        set_artifact_hash(&mut v3).expect("set artifact hash");
+
+        let mut rebuilt = Vec::<u8>::new();
+        {
+            let mut builder = Builder::new(&mut rebuilt);
+            let mut archive = tar::Archive::new(Cursor::new(bytes));
+            let mut entries = archive.entries().expect("entries");
+            while let Some(entry) = entries.next() {
+                let mut entry = entry.expect("entry");
+                let path = entry.path().expect("path").to_string_lossy().to_string();
+                let mut content = Vec::new();
+                entry.read_to_end(&mut content).expect("read entry");
+                let mut header = tar::Header::new_gnu();
+                header.set_mode(0o644);
+                header.set_size(content.len() as u64);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, path, Cursor::new(content))
+                    .expect("append existing entry");
+            }
+
+            let manifest_bytes = serde_jcs::to_vec(&v3).expect("serialize v3");
+            let mut v3_header = tar::Header::new_gnu();
+            v3_header.set_mode(0o644);
+            v3_header.set_size(manifest_bytes.len() as u64);
+            v3_header.set_cksum();
+            builder
+                .append_data(
+                    &mut v3_header,
+                    capsule_core::capsule_v3::V3_PAYLOAD_MANIFEST_PATH,
+                    Cursor::new(manifest_bytes),
+                )
+                .expect("append v3 manifest");
+            builder.finish().expect("finish tar");
+        }
+        rebuilt
     }
 
     #[test]
