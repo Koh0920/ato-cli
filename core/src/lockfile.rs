@@ -1981,7 +1981,17 @@ fn selected_target_table(manifest: &toml::Value) -> Option<&toml::Value> {
 }
 
 fn lockfile_runtime_platforms(manifest: &toml::Value) -> Result<Vec<RuntimePlatform>> {
-    if selected_target_runtime(manifest).as_deref() == Some("web") {
+    let runtime = selected_target_runtime(manifest);
+    let driver = selected_target_driver(manifest).or_else(|| detect_language(manifest));
+    let runtime_tools = read_runtime_tools(manifest);
+    let needs_universal_lock = runtime.as_deref() == Some("web")
+        || (runtime.as_deref() == Some("source")
+            && (matches!(
+                driver.as_deref(),
+                Some("python") | Some("node") | Some("deno")
+            ) || !runtime_tools.is_empty()));
+
+    if needs_universal_lock {
         return Ok(SUPPORTED_RUNTIME_PLATFORMS.to_vec());
     }
     Ok(vec![current_runtime_platform()?])
@@ -2229,7 +2239,7 @@ runtime_version = "1.46.3"
     }
 
     #[test]
-    fn source_targets_keep_current_runtime_platform_only() {
+    fn source_managed_runtime_targets_include_all_supported_runtime_platforms_in_lockfile() {
         let manifest: toml::Value = toml::from_str(
             r#"
 default_target = "default"
@@ -2242,8 +2252,31 @@ runtime_version = "1.46.3"
         .unwrap();
 
         let platforms = lockfile_runtime_platforms(&manifest).unwrap();
-        assert_eq!(platforms.len(), 1);
-        assert_eq!(platforms[0].target_triple, platform_triple().unwrap());
+        assert_eq!(platforms.len(), SUPPORTED_RUNTIME_PLATFORMS.len());
+        for expected in SUPPORTED_RUNTIME_PLATFORMS {
+            assert!(platforms.contains(expected));
+        }
+    }
+
+    #[test]
+    fn source_targets_with_runtime_tools_include_all_supported_runtime_platforms_in_lockfile() {
+        let manifest: toml::Value = toml::from_str(
+            r#"
+default_target = "default"
+[targets.default]
+runtime = "source"
+driver = "node"
+runtime_version = "20.11.0"
+runtime_tools = { python = "3.11.7" }
+"#,
+        )
+        .unwrap();
+
+        let platforms = lockfile_runtime_platforms(&manifest).unwrap();
+        assert_eq!(platforms.len(), SUPPORTED_RUNTIME_PLATFORMS.len());
+        for expected in SUPPORTED_RUNTIME_PLATFORMS {
+            assert!(platforms.contains(expected));
+        }
     }
 
     #[test]
