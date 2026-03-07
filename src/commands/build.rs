@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use capsule_core::execution_plan::error::AtoExecutionError;
 use capsule_core::CapsuleReporter;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -7,6 +8,7 @@ use tracing::debug;
 use crate::init;
 use crate::reporters;
 
+#[allow(clippy::too_many_arguments)]
 pub fn execute_pack_command(
     dir: PathBuf,
     init_if_missing: bool,
@@ -14,6 +16,7 @@ pub fn execute_pack_command(
     standalone: bool,
     force_large_payload: bool,
     keep_failed_artifacts: bool,
+    strict_manifest: bool,
     enforcement: String,
     reporter: std::sync::Arc<reporters::CliReporter>,
     cli_json: bool,
@@ -74,6 +77,22 @@ pub fn execute_pack_command(
         &manifest,
         decision.plan.selected_target_label(),
     )?;
+    let ipc_diagnostics = crate::ipc::validate::validate_manifest(
+        &decision.plan.manifest,
+        &decision.plan.manifest_dir,
+    )
+    .map_err(|err| AtoExecutionError::policy_violation(format!("IPC validation failed: {err}")))?;
+    if crate::ipc::validate::has_errors(&ipc_diagnostics) {
+        return Err(
+            AtoExecutionError::policy_violation(crate::ipc::validate::format_diagnostics(
+                &ipc_diagnostics,
+            ))
+            .into(),
+        );
+    }
+    for diagnostic in ipc_diagnostics {
+        futures::executor::block_on(reporter.warn(diagnostic.to_string()))?;
+    }
 
     futures::executor::block_on(reporter.notify(format!(
         "📦 Packing capsule \"{}\" (v{})...",
@@ -114,6 +133,7 @@ pub fn execute_pack_command(
                     skip_validation: false,
                     nacelle_override,
                     standalone,
+                    strict_manifest,
                 },
                 reporter.clone(),
             );
@@ -256,6 +276,7 @@ pub fn execute_pack_command(
                         skip_validation: false,
                         nacelle_override,
                         standalone,
+                        strict_manifest,
                     },
                     reporter.clone(),
                 );

@@ -1,23 +1,34 @@
 //! Install command implementation
 //!
 //! Downloads and installs capsules from the Store.
-//! Primary path: `/v1/capsules/by/:publisher/:slug/distributions` (.capsule contract)
-//! Legacy fallback: `/v1/capsules/by/:publisher/:slug/download`
+//! Primary path: `/v1/manifest/capsules/by/:publisher/:slug/distributions` (.capsule contract)
 
 use anyhow::{bail, Context, Result};
-use futures::stream::{FuturesUnordered, StreamExt};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::io::Write;
-use std::path::PathBuf;
-use std::sync::{Arc, Once};
-use std::time::Duration;
-use tokio::sync::Semaphore;
+use std::io::{Cursor, Read};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use capsule_core::packers::payload as manifest_payload;
+use capsule_core::resource::cas::LocalCasIndex;
+use capsule_core::types::identity::public_key_to_did;
+use capsule_core::types::CapsuleManifest;
 
 use crate::registry::RegistryResolver;
+use crate::runtime_tree;
 
-const DEFAULT_STORE_DIR: &str = ".capsule/store";
+const DEFAULT_STORE_DIR: &str = ".ato/store";
 const SEGMENT_MAX_LEN: usize = 63;
+const LEASE_REFRESH_INTERVAL_SECS: u64 = 300;
+const NEGOTIATE_DEFAULT_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const DELTA_RECONSTRUCT_ZSTD_LEVEL: i32 = 3;
 
 #[derive(Debug, Serialize)]
 pub struct InstallResult {
@@ -98,28 +109,100 @@ struct CapsuleDetail {
     latest_version: Option<String>,
     releases: Vec<ReleaseInfo>,
     #[serde(default)]
+    manifest_toml: Option<String>,
+    #[serde(default)]
+    capsule_lock: Option<String>,
+    #[serde(default)]
     permissions: Option<CapsulePermissions>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ReleaseInfo {
     version: String,
-    content_hash: String,
-    #[serde(default)]
-    signature_status: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-struct DistributionResponse {
-    version: String,
-    artifact_url: String,
-    sha256: Option<String>,
-    blake3: Option<String>,
-    file_name: String,
+struct ManifestEpochResolveResponse {
+    pointer: ManifestEpochPointer,
+    public_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestEpochPointer {
+    scoped_id: String,
+    epoch: u64,
+    manifest_hash: String,
     #[serde(default)]
-    signature_status: Option<String>,
+    prev_epoch_hash: Option<String>,
+    issued_at: String,
+    signer_did: String,
+    key_id: String,
+    signature: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ManifestChunkBloomRequest {
+    m_bits: u64,
+    k_hashes: u32,
+    seed: u64,
+    bitset_base64: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ManifestNegotiateRequest {
+    scoped_id: String,
+    target_manifest_hash: String,
     #[serde(default)]
-    publisher_verified: Option<bool>,
+    have_chunks: Vec<String>,
+    #[serde(default)]
+    have_chunks_bloom: Option<ManifestChunkBloomRequest>,
+    #[serde(default)]
+    reuse_lease_id: Option<String>,
+    #[serde(default)]
+    max_bytes: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestNegotiateResponse {
+    required_chunks: Vec<String>,
+    #[serde(default)]
+    yanked: Option<bool>,
+    #[serde(default)]
+    lease_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ManifestLeaseRefreshRequest {
+    lease_id: String,
+    ttl_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestLeaseRefreshResponse {
+    lease_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ManifestLeaseReleaseRequest {
+    lease_id: String,
+}
+
+#[derive(Debug)]
+enum DeltaInstallResult {
+    Artifact(Vec<u8>),
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct EpochGuardState {
+    #[serde(default)]
+    capsules: HashMap<String, EpochGuardEntry>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct EpochGuardEntry {
+    max_epoch: u64,
+    manifest_hash: String,
+    updated_at: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -127,6 +210,12 @@ pub struct ScopedCapsuleRef {
     pub publisher: String,
     pub slug: String,
     pub scoped_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ParsedCapsuleRequest {
+    pub scoped_ref: ScopedCapsuleRef,
+    pub version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -156,17 +245,28 @@ struct SuggestionPublisher {
     handle: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum V3SyncOutcome {
-    Synced,
-    SkippedUnsupportedRegistry,
-    SkippedDisabledCas(capsule_core::capsule_v3::CasDisableReason),
+#[derive(Debug, Deserialize)]
+struct VersionManifestResolveResponse {
+    scoped_id: String,
+    version: String,
+    manifest_hash: String,
+    #[serde(default)]
+    yanked_at: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChunkDownloadOutcome {
-    Stored,
-    UnsupportedRegistry,
+#[derive(Debug)]
+enum ManifestResolution {
+    Current(ManifestEpochResolveResponse),
+    Version(VersionManifestResolveResponse),
+}
+
+impl ManifestResolution {
+    fn manifest_hash(&self) -> &str {
+        match self {
+            Self::Current(response) => &response.pointer.manifest_hash,
+            Self::Version(response) => &response.manifest_hash,
+        }
+    }
 }
 
 fn is_valid_segment(value: &str) -> bool {
@@ -194,12 +294,35 @@ fn is_valid_segment(value: &str) -> bool {
     !value.ends_with('-')
 }
 
-pub fn parse_capsule_ref(input: &str) -> Result<ScopedCapsuleRef> {
+fn split_capsule_request(input: &str) -> Result<(String, Option<String>)> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         bail!("scoped_id_required: use publisher/slug (for example: koh0920/sample-capsule)");
     }
-    let normalized = trimmed.strip_prefix('@').unwrap_or(trimmed);
+
+    let normalized = trimmed.strip_prefix('@').unwrap_or(trimmed).trim();
+    if normalized.is_empty() {
+        bail!("scoped_id_required: use publisher/slug (for example: koh0920/sample-capsule)");
+    }
+
+    if let Some((base, version)) = normalized.rsplit_once('@') {
+        let base = base.trim();
+        let version = version.trim();
+        if base.is_empty() {
+            bail!("scoped_id_required: use publisher/slug (for example: koh0920/sample-capsule)");
+        }
+        if version.is_empty() {
+            bail!("version_required: use publisher/slug@version");
+        }
+        return Ok((base.to_string(), Some(version.to_string())));
+    }
+
+    Ok((normalized.to_string(), None))
+}
+
+pub fn parse_capsule_request(input: &str) -> Result<ParsedCapsuleRequest> {
+    let (scoped_input, version) = split_capsule_request(input)?;
+    let normalized = scoped_input.strip_prefix('@').unwrap_or(&scoped_input);
     let mut parts = normalized.split('/');
     let publisher = parts.next().unwrap_or_default().trim().to_lowercase();
     let slug = parts.next().unwrap_or_default().trim().to_lowercase();
@@ -212,22 +335,53 @@ pub fn parse_capsule_ref(input: &str) -> Result<ScopedCapsuleRef> {
     if !is_valid_segment(&publisher) || !is_valid_segment(&slug) {
         bail!("invalid_capsule_ref: publisher/slug must be lowercase kebab-case");
     }
-    Ok(ScopedCapsuleRef {
-        publisher: publisher.clone(),
-        slug: slug.clone(),
-        scoped_id: format!("{}/{}", publisher, slug),
+    Ok(ParsedCapsuleRequest {
+        scoped_ref: ScopedCapsuleRef {
+            publisher: publisher.clone(),
+            slug: slug.clone(),
+            scoped_id: format!("{}/{}", publisher, slug),
+        },
+        version,
     })
 }
 
-pub fn is_slug_only_ref(input: &str) -> bool {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    let normalized = trimmed.strip_prefix('@').unwrap_or(trimmed);
-    !normalized.contains('/')
+pub fn parse_capsule_ref(input: &str) -> Result<ScopedCapsuleRef> {
+    Ok(parse_capsule_request(input)?.scoped_ref)
 }
 
+pub fn is_slug_only_ref(input: &str) -> bool {
+    let Ok((scoped_input, _)) = split_capsule_request(input) else {
+        return false;
+    };
+    !scoped_input.contains('/')
+}
+
+pub fn merge_requested_version(
+    embedded_version: Option<&str>,
+    explicit_version: Option<&str>,
+) -> Result<Option<String>> {
+    match (
+        embedded_version
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+        explicit_version
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+    ) {
+        (Some(left), Some(right)) if left != right => {
+            bail!(
+                "conflicting_version_request: ref specifies version '{}' but --version requested '{}'",
+                left,
+                right
+            );
+        }
+        (Some(left), _) => Ok(Some(left.to_string())),
+        (None, Some(right)) => Ok(Some(right.to_string())),
+        (None, None) => Ok(None),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn install_app(
     capsule_ref: &str,
     registry_url: Option<&str>,
@@ -235,14 +389,17 @@ pub async fn install_app(
     output_dir: Option<PathBuf>,
     _set_default: bool,
     allow_unverified: bool,
+    allow_downgrade: bool,
     json_output: bool,
 ) -> Result<InstallResult> {
-    let scoped_ref = parse_capsule_ref(capsule_ref)?;
+    let request = parse_capsule_request(capsule_ref)?;
+    let scoped_ref = request.scoped_ref;
+    let requested_version = merge_requested_version(request.version.as_deref(), version)?;
     let registry = resolve_registry_url(registry_url, !json_output).await?;
 
     let client = reqwest::Client::new();
     let capsule_url = format!(
-        "{}/v1/capsules/by/{}/{}",
+        "{}/v1/manifest/capsules/by/{}/{}",
         registry,
         urlencoding::encode(&scoped_ref.publisher),
         urlencoding::encode(&scoped_ref.slug)
@@ -277,7 +434,7 @@ pub async fn install_app(
         }
     }
 
-    let target_version_owned = match version.map(str::trim).filter(|value| !value.is_empty()) {
+    let target_version_owned = match requested_version.as_deref() {
         Some(explicit) => explicit.to_string(),
         None => capsule
             .latest_version
@@ -293,99 +450,55 @@ pub async fn install_app(
             })?,
     };
     let target_version = target_version_owned.as_str();
-    let release = capsule
+    capsule
         .releases
         .iter()
         .find(|r| r.version == target_version)
         .with_context(|| format!("Version {} not found", target_version))?;
-
-    let (download_url, sha256, blake3, file_name, signature_status) = match resolve_distribution(
+    let (bytes, normalized_file_name) = match install_manifest_delta_path(
         &client,
         &registry,
         &scoped_ref,
-        target_version,
-        allow_unverified,
+        requested_version.as_deref(),
+        capsule.manifest_toml.as_deref(),
+        capsule.capsule_lock.as_deref(),
     )
-    .await
+    .await?
     {
-        Ok(d) => (
-            d.artifact_url,
-            d.sha256,
-            d.blake3,
-            d.file_name,
-            d.signature_status.unwrap_or_else(|| "unknown".to_string()),
-        ),
-        Err(_) => {
-            if !json_output {
-                eprintln!(
-                    "ℹ️  Distribution API unavailable, falling back to legacy download endpoint"
-                );
-            }
-            let legacy_download_url = resolve_legacy_download_url(
+        DeltaInstallResult::Artifact(bytes) => {
+            verify_manifest_supply_chain(
                 &client,
                 &registry,
                 &scoped_ref,
-                target_version,
+                requested_version.as_deref(),
+                &bytes,
                 allow_unverified,
+                allow_downgrade,
             )
             .await?;
             (
-                legacy_download_url,
-                None,
-                if release.content_hash.starts_with("blake3:") {
-                    Some(release.content_hash.clone())
-                } else {
-                    None
-                },
+                bytes,
                 format!("{}-{}.capsule", scoped_ref.slug, target_version),
-                release
-                    .signature_status
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string()),
             )
         }
     };
 
-    if !json_output {
-        eprintln!("⬇️  Downloading {}", file_name);
-    }
-
-    let bytes = client
-        .get(&download_url)
-        .send()
-        .await
-        .with_context(|| "Failed to download artifact")?
-        .bytes()
-        .await
-        .with_context(|| "Failed to read downloaded artifact")?;
-
     let computed_blake3 = compute_blake3(&bytes);
-    ensure_signature_verified(&signature_status, allow_unverified)?;
 
-    match (sha256.as_ref(), blake3.as_ref()) {
-        (None, None) => {
-            bail!("No hash metadata available for verification");
-        }
-        (Some(expected_sha), _) => {
-            let got_sha = compute_sha256(&bytes);
-            if !equals_hash(expected_sha, &got_sha) {
-                bail!(
-                    "SHA256 mismatch!\n  Expected: {}\n  Got: {}",
-                    expected_sha,
-                    got_sha
-                );
+    if let Some(v3_manifest) = extract_payload_v3_manifest_from_capsule(&bytes)? {
+        let sync_result = sync_v3_chunks_from_manifest(&client, &registry, &v3_manifest).await?;
+        match sync_result {
+            V3SyncOutcome::Synced => {}
+            V3SyncOutcome::SkippedUnsupportedRegistry => {
+                if !json_output {
+                    eprintln!(
+                        "ℹ️  Registry does not expose v3 chunk sync endpoint; falling back to embedded payload"
+                    );
+                }
             }
-        }
-        (None, Some(_)) => {}
-    }
-
-    if let Some(expected_blake3) = blake3.as_ref() {
-        if !equals_hash(expected_blake3, &computed_blake3) {
-            bail!(
-                "BLAKE3 mismatch!\n  Expected: {}\n  Got: {}",
-                expected_blake3,
-                computed_blake3
-            );
+            V3SyncOutcome::SkippedDisabledCas(reason) => {
+                emit_cas_disabled_performance_warning_once(&reason, json_output);
+            }
         }
     }
 
@@ -422,16 +535,15 @@ pub async fn install_app(
         )
     })?;
 
-    let normalized_file_name = if file_name.to_lowercase().ends_with(".capsule") {
-        file_name
-    } else {
-        format!("{}-{}.capsule", scoped_ref.slug, target_version)
-    };
-
     let output_path = install_dir.join(normalized_file_name);
-    let mut file = std::fs::File::create(&output_path)
-        .with_context(|| format!("Failed to create file: {}", output_path.display()))?;
-    file.write_all(&bytes)?;
+    sweep_stale_tmp_capsules(&install_dir)?;
+    write_capsule_atomic(&output_path, &bytes, &computed_blake3)?;
+    runtime_tree::prepare_runtime_tree(
+        &scoped_ref.publisher,
+        &scoped_ref.slug,
+        target_version,
+        &bytes,
+    )?;
 
     if !json_output {
         eprintln!("✅ Installed to: {}", output_path.display());
@@ -443,7 +555,7 @@ pub async fn install_app(
         scoped_id: scoped_ref.scoped_id.clone(),
         publisher: scoped_ref.publisher,
         slug: capsule.slug,
-        version: release.version.clone(),
+        version: target_version_owned,
         path: output_path,
         content_hash: computed_blake3,
     })
@@ -715,7 +827,7 @@ pub async fn fetch_capsule_detail(
     let registry = resolve_registry_url(registry_url, false).await?;
     let client = reqwest::Client::new();
     let capsule_url = format!(
-        "{}/v1/capsules/by/{}/{}",
+        "{}/v1/manifest/capsules/by/{}/{}",
         registry,
         urlencoding::encode(&scoped_ref.publisher),
         urlencoding::encode(&scoped_ref.slug)
@@ -763,94 +875,540 @@ async fn resolve_registry_url(registry_url: Option<&str>, emit_log: bool) -> Res
     Ok(info.url)
 }
 
-async fn resolve_distribution(
+async fn resolve_manifest_target(
+    client: &reqwest::Client,
+    base: &str,
+    scoped_ref: &ScopedCapsuleRef,
+    requested_version: Option<&str>,
+    has_token: bool,
+    require_current_epoch: bool,
+) -> Result<ManifestResolution> {
+    if let Some(version) = requested_version
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let endpoint = format!(
+            "{}/v1/manifest/resolve/{}/{}/{}",
+            base,
+            urlencoding::encode(&scoped_ref.publisher),
+            urlencoding::encode(&scoped_ref.slug),
+            urlencoding::encode(version)
+        );
+        let response = with_ato_token(client.get(&endpoint))
+            .send()
+            .await
+            .with_context(|| "Failed to resolve versioned manifest hash")?;
+        let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED && !has_token {
+            bail!(
+                "{}: registry requires authentication for manifest read APIs. Run `ato login` or set `ATO_TOKEN=<token>`.",
+                crate::error_codes::ATO_ERR_AUTH_REQUIRED
+            );
+        }
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            if let Some(message) = parse_yanked_message(&body) {
+                bail!(
+                    "{}: {}",
+                    crate::error_codes::ATO_ERR_INTEGRITY_FAILURE,
+                    message
+                );
+            }
+            bail!(
+                "Failed to resolve manifest for {}@{} (status={}): {}",
+                scoped_ref.scoped_id,
+                version,
+                status,
+                body
+            );
+        }
+        let payload = response
+            .json::<VersionManifestResolveResponse>()
+            .await
+            .with_context(|| "Invalid version resolve response")?;
+        if payload.scoped_id != scoped_ref.scoped_id {
+            bail!(
+                "version resolve scoped_id mismatch (expected {}, got {})",
+                scoped_ref.scoped_id,
+                payload.scoped_id
+            );
+        }
+        if payload.version != version {
+            bail!(
+                "version resolve mismatch (expected {}, got {})",
+                version,
+                payload.version
+            );
+        }
+        if let Some(yanked_at) = payload.yanked_at.as_deref() {
+            bail!(
+                "{}: manifest has been yanked by the publisher at {}",
+                crate::error_codes::ATO_ERR_INTEGRITY_FAILURE,
+                yanked_at
+            );
+        }
+        return Ok(ManifestResolution::Version(payload));
+    }
+
+    let epoch_endpoint = format!("{}/v1/manifest/epoch/resolve", base);
+    let epoch_response = with_ato_token(
+        client
+            .post(&epoch_endpoint)
+            .json(&serde_json::json!({ "scoped_id": scoped_ref.scoped_id })),
+    )
+    .send()
+    .await
+    .with_context(|| "Failed to fetch manifest epoch pointer")?;
+    if !epoch_response.status().is_success() {
+        if epoch_response.status() == reqwest::StatusCode::UNAUTHORIZED && !has_token {
+            bail!(
+                "{}: registry requires authentication for manifest read APIs. Run `ato login` or set `ATO_TOKEN=<token>`.",
+                crate::error_codes::ATO_ERR_AUTH_REQUIRED
+            );
+        }
+        if require_current_epoch {
+            bail!(
+                "manifest epoch pointer is required for delta install (status={})",
+                epoch_response.status()
+            );
+        }
+        bail!(
+            "manifest epoch pointer is required for verified install (status={})",
+            epoch_response.status()
+        );
+    }
+    let epoch = epoch_response
+        .json::<ManifestEpochResolveResponse>()
+        .await
+        .with_context(|| "Invalid manifest epoch response")?;
+    verify_epoch_signature(&epoch).with_context(|| "Epoch signature verification failed")?;
+    Ok(ManifestResolution::Current(epoch))
+}
+
+async fn install_manifest_delta_path(
     client: &reqwest::Client,
     registry: &str,
     scoped_ref: &ScopedCapsuleRef,
-    version: &str,
-    allow_unverified: bool,
-) -> Result<DistributionResponse> {
-    let os = normalize_os(std::env::consts::OS);
-    let arch = normalize_arch(std::env::consts::ARCH);
-    let url = format!(
-        "{}/v1/capsules/by/{}/{}/distributions?os={}&arch={}&channel=stable&version={}&allow_unverified={}",
+    requested_version: Option<&str>,
+    capsule_toml: Option<&str>,
+    capsule_lock: Option<&str>,
+) -> Result<DeltaInstallResult> {
+    let mut lease_id: Option<String> = None;
+    let result = install_manifest_delta_path_inner(
+        client,
         registry,
-        urlencoding::encode(&scoped_ref.publisher),
-        urlencoding::encode(&scoped_ref.slug),
-        urlencoding::encode(os),
-        urlencoding::encode(arch),
-        urlencoding::encode(version),
-        if allow_unverified { "true" } else { "false" },
-    );
+        scoped_ref,
+        requested_version,
+        capsule_toml,
+        capsule_lock,
+        &mut lease_id,
+    )
+    .await;
+    if let Some(lease_id) = lease_id {
+        let _ = release_lease_best_effort(client, registry, &lease_id).await;
+    }
+    result
+}
 
-    let response = client
-        .get(&url)
+async fn install_manifest_delta_path_inner(
+    client: &reqwest::Client,
+    registry: &str,
+    scoped_ref: &ScopedCapsuleRef,
+    requested_version: Option<&str>,
+    _capsule_toml: Option<&str>,
+    capsule_lock: Option<&str>,
+    lease_id: &mut Option<String>,
+) -> Result<DeltaInstallResult> {
+    let base = registry.trim_end_matches('/');
+    let has_token = has_ato_token();
+    let resolution =
+        resolve_manifest_target(client, base, scoped_ref, requested_version, has_token, true)
+            .await?;
+    let target_manifest_hash = resolution.manifest_hash().to_string();
+
+    let manifest_endpoint = format!(
+        "{}/v1/manifest/documents/{}",
+        base,
+        urlencoding::encode(&target_manifest_hash)
+    );
+    let manifest_response = with_ato_token(client.get(&manifest_endpoint))
         .send()
         .await
-        .with_context(|| "Failed to resolve distribution")?;
-    if !response.status().is_success() {
-        bail!("Distribution resolution failed with {}", response.status());
+        .with_context(|| "Failed to fetch manifest document for delta install")?;
+    let manifest_status = manifest_response.status();
+    if !manifest_status.is_success() {
+        if manifest_status == reqwest::StatusCode::UNAUTHORIZED && !has_token {
+            bail!(
+                "{}: registry requires authentication for manifest read APIs. Run `ato login` or set `ATO_TOKEN=<token>`.",
+                crate::error_codes::ATO_ERR_AUTH_REQUIRED
+            );
+        }
+        let body = manifest_response.text().await.unwrap_or_default();
+        if let Some(message) = parse_yanked_message(&body) {
+            bail!(
+                "{}: {}",
+                crate::error_codes::ATO_ERR_INTEGRITY_FAILURE,
+                message
+            );
+        }
+        bail!(
+            "Failed to fetch registry manifest for delta install (status={})",
+            manifest_status
+        );
+    }
+
+    let manifest_bytes = manifest_response
+        .bytes()
+        .await
+        .with_context(|| "Failed to read manifest payload for delta install")?
+        .to_vec();
+    let manifest_toml = String::from_utf8(manifest_bytes)
+        .with_context(|| "Remote manifest payload must be UTF-8 TOML")?;
+    let manifest: CapsuleManifest = toml::from_str(&manifest_toml)
+        .with_context(|| "Invalid remote capsule.toml for delta install")?;
+    let manifest_hash = compute_manifest_hash_without_signatures(&manifest)?;
+    if normalize_hash_for_compare(&manifest_hash)
+        != normalize_hash_for_compare(&target_manifest_hash)
+    {
+        bail!(
+            "Manifest hash mismatch for delta install (expected {}, got {})",
+            target_manifest_hash,
+            manifest_hash
+        );
+    }
+
+    let cas_index =
+        LocalCasIndex::open_default().with_context(|| "Failed to open local CAS index")?;
+    let bloom_wire = cas_index.build_bloom(Some(0.01))?.to_wire();
+    let negotiate_request = ManifestNegotiateRequest {
+        scoped_id: scoped_ref.scoped_id.clone(),
+        target_manifest_hash: target_manifest_hash.clone(),
+        have_chunks: Vec::new(),
+        have_chunks_bloom: Some(ManifestChunkBloomRequest {
+            m_bits: bloom_wire.m_bits,
+            k_hashes: bloom_wire.k_hashes,
+            seed: bloom_wire.seed,
+            bitset_base64: bloom_wire.bitset_base64,
+        }),
+        reuse_lease_id: None,
+        max_bytes: Some(NEGOTIATE_DEFAULT_MAX_BYTES),
+    };
+
+    let first_payload = negotiate_manifest(client, base, &negotiate_request, has_token).await?;
+    if let Some(id) = first_payload.lease_id.clone() {
+        *lease_id = Some(id);
+    }
+
+    download_required_chunks(
+        client,
+        base,
+        &cas_index,
+        &first_payload.required_chunks,
+        lease_id,
+        has_token,
+    )
+    .await?;
+
+    let mut reconstruction = reconstruct_payload_from_local_chunks(&cas_index, &manifest)?;
+    if !reconstruction.missing_chunks.is_empty() {
+        let reuse_lease = lease_id.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "{}: delta negotiate returned no lease_id; cannot retry exact chunk list.",
+                crate::error_codes::ATO_ERR_INTEGRITY_FAILURE
+            )
+        })?;
+        let have_exact = cas_index.available_hashes_for_manifest(
+            &manifest_distribution(&manifest)?
+                .chunk_list
+                .iter()
+                .map(|chunk| chunk.chunk_hash.clone())
+                .collect::<Vec<_>>(),
+        )?;
+        let second_request = ManifestNegotiateRequest {
+            scoped_id: scoped_ref.scoped_id.clone(),
+            target_manifest_hash: target_manifest_hash.clone(),
+            have_chunks: have_exact,
+            have_chunks_bloom: None,
+            reuse_lease_id: Some(reuse_lease),
+            max_bytes: Some(NEGOTIATE_DEFAULT_MAX_BYTES),
+        };
+        let second_payload = negotiate_manifest(client, base, &second_request, has_token).await?;
+        if let Some(id) = second_payload.lease_id.clone() {
+            *lease_id = Some(id);
+        }
+        download_required_chunks(
+            client,
+            base,
+            &cas_index,
+            &second_payload.required_chunks,
+            lease_id,
+            has_token,
+        )
+        .await?;
+        reconstruction = reconstruct_payload_from_local_chunks(&cas_index, &manifest)?;
+        if !reconstruction.missing_chunks.is_empty() {
+            bail!(
+                "{}: missing chunks after retry negotiate: {}",
+                crate::error_codes::ATO_ERR_INTEGRITY_FAILURE,
+                reconstruction.missing_chunks.join(",")
+            );
+        }
+    }
+
+    verify_payload_chunks(&manifest, &reconstruction.payload_tar)?;
+    verify_manifest_merkle_root(&manifest)?;
+
+    let payload_tar_zst = {
+        let mut encoder = zstd::stream::Encoder::new(Vec::new(), DELTA_RECONSTRUCT_ZSTD_LEVEL)
+            .with_context(|| "Failed to create zstd encoder for reconstructed payload")?;
+        encoder
+            .write_all(&reconstruction.payload_tar)
+            .with_context(|| "Failed to encode reconstructed payload.tar.zst")?;
+        encoder
+            .finish()
+            .with_context(|| "Failed to finalize reconstructed payload.tar.zst")?
+    };
+    let artifact = build_capsule_artifact(Some(&manifest_toml), capsule_lock, &payload_tar_zst)?;
+    Ok(DeltaInstallResult::Artifact(artifact))
+}
+
+async fn negotiate_manifest(
+    client: &reqwest::Client,
+    base: &str,
+    request: &ManifestNegotiateRequest,
+    has_token: bool,
+) -> Result<ManifestNegotiateResponse> {
+    let endpoint = format!("{}/v1/manifest/negotiate", base);
+    let response = with_ato_token(client.post(&endpoint).json(request))
+        .send()
+        .await
+        .with_context(|| "Failed to call manifest negotiate")?;
+    let status = response.status();
+    if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::NOT_IMPLEMENTED {
+        bail!("Registry does not support the manifest negotiate API");
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED && !has_token {
+        bail!(
+            "{}: registry requires authentication for manifest read APIs. Run `ato login` or set `ATO_TOKEN=<token>`.",
+            crate::error_codes::ATO_ERR_AUTH_REQUIRED
+        );
+    }
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        if let Some(message) = parse_yanked_message(&body) {
+            bail!(
+                "{}: {}",
+                crate::error_codes::ATO_ERR_INTEGRITY_FAILURE,
+                message
+            );
+        }
+        bail!("manifest negotiate failed (status={}): {}", status, body);
     }
     let payload = response
-        .json::<DistributionResponse>()
+        .json::<ManifestNegotiateResponse>()
         .await
-        .with_context(|| "Invalid distribution response")?;
+        .with_context(|| "Invalid manifest negotiate response payload")?;
+    if payload.yanked.unwrap_or(false) {
+        bail!(
+            "{}: manifest has been yanked by the publisher.",
+            crate::error_codes::ATO_ERR_INTEGRITY_FAILURE
+        );
+    }
     Ok(payload)
 }
 
-async fn resolve_legacy_download_url(
+async fn download_required_chunks(
+    client: &reqwest::Client,
+    base: &str,
+    cas_index: &LocalCasIndex,
+    required_chunks: &[String],
+    lease_id: &mut Option<String>,
+    has_token: bool,
+) -> Result<()> {
+    let mut last_refresh = Instant::now();
+    for chunk_hash in required_chunks {
+        if cas_index.load_chunk_bytes(chunk_hash)?.is_some() {
+            continue;
+        }
+        if lease_id.is_some()
+            && last_refresh.elapsed() >= Duration::from_secs(LEASE_REFRESH_INTERVAL_SECS)
+        {
+            let refreshed =
+                refresh_lease(client, base, lease_id.as_deref().unwrap(), has_token).await?;
+            *lease_id = Some(refreshed.lease_id);
+            last_refresh = Instant::now();
+        }
+        let endpoint = format!(
+            "{}/v1/manifest/chunks/{}",
+            base,
+            urlencoding::encode(chunk_hash)
+        );
+        let response = with_ato_token(client.get(&endpoint))
+            .send()
+            .await
+            .with_context(|| format!("Failed to fetch required chunk {}", chunk_hash))?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED && !has_token {
+            bail!(
+                "{}: registry requires authentication for manifest read APIs. Run `ato login` or set `ATO_TOKEN=<token>`.",
+                crate::error_codes::ATO_ERR_AUTH_REQUIRED
+            );
+        }
+        if !response.status().is_success() {
+            bail!(
+                "{}: failed to fetch chunk {} (status={})",
+                crate::error_codes::ATO_ERR_INTEGRITY_FAILURE,
+                chunk_hash,
+                response.status()
+            );
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .with_context(|| format!("Failed to read required chunk {}", chunk_hash))?;
+        cas_index.put_verified_chunk(chunk_hash, &bytes)?;
+    }
+    Ok(())
+}
+
+async fn refresh_lease(
+    client: &reqwest::Client,
+    base: &str,
+    lease_id: &str,
+    has_token: bool,
+) -> Result<ManifestLeaseRefreshResponse> {
+    let endpoint = format!("{}/v1/manifest/leases/refresh", base);
+    let response = with_ato_token(client.post(&endpoint).json(&ManifestLeaseRefreshRequest {
+        lease_id: lease_id.to_string(),
+        ttl_secs: Some(LEASE_REFRESH_INTERVAL_SECS),
+    }))
+    .send()
+    .await
+    .with_context(|| "Failed to refresh manifest lease")?;
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED && !has_token {
+        bail!(
+            "{}: registry requires authentication for manifest read APIs. Run `ato login` or set `ATO_TOKEN=<token>`.",
+            crate::error_codes::ATO_ERR_AUTH_REQUIRED
+        );
+    }
+    if !response.status().is_success() {
+        bail!(
+            "manifest lease refresh failed (status={})",
+            response.status()
+        );
+    }
+    response
+        .json::<ManifestLeaseRefreshResponse>()
+        .await
+        .with_context(|| "Invalid manifest lease refresh response")
+}
+
+async fn release_lease_best_effort(
     client: &reqwest::Client,
     registry: &str,
-    scoped_ref: &ScopedCapsuleRef,
-    version: &str,
-    allow_unverified: bool,
-) -> Result<String> {
-    let download_url = format!(
-        "{}/v1/capsules/by/{}/{}/download?version={}&allow_unverified={}",
-        registry,
-        urlencoding::encode(&scoped_ref.publisher),
-        urlencoding::encode(&scoped_ref.slug),
-        urlencoding::encode(version),
-        if allow_unverified { "true" } else { "false" },
+    lease_id: &str,
+) -> Result<()> {
+    let endpoint = format!(
+        "{}/v1/manifest/leases/release",
+        registry.trim_end_matches('/')
     );
-
-    let response = client
-        .get(&download_url)
-        .send()
-        .await
-        .with_context(|| "Failed to get legacy download URL")?;
-
-    if response.status().is_redirection() {
-        let location = response
-            .headers()
-            .get("location")
-            .and_then(|v| v.to_str().ok())
-            .with_context(|| "Missing Location header in redirect")?;
-        return Ok(location.to_string());
-    }
-
-    if response.status().is_success() {
-        return Ok(download_url);
-    }
-
-    bail!("Legacy download URL failed: {}", response.status())
+    let _ = with_ato_token(client.post(&endpoint).json(&ManifestLeaseReleaseRequest {
+        lease_id: lease_id.to_string(),
+    }))
+    .send()
+    .await;
+    Ok(())
 }
 
-fn normalize_os(raw: &str) -> &str {
-    match raw {
-        "macos" => "macos",
-        "windows" => "windows",
-        "linux" => "linux",
-        _ => "any",
-    }
+#[derive(Debug, Default)]
+struct ReconstructResult {
+    payload_tar: Vec<u8>,
+    missing_chunks: Vec<String>,
 }
 
-fn normalize_arch(raw: &str) -> &str {
-    match raw {
-        "x86_64" => "x86_64",
-        "aarch64" => "aarch64",
-        _ => "any",
+fn manifest_distribution(
+    manifest: &CapsuleManifest,
+) -> Result<&capsule_core::types::DistributionInfo> {
+    manifest.distribution.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "{}: distribution metadata is missing from capsule.toml",
+            crate::error_codes::ATO_ERR_INTEGRITY_FAILURE
+        )
+    })
+}
+
+fn reconstruct_payload_from_local_chunks(
+    cas_index: &LocalCasIndex,
+    manifest: &CapsuleManifest,
+) -> Result<ReconstructResult> {
+    let mut payload = Vec::new();
+    let mut missing = Vec::new();
+    for chunk in &manifest_distribution(manifest)?.chunk_list {
+        match cas_index.load_chunk_bytes(&chunk.chunk_hash)? {
+            Some(bytes) => {
+                if bytes.len() as u64 != chunk.length {
+                    bail!(
+                        "{}: chunk length mismatch for {} (expected {}, got {})",
+                        crate::error_codes::ATO_ERR_INTEGRITY_FAILURE,
+                        chunk.chunk_hash,
+                        chunk.length,
+                        bytes.len()
+                    );
+                }
+                payload.extend_from_slice(&bytes);
+            }
+            None => {
+                missing.push(chunk.chunk_hash.clone());
+            }
+        }
     }
+    Ok(ReconstructResult {
+        payload_tar: payload,
+        missing_chunks: missing,
+    })
+}
+
+fn build_capsule_artifact(
+    capsule_toml: Option<&str>,
+    capsule_lock: Option<&str>,
+    payload_tar_zst: &[u8],
+) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut out);
+        if let Some(manifest_toml) = capsule_toml {
+            if !manifest_toml.is_empty() {
+                append_capsule_entry(&mut builder, "capsule.toml", manifest_toml.as_bytes())?;
+            }
+        }
+        if let Some(lockfile) = capsule_lock {
+            if !lockfile.is_empty() {
+                append_capsule_entry(&mut builder, "capsule.lock", lockfile.as_bytes())?;
+            }
+        }
+        append_capsule_entry(&mut builder, "payload.tar.zst", payload_tar_zst)?;
+        builder
+            .finish()
+            .with_context(|| "Failed to finalize reconstructed .capsule archive")?;
+    }
+    Ok(out)
+}
+
+fn append_capsule_entry(
+    builder: &mut tar::Builder<&mut Vec<u8>>,
+    path: &str,
+    bytes: &[u8],
+) -> Result<()> {
+    let mut header = tar::Header::new_gnu();
+    header.set_size(bytes.len() as u64);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_mode(0o644);
+    header.set_mtime(0);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, path, Cursor::new(bytes))
+        .with_context(|| format!("Failed to append {} to reconstructed artifact", path))?;
+    Ok(())
 }
 
 fn compute_blake3(data: &[u8]) -> String {
@@ -861,6 +1419,7 @@ fn compute_blake3(data: &[u8]) -> String {
     format!("blake3:{}", hex::encode(hash.as_bytes()))
 }
 
+#[cfg(test)]
 fn compute_sha256(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
@@ -881,27 +1440,600 @@ fn equals_hash(expected: &str, got_raw: &str) -> bool {
     normalized_expected == normalized_got
 }
 
-fn read_ato_token() -> Option<String> {
-    std::env::var("ATO_TOKEN")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
+#[derive(Debug, Deserialize)]
+struct YankedResponsePayload {
+    #[serde(default)]
+    yanked: Option<bool>,
+    #[serde(default)]
+    message: Option<String>,
 }
 
-fn ensure_signature_verified(signature_status: &str, allow_unverified: bool) -> Result<()> {
-    if signature_status == "verified" || (allow_unverified && signature_status == "unverified") {
-        return Ok(());
-    }
-    if allow_unverified {
-        bail!(
-            "Signature verification failed even with --allow-unverified: signature_status={}",
-            signature_status
+fn parse_yanked_message(body: &str) -> Option<String> {
+    let parsed: YankedResponsePayload = serde_json::from_str(body).ok()?;
+    if parsed.yanked.unwrap_or(false) {
+        return Some(
+            parsed
+                .message
+                .unwrap_or_else(|| "Manifest has been yanked by the publisher.".to_string()),
         );
     }
-    bail!(
-        "Signature verification failed: signature_status={}",
-        signature_status
+    None
+}
+
+fn sweep_stale_tmp_capsules(install_dir: &Path) -> Result<()> {
+    let entries = match std::fs::read_dir(install_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(anyhow::anyhow!(
+                "Failed to read install directory {}: {}",
+                install_dir.display(),
+                err
+            ))
+        }
+    };
+    for entry in entries {
+        let entry = entry.with_context(|| {
+            format!(
+                "Failed to enumerate install directory {}",
+                install_dir.display()
+            )
+        })?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with(".capsule.tmp.") {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_file() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    Ok(())
+}
+
+fn write_capsule_atomic(path: &Path, bytes: &[u8], expected_blake3: &str) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Invalid install path without parent directory: {}",
+            path.display()
+        )
+    })?;
+    let mut nonce = [0u8; 8];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    let tmp_path = parent.join(format!(".capsule.tmp.{}", hex::encode(nonce)));
+
+    let result = (|| -> Result<()> {
+        let mut file = std::fs::File::create(&tmp_path)
+            .with_context(|| format!("Failed to create file: {}", tmp_path.display()))?;
+        file.write_all(bytes)
+            .with_context(|| format!("Failed to write file: {}", tmp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("Failed to sync file: {}", tmp_path.display()))?;
+
+        let computed = compute_blake3(bytes);
+        if !equals_hash(expected_blake3, &computed) {
+            bail!(
+                "{}: computed artifact hash changed during atomic install write",
+                crate::error_codes::ATO_ERR_INTEGRITY_FAILURE
+            );
+        }
+
+        std::fs::rename(&tmp_path, path).with_context(|| {
+            format!(
+                "Failed to atomically move {} -> {}",
+                tmp_path.display(),
+                path.display()
+            )
+        })?;
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    result
+}
+
+async fn verify_manifest_supply_chain(
+    client: &reqwest::Client,
+    registry: &str,
+    scoped_ref: &ScopedCapsuleRef,
+    requested_version: Option<&str>,
+    artifact_bytes: &[u8],
+    allow_unverified: bool,
+    allow_downgrade: bool,
+) -> Result<()> {
+    let base = registry.trim_end_matches('/');
+    let endpoint = format!("{}/v1/manifest/epoch/resolve", base);
+    let has_token = has_ato_token();
+    let resolution = if requested_version.is_some() {
+        resolve_manifest_target(
+            client,
+            base,
+            scoped_ref,
+            requested_version,
+            has_token,
+            false,
+        )
+        .await?
+    } else {
+        let response = with_ato_token(
+            client
+                .post(&endpoint)
+                .json(&serde_json::json!({ "scoped_id": scoped_ref.scoped_id })),
+        )
+        .send()
+        .await
+        .with_context(|| "Failed to fetch manifest epoch pointer")?;
+        if !response.status().is_success() {
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED && !has_token {
+                bail!(
+                    "{}: registry requires authentication for manifest read APIs. Run `ato login` or set `ATO_TOKEN=<token>`.",
+                    crate::error_codes::ATO_ERR_AUTH_REQUIRED
+                );
+            }
+            if allow_unverified {
+                eprintln!(
+                    "⚠️  manifest epoch pointer unavailable (status={}): continuing due to --allow-unverified",
+                    response.status()
+                );
+                return Ok(());
+            }
+            bail!(
+                "manifest epoch pointer is required for verified install (status={})",
+                response.status()
+            );
+        }
+        let epoch = response
+            .json::<ManifestEpochResolveResponse>()
+            .await
+            .with_context(|| "Invalid manifest epoch response")?;
+        verify_epoch_signature(&epoch).with_context(|| "Epoch signature verification failed")?;
+        ManifestResolution::Current(epoch)
+    };
+    let target_manifest_hash = resolution.manifest_hash().to_string();
+
+    let local_manifest_bytes = extract_manifest_toml_from_capsule(artifact_bytes)
+        .with_context(|| "capsule.toml is required in artifact")?;
+    let local_manifest: CapsuleManifest =
+        toml::from_str(&local_manifest_bytes).with_context(|| "Invalid local capsule.toml")?;
+    let local_manifest_hash = compute_manifest_hash_without_signatures(&local_manifest)?;
+    if normalize_hash_for_compare(&local_manifest_hash)
+        != normalize_hash_for_compare(&target_manifest_hash)
+    {
+        bail!(
+            "Artifact manifest hash mismatch against resolved manifest (expected {}, got {})",
+            target_manifest_hash,
+            local_manifest_hash
+        );
+    }
+
+    let manifest_endpoint = format!(
+        "{}/v1/manifest/documents/{}",
+        base,
+        urlencoding::encode(&target_manifest_hash)
     );
+    let manifest_response = with_ato_token(client.get(&manifest_endpoint))
+        .send()
+        .await
+        .with_context(|| "Failed to fetch manifest payload")?;
+    let manifest_status = manifest_response.status();
+    if manifest_status.is_success() {
+        let remote_manifest_bytes = manifest_response
+            .bytes()
+            .await
+            .with_context(|| "Failed to read remote manifest payload")?;
+        let remote_manifest_toml = String::from_utf8(remote_manifest_bytes.to_vec())
+            .with_context(|| "Remote manifest payload must be UTF-8 TOML")?;
+        let remote_manifest: CapsuleManifest =
+            toml::from_str(&remote_manifest_toml).with_context(|| "Invalid remote capsule.toml")?;
+        let remote_manifest_hash = compute_manifest_hash_without_signatures(&remote_manifest)?;
+        if normalize_hash_for_compare(&remote_manifest_hash)
+            != normalize_hash_for_compare(&target_manifest_hash)
+        {
+            bail!(
+                "Remote manifest hash mismatch against resolved manifest (expected {}, got {})",
+                target_manifest_hash,
+                remote_manifest_hash
+            );
+        }
+    } else if manifest_status == reqwest::StatusCode::UNAUTHORIZED && !has_token {
+        bail!(
+            "{}: registry requires authentication for manifest read APIs. Run `ato login` or set `ATO_TOKEN=<token>`.",
+            crate::error_codes::ATO_ERR_AUTH_REQUIRED
+        );
+    } else {
+        let body = manifest_response.text().await.unwrap_or_default();
+        if let Some(message) = parse_yanked_message(&body) {
+            bail!(
+                "{}: {}",
+                crate::error_codes::ATO_ERR_INTEGRITY_FAILURE,
+                message
+            );
+        }
+    }
+    if !manifest_status.is_success() && !allow_unverified {
+        bail!(
+            "Failed to fetch registry manifest (status={})",
+            manifest_status
+        );
+    }
+
+    let payload_tar_bytes = extract_payload_tar_from_capsule(artifact_bytes)?;
+    verify_payload_chunks(&local_manifest, &payload_tar_bytes)?;
+    verify_manifest_merkle_root(&local_manifest)?;
+
+    if let ManifestResolution::Current(epoch) = resolution {
+        enforce_epoch_monotonicity(
+            &scoped_ref.scoped_id,
+            epoch.pointer.epoch,
+            &epoch.pointer.manifest_hash,
+            allow_downgrade,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn with_ato_token(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    if let Some(token) = current_ato_token() {
+        request.header("authorization", format!("Bearer {}", token))
+    } else {
+        request
+    }
+}
+
+fn has_ato_token() -> bool {
+    current_ato_token().is_some()
+}
+
+fn current_ato_token() -> Option<String> {
+    std::env::var("ATO_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn verify_epoch_signature(epoch: &ManifestEpochResolveResponse) -> Result<()> {
+    let pub_bytes = BASE64
+        .decode(epoch.public_key.as_bytes())
+        .with_context(|| "Invalid base64 public key")?;
+    if pub_bytes.len() != 32 {
+        bail!(
+            "Invalid manifest epoch public key length: {}",
+            pub_bytes.len()
+        );
+    }
+    let mut pubkey = [0u8; 32];
+    pubkey.copy_from_slice(&pub_bytes);
+    let did = public_key_to_did(&pubkey);
+    if did != epoch.pointer.signer_did {
+        bail!(
+            "Epoch signer DID mismatch (expected {}, got {})",
+            epoch.pointer.signer_did,
+            did
+        );
+    }
+    let verifying_key =
+        VerifyingKey::from_bytes(&pubkey).with_context(|| "Invalid manifest epoch public key")?;
+    let signature_bytes = BASE64
+        .decode(epoch.pointer.signature.as_bytes())
+        .with_context(|| "Invalid base64 epoch signature")?;
+    if signature_bytes.len() != 64 {
+        bail!(
+            "Invalid manifest epoch signature length: {}",
+            signature_bytes.len()
+        );
+    }
+    let mut sig = [0u8; 64];
+    sig.copy_from_slice(&signature_bytes);
+    let signature = Signature::from_bytes(&sig);
+    let unsigned = serde_json::json!({
+        "scoped_id": epoch.pointer.scoped_id,
+        "epoch": epoch.pointer.epoch,
+        "manifest_hash": epoch.pointer.manifest_hash,
+        "prev_epoch_hash": epoch.pointer.prev_epoch_hash,
+        "issued_at": epoch.pointer.issued_at,
+        "signer_did": epoch.pointer.signer_did,
+        "key_id": epoch.pointer.key_id,
+    });
+    let canonical = serde_jcs::to_vec(&unsigned)?;
+    verifying_key
+        .verify(&canonical, &signature)
+        .with_context(|| "ed25519 verification failed")?;
+    Ok(())
+}
+
+fn extract_manifest_toml_from_capsule(bytes: &[u8]) -> Result<String> {
+    let mut archive = tar::Archive::new(Cursor::new(bytes));
+    let entries = archive
+        .entries()
+        .context("Failed to read .capsule archive entries")?;
+    for entry in entries {
+        let mut entry = entry.context("Invalid .capsule entry")?;
+        let path = entry.path().context("Failed to read archive entry path")?;
+        if path.to_string_lossy() == "capsule.toml" {
+            let mut manifest = Vec::new();
+            entry
+                .read_to_end(&mut manifest)
+                .context("Failed to read capsule.toml from artifact")?;
+            return String::from_utf8(manifest).with_context(|| "capsule.toml must be UTF-8");
+        }
+    }
+    bail!("Invalid artifact: capsule.toml not found in .capsule archive")
+}
+
+fn extract_payload_tar_from_capsule(bytes: &[u8]) -> Result<Vec<u8>> {
+    let mut archive = tar::Archive::new(Cursor::new(bytes));
+    let entries = archive
+        .entries()
+        .context("Failed to read .capsule archive entries")?;
+    for entry in entries {
+        let mut entry = entry.context("Invalid .capsule entry")?;
+        let path = entry.path().context("Failed to read archive entry path")?;
+        if path.to_string_lossy() == "payload.tar.zst" {
+            let mut payload_zst = Vec::new();
+            entry
+                .read_to_end(&mut payload_zst)
+                .context("Failed to read payload.tar.zst from artifact")?;
+            let mut decoder = zstd::stream::Decoder::new(Cursor::new(payload_zst))
+                .with_context(|| "Failed to decode payload.tar.zst")?;
+            let mut payload_tar = Vec::new();
+            decoder
+                .read_to_end(&mut payload_tar)
+                .context("Failed to read payload.tar bytes")?;
+            return Ok(payload_tar);
+        }
+    }
+    bail!("Invalid artifact: payload.tar.zst not found in .capsule archive")
+}
+
+fn compute_manifest_hash_without_signatures(manifest: &CapsuleManifest) -> Result<String> {
+    manifest_payload::compute_manifest_hash_without_signatures(manifest)
+        .map_err(anyhow::Error::from)
+}
+
+fn verify_payload_chunks(manifest: &CapsuleManifest, payload_tar: &[u8]) -> Result<()> {
+    let distribution = manifest_distribution(manifest)?;
+    let mut next_offset = 0u64;
+    for chunk in &distribution.chunk_list {
+        if chunk.offset != next_offset {
+            bail!(
+                "manifest chunk_list offset mismatch: expected {}, got {}",
+                next_offset,
+                chunk.offset
+            );
+        }
+        let start = chunk.offset as usize;
+        let end = start.saturating_add(chunk.length as usize);
+        if end > payload_tar.len() {
+            bail!(
+                "manifest chunk range out of bounds: {}..{} (payload={})",
+                start,
+                end,
+                payload_tar.len()
+            );
+        }
+        let actual = format!("blake3:{}", blake3::hash(&payload_tar[start..end]).to_hex());
+        if normalize_hash_for_compare(&actual) != normalize_hash_for_compare(&chunk.chunk_hash) {
+            bail!(
+                "manifest chunk hash mismatch at offset {}: expected {}, got {}",
+                chunk.offset,
+                chunk.chunk_hash,
+                actual
+            );
+        }
+        next_offset = chunk.offset.saturating_add(chunk.length);
+    }
+    if next_offset != payload_tar.len() as u64 {
+        bail!(
+            "manifest chunk coverage mismatch: covered {}, payload {}",
+            next_offset,
+            payload_tar.len()
+        );
+    }
+    Ok(())
+}
+
+fn verify_manifest_merkle_root(manifest: &CapsuleManifest) -> Result<()> {
+    let distribution = manifest_distribution(manifest)?;
+    let mut level: Vec<[u8; 32]> = manifest
+        .distribution
+        .as_ref()
+        .expect("distribution metadata")
+        .chunk_list
+        .iter()
+        .map(|chunk| {
+            let normalized = normalize_hash_for_compare(&chunk.chunk_hash);
+            let decoded = hex::decode(normalized).unwrap_or_default();
+            let mut out = [0u8; 32];
+            if decoded.len() == 32 {
+                out.copy_from_slice(&decoded);
+            }
+            out
+        })
+        .collect();
+    let actual_merkle = if level.is_empty() {
+        format!("blake3:{}", blake3::hash(b"").to_hex())
+    } else {
+        while level.len() > 1 {
+            let mut next = Vec::with_capacity(level.len().div_ceil(2));
+            let mut idx = 0usize;
+            while idx < level.len() {
+                let left = level[idx];
+                let right = if idx + 1 < level.len() {
+                    level[idx + 1]
+                } else {
+                    level[idx]
+                };
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(&left);
+                hasher.update(&right);
+                let digest = hasher.finalize();
+                let mut out = [0u8; 32];
+                out.copy_from_slice(digest.as_bytes());
+                next.push(out);
+                idx += 2;
+            }
+            level = next;
+        }
+        format!("blake3:{}", hex::encode(level[0]))
+    };
+    if normalize_hash_for_compare(&actual_merkle)
+        != normalize_hash_for_compare(&distribution.merkle_root)
+    {
+        bail!(
+            "manifest merkle_root mismatch: expected {}, got {}",
+            distribution.merkle_root,
+            actual_merkle
+        );
+    }
+    Ok(())
+}
+
+fn normalize_hash_for_compare(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches("sha256:")
+        .trim_start_matches("blake3:")
+        .to_ascii_lowercase()
+}
+
+fn epoch_guard_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".ato")
+        .join("state")
+        .join("epoch-guard.json")
+}
+
+fn enforce_epoch_monotonicity(
+    scoped_id: &str,
+    epoch: u64,
+    manifest_hash: &str,
+    allow_downgrade: bool,
+) -> Result<()> {
+    enforce_epoch_monotonicity_at(
+        &epoch_guard_path(),
+        scoped_id,
+        epoch,
+        manifest_hash,
+        allow_downgrade,
+    )
+}
+
+fn enforce_epoch_monotonicity_at(
+    state_path: &Path,
+    scoped_id: &str,
+    epoch: u64,
+    manifest_hash: &str,
+    allow_downgrade: bool,
+) -> Result<()> {
+    let mut state = load_epoch_guard_state(state_path)?;
+    let manifest_norm = normalize_hash_for_compare(manifest_hash);
+    let now = chrono::Utc::now().to_rfc3339();
+
+    if let Some(previous) = state.capsules.get(scoped_id) {
+        if epoch == previous.max_epoch
+            && normalize_hash_for_compare(&previous.manifest_hash) != manifest_norm
+        {
+            bail!(
+                "Epoch replay mismatch for {} at epoch {}: manifest differs from previously trusted value",
+                scoped_id,
+                epoch
+            );
+        }
+        if epoch < previous.max_epoch && !allow_downgrade {
+            bail!(
+                "Downgrade detected for {}: remote epoch {} is older than trusted epoch {}. Re-run with --allow-downgrade to proceed.",
+                scoped_id,
+                epoch,
+                previous.max_epoch
+            );
+        }
+    }
+
+    let mut should_persist = false;
+    match state.capsules.get_mut(scoped_id) {
+        Some(entry) => {
+            if epoch > entry.max_epoch {
+                entry.max_epoch = epoch;
+                entry.manifest_hash = manifest_hash.to_string();
+                entry.updated_at = now;
+                should_persist = true;
+            }
+        }
+        None => {
+            state.capsules.insert(
+                scoped_id.to_string(),
+                EpochGuardEntry {
+                    max_epoch: epoch,
+                    manifest_hash: manifest_hash.to_string(),
+                    updated_at: now,
+                },
+            );
+            should_persist = true;
+        }
+    }
+
+    if should_persist {
+        write_epoch_guard_state_atomic(state_path, &state)?;
+    }
+    Ok(())
+}
+
+fn load_epoch_guard_state(path: &Path) -> Result<EpochGuardState> {
+    if !path.exists() {
+        return Ok(EpochGuardState::default());
+    }
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read epoch guard state: {}", path.display()))?;
+    if raw.trim().is_empty() {
+        return Ok(EpochGuardState::default());
+    }
+    serde_json::from_str(&raw)
+        .with_context(|| format!("Failed to parse epoch guard state: {}", path.display()))
+}
+
+fn write_epoch_guard_state_atomic(path: &Path, state: &EpochGuardState) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "Failed to create epoch guard state directory: {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let payload = serde_json::to_vec_pretty(state).context("Failed to serialize epoch guard")?;
+    let mut nonce = [0u8; 8];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    let tmp_name = format!(
+        ".{}.tmp-{}",
+        path.file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or("epoch-guard"),
+        hex::encode(nonce)
+    );
+    let tmp_path = path.with_file_name(tmp_name);
+    {
+        let mut file = std::fs::File::create(&tmp_path)
+            .with_context(|| format!("Failed to create {}", tmp_path.display()))?;
+        file.write_all(&payload)
+            .with_context(|| format!("Failed to write {}", tmp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("Failed to flush {}", tmp_path.display()))?;
+    }
+    std::fs::rename(&tmp_path, path).with_context(|| {
+        format!(
+            "Failed to atomically replace epoch guard state at {}",
+            path.display()
+        )
+    })?;
+    Ok(())
 }
 
 pub async fn suggest_scoped_capsules(
@@ -912,7 +2044,7 @@ pub async fn suggest_scoped_capsules(
     let registry = resolve_registry_url(registry_url, false).await?;
     let client = reqwest::Client::new();
     let url = format!(
-        "{}/v1/capsules?q={}&limit={}",
+        "{}/v1/manifest/capsules?q={}&limit={}",
         registry,
         urlencoding::encode(slug),
         limit.clamp(1, 10)
@@ -960,16 +2092,591 @@ pub async fn suggest_scoped_capsules(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+
     use axum::extract::{Path as AxumPath, State};
-    use axum::http::StatusCode;
-    use axum::response::IntoResponse;
-    use axum::routing::get;
-    use axum::Router;
-    use capsule_core::capsule_v3::{set_artifact_hash, CapsuleManifestV3, ChunkMeta};
-    use std::collections::{HashMap, HashSet};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
-    use tokio::sync::Mutex as AsyncMutex;
+    use axum::http::{header::HOST, HeaderMap, StatusCode};
+    use axum::response::{IntoResponse, Response};
+    use axum::routing::{get, post};
+    use axum::{Json, Router};
+    use ed25519_dalek::{Signer as _, SigningKey};
+    use tokio::sync::Mutex;
+
+    const TEST_SCOPED_ID: &str = "koh0920/sample";
+    const TEST_VERSION: &str = "1.0.0";
+    const TEST_LEASE_ID: &str = "lease-test-1";
+
+    fn test_env_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    async fn acquire_test_env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        test_env_lock().lock().await
+    }
+
+    struct EnvVarGuard {
+        key: String,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &str, value: Option<&str>) -> Self {
+            let previous = std::env::var(key).ok();
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+            Self {
+                key: key.to_string(),
+                previous,
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.previous {
+                std::env::set_var(&self.key, value);
+            } else {
+                std::env::remove_var(&self.key);
+            }
+        }
+    }
+
+    fn test_scoped_ref() -> ScopedCapsuleRef {
+        parse_capsule_ref(TEST_SCOPED_ID).expect("valid scoped ref")
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum MockScenario {
+        FalsePositiveRecovery,
+        FallbackNotImplemented,
+        UnauthorizedManifest,
+        LeaseReleaseOnFailure,
+        YankedNegotiate,
+        YankedManifest,
+    }
+
+    #[derive(Debug, Clone)]
+    struct MockRegistryFixture {
+        scoped_id: String,
+        publisher: String,
+        slug: String,
+        version: String,
+        manifest_hash: String,
+        manifest_toml: String,
+        payload_tar: Vec<u8>,
+        artifact_bytes: Vec<u8>,
+        chunk_hashes: Vec<String>,
+        chunk_bytes: HashMap<String, Vec<u8>>,
+        lease_id: String,
+        epoch_response: serde_json::Value,
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct RecordedNegotiateRequest {
+        has_bloom: bool,
+        have_chunks_len: usize,
+        reuse_lease_id: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct MockObservations {
+        epoch_calls: usize,
+        version_resolve_calls: usize,
+        manifest_calls: usize,
+        negotiate_calls: Vec<RecordedNegotiateRequest>,
+        chunk_calls: Vec<String>,
+        distribution_calls: usize,
+        artifact_calls: usize,
+        release_calls: Vec<String>,
+    }
+
+    #[derive(Debug)]
+    struct MockRegistryState {
+        scenario: MockScenario,
+        fixture: MockRegistryFixture,
+        observations: MockObservations,
+    }
+
+    type SharedMockState = std::sync::Arc<Mutex<MockRegistryState>>;
+
+    struct MockRegistryHandle {
+        base_url: String,
+        state: SharedMockState,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl MockRegistryHandle {
+        fn base_url(&self) -> &str {
+            &self.base_url
+        }
+
+        async fn observations(&self) -> MockObservations {
+            self.state.lock().await.observations.clone()
+        }
+    }
+
+    impl Drop for MockRegistryHandle {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    fn compute_merkle_root_for_test(chunk_hashes: &[String]) -> String {
+        let mut level: Vec<[u8; 32]> = chunk_hashes
+            .iter()
+            .map(|chunk_hash| {
+                let normalized = normalize_hash_for_compare(chunk_hash);
+                let bytes = hex::decode(normalized).expect("hex decode");
+                let mut out = [0u8; 32];
+                out.copy_from_slice(&bytes);
+                out
+            })
+            .collect();
+        if level.is_empty() {
+            return format!("blake3:{}", blake3::hash(b"").to_hex());
+        }
+        while level.len() > 1 {
+            let mut next = Vec::with_capacity(level.len().div_ceil(2));
+            let mut idx = 0usize;
+            while idx < level.len() {
+                let left = level[idx];
+                let right = if idx + 1 < level.len() {
+                    level[idx + 1]
+                } else {
+                    level[idx]
+                };
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(&left);
+                hasher.update(&right);
+                next.push(*hasher.finalize().as_bytes());
+                idx += 2;
+            }
+            level = next;
+        }
+        format!("blake3:{}", hex::encode(level[0]))
+    }
+
+    fn build_mock_fixture(
+        scoped_id: &str,
+        version: &str,
+        chunks: Vec<Vec<u8>>,
+    ) -> MockRegistryFixture {
+        let (publisher, slug) = scoped_id
+            .split_once('/')
+            .expect("scoped_id must be publisher/slug");
+
+        let mut chunk_hashes = Vec::new();
+        let mut chunk_list = Vec::new();
+        let mut chunk_bytes = HashMap::new();
+        let mut payload_tar = Vec::new();
+        let mut offset = 0u64;
+        for bytes in chunks {
+            let chunk_hash = format!("blake3:{}", blake3::hash(&bytes).to_hex());
+            chunk_hashes.push(chunk_hash.clone());
+            chunk_bytes.insert(chunk_hash.clone(), bytes.clone());
+            chunk_list.push(capsule_core::types::ChunkDescriptor {
+                chunk_hash,
+                offset,
+                length: bytes.len() as u64,
+                codec: "fastcdc".to_string(),
+                compression: "none".to_string(),
+            });
+            payload_tar.extend_from_slice(&bytes);
+            offset += bytes.len() as u64;
+        }
+        let merkle_root = compute_merkle_root_for_test(&chunk_hashes);
+        let mut manifest = CapsuleManifest::from_toml(
+            r#"
+schema_version = "1"
+name = "sample"
+version = "1.0.0"
+type = "app"
+default_target = "cli"
+
+[targets.cli]
+runtime = "source"
+entrypoint = "main.py"
+"#,
+        )
+        .expect("manifest");
+        manifest.distribution = Some(capsule_core::types::DistributionInfo {
+            manifest_hash: String::new(),
+            merkle_root,
+            chunk_list,
+            signatures: vec![],
+        });
+        let manifest_hash =
+            compute_manifest_hash_without_signatures(&manifest).expect("manifest hash");
+        manifest
+            .distribution
+            .as_mut()
+            .expect("distribution")
+            .manifest_hash = manifest_hash.clone();
+        let manifest_toml = toml::to_string_pretty(&manifest).expect("manifest TOML");
+
+        let payload_tar_zst = {
+            let mut encoder = zstd::stream::Encoder::new(Vec::new(), DELTA_RECONSTRUCT_ZSTD_LEVEL)
+                .expect("zstd encoder");
+            encoder
+                .write_all(&payload_tar)
+                .expect("write payload tar bytes");
+            encoder.finish().expect("finish zstd stream")
+        };
+        let artifact_bytes = build_capsule_artifact(Some(&manifest_toml), None, &payload_tar_zst)
+            .expect("build artifact");
+
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        let signer_did = public_key_to_did(&verifying_key.to_bytes());
+        let issued_at = "2026-03-05T00:00:00Z";
+        let key_id = "k-main";
+        let unsigned_pointer = serde_json::json!({
+            "scoped_id": scoped_id,
+            "epoch": 1u64,
+            "manifest_hash": manifest_hash,
+            "prev_epoch_hash": serde_json::Value::Null,
+            "issued_at": issued_at,
+            "signer_did": signer_did,
+            "key_id": key_id,
+        });
+        let canonical_pointer = serde_jcs::to_vec(&unsigned_pointer).expect("canonical pointer");
+        let signature = signing_key.sign(&canonical_pointer);
+        let epoch_response = serde_json::json!({
+            "pointer": {
+                "scoped_id": scoped_id,
+                "epoch": 1u64,
+                "manifest_hash": manifest_hash,
+                "prev_epoch_hash": serde_json::Value::Null,
+                "issued_at": issued_at,
+                "signer_did": signer_did,
+                "key_id": key_id,
+                "signature": BASE64.encode(signature.to_bytes()),
+            },
+            "public_key": BASE64.encode(verifying_key.to_bytes()),
+        });
+
+        MockRegistryFixture {
+            scoped_id: scoped_id.to_string(),
+            publisher: publisher.to_string(),
+            slug: slug.to_string(),
+            version: version.to_string(),
+            manifest_hash,
+            manifest_toml,
+            payload_tar,
+            artifact_bytes,
+            chunk_hashes,
+            chunk_bytes,
+            lease_id: TEST_LEASE_ID.to_string(),
+            epoch_response,
+        }
+    }
+
+    fn build_payload_tar_with_source(path: &str, source: &[u8]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut payload);
+            let mut header = tar::Header::new_gnu();
+            header.set_path(path).expect("set payload path");
+            header.set_mode(0o644);
+            header.set_size(source.len() as u64);
+            header.set_mtime(0);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, path, Cursor::new(source))
+                .expect("append payload source");
+            builder.finish().expect("finish payload tar");
+        }
+        payload
+    }
+
+    async fn spawn_mock_registry(
+        scenario: MockScenario,
+        fixture: MockRegistryFixture,
+    ) -> MockRegistryHandle {
+        let state = std::sync::Arc::new(Mutex::new(MockRegistryState {
+            scenario,
+            fixture,
+            observations: MockObservations::default(),
+        }));
+        let app = Router::new()
+            .route("/v1/manifest/epoch/resolve", post(mock_epoch_resolve))
+            .route(
+                "/v1/manifest/resolve/:publisher/:slug/:version",
+                get(mock_version_resolve),
+            )
+            .route("/v1/manifest/documents/:manifest_hash", get(mock_manifest))
+            .route("/v1/manifest/negotiate", post(mock_negotiate))
+            .route("/v1/manifest/chunks/:chunk_hash", get(mock_chunk))
+            .route("/v1/manifest/leases/refresh", post(mock_lease_refresh))
+            .route("/v1/manifest/leases/release", post(mock_lease_release))
+            .route(
+                "/v1/manifest/capsules/by/:publisher/:slug",
+                get(mock_capsule_detail),
+            )
+            .route(
+                "/v1/manifest/capsules/by/:publisher/:slug/distributions",
+                get(mock_distribution),
+            )
+            .route("/mock/artifact.capsule", get(mock_artifact))
+            .with_state(state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock registry");
+        let addr = listener.local_addr().expect("mock registry local addr");
+        let task = tokio::spawn(async move {
+            if let Err(err) = axum::serve(listener, app).await {
+                eprintln!("mock registry server error: {}", err);
+            }
+        });
+
+        MockRegistryHandle {
+            base_url: format!("http://{}", addr),
+            state,
+            task,
+        }
+    }
+
+    async fn mock_epoch_resolve(State(state): State<SharedMockState>) -> Response {
+        let mut guard = state.lock().await;
+        guard.observations.epoch_calls += 1;
+        match guard.scenario {
+            MockScenario::UnauthorizedManifest => StatusCode::UNAUTHORIZED.into_response(),
+            MockScenario::FallbackNotImplemented if guard.observations.epoch_calls >= 2 => {
+                StatusCode::SERVICE_UNAVAILABLE.into_response()
+            }
+            _ => Json(guard.fixture.epoch_response.clone()).into_response(),
+        }
+    }
+
+    async fn mock_version_resolve(
+        State(state): State<SharedMockState>,
+        AxumPath((publisher, slug, version)): AxumPath<(String, String, String)>,
+    ) -> Response {
+        let mut guard = state.lock().await;
+        guard.observations.version_resolve_calls += 1;
+        if publisher != guard.fixture.publisher
+            || slug != guard.fixture.slug
+            || version != guard.fixture.version
+        {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        Json(serde_json::json!({
+            "scoped_id": guard.fixture.scoped_id,
+            "version": guard.fixture.version,
+            "manifest_hash": guard.fixture.manifest_hash,
+            "yanked_at": serde_json::Value::Null,
+        }))
+        .into_response()
+    }
+
+    async fn mock_manifest(
+        State(state): State<SharedMockState>,
+        AxumPath(manifest_hash): AxumPath<String>,
+    ) -> Response {
+        let mut guard = state.lock().await;
+        guard.observations.manifest_calls += 1;
+        if guard.scenario == MockScenario::UnauthorizedManifest {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        if guard.scenario == MockScenario::YankedManifest {
+            return (
+                StatusCode::GONE,
+                Json(serde_json::json!({
+                    "error": "manifest_yanked",
+                    "message": "Manifest has been yanked by the publisher.",
+                    "yanked": true
+                })),
+            )
+                .into_response();
+        }
+        if normalize_hash_for_compare(&manifest_hash)
+            != normalize_hash_for_compare(&guard.fixture.manifest_hash)
+        {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        (StatusCode::OK, guard.fixture.manifest_toml.clone()).into_response()
+    }
+
+    async fn mock_negotiate(
+        State(state): State<SharedMockState>,
+        Json(request): Json<ManifestNegotiateRequest>,
+    ) -> Response {
+        let mut guard = state.lock().await;
+        guard
+            .observations
+            .negotiate_calls
+            .push(RecordedNegotiateRequest {
+                has_bloom: request.have_chunks_bloom.is_some(),
+                have_chunks_len: request.have_chunks.len(),
+                reuse_lease_id: request.reuse_lease_id.clone(),
+            });
+        let call_index = guard.observations.negotiate_calls.len();
+        match guard.scenario {
+            MockScenario::FallbackNotImplemented => StatusCode::NOT_IMPLEMENTED.into_response(),
+            MockScenario::UnauthorizedManifest => StatusCode::UNAUTHORIZED.into_response(),
+            MockScenario::YankedNegotiate => (
+                StatusCode::GONE,
+                Json(serde_json::json!({
+                    "error": "manifest_yanked",
+                    "message": "Manifest has been yanked by the publisher.",
+                    "yanked": true
+                })),
+            )
+                .into_response(),
+            MockScenario::YankedManifest => Json(serde_json::json!({
+                "session_id": format!("session-{}", call_index),
+                "required_chunks": [],
+                "required_manifests": [],
+                "lease_id": guard.fixture.lease_id,
+                "lease_expires_at": "2026-03-05T00:15:00Z",
+            }))
+            .into_response(),
+            MockScenario::LeaseReleaseOnFailure => Json(serde_json::json!({
+                "session_id": format!("session-{}", call_index),
+                "required_chunks": [guard.fixture.chunk_hashes[0].clone()],
+                "required_manifests": [],
+                "lease_id": guard.fixture.lease_id,
+                "lease_expires_at": "2026-03-05T00:15:00Z",
+            }))
+            .into_response(),
+            MockScenario::FalsePositiveRecovery => {
+                let lease_id = guard.fixture.lease_id.clone();
+                if call_index == 1 {
+                    Json(serde_json::json!({
+                        "session_id": "session-1",
+                        "required_chunks": [guard.fixture.chunk_hashes[0].clone()],
+                        "required_manifests": [],
+                        "lease_id": lease_id,
+                        "lease_expires_at": "2026-03-05T00:15:00Z",
+                    }))
+                    .into_response()
+                } else {
+                    Json(serde_json::json!({
+                        "session_id": "session-2",
+                        "required_chunks": [guard.fixture.chunk_hashes[1].clone()],
+                        "required_manifests": [],
+                        "lease_id": lease_id,
+                        "lease_expires_at": "2026-03-05T00:15:00Z",
+                    }))
+                    .into_response()
+                }
+            }
+        }
+    }
+
+    async fn mock_chunk(
+        State(state): State<SharedMockState>,
+        AxumPath(chunk_hash): AxumPath<String>,
+    ) -> Response {
+        let mut guard = state.lock().await;
+        guard.observations.chunk_calls.push(chunk_hash.clone());
+        if guard.scenario == MockScenario::UnauthorizedManifest {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        if guard.scenario == MockScenario::LeaseReleaseOnFailure {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        let bytes = guard.fixture.chunk_bytes.iter().find_map(|(hash, bytes)| {
+            if normalize_hash_for_compare(hash) == normalize_hash_for_compare(&chunk_hash) {
+                Some(bytes.clone())
+            } else {
+                None
+            }
+        });
+        match bytes {
+            Some(bytes) => (StatusCode::OK, bytes).into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+
+    async fn mock_lease_refresh(
+        State(state): State<SharedMockState>,
+        Json(payload): Json<serde_json::Value>,
+    ) -> Response {
+        let guard = state.lock().await;
+        let lease_id = payload
+            .get("lease_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or(guard.fixture.lease_id.as_str());
+        Json(serde_json::json!({
+            "lease_id": lease_id,
+            "expires_at": "2026-03-05T00:20:00Z",
+            "chunk_count": guard.fixture.chunk_hashes.len(),
+        }))
+        .into_response()
+    }
+
+    async fn mock_lease_release(
+        State(state): State<SharedMockState>,
+        Json(payload): Json<serde_json::Value>,
+    ) -> Response {
+        let mut guard = state.lock().await;
+        if let Some(lease_id) = payload.get("lease_id").and_then(|value| value.as_str()) {
+            guard.observations.release_calls.push(lease_id.to_string());
+        }
+        StatusCode::OK.into_response()
+    }
+
+    async fn mock_capsule_detail(
+        State(state): State<SharedMockState>,
+        AxumPath((publisher, slug)): AxumPath<(String, String)>,
+    ) -> Response {
+        let guard = state.lock().await;
+        if publisher != guard.fixture.publisher || slug != guard.fixture.slug {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        Json(serde_json::json!({
+            "id": format!("capsule-{}-{}", guard.fixture.publisher, guard.fixture.slug),
+            "scoped_id": guard.fixture.scoped_id,
+            "slug": guard.fixture.slug,
+            "name": "Mock Capsule",
+            "description": "mock description",
+            "price": 0,
+            "currency": "USD",
+            "latestVersion": guard.fixture.version,
+            "releases": [{
+                "version": guard.fixture.version,
+                "content_hash": compute_blake3(&guard.fixture.artifact_bytes),
+                "signature_status": "verified",
+            }],
+        }))
+        .into_response()
+    }
+
+    async fn mock_distribution(
+        State(state): State<SharedMockState>,
+        AxumPath((publisher, slug)): AxumPath<(String, String)>,
+        headers: HeaderMap,
+    ) -> Response {
+        let mut guard = state.lock().await;
+        if publisher != guard.fixture.publisher || slug != guard.fixture.slug {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        guard.observations.distribution_calls += 1;
+        let host = headers
+            .get(HOST)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("127.0.0.1");
+        Json(serde_json::json!({
+            "version": guard.fixture.version,
+            "artifact_url": format!("http://{}/mock/artifact.capsule", host),
+            "sha256": compute_sha256(&guard.fixture.artifact_bytes),
+            "blake3": compute_blake3(&guard.fixture.artifact_bytes),
+            "file_name": format!("{}-{}.capsule", guard.fixture.slug, guard.fixture.version),
+        }))
+        .into_response()
+    }
+
+    async fn mock_artifact(State(state): State<SharedMockState>) -> Response {
+        let mut guard = state.lock().await;
+        guard.observations.artifact_calls += 1;
+        (StatusCode::OK, guard.fixture.artifact_bytes.clone()).into_response()
+    }
 
     #[test]
     fn test_compute_blake3() {
@@ -995,11 +2702,11 @@ mod tests {
     }
 
     #[test]
-    fn test_ensure_signature_verified() {
-        assert!(ensure_signature_verified("verified", false).is_ok());
-        assert!(ensure_signature_verified("unverified", false).is_err());
-        assert!(ensure_signature_verified("unverified", true).is_ok());
-        assert!(ensure_signature_verified("unknown", true).is_err());
+    fn test_normalize_hash_for_compare() {
+        let value = "ABCDEF";
+        assert_eq!(normalize_hash_for_compare(value), "abcdef");
+        assert_eq!(normalize_hash_for_compare("sha256:ABCDEF"), "abcdef");
+        assert_eq!(normalize_hash_for_compare("blake3:ABCDEF"), "abcdef");
     }
 
     #[test]
@@ -1056,284 +2763,530 @@ mod tests {
         assert!(is_slug_only_ref("sample-capsule"));
     }
 
-    #[derive(Clone)]
-    struct PullMockState {
-        zstd_by_hash: Arc<HashMap<String, Vec<u8>>>,
-        calls_by_hash: Arc<AsyncMutex<HashMap<String, usize>>>,
-        fail_once_hashes: Arc<AsyncMutex<HashSet<String>>>,
-        fail_n_times_by_hash: Arc<AsyncMutex<HashMap<String, usize>>>,
-        corrupt_hashes: Arc<HashSet<String>>,
-        total_gets: Arc<AtomicUsize>,
+    #[test]
+    fn test_parse_capsule_request_extracts_version_suffix() {
+        let parsed = parse_capsule_request("koh0920/sample-capsule@1.2.3").unwrap();
+        assert_eq!(parsed.scoped_ref.scoped_id, "koh0920/sample-capsule");
+        assert_eq!(parsed.version.as_deref(), Some("1.2.3"));
     }
 
-    impl PullMockState {
-        fn new(zstd_by_hash: HashMap<String, Vec<u8>>) -> Self {
-            Self {
-                zstd_by_hash: Arc::new(zstd_by_hash),
-                calls_by_hash: Arc::new(AsyncMutex::new(HashMap::new())),
-                fail_once_hashes: Arc::new(AsyncMutex::new(HashSet::new())),
-                fail_n_times_by_hash: Arc::new(AsyncMutex::new(HashMap::new())),
-                corrupt_hashes: Arc::new(HashSet::new()),
-                total_gets: Arc::new(AtomicUsize::new(0)),
-            }
-        }
+    #[test]
+    fn test_merge_requested_version_rejects_conflicts() {
+        let err = merge_requested_version(Some("1.0.0"), Some("2.0.0")).expect_err("must fail");
+        assert!(err.to_string().contains("conflicting_version_request"));
     }
 
-    async fn pull_chunk_handler(
-        State(state): State<PullMockState>,
-        AxumPath(raw_hash): AxumPath<String>,
-    ) -> impl IntoResponse {
-        state.total_gets.fetch_add(1, Ordering::SeqCst);
-        {
-            let mut calls = state.calls_by_hash.lock().await;
-            let entry = calls.entry(raw_hash.clone()).or_insert(0);
-            *entry += 1;
-        }
+    #[test]
+    fn test_epoch_guard_rejects_downgrade_without_flag() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_path = temp.path().join("epoch-guard.json");
+        enforce_epoch_monotonicity_at(&state_path, "koh0920/app", 10, "blake3:aaaa", false)
+            .expect("seed epoch");
+        let err =
+            enforce_epoch_monotonicity_at(&state_path, "koh0920/app", 9, "blake3:bbbb", false)
+                .expect_err("downgrade must fail");
+        assert!(err.to_string().contains("Downgrade detected"));
+    }
 
-        {
-            let mut fail_once = state.fail_once_hashes.lock().await;
-            if fail_once.remove(&raw_hash) {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    axum::body::Bytes::from_static(b"transient"),
-                )
-                    .into_response();
-            }
-        }
-        {
-            let mut fail_n = state.fail_n_times_by_hash.lock().await;
-            if let Some(remaining) = fail_n.get_mut(&raw_hash) {
-                if *remaining > 0 {
-                    *remaining -= 1;
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        axum::body::Bytes::from_static(b"transient"),
-                    )
-                        .into_response();
-                }
-            }
-        }
+    #[test]
+    fn test_epoch_guard_allows_downgrade_with_flag() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_path = temp.path().join("epoch-guard.json");
+        enforce_epoch_monotonicity_at(&state_path, "koh0920/app", 10, "blake3:aaaa", false)
+            .expect("seed epoch");
+        enforce_epoch_monotonicity_at(&state_path, "koh0920/app", 9, "blake3:bbbb", true)
+            .expect("downgrade should be allowed with explicit flag");
+        let state = load_epoch_guard_state(&state_path).expect("state readable");
+        let entry = state.capsules.get("koh0920/app").expect("entry exists");
+        assert_eq!(entry.max_epoch, 10);
+    }
 
-        let Some(mut bytes) = state.zstd_by_hash.get(&raw_hash).cloned() else {
-            return (StatusCode::NOT_FOUND, axum::body::Bytes::new()).into_response();
-        };
-        if state.corrupt_hashes.contains(&raw_hash) && !bytes.is_empty() {
-            bytes[0] = bytes[0].wrapping_add(1);
-        }
-        (
-            StatusCode::OK,
-            [("cache-control", "public, max-age=31536000, immutable")],
-            axum::body::Bytes::from(bytes),
+    #[test]
+    fn test_epoch_guard_rejects_same_epoch_conflict() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_path = temp.path().join("epoch-guard.json");
+        enforce_epoch_monotonicity_at(&state_path, "koh0920/app", 7, "blake3:aaaa", false)
+            .expect("seed epoch");
+        let err = enforce_epoch_monotonicity_at(&state_path, "koh0920/app", 7, "blake3:bbbb", true)
+            .expect_err("same epoch conflict must fail");
+        assert!(err.to_string().contains("Epoch replay mismatch"));
+    }
+
+    #[test]
+    fn test_compute_manifest_hash_without_signatures_is_stable() {
+        let chunk_hash = format!("blake3:{}", blake3::hash(b"payload").to_hex());
+        let mut manifest = CapsuleManifest::from_toml(
+            r#"
+schema_version = "1"
+name = "sample"
+version = "1.0.0"
+type = "app"
+default_target = "cli"
+
+[targets.cli]
+runtime = "source"
+entrypoint = "main.py"
+"#,
         )
-            .into_response()
-    }
-
-    async fn start_pull_mock_server(state: PullMockState) -> (String, tokio::task::JoinHandle<()>) {
-        let app = Router::new()
-            .route("/v1/chunks/:raw_hash", get(pull_chunk_handler))
-            .with_state(state);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        let handle = tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("serve");
+        .expect("manifest");
+        manifest.distribution = Some(capsule_core::types::DistributionInfo {
+            manifest_hash: String::new(),
+            merkle_root: chunk_hash.clone(),
+            chunk_list: vec![capsule_core::types::ChunkDescriptor {
+                chunk_hash: chunk_hash.clone(),
+                offset: 0,
+                length: 7,
+                codec: "fastcdc".to_string(),
+                compression: "none".to_string(),
+            }],
+            signatures: vec![],
         });
-        (format!("http://{}", addr), handle)
-    }
-
-    fn compress_zstd(raw: &[u8]) -> Vec<u8> {
-        let mut encoder = zstd::Encoder::new(Vec::new(), 3).expect("encoder");
-        encoder.write_all(raw).expect("write");
-        encoder.finish().expect("finish")
-    }
-
-    fn build_manifest_and_chunks(
-        count: usize,
-    ) -> (
-        CapsuleManifestV3,
-        HashMap<String, Vec<u8>>,
-        Vec<(String, Vec<u8>)>,
-    ) {
-        let mut chunks = Vec::new();
-        let mut map = HashMap::new();
-        let mut ordered_raw = Vec::new();
-        for i in 0..count {
-            let raw = vec![(i % 251) as u8; 1024 + (i * 17)];
-            let raw_hash = capsule_core::capsule_v3::manifest::blake3_digest(&raw);
-            let zstd = compress_zstd(&raw);
-            chunks.push(ChunkMeta {
-                raw_hash: raw_hash.clone(),
-                raw_size: raw.len() as u32,
-                zstd_size_hint: Some(zstd.len() as u32),
+        let hash = compute_manifest_hash_without_signatures(&manifest).expect("hash");
+        manifest
+            .distribution
+            .as_mut()
+            .expect("distribution")
+            .manifest_hash = hash.clone();
+        manifest
+            .distribution
+            .as_mut()
+            .expect("distribution")
+            .signatures
+            .push(capsule_core::types::SignatureEntry {
+                signer_did: "did:key:zabc".to_string(),
+                key_id: "k1".to_string(),
+                algorithm: "ed25519".to_string(),
+                signature: "AAAA".to_string(),
+                signed_at: None,
             });
-            map.insert(raw_hash.clone(), zstd);
-            ordered_raw.push((raw_hash, raw));
-        }
-        let mut manifest = CapsuleManifestV3::new(chunks);
-        set_artifact_hash(&mut manifest).expect("artifact hash");
-        (manifest, map, ordered_raw)
+        let hash_with_signature =
+            compute_manifest_hash_without_signatures(&manifest).expect("hash");
+        assert_eq!(hash, hash_with_signature);
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_v3_sync_discards_corrupted_download() {
-        let (manifest, zstd_by_hash, ordered_raw) = build_manifest_and_chunks(1);
-        let corrupted_hash = ordered_raw[0].0.clone();
-        let mut state = PullMockState::new(zstd_by_hash);
-        state.corrupt_hashes = Arc::new(HashSet::from([corrupted_hash.clone()]));
-        let (base_url, handle) = start_pull_mock_server(state.clone()).await;
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let cas = capsule_core::capsule_v3::CasStore::new(tmp.path()).expect("cas");
-        let client = reqwest::Client::new();
+    #[test]
+    fn test_verify_payload_chunks_and_merkle_root() {
+        let payload = b"payload".to_vec();
+        let chunk_hash = format!("blake3:{}", blake3::hash(&payload).to_hex());
+        let mut manifest = CapsuleManifest::from_toml(
+            r#"
+schema_version = "1"
+name = "sample"
+version = "1.0.0"
+type = "app"
+default_target = "cli"
 
-        let err = sync_v3_chunks_from_manifest_with_options(
-            &client,
-            &base_url,
-            &manifest,
-            cas.clone(),
-            None,
-            1,
+[targets.cli]
+runtime = "source"
+entrypoint = "main.py"
+"#,
         )
-        .await
-        .expect_err("must fail on corruption");
-        assert!(
-            err.to_string().contains("hash mismatch")
-                || err.to_string().contains("decode")
-                || err.to_string().contains("raw_size mismatch")
-        );
-        assert!(!cas.has_chunk(&corrupted_hash).expect("has_chunk"));
+        .expect("manifest");
+        manifest.distribution = Some(capsule_core::types::DistributionInfo {
+            manifest_hash: "blake3:dummy".to_string(),
+            merkle_root: chunk_hash.clone(),
+            chunk_list: vec![capsule_core::types::ChunkDescriptor {
+                chunk_hash,
+                offset: 0,
+                length: payload.len() as u64,
+                codec: "fastcdc".to_string(),
+                compression: "none".to_string(),
+            }],
+            signatures: vec![],
+        });
+        verify_payload_chunks(&manifest, &payload).expect("chunks");
+        verify_manifest_merkle_root(&manifest).expect("merkle");
+    }
 
-        // Ensure no temporary artifacts remain after failure.
-        let mut stack = vec![cas.root().to_path_buf()];
-        while let Some(dir) = stack.pop() {
-            for entry in std::fs::read_dir(&dir).expect("read_dir") {
-                let entry = entry.expect("entry");
-                let path = entry.path();
-                if path.is_dir() {
-                    stack.push(path);
-                    continue;
-                }
-                let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                assert!(
-                    !name.starts_with(".tmp-"),
-                    "temporary file leaked: {}",
-                    path.display()
-                );
+    #[test]
+    fn test_build_capsule_artifact_contains_manifest_and_payload() {
+        let manifest = "schema_version = \"1\"\nname = \"sample\"\nversion = \"1.0.0\"\ntype = \"app\"\ndefault_target = \"cli\"\n";
+        let payload = b"compressed-payload";
+        let artifact = build_capsule_artifact(Some(manifest), None, payload).expect("artifact");
+        let mut archive = tar::Archive::new(Cursor::new(artifact));
+        let mut has_manifest = false;
+        let mut has_payload = false;
+        for entry in archive.entries().expect("entries") {
+            let mut entry = entry.expect("entry");
+            let path = entry.path().expect("path").to_string_lossy().to_string();
+            if path == "capsule.toml" {
+                has_manifest = true;
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes).expect("read manifest");
+                assert_eq!(bytes, manifest.as_bytes());
+            } else if path == "payload.tar.zst" {
+                has_payload = true;
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes).expect("read payload");
+                assert_eq!(bytes, payload);
             }
         }
-
-        handle.abort();
+        assert!(has_manifest);
+        assert!(has_payload);
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_v3_sync_pull_resume_after_interruption() {
-        let (manifest, zstd_by_hash, ordered_raw) = build_manifest_and_chunks(2);
-        let first_hash = ordered_raw[0].0.clone();
-        let second_hash = ordered_raw[1].0.clone();
-
-        let state = PullMockState::new(zstd_by_hash);
-        {
-            let mut fail_n = state.fail_n_times_by_hash.lock().await;
-            // Exceed MAX_RETRIES (=4) so first sync fails; second sync resumes and succeeds.
-            fail_n.insert(second_hash.clone(), 5);
+    #[test]
+    fn test_build_capsule_artifact_includes_capsule_toml_when_provided() {
+        let payload = b"compressed-payload";
+        let capsule_toml = "schema_version = \"0.2\"\nname = \"sample\"\nversion = \"1.0.0\"\ntype = \"app\"\ndefault_target = \"cli\"\n";
+        let artifact = build_capsule_artifact(Some(capsule_toml), None, payload).expect("artifact");
+        let mut archive = tar::Archive::new(Cursor::new(artifact));
+        let mut has_capsule_toml = false;
+        for entry in archive.entries().expect("entries") {
+            let mut entry = entry.expect("entry");
+            let path = entry.path().expect("path").to_string_lossy().to_string();
+            if path == "capsule.toml" {
+                has_capsule_toml = true;
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes).expect("read capsule.toml");
+                assert_eq!(bytes, capsule_toml.as_bytes());
+            }
         }
-        let (base_url, handle) = start_pull_mock_server(state.clone()).await;
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let cas = capsule_core::capsule_v3::CasStore::new(tmp.path()).expect("cas");
-        let client = reqwest::Client::new();
+        assert!(has_capsule_toml);
+    }
 
-        let first_attempt = sync_v3_chunks_from_manifest_with_options(
-            &client,
-            &base_url,
-            &manifest,
-            cas.clone(),
-            None,
-            1,
+    #[test]
+    fn test_build_capsule_artifact_includes_capsule_lock_when_provided() {
+        let payload = b"compressed-payload";
+        let capsule_lock = r#"{"schema_version":"0.1","lock_generated_at":"2026-03-05T00:00:00Z"}"#;
+        let artifact = build_capsule_artifact(None, Some(capsule_lock), payload).expect("artifact");
+        let mut archive = tar::Archive::new(Cursor::new(artifact));
+        let mut has_capsule_lock = false;
+        for entry in archive.entries().expect("entries") {
+            let mut entry = entry.expect("entry");
+            let path = entry.path().expect("path").to_string_lossy().to_string();
+            if path == "capsule.lock" {
+                has_capsule_lock = true;
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes).expect("read capsule.lock");
+                assert_eq!(bytes, capsule_lock.as_bytes());
+            }
+        }
+        assert!(has_capsule_lock);
+    }
+
+    #[test]
+    fn test_reconstruct_payload_reports_missing_chunks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cas = LocalCasIndex::open(temp.path()).expect("open cas");
+        let first = b"chunk-a";
+        let second = b"chunk-b";
+        let first_hash = format!("blake3:{}", blake3::hash(first).to_hex());
+        let second_hash = format!("blake3:{}", blake3::hash(second).to_hex());
+        cas.put_verified_chunk(&first_hash, first)
+            .expect("put first");
+
+        let mut manifest = CapsuleManifest::from_toml(
+            r#"
+schema_version = "1"
+name = "sample"
+version = "1.0.0"
+type = "app"
+default_target = "cli"
+
+[targets.cli]
+runtime = "source"
+entrypoint = "main.py"
+"#,
         )
-        .await;
-        assert!(first_attempt.is_err(), "first attempt should fail");
-        assert!(cas.has_chunk(&first_hash).expect("has first"));
-        assert!(!cas.has_chunk(&second_hash).expect("has second"));
+        .expect("manifest");
+        manifest.distribution = Some(capsule_core::types::DistributionInfo {
+            manifest_hash: "blake3:dummy".to_string(),
+            merkle_root: "blake3:dummy".to_string(),
+            chunk_list: vec![
+                capsule_core::types::ChunkDescriptor {
+                    chunk_hash: first_hash.clone(),
+                    offset: 0,
+                    length: first.len() as u64,
+                    codec: "fastcdc".to_string(),
+                    compression: "none".to_string(),
+                },
+                capsule_core::types::ChunkDescriptor {
+                    chunk_hash: second_hash.clone(),
+                    offset: first.len() as u64,
+                    length: second.len() as u64,
+                    codec: "fastcdc".to_string(),
+                    compression: "none".to_string(),
+                },
+            ],
+            signatures: vec![],
+        });
 
-        let second_outcome = sync_v3_chunks_from_manifest_with_options(
-            &client,
-            &base_url,
-            &manifest,
-            cas.clone(),
-            None,
-            1,
-        )
-        .await
-        .expect("second attempt should succeed");
-        assert_eq!(second_outcome, V3SyncOutcome::Synced);
-        assert!(cas.has_chunk(&first_hash).expect("has first"));
-        assert!(cas.has_chunk(&second_hash).expect("has second"));
-
-        let calls = state.calls_by_hash.lock().await;
-        // first chunk should be fetched only once (then skipped on resume).
-        assert_eq!(calls.get(&first_hash).copied().unwrap_or(0), 1);
-        // second chunk should have at least one failed attempt before succeeding on resume.
-        assert!(calls.get(&second_hash).copied().unwrap_or(0) >= 2);
-
-        handle.abort();
+        let reconstructed =
+            reconstruct_payload_from_local_chunks(&cas, &manifest).expect("reconstruct");
+        assert_eq!(reconstructed.missing_chunks, vec![second_hash]);
+        assert_eq!(reconstructed.payload_tar, first);
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn test_v3_sync_zero_transfer_on_full_hit() {
-        let (manifest, zstd_by_hash, ordered_raw) = build_manifest_and_chunks(3);
-        let expected_chunk_gets = ordered_raw.len();
-        let state = PullMockState::new(zstd_by_hash);
-        let (base_url, handle) = start_pull_mock_server(state.clone()).await;
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let cas = capsule_core::capsule_v3::CasStore::new(tmp.path()).expect("cas");
+    async fn test_delta_install_false_positive_recovers_with_reuse_lease_id() {
+        let _env_lock = acquire_test_env_lock().await;
+        let cas_root = tempfile::tempdir().expect("cas root");
+        let _cas_guard = EnvVarGuard::set(
+            "ATO_CAS_ROOT",
+            Some(cas_root.path().to_string_lossy().as_ref()),
+        );
+        let _token_guard = EnvVarGuard::set("ATO_TOKEN", None);
+
+        let fixture = build_mock_fixture(
+            TEST_SCOPED_ID,
+            TEST_VERSION,
+            vec![b"chunk-alpha".to_vec(), b"chunk-beta".to_vec()],
+        );
+        let server =
+            spawn_mock_registry(MockScenario::FalsePositiveRecovery, fixture.clone()).await;
         let client = reqwest::Client::new();
-
-        let first_outcome = sync_v3_chunks_from_manifest_with_options(
-            &client,
-            &base_url,
-            &manifest,
-            cas.clone(),
-            None,
-            3,
-        )
-        .await
-        .expect("first sync should succeed");
-        assert_eq!(first_outcome, V3SyncOutcome::Synced);
-        let gets_after_first = state.total_gets.load(Ordering::SeqCst);
-        assert_eq!(
-            gets_after_first, expected_chunk_gets,
-            "first sync should fetch each chunk exactly once"
-        );
-
-        let second_outcome =
-            sync_v3_chunks_from_manifest_with_options(&client, &base_url, &manifest, cas, None, 3)
+        let scoped_ref = test_scoped_ref();
+        let result =
+            install_manifest_delta_path(&client, server.base_url(), &scoped_ref, None, None, None)
                 .await
-                .expect("second sync should succeed");
-        assert_eq!(second_outcome, V3SyncOutcome::Synced);
-        let gets_after_second = state.total_gets.load(Ordering::SeqCst);
-        assert_eq!(
-            gets_after_second, gets_after_first,
-            "second sync should not download any chunk on full local hit"
-        );
+                .expect("delta install should succeed after retry");
+        let DeltaInstallResult::Artifact(artifact) = result;
+        let reconstructed_payload =
+            extract_payload_tar_from_capsule(&artifact).expect("extract reconstructed payload");
+        assert_eq!(reconstructed_payload, fixture.payload_tar);
 
-        handle.abort();
+        let observations = server.observations().await;
+        assert_eq!(observations.negotiate_calls.len(), 2);
+        assert!(observations.negotiate_calls[0].has_bloom);
+        assert!(!observations.negotiate_calls[1].has_bloom);
+        assert_eq!(observations.negotiate_calls[1].have_chunks_len, 1);
+        assert_eq!(
+            observations.negotiate_calls[1].reuse_lease_id.as_deref(),
+            Some(TEST_LEASE_ID)
+        );
+        assert_eq!(observations.release_calls, vec![TEST_LEASE_ID.to_string()]);
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn test_v3_sync_falls_back_when_registry_lacks_chunk_endpoint() {
-        let (manifest, _zstd_by_hash, _ordered_raw) = build_manifest_and_chunks(1);
-        let state = PullMockState::new(HashMap::new());
-        let (base_url, handle) = start_pull_mock_server(state).await;
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let cas = capsule_core::capsule_v3::CasStore::new(tmp.path()).expect("cas");
+    async fn test_install_app_uses_version_resolve_for_explicit_time_travel() {
+        let _env_lock = acquire_test_env_lock().await;
+        let cas_root = tempfile::tempdir().expect("cas root");
+        let output_root = tempfile::tempdir().expect("output root");
+        let runtime_root = tempfile::tempdir().expect("runtime root");
+        let _cas_guard = EnvVarGuard::set(
+            "ATO_CAS_ROOT",
+            Some(cas_root.path().to_string_lossy().as_ref()),
+        );
+        let _runtime_guard = EnvVarGuard::set(
+            "ATO_RUNTIME_ROOT",
+            Some(runtime_root.path().to_string_lossy().as_ref()),
+        );
+        let _token_guard = EnvVarGuard::set("ATO_TOKEN", None);
+
+        let payload_tar = build_payload_tar_with_source("main.py", b"print('time travel')\n");
+        let fixture = build_mock_fixture(TEST_SCOPED_ID, TEST_VERSION, vec![payload_tar]);
+        let server = spawn_mock_registry(MockScenario::FalsePositiveRecovery, fixture).await;
+        let result = install_app(
+            "koh0920/sample@1.0.0",
+            Some(server.base_url()),
+            None,
+            Some(output_root.path().to_path_buf()),
+            false,
+            false,
+            false,
+            true,
+        )
+        .await
+        .expect("explicit version install should succeed");
+        assert_eq!(result.version, TEST_VERSION);
+
+        let observations = server.observations().await;
+        assert_eq!(observations.version_resolve_calls, 2);
+        assert_eq!(observations.epoch_calls, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_install_app_fails_closed_on_negotiate_501() {
+        let _env_lock = acquire_test_env_lock().await;
+        let cas_root = tempfile::tempdir().expect("cas root");
+        let output_root = tempfile::tempdir().expect("output root");
+        let runtime_root = tempfile::tempdir().expect("runtime root");
+        let _cas_guard = EnvVarGuard::set(
+            "ATO_CAS_ROOT",
+            Some(cas_root.path().to_string_lossy().as_ref()),
+        );
+        let _runtime_guard = EnvVarGuard::set(
+            "ATO_RUNTIME_ROOT",
+            Some(runtime_root.path().to_string_lossy().as_ref()),
+        );
+        let _token_guard = EnvVarGuard::set("ATO_TOKEN", None);
+
+        let fixture = build_mock_fixture(TEST_SCOPED_ID, TEST_VERSION, vec![b"payload".to_vec()]);
+        let server = spawn_mock_registry(MockScenario::FallbackNotImplemented, fixture).await;
+        let err = install_app(
+            TEST_SCOPED_ID,
+            Some(server.base_url()),
+            Some(TEST_VERSION),
+            Some(output_root.path().to_path_buf()),
+            false,
+            true,
+            false,
+            true,
+        )
+        .await
+        .expect_err("install should fail closed when negotiate is unavailable");
+        assert!(err
+            .to_string()
+            .contains("Registry does not support the manifest negotiate API"));
+
+        let observations = server.observations().await;
+        assert_eq!(observations.negotiate_calls.len(), 1);
+        assert_eq!(observations.distribution_calls, 0);
+        assert_eq!(observations.artifact_calls, 0);
+        assert!(observations.release_calls.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_install_app_unauthorized_manifest_fails_closed_without_fallback() {
+        let _env_lock = acquire_test_env_lock().await;
+        let cas_root = tempfile::tempdir().expect("cas root");
+        let output_root = tempfile::tempdir().expect("output root");
+        let runtime_root = tempfile::tempdir().expect("runtime root");
+        let _cas_guard = EnvVarGuard::set(
+            "ATO_CAS_ROOT",
+            Some(cas_root.path().to_string_lossy().as_ref()),
+        );
+        let _runtime_guard = EnvVarGuard::set(
+            "ATO_RUNTIME_ROOT",
+            Some(runtime_root.path().to_string_lossy().as_ref()),
+        );
+        let _token_guard = EnvVarGuard::set("ATO_TOKEN", None);
+
+        let fixture = build_mock_fixture(TEST_SCOPED_ID, TEST_VERSION, vec![b"payload".to_vec()]);
+        let server = spawn_mock_registry(MockScenario::UnauthorizedManifest, fixture).await;
+        let err = install_app(
+            TEST_SCOPED_ID,
+            Some(server.base_url()),
+            Some(TEST_VERSION),
+            Some(output_root.path().to_path_buf()),
+            false,
+            false,
+            false,
+            true,
+        )
+        .await
+        .expect_err("install should fail closed on unauthorized manifest read");
+        assert!(err
+            .to_string()
+            .contains(crate::error_codes::ATO_ERR_AUTH_REQUIRED));
+
+        let observations = server.observations().await;
+        assert_eq!(observations.distribution_calls, 0);
+        assert_eq!(observations.artifact_calls, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_delta_install_releases_lease_when_chunk_download_fails() {
+        let _env_lock = acquire_test_env_lock().await;
+        let cas_root = tempfile::tempdir().expect("cas root");
+        let _cas_guard = EnvVarGuard::set(
+            "ATO_CAS_ROOT",
+            Some(cas_root.path().to_string_lossy().as_ref()),
+        );
+        let _token_guard = EnvVarGuard::set("ATO_TOKEN", None);
+
+        let fixture = build_mock_fixture(TEST_SCOPED_ID, TEST_VERSION, vec![b"chunk".to_vec()]);
+        let server = spawn_mock_registry(MockScenario::LeaseReleaseOnFailure, fixture).await;
         let client = reqwest::Client::new();
-
-        let outcome =
-            sync_v3_chunks_from_manifest_with_options(&client, &base_url, &manifest, cas, None, 1)
+        let scoped_ref = test_scoped_ref();
+        let err =
+            install_manifest_delta_path(&client, server.base_url(), &scoped_ref, None, None, None)
                 .await
-                .expect("must skip unsupported chunk endpoint");
-        assert_eq!(outcome, V3SyncOutcome::SkippedUnsupportedRegistry);
+                .expect_err("chunk failure should abort delta install");
+        assert!(err
+            .to_string()
+            .contains(crate::error_codes::ATO_ERR_INTEGRITY_FAILURE));
 
-        handle.abort();
+        let observations = server.observations().await;
+        assert_eq!(observations.release_calls, vec![TEST_LEASE_ID.to_string()]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_negotiate_yanked_fails_closed() {
+        let _env_lock = acquire_test_env_lock().await;
+        let cas_root = tempfile::tempdir().expect("cas root");
+        let _cas_guard = EnvVarGuard::set(
+            "ATO_CAS_ROOT",
+            Some(cas_root.path().to_string_lossy().as_ref()),
+        );
+        let _token_guard = EnvVarGuard::set("ATO_TOKEN", None);
+
+        let fixture = build_mock_fixture(TEST_SCOPED_ID, TEST_VERSION, vec![b"chunk".to_vec()]);
+        let server = spawn_mock_registry(MockScenario::YankedNegotiate, fixture).await;
+        let client = reqwest::Client::new();
+        let scoped_ref = test_scoped_ref();
+        let err =
+            install_manifest_delta_path(&client, server.base_url(), &scoped_ref, None, None, None)
+                .await
+                .expect_err("yanked negotiate must fail closed");
+        let message = err.to_string();
+        assert!(message.contains(crate::error_codes::ATO_ERR_INTEGRITY_FAILURE));
+        assert!(message.to_ascii_lowercase().contains("yanked"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_manifest_yanked_fails_closed_even_with_allow_unverified() {
+        let _env_lock = acquire_test_env_lock().await;
+        let cas_root = tempfile::tempdir().expect("cas root");
+        let output_root = tempfile::tempdir().expect("output root");
+        let runtime_root = tempfile::tempdir().expect("runtime root");
+        let _cas_guard = EnvVarGuard::set(
+            "ATO_CAS_ROOT",
+            Some(cas_root.path().to_string_lossy().as_ref()),
+        );
+        let _runtime_guard = EnvVarGuard::set(
+            "ATO_RUNTIME_ROOT",
+            Some(runtime_root.path().to_string_lossy().as_ref()),
+        );
+        let _token_guard = EnvVarGuard::set("ATO_TOKEN", None);
+
+        let fixture = build_mock_fixture(TEST_SCOPED_ID, TEST_VERSION, vec![b"chunk".to_vec()]);
+        let server = spawn_mock_registry(MockScenario::YankedManifest, fixture).await;
+        let err = install_app(
+            TEST_SCOPED_ID,
+            Some(server.base_url()),
+            Some(TEST_VERSION),
+            Some(output_root.path().to_path_buf()),
+            false,
+            true,
+            false,
+            true,
+        )
+        .await
+        .expect_err("yanked manifest must fail closed");
+        let message = err.to_string();
+        assert!(message.contains(crate::error_codes::ATO_ERR_INTEGRITY_FAILURE));
+        assert!(message.to_ascii_lowercase().contains("yanked"));
+    }
+
+    #[test]
+    fn test_atomic_install_writes_via_tmp_and_rename() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let install_dir = temp.path().join("install");
+        std::fs::create_dir_all(&install_dir).expect("mkdir");
+        let stale = install_dir.join(".capsule.tmp.stale");
+        std::fs::write(&stale, b"stale").expect("write stale");
+        sweep_stale_tmp_capsules(&install_dir).expect("sweep stale");
+        assert!(!stale.exists());
+
+        let output_path = install_dir.join("sample.capsule");
+        let payload = b"atomic-payload".to_vec();
+        let expected = compute_blake3(&payload);
+        write_capsule_atomic(&output_path, &payload, &expected).expect("atomic write");
+
+        let written = std::fs::read(&output_path).expect("read output");
+        assert_eq!(written, payload);
+        let leftovers = std::fs::read_dir(&install_dir)
+            .expect("read dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".capsule.tmp.")
+            })
+            .count();
+        assert_eq!(leftovers, 0);
     }
 }

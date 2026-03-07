@@ -5,11 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use futures::stream::{FuturesUnordered, StreamExt};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::Semaphore;
 
 #[derive(Debug, Clone)]
 pub struct PublishArtifactArgs {
@@ -113,6 +111,29 @@ pub enum PublishArtifactError {
     UploadFailed { status: u16, message: String },
 }
 
+#[derive(Debug, Clone)]
+pub struct ArtifactManifestInfo {
+    pub name: String,
+    pub version: String,
+    pub repository_owner: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegistryErrorPayload {
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+#[derive(Debug, Error)]
+pub enum PublishArtifactError {
+    #[error("Artifact upload conflict (409 version_exists): {message}")]
+    VersionExists { message: String },
+    #[error("Artifact upload failed ({status}): {message}")]
+    UploadFailed { status: u16, message: String },
+}
+
 pub fn publish_artifact(args: PublishArtifactArgs) -> Result<PublishArtifactResult> {
     let base_url = normalize_registry_url(&args.registry_url)?;
     crate::payload_guard::ensure_payload_size(
@@ -121,9 +142,6 @@ pub fn publish_artifact(args: PublishArtifactArgs) -> Result<PublishArtifactResu
         "--force-large-payload",
     )?;
     let payload = load_artifact_payload(&args.artifact_path, &args.scoped_id)?;
-    let v3_sync_payload = payload.v3_sync_payload();
-    sync_v3_chunks_if_present(&base_url, v3_sync_payload.as_ref())
-        .with_context(|| "Failed to sync payload v3 chunks to registry")?;
     let endpoint = build_upload_endpoint(
         &base_url,
         &payload.publisher,
@@ -181,7 +199,7 @@ pub fn inspect_artifact_manifest(path: &Path) -> Result<ArtifactManifestInfo> {
     let bytes = std::fs::read(path)
         .with_context(|| format!("Failed to read artifact: {}", path.display()))?;
     let manifest = extract_manifest_from_capsule(&bytes)?;
-    let parsed = capsule_core::types::capsule_v1::CapsuleManifestV1::from_toml(&manifest)
+    let parsed = capsule_core::types::CapsuleManifest::from_toml(&manifest)
         .map_err(|err| anyhow::anyhow!("Failed to parse capsule.toml from artifact: {}", err))?;
 
     Ok(ArtifactManifestInfo {
@@ -213,255 +231,6 @@ fn build_upload_endpoint(
     endpoint
 }
 
-fn sync_v3_chunks_if_present(base_url: &str, payload: Option<&V3SyncPayload>) -> Result<()> {
-    let Some(payload) = payload else {
-        return Ok(());
-    };
-
-    let cas = match capsule_core::capsule_v3::CasProvider::from_env() {
-        capsule_core::capsule_v3::CasProvider::Enabled(cas) => cas,
-        capsule_core::capsule_v3::CasProvider::Disabled(reason) => {
-            capsule_core::capsule_v3::CasProvider::log_disabled_once(
-                "publish_v3_chunk_sync",
-                &reason,
-            );
-            return Ok(());
-        }
-    };
-    let concurrency = sync_concurrency();
-    let token = read_ato_token();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("Failed to initialize async runtime for v3 sync")?;
-    runtime.block_on(sync_v3_chunks_async_with_options(
-        base_url,
-        payload,
-        cas,
-        concurrency,
-        token,
-    ))
-}
-
-async fn sync_v3_chunks_async_with_options(
-    base_url: &str,
-    payload: &V3SyncPayload,
-    cas: capsule_core::capsule_v3::CasStore,
-    concurrency: usize,
-    token: Option<String>,
-) -> Result<()> {
-    let manifest = &payload.manifest;
-
-    let client = reqwest::Client::new();
-    let negotiate_url = format!("{}/v1/sync/negotiate", base_url);
-    let negotiate_body = SyncNegotiateRequest {
-        artifact_hash: manifest.artifact_hash.clone(),
-        schema_version: manifest.schema_version,
-        chunks: manifest
-            .chunks
-            .iter()
-            .map(|chunk| SyncChunkDescriptor {
-                raw_hash: chunk.raw_hash.clone(),
-                raw_size: chunk.raw_size,
-            })
-            .collect(),
-    };
-
-    let mut negotiate_req = client
-        .post(&negotiate_url)
-        .header("content-type", "application/json")
-        .json(&negotiate_body);
-    if let Some(token) = token.as_deref() {
-        negotiate_req = negotiate_req.bearer_auth(token);
-    }
-    let negotiate_resp = negotiate_req.send().await.with_context(|| {
-        format!(
-            "Failed to negotiate missing v3 chunks via {}",
-            negotiate_url
-        )
-    })?;
-    if is_sync_not_supported_status(negotiate_resp.status()) {
-        return Ok(());
-    }
-    if !negotiate_resp.status().is_success() {
-        let status = negotiate_resp.status();
-        let body = negotiate_resp.text().await.unwrap_or_default();
-        bail!(
-            "v3 sync negotiate failed ({}): {}",
-            status.as_u16(),
-            body.trim()
-        );
-    }
-    let negotiate = negotiate_resp
-        .json::<SyncNegotiateResponse>()
-        .await
-        .context("Invalid v3 sync negotiate response")?;
-
-    let raw_sizes: HashMap<String, u32> = manifest
-        .chunks
-        .iter()
-        .map(|chunk| (chunk.raw_hash.clone(), chunk.raw_size))
-        .collect();
-    let semaphore = Arc::new(Semaphore::new(concurrency));
-
-    let mut uploads = FuturesUnordered::new();
-    for raw_hash in negotiate.missing_chunks {
-        let raw_size = *raw_sizes.get(&raw_hash).ok_or_else(|| {
-            anyhow::anyhow!(
-                "registry requested unknown chunk hash during v3 sync: {}",
-                raw_hash
-            )
-        })?;
-        let chunk_path = cas
-            .chunk_path(&raw_hash)
-            .with_context(|| format!("Failed to resolve local chunk path: {}", raw_hash))?;
-        let client = client.clone();
-        let token = token.clone();
-        let base_url = base_url.to_string();
-        let semaphore = Arc::clone(&semaphore);
-        uploads.push(async move {
-            let _permit = semaphore
-                .acquire_owned()
-                .await
-                .map_err(|_| anyhow::anyhow!("v3 sync semaphore was closed"))?;
-            upload_chunk_with_retry(
-                &client,
-                &base_url,
-                &raw_hash,
-                raw_size,
-                &chunk_path,
-                token.as_deref(),
-            )
-            .await
-        });
-    }
-
-    while let Some(result) = uploads.next().await {
-        result?;
-    }
-
-    let commit_url = format!("{}/v1/sync/commit", base_url);
-    let commit_body = SyncCommitRequest {
-        publisher: payload.publisher.clone(),
-        slug: payload.slug.clone(),
-        version: payload.version.clone(),
-        manifest: payload.manifest.clone(),
-    };
-    let mut commit_req = client
-        .post(&commit_url)
-        .header("content-type", "application/json")
-        .json(&commit_body);
-    if let Some(token) = token.as_deref() {
-        commit_req = commit_req.bearer_auth(token);
-    }
-    let commit_resp = commit_req
-        .send()
-        .await
-        .with_context(|| format!("Failed to commit v3 manifest via {}", commit_url))?;
-    if is_sync_not_supported_status(commit_resp.status()) {
-        return Ok(());
-    }
-    if !commit_resp.status().is_success() {
-        let status = commit_resp.status();
-        let body = commit_resp.text().await.unwrap_or_default();
-        bail!(
-            "v3 sync commit failed ({}): {}",
-            status.as_u16(),
-            body.trim()
-        );
-    }
-
-    Ok(())
-}
-
-async fn upload_chunk_with_retry(
-    client: &reqwest::Client,
-    base_url: &str,
-    raw_hash: &str,
-    raw_size: u32,
-    chunk_path: &Path,
-    token: Option<&str>,
-) -> Result<()> {
-    let endpoint = format!("{}/v1/chunks/{}", base_url, urlencoding::encode(raw_hash));
-    let bytes = tokio::fs::read(chunk_path)
-        .await
-        .with_context(|| format!("Failed to read local CAS chunk {}", chunk_path.display()))?;
-
-    const MAX_RETRIES: usize = 4;
-    for attempt in 0..=MAX_RETRIES {
-        let mut req = client
-            .put(&endpoint)
-            .header("content-type", "application/zstd")
-            .header("x-raw-size", raw_size.to_string())
-            .body(bytes.clone());
-        if let Some(token) = token {
-            req = req.bearer_auth(token);
-        }
-
-        match req.send().await {
-            Ok(resp) if resp.status().is_success() => return Ok(()),
-            Ok(resp) => {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                if is_transient_status(status) && attempt < MAX_RETRIES {
-                    tokio::time::sleep(backoff_duration(attempt)).await;
-                    continue;
-                }
-                bail!(
-                    "v3 chunk upload failed for {} ({}): {}",
-                    raw_hash,
-                    status.as_u16(),
-                    body.trim()
-                );
-            }
-            Err(err) => {
-                if is_transient_reqwest_error(&err) && attempt < MAX_RETRIES {
-                    tokio::time::sleep(backoff_duration(attempt)).await;
-                    continue;
-                }
-                return Err(err).with_context(|| {
-                    format!(
-                        "v3 chunk upload request failed for {} via {}",
-                        raw_hash, endpoint
-                    )
-                });
-            }
-        }
-    }
-
-    bail!("v3 chunk upload exhausted retries for {}", raw_hash)
-}
-
-fn sync_concurrency() -> usize {
-    std::env::var("ATO_SYNC_CONCURRENCY")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .map(|v| v.clamp(1, 128))
-        .unwrap_or(8)
-}
-
-fn is_sync_not_supported_status(status: StatusCode) -> bool {
-    matches!(
-        status,
-        StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED | StatusCode::NOT_IMPLEMENTED
-    )
-}
-
-fn is_transient_status(status: StatusCode) -> bool {
-    status == StatusCode::REQUEST_TIMEOUT
-        || status == StatusCode::TOO_MANY_REQUESTS
-        || status.is_server_error()
-}
-
-fn is_transient_reqwest_error(err: &reqwest::Error) -> bool {
-    err.is_timeout() || err.is_connect() || err.is_request()
-}
-
-fn backoff_duration(attempt: usize) -> Duration {
-    let base_ms = 200u64.saturating_mul(1u64 << attempt.min(4));
-    Duration::from_millis(base_ms.min(2_000))
-}
-
 fn load_artifact_payload(path: &Path, scoped_id: &str) -> Result<ArtifactPayload> {
     if !path.exists() {
         bail!("Artifact not found: {}", path.display());
@@ -479,8 +248,7 @@ fn load_artifact_payload(path: &Path, scoped_id: &str) -> Result<ArtifactPayload
     let bytes = std::fs::read(path)
         .with_context(|| format!("Failed to read artifact: {}", path.display()))?;
     let manifest = extract_manifest_from_capsule(&bytes)?;
-    let v3_manifest = extract_payload_v3_manifest_from_capsule(&bytes)?;
-    let parsed = capsule_core::types::capsule_v1::CapsuleManifestV1::from_toml(&manifest)
+    let parsed = capsule_core::types::CapsuleManifest::from_toml(&manifest)
         .map_err(|err| anyhow::anyhow!("Failed to parse capsule.toml from artifact: {}", err))?;
 
     if parsed.name != scoped.slug {
@@ -1079,151 +847,5 @@ entrypoint = "main.ts"
             r#"{"error":"other","message":"same version is already published"}"#,
         );
         assert!(matches!(err, PublishArtifactError::VersionExists { .. }));
-    }
-
-    #[test]
-    fn extract_payload_v3_manifest_from_capsule_succeeds_when_present() {
-        let bytes = test_capsule_bytes_with_v3_manifest("sample-capsule", "1.0.0");
-        let v3 = extract_payload_v3_manifest_from_capsule(&bytes)
-            .expect("extract")
-            .expect("must exist");
-        assert_eq!(v3.schema_version, 3);
-        assert!(v3.artifact_hash.starts_with("blake3:"));
-    }
-
-    #[test]
-    fn extract_payload_v3_manifest_from_capsule_returns_none_when_absent() {
-        let bytes = test_capsule_bytes("sample-capsule", "1.0.0");
-        let v3 = extract_payload_v3_manifest_from_capsule(&bytes).expect("extract");
-        assert!(v3.is_none());
-    }
-
-    #[test]
-    fn sync_v3_chunks_if_present_skips_when_local_cas_is_unavailable() {
-        let _env_guard = env_lock().lock().expect("env lock");
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let cas_root_file = tmp.path().join("cas-root-as-file");
-        std::fs::write(&cas_root_file, "not-a-directory").expect("write cas file");
-        let _cas_root = EnvVarGuard::set("ATO_CAS_ROOT", Some(cas_root_file.as_os_str()));
-
-        let payload = V3SyncPayload {
-            publisher: "local".to_string(),
-            slug: "sync-app".to_string(),
-            version: "1.0.0".to_string(),
-            manifest: CapsuleManifestV3::new(vec![]),
-        };
-        sync_v3_chunks_if_present("http://127.0.0.1:9", Some(&payload))
-            .expect("should skip v3 sync when local CAS is unavailable");
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_v3_sync_zero_transfer_on_full_hit() {
-        let state = SyncMockState::new(vec![]);
-        let (base_url, handle) = start_sync_mock_server(state.clone()).await;
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let cas = capsule_core::capsule_v3::CasStore::new(tmp.path()).expect("cas");
-        let (payload, _hashes) = build_v3_sync_test_payload(&cas, 4);
-
-        sync_v3_chunks_async_with_options(&base_url, &payload, cas, 8, None)
-            .await
-            .expect("sync");
-
-        assert_eq!(state.negotiate_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(state.put_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(state.commit_calls.load(Ordering::SeqCst), 1);
-
-        handle.abort();
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_v3_sync_only_missing_chunks_transferred() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let cas = capsule_core::capsule_v3::CasStore::new(tmp.path()).expect("cas");
-        let (payload, hashes) = build_v3_sync_test_payload(&cas, 8);
-        let missing = vec![hashes[1].clone(), hashes[6].clone(), hashes[7].clone()];
-        let state = SyncMockState::new(missing.clone());
-        let (base_url, handle) = start_sync_mock_server(state.clone()).await;
-
-        sync_v3_chunks_async_with_options(&base_url, &payload, cas, 8, None)
-            .await
-            .expect("sync");
-
-        let mut uploaded = state.uploaded_hashes.lock().await.clone();
-        uploaded.sort();
-        let mut expected = missing.clone();
-        expected.sort();
-
-        assert_eq!(uploaded, expected);
-        assert_eq!(state.put_calls.load(Ordering::SeqCst), missing.len());
-        assert_eq!(state.commit_calls.load(Ordering::SeqCst), 1);
-
-        handle.abort();
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_v3_sync_respects_concurrency_limit() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let cas = capsule_core::capsule_v3::CasStore::new(tmp.path()).expect("cas");
-        let (payload, hashes) = build_v3_sync_test_payload(&cas, 32);
-        let state = SyncMockState::new(hashes.clone()).with_put_delay(Duration::from_millis(30));
-        let (base_url, handle) = start_sync_mock_server(state.clone()).await;
-        let concurrency = 4;
-
-        sync_v3_chunks_async_with_options(&base_url, &payload, cas, concurrency, None)
-            .await
-            .expect("sync");
-
-        let peak = state.max_inflight_puts.load(Ordering::SeqCst);
-        assert!(
-            peak <= concurrency,
-            "peak inflight={} exceeded limit={}",
-            peak,
-            concurrency
-        );
-
-        handle.abort();
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_v3_sync_retries_on_transient_errors() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let cas = capsule_core::capsule_v3::CasStore::new(tmp.path()).expect("cas");
-        let (payload, hashes) = build_v3_sync_test_payload(&cas, 2);
-        let target = hashes[0].clone();
-        let state = SyncMockState::new(vec![target.clone()]);
-        {
-            let mut transient = state.per_hash_transient_failures.lock().await;
-            transient.insert(target.clone(), 2);
-        }
-        let (base_url, handle) = start_sync_mock_server(state.clone()).await;
-
-        sync_v3_chunks_async_with_options(&base_url, &payload, cas, 2, None)
-            .await
-            .expect("sync");
-
-        let attempts = state.put_attempts.lock().await;
-        assert_eq!(attempts.get(&target).copied().unwrap_or(0), 3);
-        assert_eq!(state.commit_calls.load(Ordering::SeqCst), 1);
-
-        handle.abort();
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_v3_sync_fails_fast_on_deterministic_4xx() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let cas = capsule_core::capsule_v3::CasStore::new(tmp.path()).expect("cas");
-        let (payload, hashes) = build_v3_sync_test_payload(&cas, 1);
-        let state = SyncMockState::new(vec![hashes[0].clone()])
-            .with_fixed_put_status(StatusCode::BAD_REQUEST);
-        let (base_url, handle) = start_sync_mock_server(state.clone()).await;
-
-        let err = sync_v3_chunks_async_with_options(&base_url, &payload, cas, 4, None)
-            .await
-            .expect_err("must fail");
-        assert!(err.to_string().contains("v3 chunk upload failed"));
-        assert_eq!(state.put_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(state.commit_calls.load(Ordering::SeqCst), 0);
-
-        handle.abort();
     }
 }

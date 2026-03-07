@@ -3,8 +3,6 @@
 //! Resolves domain names to IP addresses for egress allowlists.
 //! This pre-resolution happens at pack time so nacelle doesn't need DNS.
 
-#![allow(dead_code)]
-
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::net::ToSocketAddrs;

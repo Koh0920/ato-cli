@@ -88,9 +88,7 @@ pub fn execute(plan: &ManifestData) -> Result<i32> {
         .wait()
         .with_context(|| format!("Failed waiting for OCI engine: {}", engine_binary(&engine)))?;
 
-    if let Err(err) = metrics_result {
-        return Err(err);
-    }
+    metrics_result?;
 
     Ok(status.code().unwrap_or(1))
 }

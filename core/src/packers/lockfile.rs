@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 
 use crate::error::{CapsuleError, Result};
 use crate::manifest;
+use crate::packers::payload;
 use crate::reporter::CapsuleReporter;
 
 const LOCKFILE_VERSION: &str = "1";
@@ -260,7 +260,10 @@ pub fn write_lockfile(
         version: LOCKFILE_VERSION.to_string(),
         meta: LockMeta {
             created_at: Utc::now().to_rfc3339(),
-            manifest_hash: format!("sha256:{}", sha256_hex(loaded.raw_text.as_bytes())),
+            manifest_hash: payload::compute_manifest_hash_without_signatures(&loaded.model)
+                .map_err(|e| {
+                    CapsuleError::Pack(format!("Failed to compute manifest hash: {}", e))
+                })?,
             allowlist: Some(allowlist.clone()),
         },
         tools: if tools.uv.is_some() || tools.pnpm.is_some() {
@@ -290,13 +293,6 @@ pub fn write_lockfile(
         .map_err(|e| CapsuleError::Pack(format!("Failed to write capsule.lock: {}", e)))?;
 
     Ok(lock_path)
-}
-
-fn sha256_hex(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    let digest = hasher.finalize();
-    hex::encode(digest)
 }
 
 fn detect_platform() -> Result<(String, String)> {
@@ -487,7 +483,7 @@ fn is_allowed(url: &str, allowlist: &[String]) -> bool {
 fn extract_host(url: &str) -> Option<String> {
     let without_scheme = url.split("://").nth(1).unwrap_or(url);
     let host_port = without_scheme.split('/').next()?;
-    let host = host_port.split('@').last().unwrap_or(host_port);
+    let host = host_port.split('@').next_back().unwrap_or(host_port);
     Some(host.split(':').next().unwrap_or(host).to_string())
 }
 

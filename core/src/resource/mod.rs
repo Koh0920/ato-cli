@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-#![allow(unused_imports)]
 //! Resource management modules
 //!
 //! This module handles all resource acquisition and storage:
@@ -15,5 +13,7 @@ pub mod storage;
 
 // Re-export commonly used types
 pub use artifact::ArtifactManager;
-pub use cas::{CasClient, HttpCasClient, LocalCasClient};
+pub use cas::{
+    AtoBloomFilter, AtoBloomWire, CasClient, HttpCasClient, LocalCasClient, LocalCasIndex,
+};
 pub use storage::{StorageConfig, StorageManager};

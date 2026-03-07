@@ -102,6 +102,22 @@ impl LocalCasClient {
 
         Ok(())
     }
+
+    /// Enforce immutable permissions for CAS blobs to prevent mutation taint.
+    fn enforce_blob_read_only(&self, path: &Path) -> Result<()> {
+        let mut permissions = std::fs::metadata(path)?.permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o444);
+        }
+        #[cfg(not(unix))]
+        {
+            permissions.set_readonly(true);
+        }
+        std::fs::set_permissions(path, permissions)?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -142,8 +158,11 @@ impl CasClient for LocalCasClient {
         // Copy to CAS if not already present
         if !dest_path.exists() {
             std::fs::copy(source_path, &dest_path)?;
+            self.enforce_blob_read_only(&dest_path)?;
             debug!("Stored blob in local CAS: {}", digest);
         } else {
+            // Re-apply hardening in case an existing blob was created before this policy.
+            self.enforce_blob_read_only(&dest_path)?;
             debug!("Blob already exists in local CAS: {}", digest);
         }
 
@@ -320,7 +339,7 @@ impl CasClient for HttpCasClient {
 /// Reads from environment variables:
 /// - `ATO_CAS_TYPE`: "local" or "http" (default: "local")
 /// - `ATO_CAS_ENDPOINT`: HTTP endpoint for remote CAS
-/// - `ATO_CAS_ROOT`: Root directory for local CAS (default: ~/.capsule/cas)
+/// - `ATO_CAS_ROOT`: Root directory for local CAS (default: ~/.ato/cas)
 #[allow(dead_code)] // Will be used when CAS integration is enabled
 pub fn create_cas_client_from_env() -> Result<Box<dyn CasClient>> {
     let cas_type = std::env::var("ATO_CAS_TYPE").unwrap_or_else(|_| "local".to_string());
@@ -333,7 +352,7 @@ pub fn create_cas_client_from_env() -> Result<Box<dyn CasClient>> {
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| {
                     crate::common::paths::nacelle_home_dir()
-                        .unwrap_or_else(|_| PathBuf::from("/tmp").join(".capsule"))
+                        .unwrap_or_else(|_| PathBuf::from("/tmp").join(".ato"))
                         .join("cas-cache")
                 });
             Ok(Box::new(HttpCasClient::new(endpoint, cache_dir)?))
@@ -343,7 +362,7 @@ pub fn create_cas_client_from_env() -> Result<Box<dyn CasClient>> {
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| {
                     crate::common::paths::nacelle_home_dir()
-                        .unwrap_or_else(|_| PathBuf::from("/tmp").join(".capsule"))
+                        .unwrap_or_else(|_| PathBuf::from("/tmp").join(".ato"))
                         .join("cas")
                 });
             Ok(Box::new(LocalCasClient::new(root)?))
@@ -355,7 +374,7 @@ pub fn create_cas_client_from_env() -> Result<Box<dyn CasClient>> {
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| {
                     crate::common::paths::nacelle_home_dir()
-                        .unwrap_or_else(|_| PathBuf::from("/tmp").join(".capsule"))
+                        .unwrap_or_else(|_| PathBuf::from("/tmp").join(".ato"))
                         .join("cas")
                 });
             Ok(Box::new(LocalCasClient::new(root)?))
@@ -396,6 +415,47 @@ mod tests {
             .fetch_blob("sha256:0000000000000000000000000000000000000000000000000000000000000000")
             .await;
         assert!(matches!(result, Err(CapsuleError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn test_local_cas_store_sets_read_only_permissions() {
+        let temp_dir = TempDir::new().unwrap();
+        let cas = LocalCasClient::new(temp_dir.path()).unwrap();
+
+        let test_file = temp_dir.path().join("test-readonly.txt");
+        std::fs::write(&test_file, "readonly").unwrap();
+
+        let digest = cas.store_blob(&test_file).await.unwrap();
+        let stored = cas.fetch_blob(&digest).await.unwrap();
+        let metadata = std::fs::metadata(stored).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o444);
+        }
+        #[cfg(not(unix))]
+        {
+            assert!(metadata.permissions().readonly());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_local_cas_store_rejects_in_place_mutation() {
+        let temp_dir = TempDir::new().unwrap();
+        let cas = LocalCasClient::new(temp_dir.path()).unwrap();
+
+        let test_file = temp_dir.path().join("test-taint.txt");
+        std::fs::write(&test_file, "immutable").unwrap();
+
+        let digest = cas.store_blob(&test_file).await.unwrap();
+        let stored = cas.fetch_blob(&digest).await.unwrap();
+
+        let err = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&stored)
+            .expect_err("CAS blob must not be writable");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
     #[test]

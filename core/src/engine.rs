@@ -35,7 +35,7 @@ pub fn discover_nacelle(req: EngineRequest) -> Result<PathBuf> {
         }
     }
 
-    // 4) User registry (~/.capsule/config.toml)
+    // 4) User registry (~/.ato/config.toml)
     {
         let cfg = config::load_config()?;
         if let Some(default_name) = cfg.default_engine.as_deref() {

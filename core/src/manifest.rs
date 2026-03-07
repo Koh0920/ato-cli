@@ -1,11 +1,11 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::{CapsuleError, Result};
-use crate::types::capsule_v1::{CapsuleManifestV1, TargetsConfig};
+use crate::types::{CapsuleManifest, TargetsConfig};
 
 pub struct LoadedManifest {
     pub raw: toml::Value,
-    pub model: CapsuleManifestV1,
+    pub model: CapsuleManifest,
     pub raw_text: String,
     pub path: PathBuf,
     pub dir: PathBuf,
@@ -33,7 +33,7 @@ pub fn load_manifest(path: &Path) -> Result<LoadedManifest> {
         ));
     }
 
-    let mut model = CapsuleManifestV1::from_toml(&raw_text).map_err(|e| {
+    let mut model = CapsuleManifest::from_toml(&raw_text).map_err(|e| {
         CapsuleError::Manifest(
             path.to_path_buf(),
             format!("Failed to parse manifest into schema: {}", e),

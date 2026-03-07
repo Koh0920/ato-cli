@@ -393,9 +393,9 @@ impl RuntimeFetcher {
         let total_size = response.content_length();
 
         if show_progress {
-            let _ = self
-                .reporter
-                .progress_start(format!("Downloading {}", url), total_size);
+            self.reporter
+                .progress_start(format!("Downloading {}", url), total_size)
+                .await?;
         }
 
         if let Some(parent) = dest.parent() {
@@ -414,14 +414,14 @@ impl RuntimeFetcher {
             _downloaded += chunk.len() as u64;
 
             if show_progress {
-                let _ = self.reporter.progress_inc(chunk.len() as u64);
+                self.reporter.progress_inc(chunk.len() as u64).await?;
             }
         }
 
         if show_progress {
-            let _ = self
-                .reporter
-                .progress_finish(Some("Download complete".to_string()));
+            self.reporter
+                .progress_finish(Some("Download complete".to_string()))
+                .await?;
         }
 
         Ok(())
@@ -754,7 +754,7 @@ impl RuntimeFetcher {
 fn toolchain_cache_dir() -> Result<PathBuf> {
     let home = dirs::home_dir()
         .ok_or_else(|| CapsuleError::Config("Failed to determine home directory".to_string()))?;
-    Ok(home.join(".capsule").join("toolchains"))
+    Ok(home.join(".ato").join("toolchains"))
 }
 
 #[cfg(test)]

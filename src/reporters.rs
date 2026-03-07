@@ -12,9 +12,9 @@ pub enum CliReporter {
 impl CliReporter {
     pub fn new(json: bool) -> Self {
         if json {
-            Self::Json(JsonReporter::default())
+            Self::Json(JsonReporter)
         } else {
-            Self::Stdout(StdoutReporter::default())
+            Self::Stdout(StdoutReporter)
         }
     }
 }
@@ -112,6 +112,8 @@ impl CapsuleReporter for StdoutReporter {
                 print!("\r{}", label);
             }
             std::io::stdout().flush()?;
+        } else if let Some(total) = total {
+            println!("{} ({} bytes)", label, total);
         } else {
             if let Some(total) = total {
                 println!("{} ({} bytes)", label, total);
