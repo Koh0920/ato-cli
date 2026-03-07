@@ -82,6 +82,7 @@ pub fn unpack_payload_from_capsule_root_with_provider(
     Ok(PayloadUnpackOutcome::RestoredFromV2)
 }
 
+#[cfg(test)]
 fn unpack_payload_from_capsule_root_with_cas(
     capsule_root: &Path,
     out_dir: &Path,
@@ -344,7 +345,7 @@ impl ChainedChunkReader {
             "blake3:{}",
             self.current_hasher
                 .take()
-                .unwrap_or_else(blake3::Hasher::new)
+                .unwrap_or_default()
                 .finalize()
                 .to_hex()
         );

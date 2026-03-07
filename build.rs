@@ -1,16 +1,32 @@
 use std::env;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, ExitStatus};
+
+fn npm_status(ui_dir: &Path, args: &[&str]) -> std::io::Result<ExitStatus> {
+    Command::new("npm")
+        .arg("--prefix")
+        .arg(ui_dir)
+        .args(args)
+        .status()
+}
 
 fn main() {
     let ui_dir = Path::new("apps/ato-store-local");
     let ui_src = ui_dir.join("src");
     let ui_public = ui_dir.join("public");
     let ui_package = ui_dir.join("package.json");
+    let ui_lockfile = ui_dir.join("package-lock.json");
+    let ui_vite_bin = ui_dir
+        .join("node_modules")
+        .join(".bin")
+        .join(if cfg!(windows) { "vite.cmd" } else { "vite" });
 
     println!("cargo:rerun-if-env-changed=ATO_SKIP_UI_BUILD");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={}", ui_package.display());
+    if ui_lockfile.exists() {
+        println!("cargo:rerun-if-changed={}", ui_lockfile.display());
+    }
     if ui_src.exists() {
         println!("cargo:rerun-if-changed={}", ui_src.display());
     }
@@ -35,10 +51,30 @@ fn main() {
         return;
     }
 
-    let status = Command::new("npm")
-        .args(["run", "build", "--prefix"])
-        .arg(ui_dir)
-        .status();
+    if !ui_vite_bin.exists() {
+        let install_args = if ui_lockfile.exists() {
+            ["ci"].as_slice()
+        } else {
+            ["install"].as_slice()
+        };
+        println!(
+            "cargo:warning=Installing UI dependencies because {} is missing",
+            ui_vite_bin.display()
+        );
+        match npm_status(ui_dir, install_args) {
+            Ok(status) if status.success() => {}
+            Ok(status) => panic!(
+                "UI dependency install failed (status: {}). Run `npm install --prefix apps/ato-store-local` and retry.",
+                status
+            ),
+            Err(err) => panic!(
+                "Failed to execute npm for UI dependency install: {}. Install Node.js/npm or set ATO_SKIP_UI_BUILD=1.",
+                err
+            ),
+        }
+    }
+
+    let status = npm_status(ui_dir, &["run", "build"]);
 
     match status {
         Ok(status) if status.success() => {}

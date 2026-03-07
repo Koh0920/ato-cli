@@ -7,6 +7,8 @@
 //! - `ato ipc stop`   — Stop a running IPC service by name.
 //! - `ato ipc invoke` — Validate and send a JSON-RPC invoke request.
 
+#![allow(dead_code)]
+
 #[cfg(unix)]
 use std::io::{Read, Write};
 #[cfg(unix)]

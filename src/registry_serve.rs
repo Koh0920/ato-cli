@@ -4218,6 +4218,7 @@ mod tests {
         Ok(out)
     }
 
+    #[allow(dead_code)]
     fn compress(data: &[u8]) -> Vec<u8> {
         let mut encoder = zstd::Encoder::new(Vec::new(), 3).expect("encoder");
         encoder.write_all(data).expect("write");
