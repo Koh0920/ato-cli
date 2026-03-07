@@ -1,10 +1,10 @@
 use std::collections::BTreeSet;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 #[cfg(unix)]
 use std::{
     collections::BTreeMap,
+    io::Write,
     os::{
         fd::{AsRawFd, FromRawFd},
         unix::process::CommandExt,
