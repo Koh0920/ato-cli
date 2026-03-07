@@ -397,25 +397,31 @@ pub fn run_ipc_invoke(
         );
     }
 
-    let response = match &target.endpoint {
+    #[cfg(unix)]
+    let response: JsonRpcResponse = match &target.endpoint {
         IpcTransport::UnixSocket(socket_path) => {
-            #[cfg(unix)]
-            {
-                invoke_over_unix_socket(socket_path, &request).unwrap_or_else(|err| {
-                    exit_with_invoke_error(request_id.clone(), err, json_output)
-                })
-            }
-            #[cfg(not(unix))]
-            {
-                exit_with_invoke_error(
-                    request_id,
-                    JsonRpcError::service_unavailable(
-                        "Unix socket transport is unavailable on this platform.",
-                    ),
-                    json_output,
-                );
-            }
+            invoke_over_unix_socket(socket_path, &request)
+                .unwrap_or_else(|err| exit_with_invoke_error(request_id.clone(), err, json_output))
         }
+        transport => exit_with_invoke_error(
+            request_id,
+            JsonRpcError::service_unavailable(&format!(
+                "Transport '{}' is not supported by `ato ipc invoke` yet.",
+                transport.endpoint_display()
+            )),
+            json_output,
+        ),
+    };
+
+    #[cfg(not(unix))]
+    match &target.endpoint {
+        IpcTransport::UnixSocket(_) => exit_with_invoke_error(
+            request_id,
+            JsonRpcError::service_unavailable(
+                "Unix socket transport is unavailable on this platform.",
+            ),
+            json_output,
+        ),
         transport => exit_with_invoke_error(
             request_id,
             JsonRpcError::service_unavailable(&format!(
