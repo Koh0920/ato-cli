@@ -1567,7 +1567,7 @@ fn detect_host_glibc_version() -> Option<String> {
             return None;
         }
         let cstr = unsafe { std::ffi::CStr::from_ptr(ptr) };
-        return Some(cstr.to_string_lossy().to_string());
+        Some(cstr.to_string_lossy().to_string())
     }
 
     #[cfg(not(all(target_os = "linux", target_env = "gnu")))]

@@ -52,13 +52,13 @@ fn main() {
     }
 
     if !ui_vite_bin.exists() {
-        let install_args = if ui_lockfile.exists() {
-            ["ci"].as_slice()
+        let install_args: &[&str] = if ui_lockfile.exists() {
+            &["ci", "--include=dev"]
         } else {
-            ["install"].as_slice()
+            &["install", "--include=dev"]
         };
         println!(
-            "cargo:warning=Installing UI dependencies because {} is missing",
+            "cargo:warning=Installing UI dependencies (including Vite) because {} is missing",
             ui_vite_bin.display()
         );
         match npm_status(ui_dir, install_args) {
@@ -71,6 +71,13 @@ fn main() {
                 "Failed to execute npm for UI dependency install: {}. Install Node.js/npm or set ATO_SKIP_UI_BUILD=1.",
                 err
             ),
+        }
+
+        if !ui_vite_bin.exists() {
+            panic!(
+                "UI dependency install completed but {} is still missing. Ensure npm devDependencies are enabled and retry.",
+                ui_vite_bin.display()
+            );
         }
     }
 
