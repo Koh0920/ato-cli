@@ -312,11 +312,7 @@ fn lockfile_has_required_platform_coverage(
 
     if let Some(targets) = runtime_targets.and_then(|r| r.deno.as_ref()).map(|entry| &entry.targets)
     {
-        let deno_platforms = required_platforms
-            .iter()
-            .copied()
-            .filter(|platform| deno_artifact_filename(platform.os, platform.arch).is_ok())
-            .collect::<Vec<_>>();
+        let deno_platforms = supported_deno_platforms(&required_platforms);
         if deno_platforms
             .iter()
             .any(|platform| !targets.contains_key(platform.target_triple))
@@ -325,10 +321,18 @@ fn lockfile_has_required_platform_coverage(
         }
     }
 
-    let runtime_target_sets = [
-        runtime_targets.and_then(|r| r.node.as_ref()).map(|entry| &entry.targets),
-        runtime_targets.and_then(|r| r.python.as_ref()).map(|entry| &entry.targets),
-    ];
+    if let Some(targets) = runtime_targets.and_then(|r| r.python.as_ref()).map(|entry| &entry.targets)
+    {
+        let python_platforms = supported_python_platforms(&required_platforms, &lockfile.runtimes);
+        if python_platforms
+            .iter()
+            .any(|platform| !targets.contains_key(platform.target_triple))
+        {
+            return Ok(false);
+        }
+    }
+
+    let runtime_target_sets = [runtime_targets.and_then(|r| r.node.as_ref()).map(|entry| &entry.targets)];
 
     for targets in runtime_target_sets.into_iter().flatten() {
         if required_platforms
@@ -345,7 +349,8 @@ fn lockfile_has_required_platform_coverage(
         .and_then(|tools| tools.uv.as_ref())
         .map(|entry| &entry.targets)
     {
-        if required_platforms
+        let uv_platforms = supported_uv_platforms(&required_platforms);
+        if uv_platforms
             .iter()
             .any(|platform| !targets.contains_key(platform.target_triple))
         {
@@ -354,6 +359,40 @@ fn lockfile_has_required_platform_coverage(
     }
 
     Ok(true)
+}
+
+fn supported_deno_platforms(platforms: &[RuntimePlatform]) -> Vec<RuntimePlatform> {
+    platforms
+        .iter()
+        .copied()
+        .filter(|platform| deno_artifact_filename(platform.os, platform.arch).is_ok())
+        .collect()
+}
+
+fn supported_python_platforms(
+    platforms: &[RuntimePlatform],
+    runtimes: &Option<RuntimeSection>,
+) -> Vec<RuntimePlatform> {
+    let version = runtimes
+        .as_ref()
+        .and_then(|runtime| runtime.python.as_ref())
+        .map(|python| python.version.as_str())
+        .unwrap_or("3.11.10");
+    platforms
+        .iter()
+        .copied()
+        .filter(|platform| {
+            RuntimeFetcher::get_python_download_url(version, platform.os, platform.arch).is_ok()
+        })
+        .collect()
+}
+
+fn supported_uv_platforms(platforms: &[RuntimePlatform]) -> Vec<RuntimePlatform> {
+    platforms
+        .iter()
+        .copied()
+        .filter(|platform| uv_artifact_url(platform.target_triple).is_some())
+        .collect()
 }
 
 fn manifest_hash_from_open_inputs(
@@ -1549,7 +1588,9 @@ async fn resolve_python_runtime(
     let fetcher = RuntimeFetcher::new_with_reporter(reporter)?;
     let mut targets = HashMap::new();
     for platform in platforms {
-        let url = RuntimeFetcher::get_python_download_url(version, platform.os, platform.arch)?;
+        let Ok(url) = RuntimeFetcher::get_python_download_url(version, platform.os, platform.arch) else {
+            continue;
+        };
         let sha256 = resolve_python_sha256(&fetcher, &url).await?;
         targets.insert(
             platform.target_triple.to_string(),
@@ -1812,10 +1853,9 @@ async fn resolve_uv_tool_targets(
     let fetcher = RuntimeFetcher::new_with_reporter(reporter)?;
     let mut targets = HashMap::new();
     for platform in platforms {
-        let url = format!(
-            "https://github.com/astral-sh/uv/releases/download/{0}/uv-{1}.tar.gz",
-            UV_VERSION, platform.target_triple
-        );
+        let Some(url) = uv_artifact_url(platform.target_triple) else {
+            continue;
+        };
         let sha256 = fetcher
             .fetch_expected_sha256(&(url.clone() + ".sha256"), None)
             .await?;
@@ -1829,6 +1869,18 @@ async fn resolve_uv_tool_targets(
         );
     }
     Ok(ToolTargets { targets })
+}
+
+fn uv_artifact_url(target_triple: &str) -> Option<String> {
+    let extension = match target_triple {
+        "x86_64-pc-windows-msvc" => "zip",
+        "aarch64-pc-windows-msvc" => return None,
+        _ => "tar.gz",
+    };
+    Some(format!(
+        "https://github.com/astral-sh/uv/releases/download/{0}/uv-{1}.{2}",
+        UV_VERSION, target_triple, extension
+    ))
 }
 
 fn detect_tool(cmd: &str) -> Option<String> {
@@ -2579,6 +2631,111 @@ runtime_tools = { node = "20.11.0", python = "3.11.10" }
         };
 
         assert!(lockfile_has_required_platform_coverage(&lockfile, &manifest).unwrap());
+    }
+
+    #[test]
+    fn universal_lockfile_allows_python_without_windows_arm64_target() {
+        let manifest: toml::Value = toml::from_str(
+            r#"
+default_target = "default"
+[targets.default]
+runtime = "web"
+driver = "deno"
+runtime_version = "1.46.3"
+runtime_tools = { node = "20.11.0", python = "3.11.10" }
+"#,
+        )
+        .unwrap();
+
+        let python_targets: HashMap<String, RuntimeArtifact> = SUPPORTED_RUNTIME_PLATFORMS
+            .iter()
+            .filter(|platform| {
+                RuntimeFetcher::get_python_download_url("3.11.10", platform.os, platform.arch)
+                    .is_ok()
+            })
+            .map(|platform| {
+                (
+                    platform.target_triple.to_string(),
+                    RuntimeArtifact {
+                        url: format!("https://example.com/{}/python.tar.gz", platform.target_triple),
+                        sha256: "deadbeef".to_string(),
+                    },
+                )
+            })
+            .collect();
+        let common_runtime_targets: HashMap<String, RuntimeArtifact> = SUPPORTED_RUNTIME_PLATFORMS
+            .iter()
+            .map(|platform| {
+                (
+                    platform.target_triple.to_string(),
+                    RuntimeArtifact {
+                        url: format!("https://example.com/{}/runtime.tar.gz", platform.target_triple),
+                        sha256: "deadbeef".to_string(),
+                    },
+                )
+            })
+            .collect();
+        let uv_targets: HashMap<String, ToolArtifact> = SUPPORTED_RUNTIME_PLATFORMS
+            .iter()
+            .filter(|platform| uv_artifact_url(platform.target_triple).is_some())
+            .map(|platform| {
+                (
+                    platform.target_triple.to_string(),
+                    ToolArtifact {
+                        url: uv_artifact_url(platform.target_triple).unwrap(),
+                        sha256: Some("deadbeef".to_string()),
+                        version: Some(UV_VERSION.to_string()),
+                    },
+                )
+            })
+            .collect();
+        let lockfile = CapsuleLock {
+            version: "1".to_string(),
+            meta: LockMeta {
+                created_at: "2026-03-08T00:00:00Z".to_string(),
+                manifest_hash: "blake3:deadbeef".to_string(),
+            },
+            allowlist: None,
+            tools: Some(ToolSection {
+                uv: Some(ToolTargets { targets: uv_targets }),
+                pnpm: None,
+            }),
+            runtimes: Some(RuntimeSection {
+                python: Some(RuntimeEntry {
+                    provider: "python-build-standalone".to_string(),
+                    version: "3.11.10".to_string(),
+                    targets: python_targets,
+                }),
+                deno: Some(RuntimeEntry {
+                    provider: "official".to_string(),
+                    version: "1.46.3".to_string(),
+                    targets: common_runtime_targets.clone(),
+                }),
+                node: Some(RuntimeEntry {
+                    provider: "official".to_string(),
+                    version: "20.11.0".to_string(),
+                    targets: common_runtime_targets,
+                }),
+                java: None,
+                dotnet: None,
+            }),
+            targets: HashMap::new(),
+        };
+
+        assert!(lockfile_has_required_platform_coverage(&lockfile, &manifest).unwrap());
+    }
+
+    #[test]
+    fn uv_artifact_url_uses_zip_for_windows_x64_and_skips_windows_arm64() {
+        assert_eq!(
+            uv_artifact_url("x86_64-pc-windows-msvc").as_deref(),
+            Some("https://github.com/astral-sh/uv/releases/download/0.4.19/uv-x86_64-pc-windows-msvc.zip")
+        );
+        assert!(uv_artifact_url("aarch64-pc-windows-msvc").is_none());
+        assert_eq!(
+            uv_artifact_url("x86_64-unknown-linux-gnu").as_deref(),
+            Some("https://github.com/astral-sh/uv/releases/download/0.4.19/uv-x86_64-unknown-linux-gnu.tar.gz")
+        );
     }
 
     #[test]
