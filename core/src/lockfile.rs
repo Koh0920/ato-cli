@@ -309,8 +309,23 @@ fn lockfile_has_required_platform_coverage(
     }
 
     let runtime_targets = lockfile.runtimes.as_ref();
+
+    if let Some(targets) = runtime_targets.and_then(|r| r.deno.as_ref()).map(|entry| &entry.targets)
+    {
+        let deno_platforms = required_platforms
+            .iter()
+            .copied()
+            .filter(|platform| deno_artifact_filename(platform.os, platform.arch).is_ok())
+            .collect::<Vec<_>>();
+        if deno_platforms
+            .iter()
+            .any(|platform| !targets.contains_key(platform.target_triple))
+        {
+            return Ok(false);
+        }
+    }
+
     let runtime_target_sets = [
-        runtime_targets.and_then(|r| r.deno.as_ref()).map(|entry| &entry.targets),
         runtime_targets.and_then(|r| r.node.as_ref()).map(|entry| &entry.targets),
         runtime_targets.and_then(|r| r.python.as_ref()).map(|entry| &entry.targets),
     ];
@@ -1617,7 +1632,9 @@ async fn resolve_deno_runtime(
     let fetcher = RuntimeFetcher::new_with_reporter(reporter)?;
     let mut targets = HashMap::new();
     for platform in platforms {
-        let filename = deno_artifact_filename(platform.os, platform.arch)?;
+        let Ok(filename) = deno_artifact_filename(platform.os, platform.arch) else {
+            continue;
+        };
         let url = format!(
             "https://github.com/denoland/deno/releases/download/v{}/{}",
             version, filename
@@ -1642,7 +1659,6 @@ fn deno_artifact_filename(os: &str, arch: &str) -> Result<String> {
         ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
         ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
         ("windows", "x86_64") => "x86_64-pc-windows-msvc",
-        ("windows", "aarch64") => "aarch64-pc-windows-msvc",
         _ => {
             return Err(CapsuleError::Pack(format!(
                 "Unsupported Deno platform: {} {}",
@@ -2232,6 +2248,7 @@ default_target = "cli"
             deno_artifact_filename("windows", "x86_64").unwrap(),
             "deno-x86_64-pc-windows-msvc.zip"
         );
+        assert!(deno_artifact_filename("windows", "aarch64").is_err());
     }
 
     #[test]
@@ -2464,6 +2481,96 @@ runtime_tools = { node = "20.11.0", python = "3.11.10" }
                     provider: "official".to_string(),
                     version: "20.11.0".to_string(),
                     targets: runtime_targets,
+                }),
+                java: None,
+                dotnet: None,
+            }),
+            targets: HashMap::new(),
+        };
+
+        assert!(lockfile_has_required_platform_coverage(&lockfile, &manifest).unwrap());
+    }
+
+    #[test]
+    fn universal_lockfile_allows_deno_without_windows_arm64_target() {
+        let manifest: toml::Value = toml::from_str(
+            r#"
+default_target = "default"
+[targets.default]
+runtime = "web"
+driver = "deno"
+runtime_version = "1.46.3"
+runtime_tools = { node = "20.11.0", python = "3.11.10" }
+"#,
+        )
+        .unwrap();
+
+        let common_runtime_targets: HashMap<String, RuntimeArtifact> = SUPPORTED_RUNTIME_PLATFORMS
+            .iter()
+            .map(|platform| {
+                (
+                    platform.target_triple.to_string(),
+                    RuntimeArtifact {
+                        url: format!("https://example.com/{}/runtime.tar.gz", platform.target_triple),
+                        sha256: "deadbeef".to_string(),
+                    },
+                )
+            })
+            .collect();
+        let deno_runtime_targets: HashMap<String, RuntimeArtifact> = SUPPORTED_RUNTIME_PLATFORMS
+            .iter()
+            .filter(|platform| deno_artifact_filename(platform.os, platform.arch).is_ok())
+            .map(|platform| {
+                (
+                    platform.target_triple.to_string(),
+                    RuntimeArtifact {
+                        url: format!("https://example.com/{}/deno.zip", platform.target_triple),
+                        sha256: "deadbeef".to_string(),
+                    },
+                )
+            })
+            .collect();
+        let tool_targets: HashMap<String, ToolArtifact> = SUPPORTED_RUNTIME_PLATFORMS
+            .iter()
+            .map(|platform| {
+                (
+                    platform.target_triple.to_string(),
+                    ToolArtifact {
+                        url: format!("https://example.com/{}/uv.tar.gz", platform.target_triple),
+                        sha256: Some("deadbeef".to_string()),
+                        version: Some("0.4.19".to_string()),
+                    },
+                )
+            })
+            .collect();
+        let lockfile = CapsuleLock {
+            version: "1".to_string(),
+            meta: LockMeta {
+                created_at: "2026-03-08T00:00:00Z".to_string(),
+                manifest_hash: "blake3:deadbeef".to_string(),
+            },
+            allowlist: None,
+            tools: Some(ToolSection {
+                uv: Some(ToolTargets {
+                    targets: tool_targets,
+                }),
+                pnpm: None,
+            }),
+            runtimes: Some(RuntimeSection {
+                python: Some(RuntimeEntry {
+                    provider: "python-build-standalone".to_string(),
+                    version: "3.11.10".to_string(),
+                    targets: common_runtime_targets.clone(),
+                }),
+                deno: Some(RuntimeEntry {
+                    provider: "official".to_string(),
+                    version: "1.46.3".to_string(),
+                    targets: deno_runtime_targets,
+                }),
+                node: Some(RuntimeEntry {
+                    provider: "official".to_string(),
+                    version: "20.11.0".to_string(),
+                    targets: common_runtime_targets,
                 }),
                 java: None,
                 dotnet: None,
