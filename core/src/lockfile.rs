@@ -2096,9 +2096,7 @@ async fn resolve_uv_tool_targets(
 ) -> Result<ToolTargets> {
     let fetcher = Arc::new(RuntimeFetcher::new_with_reporter(reporter)?);
     let targets = try_join_all(platforms.iter().copied().filter_map(|platform| {
-        let Some(url) = uv_artifact_url(platform.target_triple) else {
-            return None;
-        };
+        let url = uv_artifact_url(platform.target_triple)?;
         let fetcher = Arc::clone(&fetcher);
         Some(async move {
             let sha256 = cached_sha256(
