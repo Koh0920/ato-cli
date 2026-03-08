@@ -393,6 +393,7 @@ pub(crate) fn build_capsule_artifact(
                     nacelle_override: None,
                     standalone: false,
                     strict_manifest: false,
+                    timings: false,
                 },
                 reporter,
             )?;
@@ -433,6 +434,7 @@ pub(crate) fn build_capsule_artifact(
                         nacelle_override: None,
                         standalone: false,
                         strict_manifest: false,
+                        timings: false,
                     },
                     reporter,
                 )?;

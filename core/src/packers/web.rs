@@ -201,6 +201,7 @@ fn ensure_lockfile(
                 manifest_raw,
                 manifest_text,
                 reporter,
+                false,
             ))
         });
     }
@@ -211,6 +212,7 @@ fn ensure_lockfile(
         manifest_raw,
         manifest_text,
         reporter,
+        false,
     ))
 }
 

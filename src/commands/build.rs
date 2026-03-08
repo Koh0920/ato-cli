@@ -3,6 +3,7 @@ use capsule_core::execution_plan::error::AtoExecutionError;
 use capsule_core::CapsuleReporter;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use tracing::debug;
 
 use crate::init;
@@ -19,9 +20,12 @@ pub fn execute_pack_command(
     strict_manifest: bool,
     enforcement: String,
     reporter: std::sync::Arc<reporters::CliReporter>,
+    timings: bool,
     cli_json: bool,
     nacelle_override: Option<PathBuf>,
 ) -> Result<()> {
+    let total_started = Instant::now();
+    let mut timing_entries = Vec::new();
     let dir = dir
         .canonicalize()
         .with_context(|| format!("Failed to resolve directory: {}", dir.display()))?;
@@ -65,6 +69,7 @@ pub fn execute_pack_command(
 
     let _temporary_manifest_guard = temporary_manifest;
 
+    let validation_started = Instant::now();
     let decision = capsule_core::router::route_manifest(
         &manifest,
         capsule_core::router::ExecutionProfile::Release,
@@ -93,6 +98,11 @@ pub fn execute_pack_command(
     for diagnostic in ipc_diagnostics {
         futures::executor::block_on(reporter.warn(diagnostic.to_string()))?;
     }
+    record_timing(
+        &mut timing_entries,
+        "build.validation",
+        validation_started.elapsed(),
+    );
 
     futures::executor::block_on(reporter.notify(format!(
         "📦 Packing capsule \"{}\" (v{})...",
@@ -111,15 +121,22 @@ pub fn execute_pack_command(
 
     match decision.kind {
         capsule_core::router::RuntimeKind::Source => {
+            let prepare_started = Instant::now();
             let prepared_config = capsule_core::packers::source::prepare_source_config(
                 &manifest,
                 enforcement.clone(),
                 standalone,
             )?;
+            record_timing(
+                &mut timing_entries,
+                "build.prepare_source_config",
+                prepare_started.elapsed(),
+            );
             futures::executor::block_on(reporter.progress_start(
                 "⏳ [build] Preparing source runtime bundle...".to_string(),
                 None,
             ))?;
+            let pack_started = Instant::now();
             let artifact_path = capsule_core::packers::source::pack(
                 &decision.plan,
                 capsule_core::packers::source::SourcePackOptions {
@@ -134,11 +151,13 @@ pub fn execute_pack_command(
                     nacelle_override,
                     standalone,
                     strict_manifest,
+                    timings,
                 },
                 reporter.clone(),
             );
             futures::executor::block_on(reporter.progress_finish(None))?;
             let artifact_path = artifact_path?;
+            record_timing(&mut timing_entries, "build.pack", pack_started.elapsed());
 
             if standalone {
                 futures::executor::block_on(
@@ -152,12 +171,14 @@ pub fn execute_pack_command(
                 futures::executor::block_on(
                     reporter.progress_start("🧪 [build] Running smoke test...".to_string(), None),
                 )?;
+                let smoke_started = Instant::now();
                 match capsule_core::smoke::run_capsule_smoke(
                     &artifact_path,
                     decision.plan.selected_target_label(),
                 ) {
                     Ok(summary) => {
                         futures::executor::block_on(reporter.progress_finish(None))?;
+                        record_timing(&mut timing_entries, "build.smoke", smoke_started.elapsed());
                         debug!(
                             "Smoke passed (timeout={}ms, port={:?}, checks={})",
                             summary.startup_timeout_ms,
@@ -167,6 +188,7 @@ pub fn execute_pack_command(
                     }
                     Err(err) => {
                         futures::executor::block_on(reporter.progress_finish(None))?;
+                        record_timing(&mut timing_entries, "build.smoke", smoke_started.elapsed());
                         handle_failed_artifact(
                             &artifact_path,
                             keep_failed_artifacts,
@@ -177,12 +199,20 @@ pub fn execute_pack_command(
                 }
             }
 
+            let payload_guard_started = Instant::now();
             crate::payload_guard::ensure_payload_size(
                 &artifact_path,
                 force_large_payload,
                 "--force-large-payload",
             )?;
+            record_timing(
+                &mut timing_entries,
+                "build.payload_guard",
+                payload_guard_started.elapsed(),
+            );
+            let sign_started = Instant::now();
             let _ = sign_if_requested(&artifact_path, key.as_ref(), reporter.clone())?;
+            record_timing(&mut timing_entries, "build.sign", sign_started.elapsed());
             let size = std::fs::metadata(&artifact_path)?.len();
             futures::executor::block_on(reporter.notify(format!(
                 "✅ Successfully built: {} ({:.1} KB)",
@@ -254,15 +284,22 @@ pub fn execute_pack_command(
                     reporter.clone(),
                 )?
             } else {
+                let prepare_started = Instant::now();
                 let prepared_config = capsule_core::packers::source::prepare_source_config(
                     &manifest,
                     enforcement.clone(),
                     standalone,
                 )?;
+                record_timing(
+                    &mut timing_entries,
+                    "build.prepare_source_config",
+                    prepare_started.elapsed(),
+                );
                 futures::executor::block_on(reporter.progress_start(
                     "⏳ [build] Preparing web runtime bundle...".to_string(),
                     None,
                 ))?;
+                let pack_started = Instant::now();
                 let artifact = capsule_core::packers::source::pack(
                     &decision.plan,
                     capsule_core::packers::source::SourcePackOptions {
@@ -277,11 +314,13 @@ pub fn execute_pack_command(
                         nacelle_override,
                         standalone,
                         strict_manifest,
+                        timings,
                     },
                     reporter.clone(),
                 );
                 futures::executor::block_on(reporter.progress_finish(None))?;
                 let artifact = artifact?;
+                record_timing(&mut timing_entries, "build.pack", pack_started.elapsed());
 
                 if standalone {
                     futures::executor::block_on(
@@ -309,6 +348,30 @@ pub fn execute_pack_command(
         }
     }
 
+    record_timing(&mut timing_entries, "build.total", total_started.elapsed());
+    emit_timings(reporter.clone(), timings, &timing_entries)?;
+
+    Ok(())
+}
+
+fn record_timing(entries: &mut Vec<(String, Duration)>, label: &str, elapsed: Duration) {
+    entries.push((label.to_string(), elapsed));
+}
+
+fn emit_timings(
+    reporter: std::sync::Arc<reporters::CliReporter>,
+    enabled: bool,
+    entries: &[(String, Duration)],
+) -> Result<()> {
+    if !enabled {
+        return Ok(());
+    }
+
+    for (label, elapsed) in entries {
+        futures::executor::block_on(
+            reporter.notify(format!("⏱ [timings] {label}: {} ms", elapsed.as_millis())),
+        )?;
+    }
     Ok(())
 }
 
