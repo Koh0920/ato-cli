@@ -538,6 +538,10 @@ function parseTargets(manifest: unknown): { defaultTarget?: string; targets: Cap
   }
 
   const table = targets as Record<string, unknown>;
+  const services =
+    root.services && typeof root.services === "object"
+      ? (root.services as Record<string, unknown>)
+      : {};
   const globalPort = parseNumberPort(table.port ?? root.port);
   const globalEnv = parseStringRecord(table.env ?? root.env);
   const parsedTargets: CapsuleTarget[] = [];
@@ -595,6 +599,50 @@ function parseTargets(manifest: unknown): { defaultTarget?: string; targets: Cap
       : typeof root.defaultTarget === "string"
         ? root.defaultTarget
         : undefined;
+
+  const requiredEnvByTarget = new Map<string, Set<string>>();
+  parsedTargets.forEach((target) => {
+    requiredEnvByTarget.set(target.label, new Set(target.requiredEnv));
+  });
+
+  let mainServiceTarget: string | undefined;
+  for (const [serviceName, rawService] of Object.entries(services)) {
+    if (!rawService || typeof rawService !== "object") {
+      continue;
+    }
+    const service = rawService as Record<string, unknown>;
+    const targetLabelRaw =
+      typeof service.target === "string"
+        ? service.target
+        : serviceName === "main"
+          ? defaultTarget
+          : undefined;
+    const targetLabel = targetLabelRaw?.trim();
+    if (!targetLabel) {
+      continue;
+    }
+    if (serviceName === "main") {
+      mainServiceTarget = targetLabel;
+    }
+    if (!requiredEnvByTarget.has(targetLabel)) {
+      requiredEnvByTarget.set(targetLabel, new Set<string>());
+    }
+  }
+
+  if (Object.keys(services).length > 0) {
+    const aggregateTarget = mainServiceTarget ?? defaultTarget ?? parsedTargets[0]?.label;
+    if (aggregateTarget) {
+      const aggregate = requiredEnvByTarget.get(aggregateTarget) ?? new Set<string>();
+      for (const keys of requiredEnvByTarget.values()) {
+        keys.forEach((key) => aggregate.add(key));
+      }
+      requiredEnvByTarget.set(aggregateTarget, aggregate);
+    }
+  }
+
+  parsedTargets.forEach((target) => {
+    target.requiredEnv = Array.from(requiredEnvByTarget.get(target.label) ?? new Set(target.requiredEnv));
+  });
 
   return { defaultTarget, targets: parsedTargets };
 }
