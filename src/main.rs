@@ -336,6 +336,10 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         keep_failed_artifacts: bool,
 
+        /// Print per-phase build timings
+        #[arg(long, default_value_t = false)]
+        timings: bool,
+
         /// Disallow fallback when source_digest/CAS(v3 path) is unavailable
         #[arg(long, default_value_t = false)]
         strict_v3: bool,
@@ -681,6 +685,10 @@ enum Commands {
         /// Keep failed build artifacts when smoke test fails
         #[arg(long, hide = true, default_value_t = false)]
         keep_failed_artifacts: bool,
+
+        /// Print per-phase build timings
+        #[arg(long, hide = true, default_value_t = false)]
+        timings: bool,
 
         /// Disallow fallback when source_digest/CAS(v3 path) is unavailable
         #[arg(long, hide = true, default_value_t = false)]
@@ -1307,6 +1315,7 @@ fn run() -> Result<()> {
             force_large_payload,
             enforcement,
             keep_failed_artifacts,
+            timings,
             strict_v3,
         } => commands::build::execute_pack_command(
             dir,
@@ -1318,6 +1327,7 @@ fn run() -> Result<()> {
             strict_v3,
             enforcement.as_str().to_string(),
             reporter.clone(),
+            timings,
             cli.json,
             cli.nacelle,
         ),
@@ -1357,6 +1367,7 @@ fn run() -> Result<()> {
             force_large_payload,
             enforcement,
             keep_failed_artifacts,
+            timings,
             strict_v3,
         } => {
             eprintln!("⚠️  'ato pack' is deprecated. Use 'ato build' instead.");
@@ -1370,6 +1381,7 @@ fn run() -> Result<()> {
                 strict_v3,
                 enforcement.as_str().to_string(),
                 reporter.clone(),
+                timings,
                 cli.json,
                 cli.nacelle,
             )

@@ -1,18 +1,20 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
+use std::future::Future;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::UNIX_EPOCH;
+use std::time::{Instant, UNIX_EPOCH};
 
 use chrono::Utc;
 use fs2::FileExt;
+use futures::future::try_join_all;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
-use crate::common::paths::toolchain_cache_dir;
+use crate::common::paths::{nacelle_home_dir, toolchain_cache_dir};
 use crate::error::{CapsuleError, Result};
 use crate::packers::payload;
 use crate::packers::runtime_fetcher::RuntimeFetcher;
@@ -23,6 +25,7 @@ const UV_VERSION: &str = "0.4.19";
 const PNPM_VERSION: &str = "9.9.0";
 const LOCKFILE_INPUT_SNAPSHOT_VERSION: u32 = 1;
 const LOCKFILE_INPUT_SNAPSHOT_NAME: &str = ".capsule.lock.inputs.json";
+const METADATA_CACHE_DIR_NAME: &str = "metadata-cache";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapsuleLock {
@@ -202,12 +205,20 @@ pub async fn generate_and_write_lockfile(
     manifest_raw: &toml::Value,
     manifest_text: &str,
     reporter: Arc<dyn CapsuleReporter + 'static>,
+    timings: bool,
 ) -> Result<PathBuf> {
     let manifest_dir = manifest_path
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
-    let lockfile = generate_lockfile(manifest_raw, manifest_text, &manifest_dir, reporter).await?;
+    let lockfile = generate_lockfile(
+        manifest_raw,
+        manifest_text,
+        &manifest_dir,
+        reporter,
+        timings,
+    )
+    .await?;
     let output_path = manifest_dir.join("capsule.lock");
     let content = toml::to_string_pretty(&lockfile)
         .map_err(|e| CapsuleError::Pack(format!("Failed to serialize capsule.lock: {}", e)))?;
@@ -225,7 +236,9 @@ pub async fn ensure_lockfile(
     manifest_raw: &toml::Value,
     manifest_text: &str,
     reporter: Arc<dyn CapsuleReporter + 'static>,
+    timings: bool,
 ) -> Result<PathBuf> {
+    let ensure_started = Instant::now();
     let manifest_dir = manifest_path
         .parent()
         .map(|p| p.to_path_buf())
@@ -239,12 +252,32 @@ pub async fn ensure_lockfile(
         && lockfile_inputs_snapshot_matches(&manifest_dir, &manifest_hash, &inputs)?
         && existing_lockfile_has_required_platform_coverage(&lock_path, manifest_raw)?
     {
+        maybe_report_timing(
+            &reporter,
+            timings,
+            "lockfile.reuse_hit",
+            ensure_started.elapsed(),
+        )
+        .await?;
         return Ok(lock_path);
     }
 
-    let generated =
-        generate_and_write_lockfile(manifest_path, manifest_raw, manifest_text, reporter).await?;
+    let generated = generate_and_write_lockfile(
+        manifest_path,
+        manifest_raw,
+        manifest_text,
+        reporter.clone(),
+        timings,
+    )
+    .await?;
     write_lockfile_inputs_snapshot(&manifest_dir, &manifest_hash, &inputs)?;
+    maybe_report_timing(
+        &reporter,
+        timings,
+        "lockfile.ensure_total",
+        ensure_started.elapsed(),
+    )
+    .await?;
     Ok(generated)
 }
 
@@ -310,7 +343,9 @@ fn lockfile_has_required_platform_coverage(
 
     let runtime_targets = lockfile.runtimes.as_ref();
 
-    if let Some(targets) = runtime_targets.and_then(|r| r.deno.as_ref()).map(|entry| &entry.targets)
+    if let Some(targets) = runtime_targets
+        .and_then(|r| r.deno.as_ref())
+        .map(|entry| &entry.targets)
     {
         let deno_platforms = supported_deno_platforms(&required_platforms);
         if deno_platforms
@@ -321,7 +356,9 @@ fn lockfile_has_required_platform_coverage(
         }
     }
 
-    if let Some(targets) = runtime_targets.and_then(|r| r.python.as_ref()).map(|entry| &entry.targets)
+    if let Some(targets) = runtime_targets
+        .and_then(|r| r.python.as_ref())
+        .map(|entry| &entry.targets)
     {
         let python_platforms = supported_python_platforms(&required_platforms, &lockfile.runtimes);
         if python_platforms
@@ -332,7 +369,9 @@ fn lockfile_has_required_platform_coverage(
         }
     }
 
-    let runtime_target_sets = [runtime_targets.and_then(|r| r.node.as_ref()).map(|entry| &entry.targets)];
+    let runtime_target_sets = [runtime_targets
+        .and_then(|r| r.node.as_ref())
+        .map(|entry| &entry.targets)];
 
     for targets in runtime_target_sets.into_iter().flatten() {
         if required_platforms
@@ -581,10 +620,10 @@ async fn generate_lockfile(
     manifest_text: &str,
     manifest_dir: &Path,
     reporter: Arc<dyn CapsuleReporter + 'static>,
+    timings: bool,
 ) -> Result<CapsuleLock> {
     let allowlist = read_allowlist(manifest_raw);
     let target_key = platform_target_key()?;
-    let target_triple = platform_triple()?;
     let runtime_platforms = lockfile_runtime_platforms(manifest_raw)?;
     let required_runtime_version = required_runtime_version(manifest_raw)?;
     let runtime_tools = read_runtime_tools(manifest_raw);
@@ -607,11 +646,28 @@ async fn generate_lockfile(
         if lang == "python" {
             let version = required_runtime_version
                 .clone()
+                .or_else(|| read_runtime_version(manifest_raw))
                 .unwrap_or_else(|| read_language_version(manifest_raw, "python", "3.11"));
+            let step_started = Instant::now();
             let python_lockfile =
                 generate_uv_lock(manifest_dir, manifest_raw, reporter.clone()).await?;
+            maybe_report_timing(
+                &reporter,
+                timings,
+                "lockfile.generate_uv_lock",
+                step_started.elapsed(),
+            )
+            .await?;
+            let step_started = Instant::now();
             let runtime =
                 resolve_python_runtime(&version, &runtime_platforms, reporter.clone()).await?;
+            maybe_report_timing(
+                &reporter,
+                timings,
+                "lockfile.resolve_python_runtime",
+                step_started.elapsed(),
+            )
+            .await?;
             runtimes.python = Some(runtime);
             if python_lockfile.is_some() {
                 let python_artifacts = match prepare_python_artifacts(
@@ -637,23 +693,56 @@ async fn generate_lockfile(
                 if let Some(artifacts) = python_artifacts {
                     target_entry.artifacts.extend(artifacts);
                 }
+                let step_started = Instant::now();
                 tools.uv =
                     Some(resolve_uv_tool_targets(&runtime_platforms, reporter.clone()).await?);
+                maybe_report_timing(
+                    &reporter,
+                    timings,
+                    "lockfile.resolve_uv_tool_targets",
+                    step_started.elapsed(),
+                )
+                .await?;
             }
         } else if lang == "node" {
             let version = required_runtime_version
                 .clone()
+                .or_else(|| read_runtime_version(manifest_raw))
                 .unwrap_or_else(|| read_language_version(manifest_raw, "node", "20"));
+            let step_started = Instant::now();
             let node_lockfile =
                 generate_pnpm_lock(manifest_dir, manifest_raw, &version, reporter.clone()).await?;
+            maybe_report_timing(
+                &reporter,
+                timings,
+                "lockfile.generate_pnpm_lock",
+                step_started.elapsed(),
+            )
+            .await?;
+            let step_started = Instant::now();
             let runtime =
                 resolve_node_runtime(&version, &runtime_platforms, reporter.clone()).await?;
+            maybe_report_timing(
+                &reporter,
+                timings,
+                "lockfile.resolve_node_runtime",
+                step_started.elapsed(),
+            )
+            .await?;
             runtimes.node = Some(runtime);
             if runtimes.deno.is_none() {
                 let deno_version = read_language_version(manifest_raw, "deno", "1.46.3");
+                let step_started = Instant::now();
                 let deno_runtime =
                     resolve_deno_runtime(&deno_version, &runtime_platforms, reporter.clone())
                         .await?;
+                maybe_report_timing(
+                    &reporter,
+                    timings,
+                    "lockfile.resolve_deno_runtime",
+                    step_started.elapsed(),
+                )
+                .await?;
                 runtimes.deno = Some(deno_runtime);
             }
             if node_lockfile.is_some() {
@@ -680,38 +769,63 @@ async fn generate_lockfile(
                 if let Some(artifacts) = node_artifacts {
                     target_entry.artifacts.extend(artifacts);
                 }
-                tools.pnpm = Some(tool_targets_for(
-                    format!(
-                        "https://registry.npmjs.org/pnpm/-/pnpm-{}.tgz",
-                        PNPM_VERSION
-                    ),
-                    PNPM_VERSION,
-                    &target_triple,
-                    None,
-                ));
+                tools.pnpm = Some(resolve_pnpm_tool_targets(&runtime_platforms));
             }
         } else if lang == "deno" {
             let version = required_runtime_version
                 .clone()
+                .or_else(|| read_runtime_version(manifest_raw))
                 .unwrap_or_else(|| read_language_version(manifest_raw, "deno", "1.46.3"));
+            let step_started = Instant::now();
             let runtime =
                 resolve_deno_runtime(&version, &runtime_platforms, reporter.clone()).await?;
+            maybe_report_timing(
+                &reporter,
+                timings,
+                "lockfile.resolve_deno_runtime",
+                step_started.elapsed(),
+            )
+            .await?;
             runtimes.deno = Some(runtime);
 
             if let Some(node_version) = runtime_tools.get("node") {
+                let step_started = Instant::now();
                 let runtime =
                     resolve_node_runtime(node_version, &runtime_platforms, reporter.clone())
                         .await?;
+                maybe_report_timing(
+                    &reporter,
+                    timings,
+                    "lockfile.resolve_node_runtime",
+                    step_started.elapsed(),
+                )
+                .await?;
                 runtimes.node = Some(runtime);
             }
             if let Some(python_version) = runtime_tools.get("python") {
+                let step_started = Instant::now();
                 let runtime =
                     resolve_python_runtime(python_version, &runtime_platforms, reporter.clone())
                         .await?;
+                maybe_report_timing(
+                    &reporter,
+                    timings,
+                    "lockfile.resolve_python_runtime",
+                    step_started.elapsed(),
+                )
+                .await?;
                 runtimes.python = Some(runtime);
 
+                let step_started = Instant::now();
                 tools.uv =
                     Some(resolve_uv_tool_targets(&runtime_platforms, reporter.clone()).await?);
+                maybe_report_timing(
+                    &reporter,
+                    timings,
+                    "lockfile.resolve_uv_tool_targets",
+                    step_started.elapsed(),
+                )
+                .await?;
             }
 
             // runtime=web/static は静的配信用途であり、Deno runtime 自体は必要だが
@@ -719,14 +833,111 @@ async fn generate_lockfile(
             let is_web_static = selected_target_runtime(manifest_raw).as_deref() == Some("web")
                 && selected_target_driver(manifest_raw).as_deref() == Some("static");
             if !is_web_static {
+                let step_started = Instant::now();
                 let _ = generate_deno_lock(manifest_dir, manifest_raw, &version, reporter.clone())
                     .await?;
+                maybe_report_timing(
+                    &reporter,
+                    timings,
+                    "lockfile.generate_deno_lock",
+                    step_started.elapsed(),
+                )
+                .await?;
+            }
+        }
+    }
+
+    for target_label in orchestration_service_target_labels(manifest_raw) {
+        if selected_target_label(manifest_raw)
+            .as_deref()
+            .map(|selected| selected == target_label)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
+        let Some(target) = named_target_table(manifest_raw, &target_label) else {
+            continue;
+        };
+
+        let runtime = target
+            .get("runtime")
+            .and_then(|v| v.as_str())
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty());
+        let driver = target
+            .get("driver")
+            .and_then(|v| v.as_str())
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty());
+        let runtime_version = target
+            .get("runtime_version")
+            .and_then(|v| v.as_str())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let runtime_tools = read_runtime_tools_from_target(target);
+
+        if matches!(driver.as_deref(), Some("node")) && runtimes.node.is_none() {
+            let version = runtime_version.clone().unwrap_or_else(|| "20".to_string());
+            runtimes.node =
+                Some(resolve_node_runtime(&version, &runtime_platforms, reporter.clone()).await?);
+        }
+
+        if matches!(driver.as_deref(), Some("python")) && runtimes.python.is_none() {
+            let version = runtime_version
+                .clone()
+                .unwrap_or_else(|| "3.11".to_string());
+            runtimes.python =
+                Some(resolve_python_runtime(&version, &runtime_platforms, reporter.clone()).await?);
+            if tools.uv.is_none() {
+                tools.uv =
+                    Some(resolve_uv_tool_targets(&runtime_platforms, reporter.clone()).await?);
+            }
+        }
+
+        if matches!(driver.as_deref(), Some("deno")) && runtimes.deno.is_none() {
+            let version = runtime_version
+                .clone()
+                .unwrap_or_else(|| "1.46.3".to_string());
+            runtimes.deno =
+                Some(resolve_deno_runtime(&version, &runtime_platforms, reporter.clone()).await?);
+        }
+
+        if runtime.as_deref() == Some("web")
+            && matches!(driver.as_deref(), Some("static"))
+            && runtimes.deno.is_none()
+        {
+            let version = runtime_version
+                .clone()
+                .unwrap_or_else(|| "1.46.3".to_string());
+            runtimes.deno =
+                Some(resolve_deno_runtime(&version, &runtime_platforms, reporter.clone()).await?);
+        }
+
+        if let Some(node_version) = runtime_tools.get("node") {
+            if runtimes.node.is_none() {
+                runtimes.node = Some(
+                    resolve_node_runtime(node_version, &runtime_platforms, reporter.clone())
+                        .await?,
+                );
+            }
+        }
+        if let Some(python_version) = runtime_tools.get("python") {
+            if runtimes.python.is_none() {
+                runtimes.python = Some(
+                    resolve_python_runtime(python_version, &runtime_platforms, reporter.clone())
+                        .await?,
+                );
+            }
+            if tools.uv.is_none() {
+                tools.uv =
+                    Some(resolve_uv_tool_targets(&runtime_platforms, reporter.clone()).await?);
             }
         }
     }
 
     let tools = if tools.uv.is_none() && tools.pnpm.is_none() {
-        detect_tools(&target_triple)
+        None
     } else {
         Some(tools)
     };
@@ -1585,18 +1796,32 @@ async fn resolve_python_runtime(
     platforms: &[RuntimePlatform],
     reporter: Arc<dyn CapsuleReporter + 'static>,
 ) -> Result<RuntimeEntry> {
-    let fetcher = RuntimeFetcher::new_with_reporter(reporter)?;
-    let mut targets = HashMap::new();
-    for platform in platforms {
-        let Ok(url) = RuntimeFetcher::get_python_download_url(version, platform.os, platform.arch) else {
-            continue;
+    let fetcher = Arc::new(RuntimeFetcher::new_with_reporter(reporter)?);
+    let targets = try_join_all(platforms.iter().copied().filter_map(|platform| {
+        let Ok(url) = RuntimeFetcher::get_python_download_url(version, platform.os, platform.arch)
+        else {
+            return None;
         };
-        let sha256 = resolve_python_sha256(&fetcher, &url).await?;
-        targets.insert(
-            platform.target_triple.to_string(),
-            RuntimeArtifact { url, sha256 },
-        );
-    }
+        let fetcher = Arc::clone(&fetcher);
+        let version = version.to_string();
+        Some(async move {
+            let sha256 = resolve_python_sha256_cached(
+                fetcher.as_ref(),
+                &version,
+                platform.target_triple,
+                &url,
+            )
+            .await?;
+            Ok::<(String, RuntimeArtifact), CapsuleError>((
+                platform.target_triple.to_string(),
+                RuntimeArtifact { url, sha256 },
+            ))
+        })
+    }))
+    .await?
+    .into_iter()
+    .collect();
+
     Ok(RuntimeEntry {
         provider: "python-build-standalone".to_string(),
         version: version.to_string(),
@@ -1642,22 +1867,36 @@ async fn resolve_node_runtime(
     platforms: &[RuntimePlatform],
     reporter: Arc<dyn CapsuleReporter + 'static>,
 ) -> Result<RuntimeEntry> {
-    let fetcher = RuntimeFetcher::new_with_reporter(reporter)?;
+    let fetcher = Arc::new(RuntimeFetcher::new_with_reporter(reporter)?);
     let full_version = RuntimeFetcher::resolve_node_full_version(version).await?;
-    let mut targets = HashMap::new();
     let checksum_url = format!("https://nodejs.org/dist/v{}/SHASUMS256.txt", full_version);
-    for platform in platforms {
-        let (filename, _is_zip) =
-            RuntimeFetcher::node_artifact_filename(&full_version, platform.os, platform.arch)?;
-        let url = format!("https://nodejs.org/dist/v{}/{}", full_version, filename);
-        let sha256 = fetcher
-            .fetch_expected_sha256(&checksum_url, Some(&filename))
+    let targets = try_join_all(platforms.iter().copied().map(|platform| {
+        let fetcher = Arc::clone(&fetcher);
+        let checksum_url = checksum_url.clone();
+        let full_version = full_version.clone();
+        async move {
+            let (filename, _is_zip) =
+                RuntimeFetcher::node_artifact_filename(&full_version, platform.os, platform.arch)?;
+            let url = format!("https://nodejs.org/dist/v{}/{}", full_version, filename);
+            let sha256 = cached_sha256(
+                metadata_cache_path("runtime", "node", &full_version, platform.target_triple)?,
+                || async {
+                    fetcher
+                        .fetch_expected_sha256(&checksum_url, Some(&filename))
+                        .await
+                },
+            )
             .await?;
-        targets.insert(
-            platform.target_triple.to_string(),
-            RuntimeArtifact { url, sha256 },
-        );
-    }
+            Ok::<(String, RuntimeArtifact), CapsuleError>((
+                platform.target_triple.to_string(),
+                RuntimeArtifact { url, sha256 },
+            ))
+        }
+    }))
+    .await?
+    .into_iter()
+    .collect();
+
     Ok(RuntimeEntry {
         provider: "official".to_string(),
         version: full_version,
@@ -1670,25 +1909,39 @@ async fn resolve_deno_runtime(
     platforms: &[RuntimePlatform],
     reporter: Arc<dyn CapsuleReporter + 'static>,
 ) -> Result<RuntimeEntry> {
-    let fetcher = RuntimeFetcher::new_with_reporter(reporter)?;
-    let mut targets = HashMap::new();
-    for platform in platforms {
+    let fetcher = Arc::new(RuntimeFetcher::new_with_reporter(reporter)?);
+    let version = version.to_string();
+    let targets = try_join_all(platforms.iter().copied().filter_map(|platform| {
         let Ok(filename) = deno_artifact_filename(platform.os, platform.arch) else {
-            continue;
+            return None;
         };
-        let url = format!(
-            "https://github.com/denoland/deno/releases/download/v{}/{}",
-            version, filename
-        );
-        let sha256 = resolve_deno_sha256(&fetcher, version, &filename).await?;
-        targets.insert(
-            platform.target_triple.to_string(),
-            RuntimeArtifact { url, sha256 },
-        );
-    }
+        let fetcher = Arc::clone(&fetcher);
+        let version = version.clone();
+        Some(async move {
+            let url = format!(
+                "https://github.com/denoland/deno/releases/download/v{}/{}",
+                version, filename
+            );
+            let sha256 = resolve_deno_sha256_cached(
+                fetcher.as_ref(),
+                &version,
+                platform.target_triple,
+                &filename,
+            )
+            .await?;
+            Ok::<(String, RuntimeArtifact), CapsuleError>((
+                platform.target_triple.to_string(),
+                RuntimeArtifact { url, sha256 },
+            ))
+        })
+    }))
+    .await?
+    .into_iter()
+    .collect();
+
     Ok(RuntimeEntry {
         provider: "official".to_string(),
-        version: version.to_string(),
+        version,
         targets,
     })
 }
@@ -1763,6 +2016,32 @@ async fn resolve_deno_sha256(
     }
 }
 
+async fn resolve_python_sha256_cached(
+    fetcher: &RuntimeFetcher,
+    version: &str,
+    target_triple: &str,
+    artifact_url: &str,
+) -> Result<String> {
+    cached_sha256(
+        metadata_cache_path("runtime", "python", version, target_triple)?,
+        || async { resolve_python_sha256(fetcher, artifact_url).await },
+    )
+    .await
+}
+
+async fn resolve_deno_sha256_cached(
+    fetcher: &RuntimeFetcher,
+    version: &str,
+    target_triple: &str,
+    filename: &str,
+) -> Result<String> {
+    cached_sha256(
+        metadata_cache_path("runtime", "deno", version, target_triple)?,
+        || async { resolve_deno_sha256(fetcher, version, filename).await },
+    )
+    .await
+}
+
 fn split_release_base_and_filename(url: &str) -> Option<(String, String)> {
     let idx = url.rfind('/')?;
     let base = url[..idx].to_string();
@@ -1791,58 +2070,23 @@ async fn download_and_sha256(url: &str) -> Result<String> {
     Ok(sha256_hex(&bytes))
 }
 
-fn detect_tools(target_triple: &str) -> Option<ToolSection> {
-    let uv = detect_tool("uv").map(|version| ToolTargets {
-        targets: [(
-            target_triple.to_string(),
-            ToolArtifact {
-                url: format!(
-                    "https://github.com/astral-sh/uv/releases/download/{0}/uv-{1}.tar.gz",
-                    version, target_triple
-                ),
-                sha256: None,
-                version: Some(version),
-            },
-        )]
-        .into_iter()
-        .collect(),
-    });
-
-    let pnpm = detect_tool("pnpm").map(|version| ToolTargets {
-        targets: [(
-            target_triple.to_string(),
-            ToolArtifact {
-                url: format!("https://registry.npmjs.org/pnpm/-/pnpm-{}.tgz", version),
-                sha256: None,
-                version: Some(version),
-            },
-        )]
-        .into_iter()
-        .collect(),
-    });
-
-    if uv.is_none() && pnpm.is_none() {
-        None
-    } else {
-        Some(ToolSection { uv, pnpm })
-    }
-}
-
-fn tool_targets_for(
-    url: String,
-    version: &str,
-    target_triple: &str,
-    sha256: Option<String>,
-) -> ToolTargets {
-    let mut targets = HashMap::new();
-    targets.insert(
-        target_triple.to_string(),
-        ToolArtifact {
-            url,
-            sha256,
-            version: Some(version.to_string()),
-        },
-    );
+fn resolve_pnpm_tool_targets(platforms: &[RuntimePlatform]) -> ToolTargets {
+    let targets = platforms
+        .iter()
+        .map(|platform| {
+            (
+                platform.target_triple.to_string(),
+                ToolArtifact {
+                    url: format!(
+                        "https://registry.npmjs.org/pnpm/-/pnpm-{}.tgz",
+                        PNPM_VERSION
+                    ),
+                    sha256: None,
+                    version: Some(PNPM_VERSION.to_string()),
+                },
+            )
+        })
+        .collect();
     ToolTargets { targets }
 }
 
@@ -1850,24 +2094,36 @@ async fn resolve_uv_tool_targets(
     platforms: &[RuntimePlatform],
     reporter: Arc<dyn CapsuleReporter + 'static>,
 ) -> Result<ToolTargets> {
-    let fetcher = RuntimeFetcher::new_with_reporter(reporter)?;
-    let mut targets = HashMap::new();
-    for platform in platforms {
+    let fetcher = Arc::new(RuntimeFetcher::new_with_reporter(reporter)?);
+    let targets = try_join_all(platforms.iter().copied().filter_map(|platform| {
         let Some(url) = uv_artifact_url(platform.target_triple) else {
-            continue;
+            return None;
         };
-        let sha256 = fetcher
-            .fetch_expected_sha256(&(url.clone() + ".sha256"), None)
+        let fetcher = Arc::clone(&fetcher);
+        Some(async move {
+            let sha256 = cached_sha256(
+                metadata_cache_path("tool", "uv", UV_VERSION, platform.target_triple)?,
+                || async {
+                    fetcher
+                        .fetch_expected_sha256(&(url.clone() + ".sha256"), None)
+                        .await
+                },
+            )
             .await?;
-        targets.insert(
-            platform.target_triple.to_string(),
-            ToolArtifact {
-                url,
-                sha256: Some(sha256),
-                version: Some(UV_VERSION.to_string()),
-            },
-        );
-    }
+            Ok::<(String, ToolArtifact), CapsuleError>((
+                platform.target_triple.to_string(),
+                ToolArtifact {
+                    url,
+                    sha256: Some(sha256),
+                    version: Some(UV_VERSION.to_string()),
+                },
+            ))
+        })
+    }))
+    .await?
+    .into_iter()
+    .collect();
+
     Ok(ToolTargets { targets })
 }
 
@@ -1883,23 +2139,76 @@ fn uv_artifact_url(target_triple: &str) -> Option<String> {
     ))
 }
 
-fn detect_tool(cmd: &str) -> Option<String> {
-    let exe = which::which(cmd).ok()?;
-    let mut command = std::process::Command::new(exe);
-    command.arg("--version");
-    apply_sanitized_command_env(&mut command, &[]);
-    let output = command.output().ok()?;
-    if !output.status.success() {
-        return None;
+fn metadata_cache_dir() -> Result<PathBuf> {
+    Ok(nacelle_home_dir()?.join(METADATA_CACHE_DIR_NAME))
+}
+
+fn metadata_cache_path(
+    scope: &str,
+    name: &str,
+    version: &str,
+    target_triple: &str,
+) -> Result<PathBuf> {
+    Ok(metadata_cache_dir()?
+        .join(scope)
+        .join(name)
+        .join(version)
+        .join(format!("{}.sha256", target_triple)))
+}
+
+fn read_cached_sha256(path: &Path) -> Result<Option<String>> {
+    if !path.exists() {
+        return Ok(None);
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout.split_whitespace().find_map(|token| {
-        if token.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-            Some(token.trim().to_string())
-        } else {
-            None
-        }
-    })
+
+    let raw = fs::read_to_string(path).map_err(|e| {
+        CapsuleError::Pack(format!(
+            "Failed to read metadata cache {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
+    let value = raw.trim();
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(value.to_string()))
+    }
+}
+
+async fn cached_sha256<F, Fut>(cache_path: PathBuf, fetch: F) -> Result<String>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<String>>,
+{
+    if let Some(value) = read_cached_sha256(&cache_path)? {
+        return Ok(value);
+    }
+
+    let value = fetch().await?;
+    write_atomic_bytes_with_os_lock(
+        &cache_path,
+        value.as_bytes(),
+        "metadata cache",
+        capsule_error_pack,
+    )?;
+    Ok(value)
+}
+
+async fn maybe_report_timing(
+    reporter: &Arc<dyn CapsuleReporter + 'static>,
+    enabled: bool,
+    label: &str,
+    elapsed: std::time::Duration,
+) -> Result<()> {
+    if !enabled {
+        return Ok(());
+    }
+
+    reporter
+        .notify(format!("⏱ [timings] {label}: {} ms", elapsed.as_millis()))
+        .await?;
+    Ok(())
 }
 
 fn read_allowlist(manifest: &toml::Value) -> Option<Vec<String>> {
@@ -2029,11 +2338,14 @@ fn read_runtime_version(manifest: &toml::Value) -> Option<String> {
 }
 
 fn read_runtime_tools(manifest: &toml::Value) -> HashMap<String, String> {
+    selected_target_table(manifest)
+        .map(read_runtime_tools_from_target)
+        .unwrap_or_default()
+}
+
+fn read_runtime_tools_from_target(target: &toml::Value) -> HashMap<String, String> {
     let mut tools = HashMap::new();
-    let Some(table) = selected_target_table(manifest)
-        .and_then(|t| t.get("runtime_tools"))
-        .and_then(|v| v.as_table())
-    else {
+    let Some(table) = target.get("runtime_tools").and_then(|v| v.as_table()) else {
         return tools;
     };
 
@@ -2047,7 +2359,59 @@ fn read_runtime_tools(manifest: &toml::Value) -> HashMap<String, String> {
         }
         tools.insert(key.to_ascii_lowercase(), trimmed.to_string());
     }
+
     tools
+}
+
+fn selected_target_label(manifest: &toml::Value) -> Option<String> {
+    let default_target = manifest
+        .get("default_target")
+        .and_then(|v| v.as_str())
+        .unwrap_or("source")
+        .trim();
+    if default_target.is_empty() {
+        None
+    } else {
+        Some(default_target.to_string())
+    }
+}
+
+fn named_target_table<'a>(
+    manifest: &'a toml::Value,
+    target_label: &str,
+) -> Option<&'a toml::Value> {
+    manifest
+        .get("targets")
+        .and_then(|targets| targets.get(target_label))
+}
+
+fn orchestration_service_target_labels(manifest: &toml::Value) -> Vec<String> {
+    let mut labels = Vec::new();
+    let Some(services) = manifest.get("services").and_then(|value| value.as_table()) else {
+        return labels;
+    };
+
+    for (name, service) in services {
+        let target = service
+            .get("target")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                (name == "main")
+                    .then(|| selected_target_label(manifest))
+                    .flatten()
+            });
+
+        if let Some(target) = target {
+            if !labels.iter().any(|existing| existing == &target) {
+                labels.push(target);
+            }
+        }
+    }
+
+    labels
 }
 
 fn selected_target_runtime(manifest: &toml::Value) -> Option<String> {
@@ -2322,6 +2686,38 @@ runtime_tools = { node = "20.11.0", python = "3.11.7" }
     }
 
     #[test]
+    fn orchestration_service_targets_are_collected() {
+        let manifest: toml::Value = toml::from_str(
+            r#"
+default_target = "dashboard"
+
+[targets.dashboard]
+runtime = "web"
+driver = "node"
+
+[targets.control_plane]
+runtime = "source"
+driver = "python"
+
+[services.main]
+target = "dashboard"
+depends_on = ["control_plane"]
+
+[services.control_plane]
+target = "control_plane"
+"#,
+        )
+        .unwrap();
+
+        let mut labels = orchestration_service_target_labels(&manifest);
+        labels.sort();
+        assert_eq!(
+            labels,
+            vec!["control_plane".to_string(), "dashboard".to_string()]
+        );
+    }
+
+    #[test]
     fn required_runtime_version_for_web_deno_target() {
         let manifest: toml::Value = toml::from_str(
             r#"
@@ -2486,7 +2882,10 @@ runtime_tools = { node = "20.11.0", python = "3.11.10" }
                 (
                     platform.target_triple.to_string(),
                     RuntimeArtifact {
-                        url: format!("https://example.com/{}/runtime.tar.gz", platform.target_triple),
+                        url: format!(
+                            "https://example.com/{}/runtime.tar.gz",
+                            platform.target_triple
+                        ),
                         sha256: "deadbeef".to_string(),
                     },
                 )
@@ -2563,7 +2962,10 @@ runtime_tools = { node = "20.11.0", python = "3.11.10" }
                 (
                     platform.target_triple.to_string(),
                     RuntimeArtifact {
-                        url: format!("https://example.com/{}/runtime.tar.gz", platform.target_triple),
+                        url: format!(
+                            "https://example.com/{}/runtime.tar.gz",
+                            platform.target_triple
+                        ),
                         sha256: "deadbeef".to_string(),
                     },
                 )
@@ -2657,7 +3059,10 @@ runtime_tools = { node = "20.11.0", python = "3.11.10" }
                 (
                     platform.target_triple.to_string(),
                     RuntimeArtifact {
-                        url: format!("https://example.com/{}/python.tar.gz", platform.target_triple),
+                        url: format!(
+                            "https://example.com/{}/python.tar.gz",
+                            platform.target_triple
+                        ),
                         sha256: "deadbeef".to_string(),
                     },
                 )
@@ -2669,7 +3074,10 @@ runtime_tools = { node = "20.11.0", python = "3.11.10" }
                 (
                     platform.target_triple.to_string(),
                     RuntimeArtifact {
-                        url: format!("https://example.com/{}/runtime.tar.gz", platform.target_triple),
+                        url: format!(
+                            "https://example.com/{}/runtime.tar.gz",
+                            platform.target_triple
+                        ),
                         sha256: "deadbeef".to_string(),
                     },
                 )
@@ -2697,7 +3105,9 @@ runtime_tools = { node = "20.11.0", python = "3.11.10" }
             },
             allowlist: None,
             tools: Some(ToolSection {
-                uv: Some(ToolTargets { targets: uv_targets }),
+                uv: Some(ToolTargets {
+                    targets: uv_targets,
+                }),
                 pnpm: None,
             }),
             runtimes: Some(RuntimeSection {
@@ -2830,6 +3240,7 @@ entrypoint = "source/main.sh"
                 &manifest_raw,
                 manifest_text,
                 reporter.clone(),
+                false,
             ))
             .unwrap();
         let first_lock = read_lockfile(&first).unwrap();
@@ -2842,12 +3253,48 @@ entrypoint = "source/main.sh"
                 &manifest_raw,
                 manifest_text,
                 reporter,
+                false,
             ))
             .unwrap();
         let second_lock = read_lockfile(&second).unwrap();
 
         assert_eq!(first_lock.meta.created_at, second_lock.meta.created_at);
         assert!(temp.path().join(LOCKFILE_INPUT_SNAPSHOT_NAME).exists());
+    }
+
+    #[test]
+    fn generate_lockfile_does_not_include_ambient_tools_for_native_target() {
+        let temp = TempDir::new().unwrap();
+        let manifest_path = temp.path().join("capsule.toml");
+        let manifest_text = r#"
+schema_version = "0.2"
+name = "demo"
+version = "0.1.0"
+type = "app"
+default_target = "default"
+[targets.default]
+runtime = "source"
+driver = "native"
+entrypoint = "main.sh"
+"#;
+        fs::write(&manifest_path, manifest_text).unwrap();
+        fs::write(temp.path().join("main.sh"), "echo demo").unwrap();
+
+        let manifest_raw: toml::Value = toml::from_str(manifest_text).unwrap();
+        let reporter: Arc<dyn CapsuleReporter + 'static> = Arc::new(crate::reporter::NoOpReporter);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let lockfile = rt
+            .block_on(generate_lockfile(
+                &manifest_raw,
+                manifest_text,
+                temp.path(),
+                reporter,
+                false,
+            ))
+            .unwrap();
+
+        assert!(lockfile.tools.is_none());
     }
 
     #[tokio::test]
