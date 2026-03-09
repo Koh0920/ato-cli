@@ -18,10 +18,7 @@ import type {
   ProcessStatus,
 } from "./types";
 import { detectPlatform, toOsFilterLabel } from "./utils/platform";
-import {
-  loadRegistryAuthToken,
-  saveRegistryAuthToken,
-} from "./utils/storage";
+import { loadRegistryAuthToken, saveRegistryAuthToken } from "./utils/storage";
 
 type Route =
   | { kind: "catalog" }
@@ -245,7 +242,10 @@ function mapCapsuleType(raw: string | undefined): Capsule["type"] {
   return "webapp";
 }
 
-function mapIconKey(rawType: Capsule["type"], category: string | undefined): Capsule["iconKey"] {
+function mapIconKey(
+  rawType: Capsule["type"],
+  category: string | undefined,
+): Capsule["iconKey"] {
   if (rawType === "cli") {
     return "package";
   }
@@ -262,7 +262,9 @@ function toScopedId(row: ApiSearchCapsuleRow): string {
   return row.scopedId ?? row.scoped_id ?? `${row.publisher.handle}/${row.slug}`;
 }
 
-function mapStoreMetadata(value: ApiStoreMetadata | undefined): Capsule["storeMetadata"] {
+function mapStoreMetadata(
+  value: ApiStoreMetadata | undefined,
+): Capsule["storeMetadata"] {
   if (!value) {
     return undefined;
   }
@@ -276,10 +278,18 @@ function mapStoreMetadata(value: ApiStoreMetadata | undefined): Capsule["storeMe
 }
 
 function formatSizeLabel(sizeBytes: unknown): string {
-  if (typeof sizeBytes === "string" && sizeBytes.trim().length > 0 && !/^\d+$/.test(sizeBytes.trim())) {
+  if (
+    typeof sizeBytes === "string" &&
+    sizeBytes.trim().length > 0 &&
+    !/^\d+$/.test(sizeBytes.trim())
+  ) {
     return sizeBytes.trim();
   }
-  if (typeof sizeBytes !== "number" || !Number.isFinite(sizeBytes) || sizeBytes <= 0) {
+  if (
+    typeof sizeBytes !== "number" ||
+    !Number.isFinite(sizeBytes) ||
+    sizeBytes <= 0
+  ) {
     return "-";
   }
   const mb = sizeBytes / (1024 * 1024);
@@ -311,10 +321,15 @@ function baseReadme(scopedId: string, description: string): string {
   return `# ${scopedId}\n\n${description || "No description"}\n`;
 }
 
-function mapSearchRowToCapsule(row: ApiSearchCapsuleRow, platform: string): Capsule {
+function mapSearchRowToCapsule(
+  row: ApiSearchCapsuleRow,
+  platform: string,
+): Capsule {
   const scopedId = toScopedId(row);
   const capsuleType = mapCapsuleType(row.type);
-  const storeMetadata = mapStoreMetadata(row.storeMetadata ?? row.store_metadata);
+  const storeMetadata = mapStoreMetadata(
+    row.storeMetadata ?? row.store_metadata,
+  );
   const description = storeMetadata?.text ?? row.description ?? "";
   return {
     id: row.id,
@@ -327,7 +342,11 @@ function mapSearchRowToCapsule(row: ApiSearchCapsuleRow, platform: string): Caps
     type: capsuleType,
     version: row.latestVersion ?? row.latest_version ?? "-",
     size: formatSizeLabel(
-      row.latestSizeBytes ?? row.latest_size_bytes ?? row.sizeBytes ?? row.size_bytes ?? row.size,
+      row.latestSizeBytes ??
+        row.latest_size_bytes ??
+        row.sizeBytes ??
+        row.size_bytes ??
+        row.size,
     ),
     osArch: [platform],
     envHints: {},
@@ -357,7 +376,12 @@ function parseStringRecord(value: unknown): Record<string, string> {
 }
 
 function parseNumberPort(value: unknown): number | null {
-  if (typeof value === "number" && Number.isFinite(value) && value >= 1 && value <= 65535) {
+  if (
+    typeof value === "number" &&
+    Number.isFinite(value) &&
+    value >= 1 &&
+    value <= 65535
+  ) {
     return Math.floor(value);
   }
   if (typeof value === "string" && /^\d+$/.test(value.trim())) {
@@ -369,7 +393,9 @@ function parseNumberPort(value: unknown): number | null {
   return null;
 }
 
-function cloneRuntimeOverride(value: CapsuleRuntimeOverride | undefined): CapsuleRuntimeOverride {
+function cloneRuntimeOverride(
+  value: CapsuleRuntimeOverride | undefined,
+): CapsuleRuntimeOverride {
   if (!value) {
     return { targets: {} };
   }
@@ -386,7 +412,9 @@ function cloneRuntimeOverride(value: CapsuleRuntimeOverride | undefined): Capsul
   };
 }
 
-function compactRuntimeOverride(value: CapsuleRuntimeOverride): CapsuleRuntimeOverride | undefined {
+function compactRuntimeOverride(
+  value: CapsuleRuntimeOverride,
+): CapsuleRuntimeOverride | undefined {
   const targets: Record<string, RuntimeTargetOverride> = {};
   Object.entries(value.targets).forEach(([rawLabel, target]) => {
     const label = rawLabel.trim();
@@ -421,11 +449,17 @@ function compactRuntimeOverride(value: CapsuleRuntimeOverride): CapsuleRuntimeOv
   };
 }
 
-function runtimeOverrideFromApi(value: ApiRuntimeConfig | undefined): CapsuleRuntimeOverride | undefined {
+function runtimeOverrideFromApi(
+  value: ApiRuntimeConfig | undefined,
+): CapsuleRuntimeOverride | undefined {
   if (!value) {
     return undefined;
   }
-  const selectedTarget = (value.selectedTarget ?? value.selected_target ?? "").trim();
+  const selectedTarget = (
+    value.selectedTarget ??
+    value.selected_target ??
+    ""
+  ).trim();
   const targets: Record<string, RuntimeTargetOverride> = {};
   Object.entries(value.targets ?? {}).forEach(([rawLabel, rawTarget]) => {
     const label = rawLabel.trim();
@@ -471,13 +505,21 @@ function rawStringList(value: unknown): string[] {
 
 function normalizeOs(value: string): "darwin" | "linux" | "windows" | null {
   const normalized = value.trim().toLowerCase();
-  if (normalized === "darwin" || normalized === "macos" || normalized === "mac") {
+  if (
+    normalized === "darwin" ||
+    normalized === "macos" ||
+    normalized === "mac"
+  ) {
     return "darwin";
   }
   if (normalized === "linux") {
     return "linux";
   }
-  if (normalized === "windows" || normalized === "win" || normalized === "win32") {
+  if (
+    normalized === "windows" ||
+    normalized === "win" ||
+    normalized === "win32"
+  ) {
     return "windows";
   }
   return null;
@@ -485,7 +527,11 @@ function normalizeOs(value: string): "darwin" | "linux" | "windows" | null {
 
 function normalizeArch(value: string): "x64" | "arm64" | null {
   const normalized = value.trim().toLowerCase();
-  if (normalized === "x64" || normalized === "amd64" || normalized === "x86_64") {
+  if (
+    normalized === "x64" ||
+    normalized === "amd64" ||
+    normalized === "x86_64"
+  ) {
     return "x64";
   }
   if (normalized === "arm64" || normalized === "aarch64") {
@@ -508,26 +554,37 @@ function collectOsArchStrings(value: unknown, out: Set<string>): void {
   }
   if (value && typeof value === "object") {
     const objectValue = value as Record<string, unknown>;
-    const osValues = rawStringList(objectValue.os).map(normalizeOs).filter((entry): entry is NonNullable<typeof entry> => Boolean(entry));
-    const archValues = rawStringList(objectValue.arch).map(normalizeArch).filter((entry): entry is NonNullable<typeof entry> => Boolean(entry));
+    const osValues = rawStringList(objectValue.os)
+      .map(normalizeOs)
+      .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry));
+    const archValues = rawStringList(objectValue.arch)
+      .map(normalizeArch)
+      .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry));
     if (osValues.length > 0 && archValues.length > 0) {
       osValues.forEach((os) => {
         archValues.forEach((arch) => out.add(`${os}/${arch}`));
       });
     }
-    Object.values(objectValue).forEach((entry) => collectOsArchStrings(entry, out));
+    Object.values(objectValue).forEach((entry) =>
+      collectOsArchStrings(entry, out),
+    );
   }
 }
 
 function inferOsArchFromTargets(targets: CapsuleTarget[]): string[] {
-  const hasWebTarget = targets.some((target) => target.runtime.trim().toLowerCase() === "web");
+  const hasWebTarget = targets.some(
+    (target) => target.runtime.trim().toLowerCase() === "web",
+  );
   if (hasWebTarget) {
     return WEB_RUNTIME_DEFAULT_OS_ARCH;
   }
   return [];
 }
 
-function parseTargets(manifest: unknown): { defaultTarget?: string; targets: CapsuleTarget[] } {
+function parseTargets(manifest: unknown): {
+  defaultTarget?: string;
+  targets: CapsuleTarget[];
+} {
   if (!manifest || typeof manifest !== "object") {
     return { targets: [] };
   }
@@ -630,9 +687,11 @@ function parseTargets(manifest: unknown): { defaultTarget?: string; targets: Cap
   }
 
   if (Object.keys(services).length > 0) {
-    const aggregateTarget = mainServiceTarget ?? defaultTarget ?? parsedTargets[0]?.label;
+    const aggregateTarget =
+      mainServiceTarget ?? defaultTarget ?? parsedTargets[0]?.label;
     if (aggregateTarget) {
-      const aggregate = requiredEnvByTarget.get(aggregateTarget) ?? new Set<string>();
+      const aggregate =
+        requiredEnvByTarget.get(aggregateTarget) ?? new Set<string>();
       for (const keys of requiredEnvByTarget.values()) {
         keys.forEach((key) => aggregate.add(key));
       }
@@ -641,7 +700,9 @@ function parseTargets(manifest: unknown): { defaultTarget?: string; targets: Cap
   }
 
   parsedTargets.forEach((target) => {
-    target.requiredEnv = Array.from(requiredEnvByTarget.get(target.label) ?? new Set(target.requiredEnv));
+    target.requiredEnv = Array.from(
+      requiredEnvByTarget.get(target.label) ?? new Set(target.requiredEnv),
+    );
   });
 
   return { defaultTarget, targets: parsedTargets };
@@ -661,7 +722,10 @@ function parseRoute(): Route {
   return { kind: "catalog" };
 }
 
-function latestProcessForCapsule(processes: Process[], capsuleId: string): Process | undefined {
+function latestProcessForCapsule(
+  processes: Process[],
+  capsuleId: string,
+): Process | undefined {
   return [...processes]
     .filter((process) => process.capsuleId === capsuleId)
     .sort((left, right) => right.startedAt.localeCompare(left.startedAt))[0];
@@ -687,7 +751,9 @@ function parseLogLine(line: string, index: number): ProcessLogLine {
 
 function toApiProcess(row: ApiProcessRow, catalogCapsules: Capsule[]): Process {
   const scopedId = row.scoped_id ?? row.name;
-  const matchedCapsule = catalogCapsules.find((capsule) => capsule.scopedId === scopedId);
+  const matchedCapsule = catalogCapsules.find(
+    (capsule) => capsule.scopedId === scopedId,
+  );
   return {
     id: row.id,
     name: row.name,
@@ -703,7 +769,9 @@ function toApiProcess(row: ApiProcessRow, catalogCapsules: Capsule[]): Process {
   };
 }
 
-function parseScopedId(scopedId: string): { publisher: string; slug: string } | null {
+function parseScopedId(
+  scopedId: string,
+): { publisher: string; slug: string } | null {
   const parts = scopedId.split("/");
   if (parts.length !== 2) {
     return null;
@@ -715,7 +783,10 @@ interface ActionFailureError extends Error {
   copyText?: string;
 }
 
-function createActionFailure(message: string, copyText?: string): ActionFailureError {
+function createActionFailure(
+  message: string,
+  copyText?: string,
+): ActionFailureError {
   const error = new Error(message) as ActionFailureError;
   error.copyText = copyText ?? message;
   return error;
@@ -738,7 +809,10 @@ function parseActionErrorResponse(
       typeof parsed.message === "string" && parsed.message.trim().length > 0
         ? parsed.message.trim()
         : fallbackMessage;
-    const code = typeof parsed.error === "string" && parsed.error.trim().length > 0 ? parsed.error.trim() : "";
+    const code =
+      typeof parsed.error === "string" && parsed.error.trim().length > 0
+        ? parsed.error.trim()
+        : "";
     return {
       message: code ? `${message} (${code})` : message,
       copyText: JSON.stringify(parsed, null, 2),
@@ -751,16 +825,23 @@ function parseActionErrorResponse(
 export default function App(): JSX.Element {
   const platform = useMemo(() => detectPlatform(), []);
   const [route, setRoute] = useState<Route>(() => parseRoute());
-  const [isMobileViewport, setIsMobileViewport] = useState<boolean>(() =>
-    window.matchMedia("(max-width: 768px)").matches,
+  const [isMobileViewport, setIsMobileViewport] = useState<boolean>(
+    () => window.matchMedia("(max-width: 768px)").matches,
   );
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [catalogCapsules, setCatalogCapsules] = useState<Capsule[]>([]);
   const [processes, setProcesses] = useState<Process[]>([]);
-  const [openReadyByProcessId, setOpenReadyByProcessId] = useState<Record<string, boolean>>({});
-  const [runtimeOverrides, setRuntimeOverrides] = useState<RuntimeOverrideStore>({});
-  const [dirtyRuntimeConfigCapsules, setDirtyRuntimeConfigCapsules] = useState<Record<string, true>>({});
-  const [logsByProcessId, setLogsByProcessId] = useState<Record<string, ProcessLogLine[]>>({});
+  const [openReadyByProcessId, setOpenReadyByProcessId] = useState<
+    Record<string, boolean>
+  >({});
+  const [runtimeOverrides, setRuntimeOverrides] =
+    useState<RuntimeOverrideStore>({});
+  const [dirtyRuntimeConfigCapsules, setDirtyRuntimeConfigCapsules] = useState<
+    Record<string, true>
+  >({});
+  const [logsByProcessId, setLogsByProcessId] = useState<
+    Record<string, ProcessLogLine[]>
+  >({});
   const [isLoadingCapsules, setIsLoadingCapsules] = useState(true);
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<OsFilter>("all");
@@ -807,14 +888,17 @@ export default function App(): JSX.Element {
     });
   }, []);
 
-  const showErrorToast = useCallback((message: string, copyText?: string): void => {
-    setToast({
-      kind: "error",
-      message,
-      copyText: copyText ?? message,
-      sticky: true,
-    });
-  }, []);
+  const showErrorToast = useCallback(
+    (message: string, copyText?: string): void => {
+      setToast({
+        kind: "error",
+        message,
+        copyText: copyText ?? message,
+        sticky: true,
+      });
+    },
+    [],
+  );
 
   useEffect(() => {
     const onPopState = (): void => setRoute(parseRoute());
@@ -859,7 +943,8 @@ export default function App(): JSX.Element {
           return;
         }
         const payload = (await response.json()) as ApiWellKnownResponse;
-        const required = payload.writeAuthRequired ?? payload.write_auth_required ?? false;
+        const required =
+          payload.writeAuthRequired ?? payload.write_auth_required ?? false;
         setWriteAuthRequired(Boolean(required));
       } catch {
         // ignore
@@ -881,9 +966,12 @@ export default function App(): JSX.Element {
       const response = await fetch("/v1/manifest/capsules?limit=200");
       const payload = (await response.json()) as ApiSearchResponse;
       const rows = Array.isArray(payload.capsules) ? payload.capsules : [];
-      setCatalogCapsules(rows.map((row) => mapSearchRowToCapsule(row, platform)));
+      setCatalogCapsules(
+        rows.map((row) => mapSearchRowToCapsule(row, platform)),
+      );
     } catch (error) {
-      const message = error instanceof Error ? error.message : "failed to fetch capsules";
+      const message =
+        error instanceof Error ? error.message : "failed to fetch capsules";
       showErrorToast(`一覧取得失敗: ${message}`, message);
       setCatalogCapsules([]);
     } finally {
@@ -920,32 +1008,41 @@ export default function App(): JSX.Element {
     return () => window.clearInterval(timer);
   }, [loadProcesses]);
 
-  const fetchProcessLogs = useCallback(async (processId: string): Promise<void> => {
-    if (!processId) {
-      return;
-    }
-    try {
-      const response = await fetch(`/v1/local/processes/${encodeURIComponent(processId)}/logs?tail=500`);
-      if (!response.ok) {
+  const fetchProcessLogs = useCallback(
+    async (processId: string): Promise<void> => {
+      if (!processId) {
         return;
       }
-      const payload = (await response.json()) as ApiProcessLogsResponse;
-      const lines = Array.isArray(payload.lines) ? payload.lines : [];
-      const parsed = lines.map((line, index) => parseLogLine(line, index + 1));
-      setLogsByProcessId((prev) => ({
-        ...prev,
-        [processId]: parsed,
-      }));
-    } catch {
-      // ignore
-    }
-  }, []);
+      try {
+        const response = await fetch(
+          `/v1/local/processes/${encodeURIComponent(processId)}/logs?tail=500`,
+        );
+        if (!response.ok) {
+          return;
+        }
+        const payload = (await response.json()) as ApiProcessLogsResponse;
+        const lines = Array.isArray(payload.lines) ? payload.lines : [];
+        const parsed = lines.map((line, index) =>
+          parseLogLine(line, index + 1),
+        );
+        setLogsByProcessId((prev) => ({
+          ...prev,
+          [processId]: parsed,
+        }));
+      } catch {
+        // ignore
+      }
+    },
+    [],
+  );
 
   useEffect(() => {
     if (route.kind !== "detail") {
       return;
     }
-    const capsule = catalogCapsules.find((entry) => entry.id === route.capsuleId);
+    const capsule = catalogCapsules.find(
+      (entry) => entry.id === route.capsuleId,
+    );
     if (!capsule) {
       return;
     }
@@ -1000,7 +1097,10 @@ export default function App(): JSX.Element {
       if (stored && capsule.targets.some((target) => target.label === stored)) {
         return stored;
       }
-      if (capsule.defaultTarget && capsule.targets.some((target) => target.label === capsule.defaultTarget)) {
+      if (
+        capsule.defaultTarget &&
+        capsule.targets.some((target) => target.label === capsule.defaultTarget)
+      ) {
         return capsule.defaultTarget;
       }
       return capsule.targets[0].label;
@@ -1010,9 +1110,12 @@ export default function App(): JSX.Element {
 
   const resolveEnvValues = useCallback(
     (capsule: Capsule, targetLabel: string): Record<string, string> => {
-      const target = capsule.targets.find((entry) => entry.label === targetLabel);
+      const target = capsule.targets.find(
+        (entry) => entry.label === targetLabel,
+      );
       const base = target?.env ?? capsule.envHints;
-      const override = runtimeOverrides[capsule.id]?.targets[targetLabel]?.env ?? {};
+      const override =
+        runtimeOverrides[capsule.id]?.targets[targetLabel]?.env ?? {};
       return {
         ...base,
         ...override,
@@ -1021,25 +1124,37 @@ export default function App(): JSX.Element {
     [runtimeOverrides],
   );
 
-  const resolveBaseEnvKeys = useCallback((capsule: Capsule, targetLabel: string): string[] => {
-    const target = capsule.targets.find((entry) => entry.label === targetLabel);
-    if (!target) {
-      return [];
-    }
-    return Object.keys(target.env);
-  }, []);
+  const resolveBaseEnvKeys = useCallback(
+    (capsule: Capsule, targetLabel: string): string[] => {
+      const target = capsule.targets.find(
+        (entry) => entry.label === targetLabel,
+      );
+      if (!target) {
+        return [];
+      }
+      return Object.keys(target.env);
+    },
+    [],
+  );
 
-  const resolveRequiredEnvKeys = useCallback((capsule: Capsule, targetLabel: string): string[] => {
-    const target = capsule.targets.find((entry) => entry.label === targetLabel);
-    if (!target) {
-      return [];
-    }
-    return target.requiredEnv;
-  }, []);
+  const resolveRequiredEnvKeys = useCallback(
+    (capsule: Capsule, targetLabel: string): string[] => {
+      const target = capsule.targets.find(
+        (entry) => entry.label === targetLabel,
+      );
+      if (!target) {
+        return [];
+      }
+      return target.requiredEnv;
+    },
+    [],
+  );
 
   const resolvePortValue = useCallback(
     (capsule: Capsule, targetLabel: string): string => {
-      const target = capsule.targets.find((entry) => entry.label === targetLabel);
+      const target = capsule.targets.find(
+        (entry) => entry.label === targetLabel,
+      );
       const override = runtimeOverrides[capsule.id]?.targets[targetLabel];
       const port = override?.port ?? target?.port;
       return port ? String(port) : "";
@@ -1069,7 +1184,9 @@ export default function App(): JSX.Element {
   };
 
   const requestStop = (capsule: Capsule): void => {
-    const process = processes.find((entry) => entry.capsuleId === capsule.id && entry.active);
+    const process = processes.find(
+      (entry) => entry.capsuleId === capsule.id && entry.active,
+    );
     if (!process) {
       return;
     }
@@ -1080,11 +1197,17 @@ export default function App(): JSX.Element {
     setConfirmState({ kind: "delete", capsule });
   };
 
-  const requestRollbackRelease = (capsule: Capsule, release: CapsuleRelease): void => {
+  const requestRollbackRelease = (
+    capsule: Capsule,
+    release: CapsuleRelease,
+  ): void => {
     setConfirmState({ kind: "rollback-release", capsule, release });
   };
 
-  const requestYankRelease = (capsule: Capsule, release: CapsuleRelease): void => {
+  const requestYankRelease = (
+    capsule: Capsule,
+    release: CapsuleRelease,
+  ): void => {
     setConfirmState({ kind: "yank-release", capsule, release });
   };
 
@@ -1144,7 +1267,9 @@ export default function App(): JSX.Element {
 
       await Promise.all(
         runningProcesses.map(async (process) => {
-          const capsule = catalogCapsules.find((entry) => entry.id === process.capsuleId);
+          const capsule = catalogCapsules.find(
+            (entry) => entry.id === process.capsuleId,
+          );
           if (!capsule) {
             next[process.id] = false;
             return;
@@ -1155,7 +1280,9 @@ export default function App(): JSX.Element {
             return;
           }
           try {
-            const response = await fetch(`/v1/local/url-ready?url=${encodeURIComponent(url)}`);
+            const response = await fetch(
+              `/v1/local/url-ready?url=${encodeURIComponent(url)}`,
+            );
             if (!response.ok) {
               next[process.id] = false;
               return;
@@ -1196,76 +1323,99 @@ export default function App(): JSX.Element {
     [openReadyByProcessId],
   );
 
-  const openRunningTarget = useCallback((capsule: Capsule, process?: Process): void => {
-    if (!isOpenReady(process)) {
-      showErrorToast("アプリURLの応答(HTTP 200)を確認中です。起動完了後にOpenできます。");
-      return;
-    }
-    const url = resolveAppUrlForCapsule(capsule, process);
-    if (!url) {
-      showErrorToast("Open先のアプリポートを解決できませんでした");
-      return;
-    }
-    window.open(url, "_blank");
-  }, [isOpenReady, resolveAppUrlForCapsule, showErrorToast]);
-
-  const clearProcessLogs = useCallback(async (processId: string): Promise<void> => {
-    await fetch(`/v1/local/processes/${encodeURIComponent(processId)}/logs`, {
-      method: "DELETE",
-      headers: createWriteHeaders(),
-    });
-    await fetchProcessLogs(processId);
-  }, [createWriteHeaders, fetchProcessLogs]);
-
-  const runConfirmed = useCallback(async (state: Extract<ConfirmState, { kind: "run" }>): Promise<void> => {
-    const parsed = parseScopedId(state.capsule.scopedId);
-    if (!parsed) {
-      throw createActionFailure("invalid scoped id");
-    }
-    const response = await fetch(
-      `/v1/local/capsules/by/${encodeURIComponent(parsed.publisher)}/${encodeURIComponent(parsed.slug)}/run`,
-      {
-        method: "POST",
-        headers: createWriteHeaders("application/json"),
-        body: JSON.stringify({
-          confirmed: true,
-          target: state.target || undefined,
-          port: state.port,
-          env: state.env,
-        }),
-      },
-    );
-    if (!response.ok) {
-      if (response.status === 401) {
-        setWriteAuthRequired(true);
+  const openRunningTarget = useCallback(
+    (capsule: Capsule, process?: Process): void => {
+      if (!isOpenReady(process)) {
+        showErrorToast(
+          "アプリURLの応答(HTTP 200)を確認中です。起動完了後にOpenできます。",
+        );
+        return;
       }
-      const text = await response.text();
-      const parsedError = parseActionErrorResponse(text, `run failed: ${response.status}`);
-      throw createActionFailure(parsedError.message, parsedError.copyText);
-    }
-    const payload = (await response.json()) as ApiRunResponse;
-    if (!payload.accepted) {
-      throw createActionFailure("run was not accepted");
-    }
-  }, [createWriteHeaders]);
-
-  const stopConfirmed = useCallback(async (state: Extract<ConfirmState, { kind: "stop" }>): Promise<void> => {
-    const response = await fetch(`/v1/local/processes/${encodeURIComponent(state.process.id)}/stop`, {
-      method: "POST",
-      headers: createWriteHeaders("application/json"),
-      body: JSON.stringify({
-        confirmed: true,
-      }),
-    });
-    if (!response.ok) {
-      if (response.status === 401) {
-        setWriteAuthRequired(true);
+      const url = resolveAppUrlForCapsule(capsule, process);
+      if (!url) {
+        showErrorToast("Open先のアプリポートを解決できませんでした");
+        return;
       }
-      const text = await response.text();
-      const parsedError = parseActionErrorResponse(text, `stop failed: ${response.status}`);
-      throw createActionFailure(parsedError.message, parsedError.copyText);
-    }
-  }, [createWriteHeaders]);
+      window.open(url, "_blank");
+    },
+    [isOpenReady, resolveAppUrlForCapsule, showErrorToast],
+  );
+
+  const clearProcessLogs = useCallback(
+    async (processId: string): Promise<void> => {
+      await fetch(`/v1/local/processes/${encodeURIComponent(processId)}/logs`, {
+        method: "DELETE",
+        headers: createWriteHeaders(),
+      });
+      await fetchProcessLogs(processId);
+    },
+    [createWriteHeaders, fetchProcessLogs],
+  );
+
+  const runConfirmed = useCallback(
+    async (state: Extract<ConfirmState, { kind: "run" }>): Promise<void> => {
+      const parsed = parseScopedId(state.capsule.scopedId);
+      if (!parsed) {
+        throw createActionFailure("invalid scoped id");
+      }
+      const response = await fetch(
+        `/v1/local/capsules/by/${encodeURIComponent(parsed.publisher)}/${encodeURIComponent(parsed.slug)}/run`,
+        {
+          method: "POST",
+          headers: createWriteHeaders("application/json"),
+          body: JSON.stringify({
+            confirmed: true,
+            target: state.target || undefined,
+            port: state.port,
+            env: state.env,
+          }),
+        },
+      );
+      if (!response.ok) {
+        if (response.status === 401) {
+          setWriteAuthRequired(true);
+        }
+        const text = await response.text();
+        const parsedError = parseActionErrorResponse(
+          text,
+          `run failed: ${response.status}`,
+        );
+        throw createActionFailure(parsedError.message, parsedError.copyText);
+      }
+      const payload = (await response.json()) as ApiRunResponse;
+      if (!payload.accepted) {
+        throw createActionFailure("run was not accepted");
+      }
+    },
+    [createWriteHeaders],
+  );
+
+  const stopConfirmed = useCallback(
+    async (state: Extract<ConfirmState, { kind: "stop" }>): Promise<void> => {
+      const response = await fetch(
+        `/v1/local/processes/${encodeURIComponent(state.process.id)}/stop`,
+        {
+          method: "POST",
+          headers: createWriteHeaders("application/json"),
+          body: JSON.stringify({
+            confirmed: true,
+          }),
+        },
+      );
+      if (!response.ok) {
+        if (response.status === 401) {
+          setWriteAuthRequired(true);
+        }
+        const text = await response.text();
+        const parsedError = parseActionErrorResponse(
+          text,
+          `stop failed: ${response.status}`,
+        );
+        throw createActionFailure(parsedError.message, parsedError.copyText);
+      }
+    },
+    [createWriteHeaders],
+  );
 
   const deleteConfirmed = useCallback(
     async (state: Extract<ConfirmState, { kind: "delete" }>): Promise<void> => {
@@ -1285,7 +1435,10 @@ export default function App(): JSX.Element {
           setWriteAuthRequired(true);
         }
         const text = await response.text();
-        const parsedError = parseActionErrorResponse(text, `delete failed: ${response.status}`);
+        const parsedError = parseActionErrorResponse(
+          text,
+          `delete failed: ${response.status}`,
+        );
         throw createActionFailure(parsedError.message, parsedError.copyText);
       }
       const payload = (await response.json()) as ApiDeleteCapsuleResponse;
@@ -1302,7 +1455,9 @@ export default function App(): JSX.Element {
   );
 
   const rollbackReleaseConfirmed = useCallback(
-    async (state: Extract<ConfirmState, { kind: "rollback-release" }>): Promise<void> => {
+    async (
+      state: Extract<ConfirmState, { kind: "rollback-release" }>,
+    ): Promise<void> => {
       if (!state.release.manifestHash) {
         throw createActionFailure("rollback target is missing a manifest hash");
       }
@@ -1319,11 +1474,18 @@ export default function App(): JSX.Element {
           setWriteAuthRequired(true);
         }
         const text = await response.text();
-        const parsedError = parseActionErrorResponse(text, `rollback failed: ${response.status}`);
+        const parsedError = parseActionErrorResponse(
+          text,
+          `rollback failed: ${response.status}`,
+        );
         throw createActionFailure(parsedError.message, parsedError.copyText);
       }
       const payload = (await response.json()) as ApiRollbackResponse;
-      if (!payload.target_manifest_hash && !payload.manifest_hash && !payload.pointer?.manifest_hash) {
+      if (
+        !payload.target_manifest_hash &&
+        !payload.manifest_hash &&
+        !payload.pointer?.manifest_hash
+      ) {
         throw createActionFailure("rollback was not accepted");
       }
       await loadCatalogCapsules();
@@ -1333,7 +1495,9 @@ export default function App(): JSX.Element {
   );
 
   const yankReleaseConfirmed = useCallback(
-    async (state: Extract<ConfirmState, { kind: "yank-release" }>): Promise<void> => {
+    async (
+      state: Extract<ConfirmState, { kind: "yank-release" }>,
+    ): Promise<void> => {
       if (!state.release.manifestHash) {
         throw createActionFailure("yank target is missing a manifest hash");
       }
@@ -1350,7 +1514,10 @@ export default function App(): JSX.Element {
           setWriteAuthRequired(true);
         }
         const text = await response.text();
-        const parsedError = parseActionErrorResponse(text, `yank failed: ${response.status}`);
+        const parsedError = parseActionErrorResponse(
+          text,
+          `yank failed: ${response.status}`,
+        );
         throw createActionFailure(parsedError.message, parsedError.copyText);
       }
       const payload = (await response.json()) as ApiYankResponse;
@@ -1364,7 +1531,10 @@ export default function App(): JSX.Element {
   );
 
   const persistRuntimeConfig = useCallback(
-    async (capsuleId: string, runtimeConfig: CapsuleRuntimeOverride | undefined): Promise<void> => {
+    async (
+      capsuleId: string,
+      runtimeConfig: CapsuleRuntimeOverride | undefined,
+    ): Promise<void> => {
       const capsule = catalogCapsules.find((entry) => entry.id === capsuleId);
       if (!capsule) {
         return;
@@ -1373,7 +1543,9 @@ export default function App(): JSX.Element {
       if (!parsed) {
         return;
       }
-      const compacted = runtimeConfig ? compactRuntimeOverride(runtimeConfig) : undefined;
+      const compacted = runtimeConfig
+        ? compactRuntimeOverride(runtimeConfig)
+        : undefined;
       const response = await fetch(
         `/v1/local/capsules/by/${encodeURIComponent(parsed.publisher)}/${encodeURIComponent(parsed.slug)}/runtime-config`,
         {
@@ -1382,13 +1554,15 @@ export default function App(): JSX.Element {
           body: JSON.stringify({
             selected_target: compacted?.selectedTarget,
             targets: Object.fromEntries(
-              Object.entries(compacted?.targets ?? {}).map(([label, target]) => [
-                label,
-                {
-                  ...(target.port ? { port: target.port } : {}),
-                  env: target.env,
-                },
-              ]),
+              Object.entries(compacted?.targets ?? {}).map(
+                ([label, target]) => [
+                  label,
+                  {
+                    ...(target.port ? { port: target.port } : {}),
+                    env: target.env,
+                  },
+                ],
+              ),
             ),
           }),
         },
@@ -1398,7 +1572,10 @@ export default function App(): JSX.Element {
           setWriteAuthRequired(true);
         }
         const text = await response.text();
-        const parsedError = parseActionErrorResponse(text, `runtime config update failed: ${response.status}`);
+        const parsedError = parseActionErrorResponse(
+          text,
+          `runtime config update failed: ${response.status}`,
+        );
         throw createActionFailure(parsedError.message, parsedError.copyText);
       }
       const payload = (await response.json()) as ApiRuntimeConfig;
@@ -1417,7 +1594,10 @@ export default function App(): JSX.Element {
   );
 
   const updateRuntimeConfig = useCallback(
-    (capsuleId: string, updater: (draft: CapsuleRuntimeOverride) => void): void => {
+    (
+      capsuleId: string,
+      updater: (draft: CapsuleRuntimeOverride) => void,
+    ): void => {
       const draft = cloneRuntimeOverride(runtimeOverrides[capsuleId]);
       updater(draft);
       const compacted = compactRuntimeOverride(draft);
@@ -1440,7 +1620,9 @@ export default function App(): JSX.Element {
 
   const requestSaveRuntimeConfig = useCallback(
     (capsule: Capsule): void => {
-      const runtimeConfig = compactRuntimeOverride(cloneRuntimeOverride(runtimeOverrides[capsule.id]));
+      const runtimeConfig = compactRuntimeOverride(
+        cloneRuntimeOverride(runtimeOverrides[capsule.id]),
+      );
       if (!dirtyRuntimeConfigCapsules[capsule.id]) {
         showSuccessToast("保存する変更はありません");
         return;
@@ -1455,7 +1637,9 @@ export default function App(): JSX.Element {
   );
 
   const saveRuntimeConfigConfirmed = useCallback(
-    async (state: Extract<ConfirmState, { kind: "save-config" }>): Promise<void> => {
+    async (
+      state: Extract<ConfirmState, { kind: "save-config" }>,
+    ): Promise<void> => {
       await persistRuntimeConfig(state.capsule.id, state.runtimeConfig);
       setDirtyRuntimeConfigCapsules((prev) => {
         const next = { ...prev };
@@ -1534,7 +1718,11 @@ export default function App(): JSX.Element {
     });
   };
 
-  const updatePort = (capsuleId: string, target: string, value: string): void => {
+  const updatePort = (
+    capsuleId: string,
+    target: string,
+    value: string,
+  ): void => {
     const normalizedTarget = target.trim();
     if (!normalizedTarget) {
       return;
@@ -1559,7 +1747,12 @@ export default function App(): JSX.Element {
     });
   };
 
-  const updateEnv = (capsuleId: string, target: string, key: string, value: string): void => {
+  const updateEnv = (
+    capsuleId: string,
+    target: string,
+    key: string,
+    value: string,
+  ): void => {
     const normalizedTarget = target.trim();
     const normalizedKey = key.trim();
     if (!normalizedTarget || !normalizedKey) {
@@ -1573,7 +1766,12 @@ export default function App(): JSX.Element {
     });
   };
 
-  const addEnv = (capsuleId: string, target: string, key: string, value: string): void => {
+  const addEnv = (
+    capsuleId: string,
+    target: string,
+    key: string,
+    value: string,
+  ): void => {
     const normalizedTarget = target.trim();
     const normalizedKey = key.trim();
     if (!normalizedTarget || !normalizedKey) {
@@ -1599,7 +1797,10 @@ export default function App(): JSX.Element {
         return;
       }
       delete targetOverride.env[normalizedKey];
-      if (Object.keys(targetOverride.env).length === 0 && !targetOverride.port) {
+      if (
+        Object.keys(targetOverride.env).length === 0 &&
+        !targetOverride.port
+      ) {
         delete draft.targets[normalizedTarget];
       }
     });
@@ -1633,13 +1834,26 @@ export default function App(): JSX.Element {
         const firstTargetEnv = targets[0]?.env ?? {};
         const readmeFromApi = detail.readmeMarkdown ?? detail.readme_markdown;
         const readmeSource = detail.readmeSource ?? detail.readme_source;
-        const readme = readmeFromApi ?? baseReadme(capsule.scopedId, detail.description ?? capsule.description);
-        const version = detail.latestVersion ?? detail.latest_version ?? capsule.version;
-        const releases = Array.isArray(detail.releases) ? detail.releases.map(mapReleaseRow) : capsule.releases;
+        const readme =
+          readmeFromApi ??
+          baseReadme(
+            capsule.scopedId,
+            detail.description ?? capsule.description,
+          );
+        const version =
+          detail.latestVersion ?? detail.latest_version ?? capsule.version;
+        const releases = Array.isArray(detail.releases)
+          ? detail.releases.map(mapReleaseRow)
+          : capsule.releases;
         const manifestToml = detail.manifestToml ?? detail.manifest_toml;
-        const storeMetadata = mapStoreMetadata(detail.storeMetadata ?? detail.store_metadata);
-        const description = storeMetadata?.text ?? detail.description ?? capsule.description;
-        const runtimeConfig = runtimeOverrideFromApi(detail.runtimeConfig ?? detail.runtime_config);
+        const storeMetadata = mapStoreMetadata(
+          detail.storeMetadata ?? detail.store_metadata,
+        );
+        const description =
+          storeMetadata?.text ?? detail.description ?? capsule.description;
+        const runtimeConfig = runtimeOverrideFromApi(
+          detail.runtimeConfig ?? detail.runtime_config,
+        );
         setCatalogCapsules((prev) =>
           prev.map((entry) =>
             entry.id === capsule.id
@@ -1653,7 +1867,10 @@ export default function App(): JSX.Element {
                   readmeSource,
                   rawToml: manifestToml,
                   manifest: detail.manifest,
-                  envHints: Object.keys(firstTargetEnv).length > 0 ? firstTargetEnv : entry.envHints,
+                  envHints:
+                    Object.keys(firstTargetEnv).length > 0
+                      ? firstTargetEnv
+                      : entry.envHints,
                   targets,
                   releases,
                   defaultTarget,
@@ -1714,10 +1931,14 @@ export default function App(): JSX.Element {
           setWriteAuthRequired(true);
         }
         const raw = await response.text();
-        throw new Error(raw || `store metadata update failed: ${response.status}`);
+        throw new Error(
+          raw || `store metadata update failed: ${response.status}`,
+        );
       }
       const payload = (await response.json()) as ApiStoreMetadataResponse;
-      const metadata = mapStoreMetadata(payload.storeMetadata ?? payload.store_metadata);
+      const metadata = mapStoreMetadata(
+        payload.storeMetadata ?? payload.store_metadata,
+      );
       const nextDescription = metadata?.text ?? capsule.description;
       setCatalogCapsules((prev) =>
         prev.map((entry) =>
@@ -1747,7 +1968,9 @@ export default function App(): JSX.Element {
     if (route.kind !== "detail") {
       return;
     }
-    const capsule = catalogCapsules.find((entry) => entry.id === route.capsuleId);
+    const capsule = catalogCapsules.find(
+      (entry) => entry.id === route.capsuleId,
+    );
     if (!capsule || capsule.detailLoaded) {
       return;
     }
@@ -1795,7 +2018,9 @@ export default function App(): JSX.Element {
       />
     );
   } else if (route.kind === "detail") {
-    const capsule = catalogCapsules.find((entry) => entry.id === route.capsuleId);
+    const capsule = catalogCapsules.find(
+      (entry) => entry.id === route.capsuleId,
+    );
     if (!capsule) {
       if (isLoadingCapsules) {
         content = <div className="row-meta">Loading capsule...</div>;
@@ -1818,16 +2043,20 @@ export default function App(): JSX.Element {
           selectedTarget={target}
           selectedPort={selectedPort}
           canRun={capsule.targets.length > 0 || !capsule.detailLoaded}
-          hasRuntimeConfigChanges={Boolean(dirtyRuntimeConfigCapsules[capsule.id])}
+          hasRuntimeConfigChanges={Boolean(
+            dirtyRuntimeConfigCapsules[capsule.id],
+          )}
           isSavingRuntimeConfig={
-            isSubmittingConfirm && confirmState?.kind === "save-config" && confirmState.capsule.id === capsule.id
+            isSubmittingConfirm &&
+            confirmState?.kind === "save-config" &&
+            confirmState.capsule.id === capsule.id
           }
           envValues={envValues}
           baseEnvKeys={baseEnvKeys}
           requiredEnvKeys={requiredEnvKeys}
           storeMetadataIconPath={capsule.storeMetadata?.iconPath ?? ""}
           storeMetadataText={capsule.storeMetadata?.text ?? ""}
-          logs={process ? logsByProcessId[process.id] ?? [] : []}
+          logs={process ? (logsByProcessId[process.id] ?? []) : []}
           onBack={() => navigate("/")}
           onRun={requestRun}
           onStop={requestStop}
@@ -1868,13 +2097,26 @@ export default function App(): JSX.Element {
         onOpen={openRunningTarget}
         isOpenReady={isOpenReady}
         onDelete={requestDelete}
-        onInspect={(capsule) => navigate(`/capsule/${encodeURIComponent(capsule.id)}`)}
+        onInspect={(capsule) =>
+          navigate(`/capsule/${encodeURIComponent(capsule.id)}`)
+        }
         publishCommand={`ato publish --registry ${window.location.origin} --artifact ./dist/my-app.capsule`}
         onCopyCommand={() => {
           navigator.clipboard
-            .writeText(`ato publish --registry ${window.location.origin} --artifact ./dist/my-app.capsule`)
-            .then(() => showSuccessToast("コマンドをコピーしました — ターミナルで実行してください"))
-            .catch(() => showErrorToast("コピーに失敗しました", "Failed to copy publish command"));
+            .writeText(
+              `ato publish --registry ${window.location.origin} --artifact ./dist/my-app.capsule`,
+            )
+            .then(() =>
+              showSuccessToast(
+                "コマンドをコピーしました — ターミナルで実行してください",
+              ),
+            )
+            .catch(() =>
+              showErrorToast(
+                "コピーに失敗しました",
+                "Failed to copy publish command",
+              ),
+            );
         }}
       />
     );
@@ -1890,9 +2132,9 @@ export default function App(): JSX.Element {
           ? "Rollback confirmation"
           : confirmState.kind === "yank-release"
             ? "Yank confirmation"
-        : confirmState.kind === "save-config"
-          ? "Save configuration"
-          : "Delete confirmation";
+            : confirmState.kind === "save-config"
+              ? "Save configuration"
+              : "Delete confirmation";
 
   const confirmLines = !confirmState
     ? []
@@ -1930,20 +2172,24 @@ export default function App(): JSX.Element {
                 `Content hash: ${confirmState.release.contentHash}`,
                 `Signature: ${confirmState.release.signatureStatus}`,
               ]
-        : confirmState.kind === "save-config"
-          ? [
-              `Capsule: ${confirmState.capsule.scopedId}`,
-              `Selected target: ${confirmState.runtimeConfig?.selectedTarget ?? "-"}`,
-              `Configured targets: ${Object.keys(confirmState.runtimeConfig?.targets ?? {}).length}`,
-            ]
-          : [
-              `Capsule: ${confirmState.capsule.scopedId}`,
-              "Action: Delete from local registry",
-              "Scope: All published versions",
-            ];
+            : confirmState.kind === "save-config"
+              ? [
+                  `Capsule: ${confirmState.capsule.scopedId}`,
+                  `Selected target: ${confirmState.runtimeConfig?.selectedTarget ?? "-"}`,
+                  `Configured targets: ${Object.keys(confirmState.runtimeConfig?.targets ?? {}).length}`,
+                ]
+              : [
+                  `Capsule: ${confirmState.capsule.scopedId}`,
+                  "Action: Delete from local registry",
+                  "Scope: All published versions",
+                ];
 
-  const confirmAuthRequired = Boolean(confirmState && (writeAuthRequired || confirmState.kind === "save-config"));
-  const confirmDisabled = Boolean(isSubmittingConfirm || (confirmAuthRequired && !registryAuthToken.trim()));
+  const confirmAuthRequired = Boolean(
+    confirmState && (writeAuthRequired || confirmState.kind === "save-config"),
+  );
+  const confirmDisabled = Boolean(
+    isSubmittingConfirm || (confirmAuthRequired && !registryAuthToken.trim()),
+  );
 
   return (
     <>
@@ -1973,7 +2219,9 @@ export default function App(): JSX.Element {
 
         <ProcessDrawer
           open={drawerOpen}
-          processes={[...processes].sort((left, right) => right.startedAt.localeCompare(left.startedAt))}
+          processes={[...processes].sort((left, right) =>
+            right.startedAt.localeCompare(left.startedAt),
+          )}
           onClose={() => setDrawerOpen(false)}
           onOpenLogs={openLogs}
           onStop={(process) => setConfirmState({ kind: "stop", process })}

@@ -625,4 +625,3 @@ jobs:
           SOURCE_DIR: ${{ steps.prepare.outputs.source_dir }}
           WRANGLER_CONFIG: ""
         run: ./scripts/upload_release_to_r2.sh
-
