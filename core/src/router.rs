@@ -725,7 +725,7 @@ fn state_mounts_for_service(manifest: &CapsuleManifest, service_name: &str) -> R
             }
 
             Ok(Mount {
-                source: manifest.ephemeral_state_source_path(state_name),
+                source: manifest.ephemeral_state_source_path(state_name)?,
                 target: binding.target.trim().to_string(),
                 readonly: false,
             })
