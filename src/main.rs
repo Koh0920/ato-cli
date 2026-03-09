@@ -149,6 +149,8 @@ Primary Commands:
   search   Search the registry for agent skills and packages
     fetch    Fetch an experimental native delivery artifact into immutable local cache
     finalize Create a locally derived native artifact from fetched input
+    project  Experimental explicit opt-in symlink projection for finalized native .app bundles
+    unproject Remove an experimental launcher projection without mutating the artifact
 
 Management:
   ps       List running capsules
@@ -426,6 +428,39 @@ enum Commands {
         /// Output directory for derived artifacts
         #[arg(long)]
         output_dir: PathBuf,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    #[command(
+        next_help_heading = "Primary Commands",
+        about = "Experimental explicit opt-in: symlink-project a finalized local native .app into launcher surface"
+    )]
+    Project {
+        /// Path to a finalized local derived .app bundle created by `ato finalize`
+        derived_app_path: Option<PathBuf>,
+
+        /// Override launcher surface directory (default: ~/Applications)
+        #[arg(long)]
+        launcher_dir: Option<PathBuf>,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+
+        #[command(subcommand)]
+        command: Option<ProjectCommands>,
+    },
+
+    #[command(
+        next_help_heading = "Primary Commands",
+        about = "Experimental explicit opt-in: remove a managed launcher projection without mutating the finalized artifact"
+    )]
+    Unproject {
+        /// Projection ID, projected symlink path, or finalized derived .app path
+        projection_ref: String,
 
         /// Emit machine-readable JSON output
         #[arg(long)]
@@ -831,6 +866,16 @@ enum Commands {
 
     #[command(hide = true)]
     Auth,
+}
+
+#[derive(Subcommand)]
+enum ProjectCommands {
+    #[command(about = "List experimental projection state and detect broken projections read-only")]
+    Ls {
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1660,6 +1705,75 @@ fn run() -> Result<()> {
                 println!("   App:      {}", result.derived_app_path.display());
                 println!("   Parent:   {}", result.parent_digest);
                 println!("   Derived:  {}", result.derived_digest);
+            }
+            Ok(())
+        }
+
+        Commands::Project {
+            derived_app_path,
+            launcher_dir,
+            json,
+            command,
+        } => match command {
+            Some(ProjectCommands::Ls { json: subcommand_json }) => {
+                let result = native_delivery::execute_project_ls()?;
+                if cli.json || json || subcommand_json {
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                } else if result.projections.is_empty() {
+                    println!("No experimental projections found.");
+                } else {
+                    for projection in result.projections {
+                        let marker = if projection.state == "ok" { "✅" } else { "⚠️" };
+                        println!(
+                            "{} [{}] {} -> {}",
+                            marker,
+                            projection.state,
+                            projection.projected_path.display(),
+                            projection.derived_app_path.display()
+                        );
+                        println!("   ID:       {}", projection.projection_id);
+                        if !projection.problems.is_empty() {
+                            println!("   Problems: {}", projection.problems.join(", "));
+                        }
+                    }
+                }
+                Ok(())
+            }
+            None => {
+                let derived_app_path = derived_app_path.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "ato project requires <DERIVED_APP_PATH> or use `ato project ls` for read-only status"
+                    )
+                })?;
+                let result = native_delivery::execute_project(
+                    &derived_app_path,
+                    launcher_dir.as_deref(),
+                )?;
+                if cli.json || json {
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                } else {
+                    println!("✅ Projected to: {}", result.projected_path.display());
+                    println!("   ID:       {}", result.projection_id);
+                    println!("   Target:   {}", result.derived_app_path.display());
+                    println!("   State:    {}", result.state);
+                    println!("   Metadata: {}", result.metadata_path.display());
+                }
+                Ok(())
+            }
+        },
+
+        Commands::Unproject {
+            projection_ref,
+            json,
+        } => {
+            let result = native_delivery::execute_unproject(&projection_ref)?;
+            if cli.json || json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!("✅ Unprojected: {}", result.projected_path.display());
+                println!("   ID:      {}", result.projection_id);
+                println!("   State:   {}", result.state_before);
+                println!("   Removed: metadata={}, symlink={}", result.removed_metadata, result.removed_projected_path);
             }
             Ok(())
         }
