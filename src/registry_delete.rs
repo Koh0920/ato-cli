@@ -36,7 +36,10 @@ pub fn delete_capsule(args: RegistryDeleteArgs) -> Result<RegistryDeleteResult> 
         args.version.as_deref(),
     );
 
-    let request = reqwest::blocking::Client::new().delete(&endpoint);
+    let request = crate::registry_http::blocking_client_builder(&base_url)
+        .build()
+        .context("Failed to create registry delete client")?
+        .delete(&endpoint);
     let request = if let Some(token) = read_ato_token() {
         request.header("authorization", format!("Bearer {}", token))
     } else {
@@ -45,7 +48,7 @@ pub fn delete_capsule(args: RegistryDeleteArgs) -> Result<RegistryDeleteResult> 
 
     let response = request
         .send()
-        .with_context(|| format!("Failed to delete capsule via {}", endpoint))?;
+        .map_err(|err| anyhow::anyhow!("Failed to delete capsule via {}: {}", endpoint, err))?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -79,17 +82,7 @@ fn build_delete_endpoint(
 }
 
 fn normalize_registry_url(raw: &str) -> Result<String> {
-    let trimmed = raw.trim();
-    let parsed = reqwest::Url::parse(trimmed)
-        .with_context(|| format!("Invalid --registry URL for delete: {}", raw))?;
-    let scheme = parsed.scheme().to_ascii_lowercase();
-    if scheme != "http" && scheme != "https" {
-        bail!(
-            "Registry URL must use http or https scheme (got '{}')",
-            parsed.scheme()
-        );
-    }
-    Ok(trimmed.trim_end_matches('/').to_string())
+    crate::registry_http::normalize_registry_url(raw, "--registry")
 }
 
 fn parse_error_message(status: StatusCode, body: &str) -> String {

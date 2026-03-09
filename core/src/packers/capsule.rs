@@ -904,7 +904,10 @@ mod tests {
         verify_artifact_hash(&manifest).expect("verify artifact hash");
         let fsck = cas.fsck_manifest(&manifest).expect("fsck manifest");
         assert!(fsck.is_ok(), "fsck report should be clean: {fsck:?}");
-        assert!(!manifest.chunks.is_empty(), "manifest should contain chunks");
+        assert!(
+            !manifest.chunks.is_empty(),
+            "manifest should contain chunks"
+        );
     }
 
     #[tokio::test]

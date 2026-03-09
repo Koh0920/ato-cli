@@ -145,7 +145,9 @@ pub fn publish_artifact(args: PublishArtifactArgs) -> Result<PublishArtifactResu
         args.allow_existing,
     );
 
-    let request = reqwest::blocking::Client::new()
+    let request = crate::registry_http::blocking_client_builder(&base_url)
+        .build()
+        .context("Failed to create registry upload client")?
         .put(&endpoint)
         .header("content-type", "application/octet-stream")
         .header("x-ato-sha256", &payload.sha256)
@@ -160,7 +162,7 @@ pub fn publish_artifact(args: PublishArtifactArgs) -> Result<PublishArtifactResu
     let response = request
         .body(payload.bytes)
         .send()
-        .with_context(|| format!("Failed to upload artifact to {}", endpoint))?;
+        .map_err(|err| anyhow::anyhow!("Failed to upload artifact to {}: {}", endpoint, err))?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -343,7 +345,7 @@ fn sync_v3_chunks_if_present(base_url: &str, payload: Option<&V3SyncPayload>) ->
         }
     };
 
-    let client = reqwest::blocking::Client::builder()
+    let client = crate::registry_http::blocking_client_builder(base_url)
         .timeout(Duration::from_secs(30))
         .build()
         .context("Failed to create v3 sync client")?;
@@ -368,10 +370,11 @@ fn sync_v3_chunks_if_present(base_url: &str, payload: Option<&V3SyncPayload>) ->
     if let Some(token) = token.as_deref() {
         negotiate = negotiate.bearer_auth(token);
     }
-    let negotiate_response = negotiate.send().with_context(|| {
-        format!(
-            "Failed to negotiate v3 payload sync via {}",
-            negotiate_endpoint
+    let negotiate_response = negotiate.send().map_err(|err| {
+        anyhow::anyhow!(
+            "Failed to negotiate v3 payload sync via {}: {}",
+            negotiate_endpoint,
+            err
         )
     })?;
     if is_sync_not_supported_status(negotiate_response.status()) {
@@ -414,10 +417,12 @@ fn sync_v3_chunks_if_present(base_url: &str, payload: Option<&V3SyncPayload>) ->
         if let Some(token) = token.as_deref() {
             request = request.bearer_auth(token);
         }
-        let response = request.send().with_context(|| {
-            format!(
-                "Failed to upload v3 chunk {} via {}",
-                chunk.raw_hash, chunk_endpoint
+        let response = request.send().map_err(|err| {
+            anyhow::anyhow!(
+                "Failed to upload v3 chunk {} via {}: {}",
+                chunk.raw_hash,
+                chunk_endpoint,
+                err
             )
         })?;
         if is_sync_not_supported_status(response.status()) {
@@ -448,9 +453,13 @@ fn sync_v3_chunks_if_present(base_url: &str, payload: Option<&V3SyncPayload>) ->
     if let Some(token) = token.as_deref() {
         commit = commit.bearer_auth(token);
     }
-    let commit_response = commit
-        .send()
-        .with_context(|| format!("Failed to commit v3 payload sync via {}", commit_endpoint))?;
+    let commit_response = commit.send().map_err(|err| {
+        anyhow::anyhow!(
+            "Failed to commit v3 payload sync via {}: {}",
+            commit_endpoint,
+            err
+        )
+    })?;
     if is_sync_not_supported_status(commit_response.status()) {
         return Ok(());
     }
@@ -478,16 +487,7 @@ fn is_sync_not_supported_status(status: StatusCode) -> bool {
 }
 
 fn normalize_registry_url(raw: &str) -> Result<String> {
-    let url = reqwest::Url::parse(raw)
-        .with_context(|| format!("Invalid --registry URL for artifact publish: {}", raw))?;
-    let scheme = url.scheme().to_ascii_lowercase();
-    if scheme != "http" && scheme != "https" {
-        bail!(
-            "Registry URL must use http or https scheme (got '{}')",
-            url.scheme()
-        );
-    }
-    Ok(raw.trim().trim_end_matches('/').to_string())
+    crate::registry_http::normalize_registry_url(raw, "--registry")
 }
 
 fn classify_upload_failure(status: StatusCode, body: &str) -> PublishArtifactError {

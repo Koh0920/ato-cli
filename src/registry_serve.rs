@@ -133,12 +133,21 @@ struct CapsuleRuntimeConfig {
     targets: HashMap<String, RuntimeTargetConfig>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum RunPermissionMode {
+    Sandbox,
+    Dangerous,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct RuntimeTargetConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     port: Option<u16>,
     #[serde(default)]
     env: HashMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    permission_mode: Option<RunPermissionMode>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -177,6 +186,7 @@ struct UpsertRuntimeConfigRequest {
 struct RuntimeTargetConfigRequest {
     port: Option<u16>,
     env: Option<HashMap<String, String>>,
+    permission_mode: Option<RunPermissionMode>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -233,6 +243,7 @@ struct RunCapsuleRequest {
     target: Option<String>,
     port: Option<u16>,
     env: Option<HashMap<String, String>>,
+    permission_mode: Option<RunPermissionMode>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2264,7 +2275,7 @@ async fn handle_put_runtime_config(
                     }
                 })
                 .collect::<HashMap<_, _>>();
-            if env.is_empty() && raw_config.port.is_none() {
+            if env.is_empty() && raw_config.port.is_none() && raw_config.permission_mode.is_none() {
                 continue;
             }
             targets.insert(
@@ -2272,6 +2283,7 @@ async fn handle_put_runtime_config(
                 RuntimeTargetConfig {
                     port: raw_config.port,
                     env,
+                    permission_mode: raw_config.permission_mode,
                 },
             );
         }
@@ -2369,6 +2381,7 @@ async fn handle_run_local_capsule(
             .and_then(|cfg| normalize_optional_string(cfg.selected_target.clone()))
     });
     let mut effective_port = request.port;
+    let mut effective_permission_mode = request.permission_mode;
     let mut env_overrides = HashMap::new();
 
     if let Some(saved) = saved_runtime_config.as_ref() {
@@ -2384,6 +2397,9 @@ async fn handle_run_local_capsule(
         if let Some(target_config) = saved_target_config {
             if effective_port.is_none() {
                 effective_port = target_config.port;
+            }
+            if effective_permission_mode.is_none() {
+                effective_permission_mode = target_config.permission_mode;
             }
             for (key, value) in &target_config.env {
                 let normalized = key.trim();
@@ -2528,6 +2544,16 @@ async fn handle_run_local_capsule(
     }
     if let Some(port) = effective_port {
         cmd.env("ATO_UI_OVERRIDE_PORT", port.to_string());
+    }
+    match effective_permission_mode {
+        Some(RunPermissionMode::Sandbox) => {
+            cmd.arg("--sandbox");
+        }
+        Some(RunPermissionMode::Dangerous) => {
+            cmd.arg("--dangerously-skip-permissions")
+                .env("CAPSULE_ALLOW_UNSAFE", "1");
+        }
+        None => {}
     }
     if !env_overrides.is_empty() {
         let env_json = match serde_json::to_string(&env_overrides) {

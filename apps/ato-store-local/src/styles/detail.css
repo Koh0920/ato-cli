@@ -360,13 +360,18 @@
 .config-pane {
   flex: 1;
   min-height: 0;
-  overflow-y: auto;
+  overflow: hidden;
   padding: 20px;
   background: var(--bg);
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 16px;
-  align-content: start;
+}
+
+.config-pane-runtime-only {
+  display: flex;
+}
+
+.config-pane-runtime-only .config-section {
+  flex: 1;
+  min-height: 0;
 }
 
 .config-section {
@@ -374,6 +379,11 @@
   border-radius: 10px;
   background: var(--surface);
   overflow: hidden;
+}
+
+.config-section-scrollable {
+  display: flex;
+  flex-direction: column;
 }
 
 .config-section-header {
@@ -466,12 +476,27 @@
   padding: 16px;
   display: grid;
   gap: 10px;
+  align-content: start;
+}
+
+.config-section-scrollable .env-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .env-help {
   margin: 0;
   color: var(--text-3);
   font-size: 12px;
+}
+
+.env-help-warn {
+  color: var(--yellow);
+}
+
+.env-help-error {
+  color: var(--red);
 }
 
 .env-row {
@@ -540,7 +565,7 @@
   }
 
   .config-pane {
-    grid-template-columns: 1fr;
+    overflow: visible;
   }
 }
 

@@ -19,9 +19,14 @@ import {
   Zap,
 } from "lucide-react";
 import { ReadmeRenderer } from "../components/ReadmeRenderer";
-import { TomlViewer } from "../components/TomlViewer";
 import { getProcessStatusMeta } from "../types";
-import type { Capsule, CapsuleRelease, Process, ProcessLogLine } from "../types";
+import type {
+  Capsule,
+  CapsuleRelease,
+  Process,
+  ProcessLogLine,
+  RunPermissionMode,
+} from "../types";
 
 interface DetailPageProps {
   capsule: Capsule;
@@ -35,6 +40,7 @@ interface DetailPageProps {
   logs: ProcessLogLine[];
   selectedTarget: string;
   selectedPort: string;
+  selectedPermissionMode: RunPermissionMode;
   canRun: boolean;
   openReady: boolean;
   hasRuntimeConfigChanges: boolean;
@@ -53,6 +59,11 @@ interface DetailPageProps {
   onEnvRemove: (capsuleId: string, target: string, key: string) => void;
   onTargetChange: (capsuleId: string, target: string) => void;
   onPortChange: (capsuleId: string, target: string, value: string) => void;
+  onPermissionModeChange: (
+    capsuleId: string,
+    target: string,
+    value: RunPermissionMode,
+  ) => void;
   onSaveRuntimeConfig: (capsule: Capsule) => void;
 }
 
@@ -86,11 +97,17 @@ function IconForCapsule({ iconKey }: { iconKey: Capsule["iconKey"] }): JSX.Eleme
   return <Package {...common} />;
 }
 
-function renderFallbackToml(capsule: Capsule, envValues: Record<string, string>): string {
-  const env = Object.entries(envValues)
-    .map(([key, value]) => `${key} = "${value}"`)
-    .join("\n");
-  return `[capsule]\nname = "${capsule.name}"\nversion = "${capsule.version.replace(/^v/i, "")}"\npublisher = "${capsule.publisher}"\n\n[env]\n${env}`;
+function requiresPermissionGrant(capsule: Capsule, targetLabel: string): boolean {
+  const target = capsule.targets.find((entry) => entry.label === targetLabel);
+  if (!target) {
+    return false;
+  }
+  const runtime = target.runtime.trim().toLowerCase();
+  const driver = target.driver.trim().toLowerCase();
+  return (
+    (runtime === "source" && (driver === "python" || driver === "native")) ||
+    (runtime === "web" && driver === "python")
+  );
 }
 
 function signatureTone(signatureStatus: string): string {
@@ -119,6 +136,7 @@ export function DetailPage({
   logs,
   selectedTarget,
   selectedPort,
+  selectedPermissionMode,
   canRun,
   openReady,
   hasRuntimeConfigChanges,
@@ -137,19 +155,21 @@ export function DetailPage({
   onEnvRemove,
   onTargetChange,
   onPortChange,
+  onPermissionModeChange,
   onSaveRuntimeConfig,
 }: DetailPageProps): JSX.Element {
   const [tab, setTab] = useState<DetailTab>("docs");
-  const [configCardOpen, setConfigCardOpen] = useState<{ manifest: boolean; runtime: boolean }>({
-    manifest: true,
-    runtime: true,
-  });
+  const [runtimeConfigOpen, setRuntimeConfigOpen] = useState(true);
   const logScrollRef = useRef<HTMLDivElement | null>(null);
   const status = getProcessStatusMeta(process?.status ?? "stopped");
   const isRunning = Boolean(process?.active);
-  const rawToml = useMemo(
-    () => capsule.rawToml ?? renderFallbackToml(capsule, envValues),
-    [capsule, envValues],
+  const selectedTargetMeta = useMemo(
+    () => capsule.targets.find((target) => target.label === selectedTarget),
+    [capsule.targets, selectedTarget],
+  );
+  const targetNeedsPermissionGrant = requiresPermissionGrant(
+    capsule,
+    selectedTarget,
   );
 
   useEffect(() => {
@@ -191,20 +211,14 @@ export function DetailPage({
   }, [capsule.id, storeMetadataIconPath, storeMetadataText]);
 
   useEffect(() => {
-    setConfigCardOpen({
-      manifest: true,
-      runtime: true,
-    });
+    setRuntimeConfigOpen(true);
   }, [capsule.id]);
 
-  const toggleConfigCard = (key: "manifest" | "runtime"): void => {
+  const toggleRuntimeConfigCard = (): void => {
     if (!isMobile) {
       return;
     }
-    setConfigCardOpen((prev) => ({
-      ...prev,
-      [key]: !prev[key],
-    }));
+    setRuntimeConfigOpen((prev) => !prev);
   };
 
   return (
@@ -333,167 +347,211 @@ export function DetailPage({
       ) : null}
 
       {tab === "config" ? (
-        <div className="config-pane" role="tabpanel" aria-label="Configuration">
-          <section className={`config-section ${isMobile && !configCardOpen.manifest ? "collapsed" : ""}`}>
+        <div
+          className="config-pane config-pane-runtime-only"
+          role="tabpanel"
+          aria-label="Configuration"
+        >
+          <section
+            className={`config-section config-section-scrollable ${
+              isMobile && !runtimeConfigOpen ? "collapsed" : ""
+            }`}
+          >
             <button
               className="config-section-header config-section-toggle"
               type="button"
-              aria-expanded={!isMobile || configCardOpen.manifest}
-              aria-controls="config-card-manifest"
-              onClick={() => toggleConfigCard("manifest")}
-            >
-              <span className="config-section-title">
-                <span>{"{}"}</span> capsule.toml
-              </span>
-              {isMobile ? (
-                <ChevronDown
-                  className={`config-section-chevron ${configCardOpen.manifest ? "open" : ""}`}
-                  size={14}
-                  strokeWidth={1.5}
-                />
-              ) : null}
-            </button>
-            {!isMobile || configCardOpen.manifest ? (
-              <div id="config-card-manifest">
-                <TomlViewer rawToml={rawToml} />
-              </div>
-            ) : null}
-          </section>
-
-          <section className={`config-section ${isMobile && !configCardOpen.runtime ? "collapsed" : ""}`}>
-            <button
-              className="config-section-header config-section-toggle"
-              type="button"
-              aria-expanded={!isMobile || configCardOpen.runtime}
+              aria-expanded={!isMobile || runtimeConfigOpen}
               aria-controls="config-card-runtime"
-              onClick={() => toggleConfigCard("runtime")}
+              onClick={toggleRuntimeConfigCard}
             >
               <span className="config-section-title">
                 <Settings2 size={13} strokeWidth={1.5} /> Runtime Configuration
               </span>
               {isMobile ? (
                 <ChevronDown
-                  className={`config-section-chevron ${configCardOpen.runtime ? "open" : ""}`}
+                  className={`config-section-chevron ${runtimeConfigOpen ? "open" : ""}`}
                   size={14}
                   strokeWidth={1.5}
                 />
               ) : null}
             </button>
-            {!isMobile || configCardOpen.runtime ? (
+            {!isMobile || runtimeConfigOpen ? (
               <div className="env-body" id="config-card-runtime">
                 <label className="env-row">
-                <span className="env-key">TARGET</span>
-                <select
-                  className="input env-input"
-                  value={selectedTarget}
-                  onChange={(event) => onTargetChange(capsule.id, event.target.value)}
-                >
-                  {capsule.targets.map((target) => (
-                    <option key={target.label} value={target.label}>
-                      {target.label} ({target.runtime})
-                    </option>
-                  ))}
-                </select>
-              </label>
+                  <span className="env-key">TARGET</span>
+                  <select
+                    className="input env-input"
+                    value={selectedTarget}
+                    onChange={(event) => onTargetChange(capsule.id, event.target.value)}
+                  >
+                    {capsule.targets.map((target) => (
+                      <option key={target.label} value={target.label}>
+                        {target.label} ({target.runtime}
+                        {target.driver ? `/${target.driver}` : ""})
+                      </option>
+                    ))}
+                  </select>
+                </label>
 
-              <label className="env-row">
-                <span className="env-key">PORT</span>
-                <input
-                  className="input env-input"
-                  value={selectedPort}
-                  inputMode="numeric"
-                  pattern="[0-9]*"
-                  onChange={(event) => onPortChange(capsule.id, selectedTarget, event.target.value)}
-                />
-              </label>
+                <label className="env-row">
+                  <span className="env-key">PORT</span>
+                  <input
+                    className="input env-input"
+                    value={selectedPort}
+                    inputMode="numeric"
+                    pattern="[0-9]*"
+                    onChange={(event) =>
+                      onPortChange(capsule.id, selectedTarget, event.target.value)
+                    }
+                  />
+                </label>
 
-              <p className="env-help">Overrides applied to the next spawned instance.</p>
-              {envRows.map((row) => (
-                <div key={row.key} className="env-row env-row-kv">
+                {targetNeedsPermissionGrant ? (
+                  <>
+                    <label className="env-row">
+                      <span className="env-key">PERMISSIONS</span>
+                      <select
+                        className="input env-input"
+                        value={selectedPermissionMode}
+                        onChange={(event) =>
+                          onPermissionModeChange(
+                            capsule.id,
+                            selectedTarget,
+                            event.target.value as RunPermissionMode,
+                          )
+                        }
+                      >
+                        <option value="standard">Standard (blocked for Tier2)</option>
+                        <option value="sandbox">Sandbox</option>
+                        <option value="dangerous">Dangerous</option>
+                      </select>
+                    </label>
+                    <p
+                      className={`env-help ${
+                        selectedPermissionMode === "dangerous"
+                          ? "env-help-warn"
+                          : selectedPermissionMode === "standard"
+                            ? "env-help-error"
+                            : ""
+                      }`}
+                    >
+                      {selectedPermissionMode === "dangerous"
+                        ? "Dangerous mode bypasses Ato runtime permission barriers for this target."
+                        : selectedPermissionMode === "sandbox"
+                          ? "Sandbox enables Tier2 execution using the native OS sandbox."
+                          : "This target needs Sandbox or Dangerous before GUI Run can proceed."}
+                    </p>
+                  </>
+                ) : (
+                  <p className="env-help">
+                    {selectedTargetMeta
+                      ? `This target runs as ${selectedTargetMeta.runtime}${
+                          selectedTargetMeta.driver
+                            ? `/${selectedTargetMeta.driver}`
+                            : ""
+                        } and does not need extra permission flags.`
+                      : "This target does not need extra permission flags."}
+                  </p>
+                )}
+
+                <p className="env-help">
+                  Overrides applied to the next spawned instance.
+                </p>
+                {envRows.map((row) => (
+                  <div key={row.key} className="env-row env-row-kv">
+                    <input
+                      className="input env-key-input"
+                      value={row.key}
+                      disabled
+                      aria-label={`Environment key ${row.key}`}
+                    />
+                    <input
+                      className="input env-input"
+                      value={row.value}
+                      onChange={(event) =>
+                        onEnvChange(
+                          capsule.id,
+                          selectedTarget,
+                          row.key,
+                          event.target.value,
+                        )
+                      }
+                    />
+                    <button
+                      className="icon-btn env-remove-btn"
+                      type="button"
+                      aria-label={`Remove ${row.key}`}
+                      disabled={row.required || row.base}
+                      onClick={() =>
+                        onEnvRemove(capsule.id, selectedTarget, row.key)
+                      }
+                    >
+                      <Trash2 size={13} strokeWidth={1.5} />
+                    </button>
+                  </div>
+                ))}
+                <div className="env-row env-row-kv env-row-add">
                   <input
                     className="input env-key-input"
-                    value={row.key}
-                    disabled
-                    aria-label={`Environment key ${row.key}`}
+                    value={draftEnvKey}
+                    placeholder="KEY"
+                    onChange={(event) => setDraftEnvKey(event.target.value)}
                   />
                   <input
                     className="input env-input"
-                    value={row.value}
-                    onChange={(event) => onEnvChange(capsule.id, selectedTarget, row.key, event.target.value)}
+                    value={draftEnvValue}
+                    placeholder="value"
+                    onChange={(event) => setDraftEnvValue(event.target.value)}
                   />
                   <button
-                    className="icon-btn env-remove-btn"
+                    className="icon-btn"
                     type="button"
-                    aria-label={`Remove ${row.key}`}
-                    disabled={row.required || row.base}
-                    onClick={() => onEnvRemove(capsule.id, selectedTarget, row.key)}
+                    aria-label="Add environment variable"
+                    disabled={draftEnvKey.trim().length === 0}
+                    onClick={() => {
+                      const key = draftEnvKey.trim();
+                      if (!key) {
+                        return;
+                      }
+                      onEnvAdd(capsule.id, selectedTarget, key, draftEnvValue);
+                      setDraftEnvKey("");
+                      setDraftEnvValue("");
+                    }}
                   >
-                    <Trash2 size={13} strokeWidth={1.5} />
+                    <Plus size={13} strokeWidth={1.5} />
                   </button>
                 </div>
-              ))}
-              <div className="env-row env-row-kv env-row-add">
-                <input
-                  className="input env-key-input"
-                  value={draftEnvKey}
-                  placeholder="KEY"
-                  onChange={(event) => setDraftEnvKey(event.target.value)}
-                />
-                <input
-                  className="input env-input"
-                  value={draftEnvValue}
-                  placeholder="value"
-                  onChange={(event) => setDraftEnvValue(event.target.value)}
-                />
+
+                <div className="env-divider" />
                 <button
-                  className="icon-btn"
+                  className="btn btn-primary"
                   type="button"
-                  aria-label="Add environment variable"
-                  disabled={draftEnvKey.trim().length === 0}
-                  onClick={() => {
-                    const key = draftEnvKey.trim();
-                    if (!key) {
-                      return;
-                    }
-                    onEnvAdd(capsule.id, selectedTarget, key, draftEnvValue);
-                    setDraftEnvKey("");
-                    setDraftEnvValue("");
-                  }}
+                  disabled={!hasRuntimeConfigChanges || isSavingRuntimeConfig}
+                  onClick={() => onSaveRuntimeConfig(capsule)}
                 >
-                  <Plus size={13} strokeWidth={1.5} />
+                  {isSavingRuntimeConfig ? "Saving..." : "Save configuration"}
                 </button>
-              </div>
 
-              <div className="env-divider" />
-              <button
-                className="btn btn-primary"
-                type="button"
-                disabled={!hasRuntimeConfigChanges || isSavingRuntimeConfig}
-                onClick={() => onSaveRuntimeConfig(capsule)}
-              >
-                {isSavingRuntimeConfig ? "Saving..." : "Save configuration"}
-              </button>
-
-              <div className="env-divider" />
-              <label className="env-row">
-                <span className="env-key">ICON_FILE_PATH</span>
-                <input
-                  className="input env-input"
-                  value={metadataIconPathInput}
-                  placeholder="~/icons/sample.png"
-                  onChange={(event) => setMetadataIconPathInput(event.target.value)}
-                />
-              </label>
-              <label className="env-row env-row-multiline">
-                <span className="env-key">TEXT</span>
-                <textarea
-                  className="input env-input env-textarea"
-                  value={metadataTextInput}
-                  placeholder="Store listing description"
-                  onChange={(event) => setMetadataTextInput(event.target.value)}
-                />
-              </label>
-              {metadataError ? <p className="env-error">{metadataError}</p> : null}
+                <div className="env-divider" />
+                <label className="env-row">
+                  <span className="env-key">ICON_FILE_PATH</span>
+                  <input
+                    className="input env-input"
+                    value={metadataIconPathInput}
+                    placeholder="~/icons/sample.png"
+                    onChange={(event) => setMetadataIconPathInput(event.target.value)}
+                  />
+                </label>
+                <label className="env-row env-row-multiline">
+                  <span className="env-key">TEXT</span>
+                  <textarea
+                    className="input env-input env-textarea"
+                    value={metadataTextInput}
+                    placeholder="Store listing description"
+                    onChange={(event) => setMetadataTextInput(event.target.value)}
+                  />
+                </label>
+                {metadataError ? <p className="env-error">{metadataError}</p> : null}
                 <button
                   className="btn btn-primary"
                   type="button"
@@ -501,9 +559,16 @@ export function DetailPage({
                   onClick={() => {
                     setMetadataSaving(true);
                     setMetadataError("");
-                    void onSaveStoreMetadata(capsule, metadataIconPathInput, metadataTextInput)
+                    void onSaveStoreMetadata(
+                      capsule,
+                      metadataIconPathInput,
+                      metadataTextInput,
+                    )
                       .catch((error: unknown) => {
-                        const message = error instanceof Error ? error.message : "metadata update failed";
+                        const message =
+                          error instanceof Error
+                            ? error.message
+                            : "metadata update failed";
                         setMetadataError(message);
                       })
                       .finally(() => setMetadataSaving(false));

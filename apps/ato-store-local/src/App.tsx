@@ -16,6 +16,7 @@ import type {
   Process,
   ProcessLogLine,
   ProcessStatus,
+  RunPermissionMode,
 } from "./types";
 import { detectPlatform, toOsFilterLabel } from "./utils/platform";
 import { loadRegistryAuthToken, saveRegistryAuthToken } from "./utils/storage";
@@ -31,6 +32,9 @@ type ConfirmState =
       capsule: Capsule;
       target: string;
       runtime: string;
+      driver: string;
+      permissionMode: RunPermissionMode;
+      requiresPermissionGrant: boolean;
       port: number | undefined;
       env: Record<string, string>;
     }
@@ -133,6 +137,8 @@ interface ApiRuntimeConfig {
 interface ApiRuntimeTargetConfig {
   port?: number | string | null;
   env?: Record<string, string>;
+  permission_mode?: string | null;
+  permissionMode?: string | null;
 }
 
 interface ApiReleaseRow {
@@ -222,6 +228,7 @@ const WEB_RUNTIME_DEFAULT_OS_ARCH: string[] = [
 interface RuntimeTargetOverride {
   port?: number;
   env: Record<string, string>;
+  permissionMode?: Exclude<RunPermissionMode, "standard">;
 }
 
 interface CapsuleRuntimeOverride {
@@ -393,6 +400,53 @@ function parseNumberPort(value: unknown): number | null {
   return null;
 }
 
+function normalizeRunPermissionMode(
+  value: unknown,
+): Exclude<RunPermissionMode, "standard"> | undefined {
+  const normalized =
+    typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (normalized === "sandbox") {
+    return "sandbox";
+  }
+  if (normalized === "dangerous") {
+    return "dangerous";
+  }
+  return undefined;
+}
+
+function parseTargetDriver(target: Record<string, unknown>): string {
+  const explicit =
+    typeof target.driver === "string" ? target.driver.trim().toLowerCase() : "";
+  if (explicit) {
+    return explicit;
+  }
+  const language =
+    typeof target.language === "string"
+      ? target.language.trim().toLowerCase()
+      : "";
+  if (language === "python" || language === "python3") {
+    return "python";
+  }
+  if (language === "node" || language === "nodejs") {
+    return "node";
+  }
+  if (language === "deno") {
+    return "deno";
+  }
+  return "";
+}
+
+function requiresPermissionGrant(target: CapsuleTarget | undefined): boolean {
+  if (!target) {
+    return false;
+  }
+  const runtime = target.runtime.trim().toLowerCase();
+  const driver = target.driver.trim().toLowerCase();
+  return (
+    (runtime === "source" && (driver === "python" || driver === "native")) ||
+    (runtime === "web" && driver === "python")
+  );
+}
 function cloneRuntimeOverride(
   value: CapsuleRuntimeOverride | undefined,
 ): CapsuleRuntimeOverride {
@@ -404,6 +458,7 @@ function cloneRuntimeOverride(
     targets[label] = {
       port: target.port,
       env: { ...target.env },
+      permissionMode: target.permissionMode,
     };
   });
   return {
@@ -430,12 +485,14 @@ function compactRuntimeOverride(
       env[key] = envValue;
     });
     const port = parseNumberPort(target.port);
-    if (!port && Object.keys(env).length === 0) {
+    const permissionMode = normalizeRunPermissionMode(target.permissionMode);
+    if (!port && Object.keys(env).length === 0 && !permissionMode) {
       return;
     }
     targets[label] = {
       ...(port ? { port } : {}),
       env,
+      ...(permissionMode ? { permissionMode } : {}),
     };
   });
 
@@ -475,12 +532,16 @@ function runtimeOverrideFromApi(
       env[key] = typeof envValue === "string" ? envValue : String(envValue);
     });
     const port = parseNumberPort(rawTarget?.port ?? null);
-    if (!port && Object.keys(env).length === 0) {
+    const permissionMode = normalizeRunPermissionMode(
+      rawTarget?.permissionMode ?? rawTarget?.permission_mode ?? null,
+    );
+    if (!port && Object.keys(env).length === 0 && !permissionMode) {
       return;
     }
     targets[label] = {
       ...(port ? { port } : {}),
       env,
+      ...(permissionMode ? { permissionMode } : {}),
     };
   });
   const normalized = compactRuntimeOverride({
@@ -644,6 +705,7 @@ function parseTargets(manifest: unknown): {
     parsedTargets.push({
       label: key,
       runtime,
+      driver: parseTargetDriver(target),
       port: parseNumberPort(target.port) ?? globalPort,
       env,
       requiredEnv: Array.from(requiredEnvSet),
@@ -1162,6 +1224,14 @@ export default function App(): JSX.Element {
     [runtimeOverrides],
   );
 
+  const resolvePermissionMode = useCallback(
+    (capsule: Capsule, targetLabel: string): RunPermissionMode => {
+      const override = runtimeOverrides[capsule.id]?.targets[targetLabel];
+      return override?.permissionMode ?? "standard";
+    },
+    [runtimeOverrides],
+  );
+
   const requestRun = (capsule: Capsule): void => {
     const target = resolveSelectedTarget(capsule);
     const targetMeta = capsule.targets.find((entry) => entry.label === target);
@@ -1178,6 +1248,9 @@ export default function App(): JSX.Element {
       capsule,
       target,
       runtime: targetMeta?.runtime ?? "",
+      driver: targetMeta?.driver ?? "",
+      permissionMode: resolvePermissionMode(capsule, target),
+      requiresPermissionGrant: requiresPermissionGrant(targetMeta),
       port,
       env,
     });
@@ -1368,6 +1441,9 @@ export default function App(): JSX.Element {
             target: state.target || undefined,
             port: state.port,
             env: state.env,
+            ...(state.permissionMode !== "standard"
+              ? { permission_mode: state.permissionMode }
+              : {}),
           }),
         },
       );
@@ -1560,6 +1636,9 @@ export default function App(): JSX.Element {
                   {
                     ...(target.port ? { port: target.port } : {}),
                     env: target.env,
+                    ...(target.permissionMode
+                      ? { permission_mode: target.permissionMode }
+                      : {}),
                   },
                 ],
               ),
@@ -1747,6 +1826,26 @@ export default function App(): JSX.Element {
     });
   };
 
+  const updatePermissionMode = (
+    capsuleId: string,
+    target: string,
+    value: RunPermissionMode,
+  ): void => {
+    const normalizedTarget = target.trim();
+    if (!normalizedTarget) {
+      return;
+    }
+    updateRuntimeConfig(capsuleId, (draft) => {
+      if (!draft.targets[normalizedTarget]) {
+        draft.targets[normalizedTarget] = { env: {} };
+      }
+      if (value === "standard") {
+        delete draft.targets[normalizedTarget].permissionMode;
+      } else {
+        draft.targets[normalizedTarget].permissionMode = value;
+      }
+    });
+  };
   const updateEnv = (
     capsuleId: string,
     target: string,
@@ -1799,7 +1898,8 @@ export default function App(): JSX.Element {
       delete targetOverride.env[normalizedKey];
       if (
         Object.keys(targetOverride.env).length === 0 &&
-        !targetOverride.port
+        !targetOverride.port &&
+        !targetOverride.permissionMode
       ) {
         delete draft.targets[normalizedTarget];
       }
@@ -2035,6 +2135,7 @@ export default function App(): JSX.Element {
       const baseEnvKeys = resolveBaseEnvKeys(capsule, target);
       const requiredEnvKeys = resolveRequiredEnvKeys(capsule, target);
       const selectedPort = resolvePortValue(capsule, target);
+      const selectedPermissionMode = resolvePermissionMode(capsule, target);
       content = (
         <DetailPage
           capsule={capsule}
@@ -2042,6 +2143,7 @@ export default function App(): JSX.Element {
           process={process}
           selectedTarget={target}
           selectedPort={selectedPort}
+          selectedPermissionMode={selectedPermissionMode}
           canRun={capsule.targets.length > 0 || !capsule.detailLoaded}
           hasRuntimeConfigChanges={Boolean(
             dirtyRuntimeConfigCapsules[capsule.id],
@@ -2077,6 +2179,7 @@ export default function App(): JSX.Element {
           onEnvRemove={removeEnv}
           onTargetChange={updateTargetSelection}
           onPortChange={updatePort}
+          onPermissionModeChange={updatePermissionMode}
           onSaveRuntimeConfig={requestSaveRuntimeConfig}
         />
       );
@@ -2141,11 +2244,20 @@ export default function App(): JSX.Element {
     : confirmState.kind === "run"
       ? [
           `Capsule: ${confirmState.capsule.scopedId}`,
-          `Target: ${confirmState.target || "(default)"}`,
+          `Target: ${confirmState.target || "(default)"} (${confirmState.runtime}${
+            confirmState.driver ? `/${confirmState.driver}` : ""
+          })`,
           `Port: ${confirmState.port ?? "-"}`,
           `Env keys: ${Object.keys(confirmState.env).length}`,
-          `Command: ato run ${confirmState.capsule.scopedId} --registry ${window.location.origin} --yes --background${
+          `Permissions: ${confirmState.permissionMode}`,
+          `Command: ato run ${confirmState.capsule.scopedId} --registry ${window.location.origin} --yes${
             confirmState.target ? ` --target ${confirmState.target}` : ""
+          }${
+            confirmState.permissionMode === "sandbox"
+              ? " --sandbox"
+              : confirmState.permissionMode === "dangerous"
+                ? " --dangerously-skip-permissions"
+                : ""
           }`,
         ]
       : confirmState.kind === "stop"
@@ -2184,11 +2296,59 @@ export default function App(): JSX.Element {
                   "Scope: All published versions",
                 ];
 
+  const confirmExtraContent =
+    confirmState?.kind === "run" && confirmState.requiresPermissionGrant ? (
+      <div className="confirm-extra">
+        <label
+          className="confirm-auth-label"
+          htmlFor="confirm-run-permission-mode"
+        >
+          Execution permissions
+        </label>
+        <select
+          id="confirm-run-permission-mode"
+          className="input confirm-auth-input mono"
+          value={confirmState.permissionMode}
+          onChange={(event) => {
+            const next = event.target.value as RunPermissionMode;
+            setConfirmState((prev) =>
+              prev && prev.kind === "run"
+                ? { ...prev, permissionMode: next }
+                : prev,
+            );
+          }}
+          disabled={isSubmittingConfirm}
+        >
+          <option value="standard">Standard (will be blocked)</option>
+          <option value="sandbox">Sandbox</option>
+          <option value="dangerous">Dangerous</option>
+        </select>
+        <p
+          className={`confirm-note ${
+            confirmState.permissionMode === "dangerous"
+              ? "warn"
+              : confirmState.permissionMode === "standard"
+                ? "error"
+                : ""
+          }`}
+        >
+          {confirmState.permissionMode === "dangerous"
+            ? "Dangerous mode bypasses Ato runtime permission barriers for this launch."
+            : confirmState.permissionMode === "sandbox"
+              ? "Sandbox runs Tier2 targets under the native OS sandbox."
+              : "Tier2 targets require Sandbox or Dangerous before Run can proceed."}
+        </p>
+      </div>
+    ) : null;
   const confirmAuthRequired = Boolean(
     confirmState && (writeAuthRequired || confirmState.kind === "save-config"),
   );
   const confirmDisabled = Boolean(
-    isSubmittingConfirm || (confirmAuthRequired && !registryAuthToken.trim()),
+    isSubmittingConfirm ||
+    (confirmAuthRequired && !registryAuthToken.trim()) ||
+    (confirmState?.kind === "run" &&
+      confirmState.requiresPermissionGrant &&
+      confirmState.permissionMode === "standard"),
   );
 
   return (
@@ -2249,6 +2409,7 @@ export default function App(): JSX.Element {
                   : "Confirm"
         }
         onAuthTokenChange={updateRegistryAuthToken}
+        extraContent={confirmExtraContent}
         onClose={() => setConfirmState(null)}
         onConfirm={() => {
           void confirmAction();
