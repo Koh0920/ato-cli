@@ -14,11 +14,14 @@ ato ps
 ato close --id <capsule-id> | --name <name> [--all] [--force]
 ato logs --id <capsule-id> [--follow]
 ato install <publisher/slug> [--registry <url>]
-ato build [dir] [--force-large-payload]
-ato publish [--registry <url>] [--artifact <file.capsule>] [--scoped-id <publisher/slug>] [--allow-existing] [--prepare] [--build] [--deploy] [--legacy-full-publish] [--force-large-payload]
+ato build [dir] [--strict-v3] [--force-large-payload]
+ato publish [--registry <url>] [--artifact <file.capsule>] [--scoped-id <publisher/slug>] [--allow-existing] [--prepare] [--build] [--deploy] [--legacy-full-publish] [--fix] [--no-tui] [--force-large-payload]
 ato publish --dry-run
 ato publish --ci
+ato gen-ci
 ato search [query]
+ato source sync-status --source-id <id> --sync-run-id <id> [--registry <url>]
+ato source rebuild --source-id <id> [--ref <branch|tag|sha>] [--wait] [--registry <url>]
 ato config engine install --engine nacelle [--version <ver>]
 ato setup --engine nacelle [--version <ver>] # compatibility command (deprecated)
 ato registry serve --host 127.0.0.1 --port 18787 [--auth-token <token>]
@@ -69,6 +72,12 @@ cargo build -p ato-cli
 - `--legacy-full-publish` (official only) temporarily restores legacy default (`prepare -> build -> deploy`), is deprecated, and is scheduled for removal in the next major release.
 - `--ci` / `--dry-run` cannot be combined with phase flags.
 
+Official registry helpers:
+
+- `ato gen-ci` generates the fixed GitHub Actions workflow for OIDC publish.
+- `ato publish --fix` applies the official workflow fix once, then reruns diagnostics.
+- `ato publish --no-tui` disables the interactive handoff UI and prints CI guidance directly.
+
 ## Dock-first Flow (Personal Dock)
 
 The Dock-first path uses existing commands (no new subcommands):
@@ -109,6 +118,24 @@ Run this only when `core/proto/tsnet/v1/tsnet.proto` changes.
 ./core/scripts/gen_tsnet_proto.sh
 ```
 
+## Source Sync Operations
+
+Use these commands for source-backed registry workflows:
+
+```bash
+# inspect a sync run
+ato source sync-status --source-id <source-id> --sync-run-id <sync-run-id> --registry <url>
+
+# trigger rebuild / re-sign and optionally wait for status
+ato source rebuild --source-id <source-id> --ref <branch|tag|sha> --wait --registry <url>
+```
+
+Notes:
+
+- `sync-status` is read-only and can emit JSON with `--json`.
+- `rebuild` can be used without `--ref`; the registry default ref is used.
+- `rebuild --wait` triggers then polls the resulting sync run status.
+
 ## Local Registry E2E
 
 ```bash
@@ -132,6 +159,12 @@ Notes:
 - In enterprise CI, attach `--allow-existing` to retry paths to make reruns deterministic and safe.
 - Version conflict is reported as `E202` with next actions (`bump version`, `--allow-existing`, or reset local registry).
 
+Local registry Web UI:
+
+- The detail page stores per-target runtime config under `/v1/local/.../runtime-config`.
+- You can save target-specific `env` and `port` overrides from the UI.
+- Tier2 targets can also persist execution permission mode (`sandbox` or `dangerous`) and reuse it on later runs.
+
 ## Cross-Device Publish (VPN / Tailscale)
 
 ```bash
@@ -153,6 +186,11 @@ If missing or empty, execution stops fail-closed.
 
 - `targets.<label>.required_env = ["KEY1", "KEY2"]` (recommended)
 - Backward compatibility: `targets.<label>.env.ATO_ORCH_REQUIRED_ENVS = "KEY1,KEY2"`
+
+## Build Strictness
+
+`ato build --strict-v3` disables fallback when `source_digest` / CAS(v3 path) is unavailable.
+Use it when you want build diagnostics to fail immediately instead of falling back to a looser manifest path.
 
 ## Dynamic App Capsule Recipe (Web + Services Supervisor)
 
