@@ -49,9 +49,12 @@ export interface StoreMetadata {
   iconUrl?: string;
 }
 
+export type RunPermissionMode = "standard" | "sandbox" | "dangerous";
+
 export interface CapsuleTarget {
   label: string;
   runtime: string;
+  driver: string;
   port: number | null;
   env: Record<string, string>;
   requiredEnv: string[];

@@ -14,18 +14,18 @@ enum NpmProgram {
     Bootstrapped(PathBuf),
 }
 
-fn npm_status(npm_program: &NpmProgram, ui_dir: &Path, args: &[&str]) -> std::io::Result<ExitStatus> {
+fn npm_status(
+    npm_program: &NpmProgram,
+    ui_dir: &Path,
+    args: &[&str],
+) -> std::io::Result<ExitStatus> {
     let mut command = match npm_program {
         NpmProgram::System => Command::new("npm"),
         #[cfg(windows)]
         NpmProgram::Bootstrapped(path) => Command::new(path),
     };
 
-    command
-        .arg("--prefix")
-        .arg(ui_dir)
-        .args(args)
-        .status()
+    command.arg("--prefix").arg(ui_dir).args(args).status()
 }
 
 fn command_available(program: &str) -> bool {
@@ -84,7 +84,10 @@ fn warn_skip_ui_build_without_npm(ui_dir: &Path, err: &std::io::Error) {
 }
 
 #[cfg(windows)]
-fn ensure_windows_bootstrapped_npm(toolchain_dir: &Path, version: &str) -> std::io::Result<PathBuf> {
+fn ensure_windows_bootstrapped_npm(
+    toolchain_dir: &Path,
+    version: &str,
+) -> std::io::Result<PathBuf> {
     let arch = match env::var("CARGO_CFG_TARGET_ARCH").ok().as_deref() {
         Some("x86_64") => "x64",
         Some("aarch64") => "arm64",
