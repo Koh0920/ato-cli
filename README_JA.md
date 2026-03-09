@@ -14,11 +14,14 @@ ato ps
 ato close --id <capsule-id> | --name <name> [--all] [--force]
 ato logs --id <capsule-id> [--follow]
 ato install <publisher/slug> [--registry <url>]
-ato build [dir] [--force-large-payload]
-ato publish [--registry <url>] [--artifact <file.capsule>] [--scoped-id <publisher/slug>] [--allow-existing] [--prepare] [--build] [--deploy] [--legacy-full-publish] [--force-large-payload]
+ato build [dir] [--strict-v3] [--force-large-payload]
+ato publish [--registry <url>] [--artifact <file.capsule>] [--scoped-id <publisher/slug>] [--allow-existing] [--prepare] [--build] [--deploy] [--legacy-full-publish] [--fix] [--no-tui] [--force-large-payload]
 ato publish --dry-run
 ato publish --ci
+ato gen-ci
 ato search [query]
+ato source sync-status --source-id <id> --sync-run-id <id> [--registry <url>]
+ato source rebuild --source-id <id> [--ref <branch|tag|sha>] [--wait] [--registry <url>]
 ato config engine install --engine nacelle [--version <ver>]
 ato setup --engine nacelle [--version <ver>] # 互換コマンド（非推奨）
 ato registry serve --host 127.0.0.1 --port 18787 [--auth-token <token>]
@@ -69,6 +72,12 @@ cargo build -p ato-cli
 - `--legacy-full-publish`（official専用）は旧既定（`prepare -> build -> deploy`）へ一時的に戻す互換フラグです。非推奨で、次回メジャーリリースで削除予定です。
 - `--ci` / `--dry-run` とフェーズ指定は併用不可
 
+公式レジストリ向け補助コマンド:
+
+- `ato gen-ci` は OIDC publish 用の GitHub Actions ワークフローを生成します。
+- `ato publish --fix` は公式 workflow の不足を一度だけ自動修正し、その後に診断を再実行します。
+- `ato publish --no-tui` は対話 UI を出さず、CI 向けガイダンスをそのまま表示します。
+
 ## Dock-first フロー（Personal Dock）
 
 Dock-first では既存コマンドだけで運用します（新サブコマンドなし）。
@@ -109,6 +118,24 @@ ATO_TOKEN=pwd ato publish --registry http://127.0.0.1:18787 --artifact ./<name>.
 ./core/scripts/gen_tsnet_proto.sh
 ```
 
+## Source 同期操作
+
+source 起点のレジストリ運用では、次のコマンドを使います。
+
+```bash
+# sync run の状態確認
+ato source sync-status --source-id <source-id> --sync-run-id <sync-run-id> --registry <url>
+
+# rebuild / re-sign を起動し、必要なら完了まで待つ
+ato source rebuild --source-id <source-id> --ref <branch|tag|sha> --wait --registry <url>
+```
+
+補足:
+
+- `sync-status` は読み取り専用で、`--json` にも対応します。
+- `rebuild` は `--ref` を省略できます。その場合はレジストリ既定の ref を使います。
+- `rebuild --wait` は rebuild 起動後、その sync run の状態を追跡します。
+
 ## ローカルレジストリ E2E
 
 ```bash
@@ -132,6 +159,12 @@ ato run <publisher>/<slug> --registry http://127.0.0.1:18787 --yes
 - エンタープライズCIの再試行経路では、`--allow-existing` を付与して再実行を安全に決定論化することを推奨します。
 - version 競合は `E202` で返り、次アクション（version更新 / `--allow-existing` / ローカルレジストリ初期化）を表示します。
 
+ローカルレジストリ Web UI:
+
+- 詳細画面は `/v1/local/.../runtime-config` に target ごとの runtime config を保存します。
+- UI から target 別の `env` / `port` override を保存できます。
+- Tier2 target では実行権限モード (`sandbox` / `dangerous`) も保存でき、次回実行時に再利用されます。
+
 ## 別デバイス公開（VPN / Tailscale 想定）
 
 ```bash
@@ -153,9 +186,9 @@ ATO_TOKEN=pwd ato publish --registry http://100.x.y.z:18787 --artifact ./<name>.
 - `targets.<label>.required_env = ["KEY1", "KEY2"]`（推奨）
 - 既存互換: `targets.<label>.env.ATO_ORCH_REQUIRED_ENVS = "KEY1,KEY2"`
 
-## 動的アプリのカプセル化手順（Web + Deno Orchestrator）
+## 動的アプリのカプセル化手順（Web + Services Supervisor）
 
-複数サービス（例: dashboard + API + worker）を1つのカプセルで動かす場合は、`web/deno` ターゲット1つに統一し、`ato-entry.ts` で子プロセスを起動します。
+複数サービス（例: dashboard + API + worker）を1つのカプセルで動かす場合は、トップレベルの `[services]` を持つ `web/deno` ターゲット1つに統一します。`ato run` は DAG 順にサービスを起動し、readiness probe を待ち、ログに service prefix を付け、どれか1つが終了したら fail-fast で全体停止します。
 
 1. パッキング前に成果物を事前ビルドする（例: `next build`、worker build、lockfile）。
 2. `[pack].include` で実行成果物だけを同梱する（生の `node_modules`、`.venv`、キャッシュは同梱しない）。
@@ -171,7 +204,6 @@ default_target = "default"
 
 [pack]
 include = [
-  "ato-entry.ts",
   "capsule.toml",
   "capsule.lock",
   "apps/dashboard/.next/standalone/**",
@@ -193,10 +225,19 @@ exclude = [
 runtime = "web"
 driver = "deno"
 runtime_version = "1.46.3"
-runtime_tools = { node = "20.11.0", python = "3.11.10" }
-entrypoint = "ato-entry.ts"
+runtime_tools = { node = "20.11.0", python = "3.11.10", uv = "0.4.30" }
 port = 4173
 required_env = ["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID"]
+
+[services.main]
+entrypoint = "node apps/dashboard/.next/standalone/server.js"
+depends_on = ["api"]
+readiness_probe = { http_get = "/health", port = "PORT" }
+
+[services.api]
+entrypoint = "python apps/control-plane/src/main.py"
+env = { API_PORT = "8000" }
+readiness_probe = { http_get = "/health", port = "API_PORT" }
 ```
 
 推奨フロー:
@@ -219,7 +260,14 @@ ato run <publisher>/<slug> --registry http://127.0.0.1:18787
 補足:
 - Next.js standalone は `ato build` 前に `.next/static`（必要なら `public` も）を standalone 出力へコピーしてください。
 - `required_env` 未設定時、`ato run` は起動前に停止します。
-- `ato-entry.ts` は、子プロセス1つの異常終了で全体停止する fail-fast 実装を推奨します。
+- `services.main` は services モードで必須で、`PORT=<targets.<label>.port>` を受け取ります。
+- `targets.<label>.entrypoint = "ato-entry.ts"` は非推奨で、現在は拒否されます。
+- service command が `node` / `python` / `uv` で始まる場合は、対応する version を `runtime_tools` に固定してください。
+
+## Build の strict モード
+
+`ato build --strict-v3` は、`source_digest` / CAS(v3 path) が使えない場合のフォールバックを禁止します。
+manifest 側への緩いフォールバックではなく、その場で build 診断を失敗させたい場合に使います。
 
 ## ランタイム隔離ポリシー（Tier）
 
