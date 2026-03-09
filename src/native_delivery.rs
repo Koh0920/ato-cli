@@ -11,6 +11,8 @@ use crate::registry::RegistryResolver;
 
 #[cfg(unix)]
 use std::os::unix::fs::{symlink, PermissionsExt};
+#[cfg(windows)]
+use std::os::windows::fs::symlink_dir;
 
 const DEFAULT_FETCHES_DIR: &str = ".ato/fetches";
 const FETCH_ARTIFACT_DIR: &str = "artifact";
@@ -662,7 +664,7 @@ fn project_with_roots(
     };
 
     let result = (|| -> Result<ProjectResult> {
-        symlink(&source.derived_app_path, &projected_path).with_context(|| {
+        create_projection_symlink(&source.derived_app_path, &projected_path).with_context(|| {
             format!(
                 "Failed to create symlink {} -> {}",
                 projected_path.display(),
@@ -1618,6 +1620,16 @@ fn is_managed_symlink_to(path: &Path, target: &Path) -> Result<bool> {
         path.parent().unwrap_or_else(|| Path::new(".")).join(link_target)
     };
     paths_match(&resolved_target, target)
+}
+
+#[cfg(unix)]
+fn create_projection_symlink(target: &Path, destination: &Path) -> std::io::Result<()> {
+    symlink(target, destination)
+}
+
+#[cfg(windows)]
+fn create_projection_symlink(target: &Path, destination: &Path) -> std::io::Result<()> {
+    symlink_dir(target, destination)
 }
 
 fn host_supports_finalize() -> bool {
