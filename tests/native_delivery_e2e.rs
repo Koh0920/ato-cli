@@ -233,6 +233,78 @@ fn assert_executable(path: &Path, context: &str) -> Result<()> {
     Ok(())
 }
 
+fn compute_tree_digest(root: &Path) -> Result<String> {
+    let mut hasher = blake3::Hasher::new();
+    hash_tree_node(root, Path::new(""), &mut hasher)?;
+    Ok(format!("blake3:{}", hasher.finalize().to_hex()))
+}
+
+fn hash_tree_node(path: &Path, relative: &Path, hasher: &mut blake3::Hasher) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to stat {}", path.display()))?;
+    let file_type = metadata.file_type();
+
+    if file_type.is_dir() {
+        if !relative.as_os_str().is_empty() {
+            update_tree_header(hasher, b"dir", relative, mode_bits(&metadata));
+        }
+        let mut entries = fs::read_dir(path)
+            .with_context(|| format!("failed to read directory {}", path.display()))?
+            .collect::<std::io::Result<Vec<_>>>()
+            .with_context(|| format!("failed to enumerate directory {}", path.display()))?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let child_path = entry.path();
+            let child_relative = if relative.as_os_str().is_empty() {
+                PathBuf::from(entry.file_name())
+            } else {
+                relative.join(entry.file_name())
+            };
+            hash_tree_node(&child_path, &child_relative, hasher)?;
+        }
+        return Ok(());
+    }
+
+    if file_type.is_symlink() {
+        update_tree_header(hasher, b"symlink", relative, 0);
+        let target = fs::read_link(path)
+            .with_context(|| format!("failed to read symlink {}", path.display()))?;
+        hasher.update(target.as_os_str().to_string_lossy().as_bytes());
+        hasher.update(b"\0");
+        return Ok(());
+    }
+
+    if file_type.is_file() {
+        update_tree_header(hasher, b"file", relative, mode_bits(&metadata));
+        hasher.update(format!("{}\0", metadata.len()).as_bytes());
+        let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+        hasher.update(&bytes);
+        hasher.update(b"\0");
+        return Ok(());
+    }
+
+    anyhow::bail!("unsupported filesystem entry in digest walk: {}", path.display())
+}
+
+fn update_tree_header(hasher: &mut blake3::Hasher, kind: &[u8], relative: &Path, mode: u32) {
+    hasher.update(kind);
+    hasher.update(b"\0");
+    hasher.update(relative.to_string_lossy().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(format!("{:o}", mode).as_bytes());
+    hasher.update(b"\0");
+}
+
+#[cfg(unix)]
+fn mode_bits(metadata: &fs::Metadata) -> u32 {
+    metadata.permissions().mode()
+}
+
+#[cfg(not(unix))]
+fn mode_bits(_metadata: &fs::Metadata) -> u32 {
+    0
+}
+
 fn prepare_sample_workspace(tmp: &TempDir) -> Result<PathBuf> {
     let source = sample_project_dir();
     let destination = tmp.path().join("sample-native-capsule");
@@ -570,6 +642,219 @@ fn e2e_native_delivery_sample_tauri_unsigned_finalize() -> Result<()> {
         finalize_json["output_dir"].as_str(),
         "finalize must create a fresh derived directory each run"
     );
+
+    Ok(())
+}
+
+#[test]
+fn e2e_native_delivery_projection_symlink_lifecycle() -> Result<()> {
+    if !cfg!(target_os = "macos") || std::env::consts::ARCH != "aarch64" {
+        eprintln!("skipping e2e_native_delivery_projection_symlink_lifecycle: darwin/arm64 only");
+        return Ok(());
+    }
+    if !sample_project_dir().exists() {
+        eprintln!(
+            "skipping e2e_native_delivery_projection_symlink_lifecycle: sample project missing"
+        );
+        return Ok(());
+    }
+    if !command_on_path("deno") || !command_available("deno", &["--version"]) {
+        eprintln!("skipping e2e_native_delivery_projection_symlink_lifecycle: deno unavailable");
+        return Ok(());
+    }
+    if !command_on_path("codesign") {
+        eprintln!(
+            "skipping e2e_native_delivery_projection_symlink_lifecycle: codesign unavailable"
+        );
+        return Ok(());
+    }
+
+    let ato = assert_cmd::cargo::cargo_bin("ato");
+    let tmp = TempDir::new().context("create temp dir")?;
+    let home_dir = tmp.path().join("home");
+    fs::create_dir_all(&home_dir)?;
+    let data_dir = tmp.path().join("registry-data");
+
+    let sample_dir = prepare_sample_workspace(&tmp)?;
+    let built_app = build_sample_app(&sample_dir)?;
+    let pack_dir = create_pack_project(&tmp, &built_app)?;
+    let artifact_path = build_native_capsule(&tmp, &pack_dir)?;
+
+    let Some((_guard, base_url)) = start_local_registry_or_skip(
+        &ato,
+        &data_dir,
+        "e2e_native_delivery_projection_symlink_lifecycle",
+    )?
+    else {
+        return Ok(());
+    };
+
+    let artifact = artifact_path.to_string_lossy().to_string();
+    let publish = run_ato_with_home(
+        &ato,
+        &[
+            "publish",
+            "--deploy",
+            "--registry",
+            &base_url,
+            "--artifact",
+            &artifact,
+            "--scoped-id",
+            "local/sample-native-capsule",
+            "--json",
+        ],
+        tmp.path(),
+        &home_dir,
+    )?;
+    require_success(publish, "publish native capsule")?;
+
+    let fetch_ref = format!(
+        "127.0.0.1:{}/sample-native-capsule:0.1.1",
+        base_url.rsplit(':').next().unwrap_or_default()
+    );
+    let fetch = run_ato_with_home(
+        &ato,
+        &["fetch", &fetch_ref, "--json"],
+        tmp.path(),
+        &home_dir,
+    )?;
+    let fetch = require_success(fetch, "fetch native capsule")?;
+    let fetch_json: serde_json::Value =
+        serde_json::from_slice(&fetch.stdout).context("parse fetch json")?;
+    let fetched_dir = PathBuf::from(
+        fetch_json["cache_dir"]
+            .as_str()
+            .context("fetch cache_dir missing")?,
+    );
+
+    let dist_dir = tmp.path().join("dist");
+    let finalize = run_ato_with_home(
+        &ato,
+        &[
+            "finalize",
+            fetched_dir.to_string_lossy().as_ref(),
+            "--allow-external-finalize",
+            "--output-dir",
+            dist_dir.to_string_lossy().as_ref(),
+            "--json",
+        ],
+        tmp.path(),
+        &home_dir,
+    )?;
+    let finalize = require_success(finalize, "finalize native capsule")?;
+    let finalize_json: serde_json::Value =
+        serde_json::from_slice(&finalize.stdout).context("parse finalize json")?;
+    let derived_app = PathBuf::from(
+        finalize_json["derived_app_path"]
+            .as_str()
+            .context("derived_app_path missing")?,
+    );
+    let fetched_artifact_dir = fetched_dir.join("artifact");
+    let fetched_digest_before = compute_tree_digest(&fetched_artifact_dir)?;
+    let derived_digest_before = compute_tree_digest(&derived_app)?;
+
+    let launcher_dir = tmp.path().join("Applications");
+    let project = run_ato_with_home(
+        &ato,
+        &[
+            "project",
+            derived_app.to_string_lossy().as_ref(),
+            "--launcher-dir",
+            launcher_dir.to_string_lossy().as_ref(),
+            "--json",
+        ],
+        tmp.path(),
+        &home_dir,
+    )?;
+    let project = require_success(project, "project finalized native capsule")?;
+    let project_json: serde_json::Value =
+        serde_json::from_slice(&project.stdout).context("parse project json")?;
+    let projection_id = project_json["projection_id"]
+        .as_str()
+        .context("projection_id missing")?
+        .to_string();
+    let projected_path = PathBuf::from(
+        project_json["projected_path"]
+            .as_str()
+            .context("projected_path missing")?,
+    );
+    let metadata_path = PathBuf::from(
+        project_json["metadata_path"]
+            .as_str()
+            .context("metadata_path missing")?,
+    );
+
+    let projected_meta = fs::symlink_metadata(&projected_path)
+        .with_context(|| format!("failed to stat {}", projected_path.display()))?;
+    assert!(projected_meta.file_type().is_symlink());
+    assert_eq!(
+        fs::read_link(&projected_path)
+            .with_context(|| format!("failed to read {}", projected_path.display()))?,
+        derived_app
+    );
+    assert!(metadata_path.exists());
+    assert_eq!(compute_tree_digest(&fetched_artifact_dir)?, fetched_digest_before);
+    assert_eq!(compute_tree_digest(&derived_app)?, derived_digest_before);
+
+    let project_ls = run_ato_with_home(&ato, &["project", "ls", "--json"], tmp.path(), &home_dir)?;
+    let project_ls = require_success(project_ls, "list projections")?;
+    let project_ls_json: serde_json::Value =
+        serde_json::from_slice(&project_ls.stdout).context("parse project ls json")?;
+    let projections = project_ls_json["projections"]
+        .as_array()
+        .context("project ls projections missing")?;
+    assert!(projections.iter().any(|projection| {
+        projection["projection_id"].as_str() == Some(projection_id.as_str())
+            && projection["state"].as_str() == Some("ok")
+    }));
+
+    let orphaned_app = derived_app
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("sample-native-capsule-orphaned.app");
+    fs::rename(&derived_app, &orphaned_app).with_context(|| {
+        format!(
+            "failed to move derived app {} -> {}",
+            derived_app.display(),
+            orphaned_app.display()
+        )
+    })?;
+
+    let broken_ls = run_ato_with_home(&ato, &["project", "ls", "--json"], tmp.path(), &home_dir)?;
+    let broken_ls = require_success(broken_ls, "list broken projections")?;
+    let broken_ls_json: serde_json::Value =
+        serde_json::from_slice(&broken_ls.stdout).context("parse broken project ls json")?;
+    let broken_projection = broken_ls_json["projections"]
+        .as_array()
+        .context("broken project ls projections missing")?
+        .iter()
+        .find(|projection| projection["projection_id"].as_str() == Some(projection_id.as_str()))
+        .context("projection entry missing after breakage")?;
+    assert_eq!(broken_projection["state"].as_str(), Some("broken"));
+    let problems = broken_projection["problems"]
+        .as_array()
+        .context("broken projection problems missing")?;
+    assert!(problems.iter().any(|problem| problem.as_str() == Some("derived_app_missing")));
+
+    let unproject = run_ato_with_home(
+        &ato,
+        &["unproject", &projection_id, "--json"],
+        tmp.path(),
+        &home_dir,
+    )?;
+    let unproject = require_success(unproject, "unproject broken projection")?;
+    let unproject_json: serde_json::Value =
+        serde_json::from_slice(&unproject.stdout).context("parse unproject json")?;
+    assert_eq!(unproject_json["projection_id"].as_str(), Some(projection_id.as_str()));
+    assert!(!projected_path.exists());
+    assert!(!metadata_path.exists());
+    assert_eq!(compute_tree_digest(&fetched_artifact_dir)?, fetched_digest_before);
+
+    let final_ls = run_ato_with_home(&ato, &["project", "ls", "--json"], tmp.path(), &home_dir)?;
+    let final_ls = require_success(final_ls, "list projections after unproject")?;
+    let final_ls_json: serde_json::Value =
+        serde_json::from_slice(&final_ls.stdout).context("parse final project ls json")?;
+    assert_eq!(final_ls_json["total"].as_u64(), Some(0));
 
     Ok(())
 }

@@ -17,7 +17,9 @@ fn test_cli_help() {
         .stdout(predicate::str::contains("build"))
         .stdout(predicate::str::contains("search"))
         .stdout(predicate::str::contains("fetch"))
-        .stdout(predicate::str::contains("finalize"));
+        .stdout(predicate::str::contains("finalize"))
+        .stdout(predicate::str::contains("project"))
+        .stdout(predicate::str::contains("unproject"));
 }
 
 #[test]
@@ -130,6 +132,40 @@ fn test_finalize_help_shows_required_contract() {
 }
 
 #[test]
+fn test_project_help_shows_experimental_explicit_opt_in_contract() {
+    let mut cmd = Command::cargo_bin("ato").unwrap();
+    cmd.args(["project", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Experimental explicit opt-in"))
+        .stdout(predicate::str::contains("ato finalize"))
+        .stdout(predicate::str::contains("--launcher-dir <LAUNCHER_DIR>"))
+        .stdout(predicate::str::contains("Commands:"))
+        .stdout(predicate::str::contains("ls    List experimental projection state"));
+}
+
+#[test]
+fn test_project_ls_help_mentions_broken_projection_detection() {
+    let mut cmd = Command::cargo_bin("ato").unwrap();
+    cmd.args(["project", "ls", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("broken projections"))
+        .stdout(predicate::str::contains("--json"));
+}
+
+#[test]
+fn test_unproject_help_shows_projection_reference_contract() {
+    let mut cmd = Command::cargo_bin("ato").unwrap();
+    cmd.args(["unproject", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Experimental explicit opt-in"))
+        .stdout(predicate::str::contains("Projection ID"))
+        .stdout(predicate::str::contains("--json"));
+}
+
+#[test]
 fn test_fetch_accepts_subcommand_json_flag() {
     let tmp = tempdir().unwrap();
     let output = Command::cargo_bin("ato")
@@ -166,6 +202,39 @@ fn test_finalize_accepts_subcommand_json_flag() {
             "--output-dir",
             output_dir.to_str().unwrap(),
         ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        !stderr.contains("unexpected argument '--json'"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn test_project_accepts_subcommand_json_flag() {
+    let tmp = tempdir().unwrap();
+    let output = Command::cargo_bin("ato")
+        .unwrap()
+        .args(["project", tmp.path().to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        !stderr.contains("unexpected argument '--json'"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn test_unproject_accepts_subcommand_json_flag() {
+    let output = Command::cargo_bin("ato")
+        .unwrap()
+        .args(["unproject", "missing-projection", "--json"])
         .output()
         .unwrap();
 

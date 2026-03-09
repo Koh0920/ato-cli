@@ -23,6 +23,9 @@ const DELIVERY_FRAMEWORK: &str = "tauri";
 const DELIVERY_STAGE: &str = "unsigned";
 const DELIVERY_TARGET: &str = "darwin/arm64";
 const FINALIZE_TOOL: &str = "codesign";
+const DEFAULT_LAUNCHER_DIR: &str = "Applications";
+const PROJECTIONS_DIR: &str = ".ato/native-delivery/projections";
+const PROJECTION_KIND: &str = "symlink";
 
 #[derive(Debug, Serialize)]
 pub struct FetchResult {
@@ -42,6 +45,53 @@ pub struct FinalizeResult {
     pub provenance_path: PathBuf,
     pub parent_digest: String,
     pub derived_digest: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProjectResult {
+    pub projection_id: String,
+    pub metadata_path: PathBuf,
+    pub launcher_dir: PathBuf,
+    pub projected_path: PathBuf,
+    pub derived_app_path: PathBuf,
+    pub parent_digest: String,
+    pub derived_digest: String,
+    pub state: String,
+    pub problems: Vec<String>,
+    pub created: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UnprojectResult {
+    pub projection_id: String,
+    pub metadata_path: PathBuf,
+    pub projected_path: PathBuf,
+    pub removed_projected_path: bool,
+    pub removed_metadata: bool,
+    pub state_before: String,
+    pub problems_before: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProjectionListResult {
+    pub projections: Vec<ProjectionStatus>,
+    pub total: usize,
+    pub broken: usize,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct ProjectionStatus {
+    pub projection_id: String,
+    pub metadata_path: PathBuf,
+    pub launcher_dir: PathBuf,
+    pub projected_path: PathBuf,
+    pub derived_app_path: PathBuf,
+    pub parent_digest: String,
+    pub derived_digest: String,
+    pub state: String,
+    pub problems: Vec<String>,
+    pub projected_at: String,
+    pub projection_kind: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -88,7 +138,7 @@ struct DeliveryFinalize {
     args: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct LocalDerivationProvenance {
     parent_digest: String,
     derived_digest: String,
@@ -104,6 +154,40 @@ struct ResolvedFetchRequest {
     capsule_ref: String,
     registry_url: Option<String>,
     version: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct ProjectionMetadata {
+    schema_version: String,
+    projection_id: String,
+    projection_kind: String,
+    projected_at: String,
+    launcher_dir: PathBuf,
+    projected_path: PathBuf,
+    derived_app_path: PathBuf,
+    provenance_path: PathBuf,
+    parent_digest: String,
+    derived_digest: String,
+    framework: String,
+    target: String,
+    finalized_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct ProjectionSource {
+    derived_app_path: PathBuf,
+    provenance_path: PathBuf,
+    parent_digest: String,
+    derived_digest: String,
+    framework: String,
+    target: String,
+    finalized_at: String,
+}
+
+#[derive(Debug)]
+struct StoredProjection {
+    metadata_path: PathBuf,
+    metadata: ProjectionMetadata,
 }
 
 pub async fn execute_fetch(
@@ -355,6 +439,35 @@ pub fn execute_finalize(
     finalize_with_runner(fetched_dir, output_dir, run_codesign_command)
 }
 
+pub fn execute_project(
+    derived_app_path: &Path,
+    launcher_dir: Option<&Path>,
+) -> Result<ProjectResult> {
+    if !host_supports_finalize() {
+        bail!("ato project PoC currently supports macOS darwin/arm64 only");
+    }
+
+    let launcher_dir = resolve_launcher_dir(launcher_dir)?;
+    let metadata_root = projections_root()?;
+    project_with_roots(derived_app_path, &launcher_dir, &metadata_root)
+}
+
+pub fn execute_project_ls() -> Result<ProjectionListResult> {
+    if !host_supports_finalize() {
+        bail!("ato project ls PoC currently supports macOS darwin/arm64 only");
+    }
+
+    list_projections(&projections_root()?)
+}
+
+pub fn execute_unproject(reference: &str) -> Result<UnprojectResult> {
+    if !host_supports_finalize() {
+        bail!("ato unproject PoC currently supports macOS darwin/arm64 only");
+    }
+
+    unproject_with_metadata_root(reference, &projections_root()?)
+}
+
 fn finalize_with_runner<F>(
     fetched_dir: &Path,
     output_dir: &Path,
@@ -443,6 +556,203 @@ where
         let _ = fs::remove_dir_all(&derived_dir);
     }
     result
+}
+
+fn project_with_roots(
+    derived_app_path: &Path,
+    launcher_dir: &Path,
+    metadata_root: &Path,
+) -> Result<ProjectResult> {
+    let source = load_projection_source(derived_app_path)?;
+    fs::create_dir_all(launcher_dir).with_context(|| {
+        format!(
+            "Failed to create launcher directory: {}",
+            launcher_dir.display()
+        )
+    })?;
+    fs::create_dir_all(metadata_root).with_context(|| {
+        format!(
+            "Failed to create projection metadata directory: {}",
+            metadata_root.display()
+        )
+    })?;
+
+    let launcher_dir = absolute_path(launcher_dir)?;
+    let app_name = source
+        .derived_app_path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("Derived app path has no terminal name"))?
+        .to_os_string();
+    let projected_path = launcher_dir.join(&app_name);
+    let projection_id = build_projection_id(&source.derived_app_path, &projected_path, &source.derived_digest);
+    let metadata_path = metadata_root.join(format!("{}.json", projection_id));
+
+    let existing = load_projection_records(metadata_root)?;
+    for record in &existing {
+        if record.metadata.projection_id == projection_id {
+            let status = inspect_projection(&record.metadata, &record.metadata_path)?;
+            if status.state == "ok" {
+                return Ok(ProjectResult {
+                    projection_id,
+                    metadata_path,
+                    launcher_dir,
+                    projected_path,
+                    derived_app_path: source.derived_app_path.clone(),
+                    parent_digest: source.parent_digest.clone(),
+                    derived_digest: source.derived_digest.clone(),
+                    state: status.state,
+                    problems: status.problems,
+                    created: false,
+                });
+            }
+            break;
+        }
+
+        if paths_match(&record.metadata.derived_app_path, &source.derived_app_path)? {
+            bail!(
+                "Derived app is already projected via '{}' (id {}). Use 'ato unproject' first.",
+                record.metadata.projected_path.display(),
+                record.metadata.projection_id
+            );
+        }
+        if paths_match(&record.metadata.projected_path, &projected_path)? {
+            bail!(
+                "Projection name conflict: '{}' is already managed by projection {}",
+                projected_path.display(),
+                record.metadata.projection_id
+            );
+        }
+    }
+
+    if projected_path.exists() || fs::symlink_metadata(&projected_path).is_ok() {
+        if is_managed_symlink_to(&projected_path, &source.derived_app_path)? {
+            return Ok(ProjectResult {
+                projection_id,
+                metadata_path,
+                launcher_dir,
+                projected_path,
+                derived_app_path: source.derived_app_path.clone(),
+                parent_digest: source.parent_digest.clone(),
+                derived_digest: source.derived_digest.clone(),
+                state: "ok".to_string(),
+                problems: Vec::new(),
+                created: false,
+            });
+        }
+        bail!(
+            "Projection name conflict: launcher path already exists: {}",
+            projected_path.display()
+        );
+    }
+
+    let metadata = ProjectionMetadata {
+        schema_version: DELIVERY_SCHEMA_VERSION.to_string(),
+        projection_id: projection_id.clone(),
+        projection_kind: PROJECTION_KIND.to_string(),
+        projected_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+        launcher_dir: launcher_dir.clone(),
+        projected_path: projected_path.clone(),
+        derived_app_path: source.derived_app_path.clone(),
+        provenance_path: source.provenance_path.clone(),
+        parent_digest: source.parent_digest.clone(),
+        derived_digest: source.derived_digest.clone(),
+        framework: source.framework.clone(),
+        target: source.target.clone(),
+        finalized_at: source.finalized_at.clone(),
+    };
+
+    let result = (|| -> Result<ProjectResult> {
+        symlink(&source.derived_app_path, &projected_path).with_context(|| {
+            format!(
+                "Failed to create symlink {} -> {}",
+                projected_path.display(),
+                source.derived_app_path.display()
+            )
+        })?;
+        write_json_pretty(&metadata_path, &metadata)?;
+        let status = inspect_projection(&metadata, &metadata_path)?;
+        Ok(ProjectResult {
+            projection_id,
+            metadata_path: metadata_path.clone(),
+            launcher_dir,
+            projected_path: projected_path.clone(),
+            derived_app_path: source.derived_app_path,
+            parent_digest: source.parent_digest,
+            derived_digest: source.derived_digest,
+            state: status.state,
+            problems: status.problems,
+            created: true,
+        })
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&projected_path);
+        let _ = fs::remove_file(&metadata_path);
+    }
+    result
+}
+
+fn list_projections(metadata_root: &Path) -> Result<ProjectionListResult> {
+    let projections = load_projection_records(metadata_root)?
+        .into_iter()
+        .map(|record| inspect_projection(&record.metadata, &record.metadata_path))
+        .collect::<Result<Vec<_>>>()?;
+    let broken = projections.iter().filter(|item| item.state == "broken").count();
+    Ok(ProjectionListResult {
+        total: projections.len(),
+        broken,
+        projections,
+    })
+}
+
+fn unproject_with_metadata_root(reference: &str, metadata_root: &Path) -> Result<UnprojectResult> {
+    let record = find_projection_record(reference, metadata_root)?;
+    let status = inspect_projection(&record.metadata, &record.metadata_path)?;
+
+    let mut removed_projected_path = false;
+    match fs::symlink_metadata(&record.metadata.projected_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            fs::remove_file(&record.metadata.projected_path).with_context(|| {
+                format!(
+                    "Failed to remove projection symlink: {}",
+                    record.metadata.projected_path.display()
+                )
+            })?;
+            removed_projected_path = true;
+        }
+        Ok(_) => {
+            bail!(
+                "Refusing to remove non-symlink projected path: {}",
+                record.metadata.projected_path.display()
+            );
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "Failed to inspect projected path: {}",
+                    record.metadata.projected_path.display()
+                )
+            })
+        }
+    }
+
+    fs::remove_file(&record.metadata_path).with_context(|| {
+        format!(
+            "Failed to remove projection metadata: {}",
+            record.metadata_path.display()
+        )
+    })?;
+
+    Ok(UnprojectResult {
+        projection_id: record.metadata.projection_id,
+        metadata_path: record.metadata_path,
+        projected_path: record.metadata.projected_path,
+        removed_projected_path,
+        removed_metadata: true,
+        state_before: status.state,
+        problems_before: status.problems,
+    })
 }
 
 fn materialize_fetch_cache(
@@ -560,6 +870,236 @@ fn load_fetch_metadata(fetched_dir: &Path) -> Result<FetchMetadata> {
             "Failed to parse fetch metadata: {}",
             metadata_path.display()
         )
+    })
+}
+
+fn load_projection_source(derived_app_path: &Path) -> Result<ProjectionSource> {
+    let absolute_path = absolute_path(derived_app_path)?;
+    if !absolute_path.is_dir() {
+        bail!(
+            "Projection input must be a finalized .app directory: {}",
+            absolute_path.display()
+        );
+    }
+    if absolute_path.extension().and_then(|ext| ext.to_str()) != Some("app") {
+        bail!(
+            "Projection input must be a .app bundle: {}",
+            absolute_path.display()
+        );
+    }
+    let derived_app_path = fs::canonicalize(&absolute_path).with_context(|| {
+        format!(
+            "Failed to canonicalize finalized app path: {}",
+            absolute_path.display()
+        )
+    })?;
+    let derived_dir = derived_app_path.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Projection input must be an ato finalize output with a parent directory"
+        )
+    })?;
+    let provenance_path = derived_dir.join(PROVENANCE_FILE);
+    let raw = fs::read_to_string(&provenance_path).with_context(|| {
+        format!(
+            "ato project requires an ato finalize output containing {} next to the .app: {}",
+            PROVENANCE_FILE,
+            provenance_path.display()
+        )
+    })?;
+    let provenance: LocalDerivationProvenance = serde_json::from_str(&raw).with_context(|| {
+        format!(
+            "Failed to parse finalize provenance: {}",
+            provenance_path.display()
+        )
+    })?;
+    if !provenance.finalized_locally {
+        bail!("Projection input must be finalized locally via `ato finalize`");
+    }
+    if provenance.finalize_tool != FINALIZE_TOOL {
+        bail!(
+            "Projection input requires finalize_tool '{}' but found '{}'",
+            FINALIZE_TOOL,
+            provenance.finalize_tool
+        );
+    }
+    if provenance.framework != DELIVERY_FRAMEWORK {
+        bail!(
+            "Projection input framework '{}' is unsupported; expected '{}'",
+            provenance.framework,
+            DELIVERY_FRAMEWORK
+        );
+    }
+    if provenance.target != DELIVERY_TARGET {
+        bail!(
+            "Projection input target '{}' is unsupported; expected '{}'",
+            provenance.target,
+            DELIVERY_TARGET
+        );
+    }
+
+    let actual_digest = compute_tree_digest(&derived_app_path)?;
+    if actual_digest != provenance.derived_digest {
+        bail!(
+            "Derived artifact digest mismatch: expected {}, got {}",
+            provenance.derived_digest,
+            actual_digest
+        );
+    }
+
+    Ok(ProjectionSource {
+        derived_app_path,
+        provenance_path,
+        parent_digest: provenance.parent_digest,
+        derived_digest: provenance.derived_digest,
+        framework: provenance.framework,
+        target: provenance.target,
+        finalized_at: provenance.finalized_at,
+    })
+}
+
+fn load_projection_records(metadata_root: &Path) -> Result<Vec<StoredProjection>> {
+    if !metadata_root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut entries = fs::read_dir(metadata_root)
+        .with_context(|| format!("Failed to read {}", metadata_root.display()))?
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("Failed to enumerate {}", metadata_root.display()))?;
+    entries.sort_by_key(|entry| entry.file_name());
+
+    let mut out = Vec::new();
+    for entry in entries {
+        let metadata_path = entry.path();
+        if metadata_path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let raw = fs::read_to_string(&metadata_path)
+            .with_context(|| format!("Failed to read {}", metadata_path.display()))?;
+        let metadata: ProjectionMetadata = serde_json::from_str(&raw)
+            .with_context(|| format!("Failed to parse {}", metadata_path.display()))?;
+        out.push(StoredProjection {
+            metadata_path,
+            metadata,
+        });
+    }
+    Ok(out)
+}
+
+fn find_projection_record(reference: &str, metadata_root: &Path) -> Result<StoredProjection> {
+    let records = load_projection_records(metadata_root)?;
+    if records.is_empty() {
+        bail!("No projection metadata found in {}", metadata_root.display());
+    }
+
+    let mut matches = Vec::new();
+    let reference_path = PathBuf::from(reference);
+    let reference_abs = absolute_path(&reference_path).ok();
+    for record in records {
+        if record.metadata.projection_id == reference {
+            matches.push(record);
+            continue;
+        }
+        if let Some(reference_abs) = reference_abs.as_ref() {
+            if paths_match(reference_abs, &record.metadata.projected_path)?
+                || paths_match(reference_abs, &record.metadata.derived_app_path)?
+                || paths_match(reference_abs, &record.metadata_path)?
+            {
+                matches.push(record);
+            }
+        }
+    }
+
+    match matches.len() {
+        0 => bail!("Projection not found: {}", reference),
+        1 => Ok(matches.remove(0)),
+        _ => bail!("Projection reference is ambiguous: {}", reference),
+    }
+}
+
+fn inspect_projection(metadata: &ProjectionMetadata, metadata_path: &Path) -> Result<ProjectionStatus> {
+    let mut problems = Vec::new();
+    if metadata.schema_version != DELIVERY_SCHEMA_VERSION {
+        problems.push(format!(
+            "unsupported_schema_version:{}",
+            metadata.schema_version
+        ));
+    }
+    if metadata.projection_kind != PROJECTION_KIND {
+        problems.push(format!(
+            "unsupported_projection_kind:{}",
+            metadata.projection_kind
+        ));
+    }
+    if metadata.framework != DELIVERY_FRAMEWORK {
+        problems.push(format!("unsupported_framework:{}", metadata.framework));
+    }
+    if metadata.target != DELIVERY_TARGET {
+        problems.push(format!("unsupported_target:{}", metadata.target));
+    }
+
+    match fs::symlink_metadata(&metadata.projected_path) {
+        Ok(projected_meta) if projected_meta.file_type().is_symlink() => {
+            let link_target = fs::read_link(&metadata.projected_path).with_context(|| {
+                format!(
+                    "Failed to read projection symlink: {}",
+                    metadata.projected_path.display()
+                )
+            })?;
+            let resolved_target = if link_target.is_absolute() {
+                link_target
+            } else {
+                metadata
+                    .projected_path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(link_target)
+            };
+            if !paths_match(&resolved_target, &metadata.derived_app_path)? {
+                problems.push("projected_symlink_target_mismatch".to_string());
+            }
+        }
+        Ok(_) => problems.push("projected_path_replaced".to_string()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            problems.push("projected_path_missing".to_string())
+        }
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "Failed to inspect projected path: {}",
+                    metadata.projected_path.display()
+                )
+            })
+        }
+    }
+
+    if !metadata.derived_app_path.exists() {
+        problems.push("derived_app_missing".to_string());
+    } else if !metadata.derived_app_path.is_dir() {
+        problems.push("derived_app_replaced".to_string());
+    } else {
+        let digest = compute_tree_digest(&metadata.derived_app_path)?;
+        if digest != metadata.derived_digest {
+            problems.push("derived_digest_mismatch".to_string());
+        }
+    }
+
+    Ok(ProjectionStatus {
+        projection_id: metadata.projection_id.clone(),
+        metadata_path: metadata_path.to_path_buf(),
+        launcher_dir: metadata.launcher_dir.clone(),
+        projected_path: metadata.projected_path.clone(),
+        derived_app_path: metadata.derived_app_path.clone(),
+        parent_digest: metadata.parent_digest.clone(),
+        derived_digest: metadata.derived_digest.clone(),
+        state: if problems.is_empty() {
+            "ok".to_string()
+        } else {
+            "broken".to_string()
+        },
+        problems,
+        projected_at: metadata.projected_at.clone(),
+        projection_kind: metadata.projection_kind.clone(),
     })
 }
 
@@ -1014,6 +1554,72 @@ fn fetches_root() -> Result<PathBuf> {
         .join(DEFAULT_FETCHES_DIR))
 }
 
+fn projections_root() -> Result<PathBuf> {
+    Ok(dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(PROJECTIONS_DIR))
+}
+
+fn resolve_launcher_dir(launcher_dir: Option<&Path>) -> Result<PathBuf> {
+    match launcher_dir {
+        Some(path) => absolute_path(path),
+        None => Ok(dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(DEFAULT_LAUNCHER_DIR)),
+    }
+}
+
+fn absolute_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()
+            .context("Failed to read current working directory")?
+            .join(path))
+    }
+}
+
+fn build_projection_id(derived_app_path: &Path, projected_path: &Path, derived_digest: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(derived_app_path.to_string_lossy().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(projected_path.to_string_lossy().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(derived_digest.as_bytes());
+    hex::encode(&hasher.finalize().as_bytes()[..8])
+}
+
+fn paths_match(left: &Path, right: &Path) -> Result<bool> {
+    if left == right {
+        return Ok(true);
+    }
+    let left_canon = fs::canonicalize(left).ok();
+    let right_canon = fs::canonicalize(right).ok();
+    if let (Some(left_canon), Some(right_canon)) = (left_canon, right_canon) {
+        return Ok(left_canon == right_canon);
+    }
+    Ok(absolute_path(left)? == absolute_path(right)?)
+}
+
+fn is_managed_symlink_to(path: &Path, target: &Path) -> Result<bool> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err).with_context(|| format!("Failed to stat {}", path.display())),
+    };
+    if !metadata.file_type().is_symlink() {
+        return Ok(false);
+    }
+    let link_target = fs::read_link(path)
+        .with_context(|| format!("Failed to read symlink {}", path.display()))?;
+    let resolved_target = if link_target.is_absolute() {
+        link_target
+    } else {
+        path.parent().unwrap_or_else(|| Path::new(".")).join(link_target)
+    };
+    paths_match(&resolved_target, target)
+}
+
 fn host_supports_finalize() -> bool {
     cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64"
 }
@@ -1090,6 +1696,31 @@ args = ["--deep", "--force", "--sign", "-", "MyApp.app"]
         fs::create_dir_all(&fetched_dir)?;
         write_json_pretty(&fetched_dir.join(FETCH_METADATA_FILE), &metadata)?;
         Ok(fetched_dir)
+    }
+
+    fn sample_finalized_app(root: &Path) -> Result<(PathBuf, PathBuf)> {
+        let derived_dir = root.join("derived-output");
+        let derived_app = derived_dir.join("MyApp.app");
+        fs::create_dir_all(derived_app.join("Contents/MacOS"))?;
+        fs::write(derived_app.join("Contents/MacOS/MyApp"), b"signed-app")?;
+        #[cfg(unix)]
+        {
+            let binary = derived_app.join("Contents/MacOS/MyApp");
+            let mut permissions = fs::metadata(&binary)?.permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&binary, permissions)?;
+        }
+        let provenance = LocalDerivationProvenance {
+            parent_digest: "blake3:parent-digest".to_string(),
+            derived_digest: compute_tree_digest(&derived_app)?,
+            framework: DELIVERY_FRAMEWORK.to_string(),
+            target: DELIVERY_TARGET.to_string(),
+            finalized_locally: true,
+            finalize_tool: FINALIZE_TOOL.to_string(),
+            finalized_at: "2026-03-09T00:00:00Z".to_string(),
+        };
+        write_json_pretty(&derived_dir.join(PROVENANCE_FILE), &provenance)?;
+        Ok((derived_dir, derived_app))
     }
 
     #[test]
@@ -1316,6 +1947,92 @@ args = ["--deep", "--force", "--sign", "-", "MyApp.app"]
             let binary = result.artifact_dir.join("MyApp.app/Contents/MacOS/MyApp");
             assert_ne!(fs::metadata(binary)?.permissions().mode() & 0o111, 0);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn project_creates_symlink_metadata_without_mutating_derived_artifact() -> Result<()> {
+        let tmp = tempdir()?;
+        let metadata_root = tmp.path().join("projection-metadata");
+        let launcher_dir = tmp.path().join("Applications");
+        let (_derived_dir, derived_app) = sample_finalized_app(tmp.path())?;
+        let digest_before = compute_tree_digest(&derived_app)?;
+
+        let result = project_with_roots(&derived_app, &launcher_dir, &metadata_root)?;
+
+        assert!(result.created);
+        assert_eq!(result.state, "ok");
+        assert_eq!(compute_tree_digest(&derived_app)?, digest_before);
+        let symlink_meta = fs::symlink_metadata(&result.projected_path)?;
+        assert!(symlink_meta.file_type().is_symlink());
+        assert!(result.metadata_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn project_rejects_name_conflict() -> Result<()> {
+        let tmp = tempdir()?;
+        let metadata_root = tmp.path().join("projection-metadata");
+        let launcher_dir = tmp.path().join("Applications");
+        let (_derived_dir, derived_app) = sample_finalized_app(tmp.path())?;
+        fs::create_dir_all(&launcher_dir)?;
+        fs::write(launcher_dir.join("MyApp.app"), b"occupied")?;
+
+        let err = project_with_roots(&derived_app, &launcher_dir, &metadata_root)
+            .expect_err("projection must reject name conflicts");
+        assert!(err.to_string().contains("Projection name conflict"));
+        Ok(())
+    }
+
+    #[test]
+    fn project_list_reports_broken_projection_when_target_missing() -> Result<()> {
+        let tmp = tempdir()?;
+        let metadata_root = tmp.path().join("projection-metadata");
+        let launcher_dir = tmp.path().join("Applications");
+        let (_derived_dir, derived_app) = sample_finalized_app(tmp.path())?;
+        let result = project_with_roots(&derived_app, &launcher_dir, &metadata_root)?;
+        fs::rename(&derived_app, tmp.path().join("MyApp-orphaned.app"))?;
+
+        let listing = list_projections(&metadata_root)?;
+        assert_eq!(listing.total, 1);
+        assert_eq!(listing.broken, 1);
+        assert_eq!(listing.projections[0].projection_id, result.projection_id);
+        assert!(listing.projections[0]
+            .problems
+            .iter()
+            .any(|problem| problem == "derived_app_missing"));
+        Ok(())
+    }
+
+    #[test]
+    fn unproject_removes_symlink_and_metadata_even_when_target_missing() -> Result<()> {
+        let tmp = tempdir()?;
+        let metadata_root = tmp.path().join("projection-metadata");
+        let launcher_dir = tmp.path().join("Applications");
+        let (_derived_dir, derived_app) = sample_finalized_app(tmp.path())?;
+        let result = project_with_roots(&derived_app, &launcher_dir, &metadata_root)?;
+        fs::rename(&derived_app, tmp.path().join("MyApp-orphaned.app"))?;
+
+        let unprojected = unproject_with_metadata_root(&result.projection_id, &metadata_root)?;
+        assert!(unprojected.removed_projected_path);
+        assert!(unprojected.removed_metadata);
+        assert!(!result.projected_path.exists());
+        assert!(!result.metadata_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn project_rejects_digest_mismatch() -> Result<()> {
+        let tmp = tempdir()?;
+        let metadata_root = tmp.path().join("projection-metadata");
+        let launcher_dir = tmp.path().join("Applications");
+        let (derived_dir, derived_app) = sample_finalized_app(tmp.path())?;
+        fs::write(derived_app.join("Contents/MacOS/MyApp"), b"tampered-app")?;
+
+        let err = project_with_roots(&derived_app, &launcher_dir, &metadata_root)
+            .expect_err("projection must reject digest mismatches");
+        assert!(err.to_string().contains("Derived artifact digest mismatch"));
+        assert!(derived_dir.join(PROVENANCE_FILE).exists());
         Ok(())
     }
 
