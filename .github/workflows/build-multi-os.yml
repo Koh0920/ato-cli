@@ -522,12 +522,6 @@ jobs:
             exit 1
           fi
 
-          pinned_nacelle_version="$(sed -nE 's/^pub const PINNED_NACELLE_VERSION: &str = "([^"]+)";/\1/p' src/engine_manager.rs | head -n1)"
-          if [[ -z "$pinned_nacelle_version" ]]; then
-            echo "Failed to read PINNED_NACELLE_VERSION from src/engine_manager.rs" >&2
-            exit 1
-          fi
-
           if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
             release_version="${GITHUB_REF#refs/tags/}"
           elif [[ "${{ github.event_name }}" == "push" ]]; then
@@ -580,7 +574,6 @@ jobs:
 
           echo "release_version=$release_version" >> "$GITHUB_OUTPUT"
           echo "cargo_version=$cargo_version" >> "$GITHUB_OUTPUT"
-          echo "pinned_nacelle_version=$pinned_nacelle_version" >> "$GITHUB_OUTPUT"
           echo "deploy_env=$deploy_env" >> "$GITHUB_OUTPUT"
           echo "update_latest=$update_latest" >> "$GITHUB_OUTPUT"
           echo "semver_alias_enabled=$semver_alias_enabled" >> "$GITHUB_OUTPUT"
@@ -633,21 +626,3 @@ jobs:
           WRANGLER_CONFIG: ""
         run: ./scripts/upload_release_to_r2.sh
 
-      - name: Mirror pinned nacelle release to R2 (staging)
-        if: ${{ steps.tag_main_check.outputs.on_main == 'true' && steps.secrets_check.outputs.available == 'true' }}
-        shell: bash
-        env:
-          NACELLE_VERSION: ${{ steps.prepare.outputs.pinned_nacelle_version }}
-          DEPLOY_ENV: ${{ steps.prepare.outputs.deploy_env }}
-          BUCKET: ${{ steps.prepare.outputs.bucket }}
-          WRANGLER_CONFIG: ""
-        run: bash ./scripts/mirror_nacelle_release_to_r2.sh
-
-      - name: Mirror pinned nacelle release to R2 (production)
-        if: ${{ steps.tag_main_check.outputs.on_main == 'true' && steps.secrets_check.outputs.available == 'true' }}
-        shell: bash
-        env:
-          NACELLE_VERSION: ${{ steps.prepare.outputs.pinned_nacelle_version }}
-          DEPLOY_ENV: production
-          WRANGLER_CONFIG: ""
-        run: bash ./scripts/mirror_nacelle_release_to_r2.sh
