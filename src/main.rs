@@ -2697,7 +2697,7 @@ fn execute_setup_command(
             };
 
             let binary_name = format!("nacelle-{}-{}-{}", resolved, os, arch);
-            let base_url = format!("https://releases.capsule.dev/nacelle/{}", resolved);
+            let base_url = format!("https://dl.ato.run/nacelle/{}", resolved);
             let url = format!("{}/{}", base_url, binary_name);
             let sha256 = if skip_verify {
                 String::new()
@@ -2741,7 +2741,7 @@ fn execute_setup_command(
 }
 
 fn fetch_latest_nacelle_version() -> Result<String> {
-    let resp = reqwest::blocking::get("https://releases.capsule.dev/nacelle/latest.txt")
+    let resp = reqwest::blocking::get("https://dl.ato.run/nacelle/latest.txt")
         .context("Failed to fetch latest nacelle version")?
         .text()?;
     let version = resp.trim();
