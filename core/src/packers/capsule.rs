@@ -1055,8 +1055,10 @@ manifest_hash = "sha256:dummy"
         .expect("pack");
 
         let mut outer = tar::Archive::new(std::fs::File::open(&out).expect("open"));
+        let mut has_sbom = false;
         let mut payload_zst = Vec::new();
         let mut manifest_toml_bytes = None::<Vec<u8>>;
+        let mut signature_bytes = None::<Vec<u8>>;
         for entry in outer.entries().expect("entries") {
             let mut entry = entry.expect("entry");
             let path = entry.path().expect("path").to_string_lossy().to_string();
@@ -1066,12 +1068,48 @@ manifest_hash = "sha256:dummy"
                 let mut bytes = Vec::new();
                 entry.read_to_end(&mut bytes).expect("read manifest");
                 manifest_toml_bytes = Some(bytes);
+            } else if path == "signature.json" {
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes).expect("read signature");
+                signature_bytes = Some(bytes);
+            } else if path == SBOM_PATH {
+                has_sbom = true;
             }
         }
+        assert!(has_sbom);
         let manifest_toml_bytes = manifest_toml_bytes.expect("capsule.toml");
+        let signature_bytes = signature_bytes.expect("signature.json");
         let manifest: CapsuleManifest =
             toml::from_str(std::str::from_utf8(&manifest_toml_bytes).expect("manifest utf8"))
                 .expect("parse manifest");
+        let signature: serde_json::Value =
+            serde_json::from_slice(&signature_bytes).expect("parse signature");
+        assert_eq!(
+            signature
+                .get("sbom")
+                .and_then(|sbom| sbom.get("path"))
+                .and_then(|path| path.as_str()),
+            Some(SBOM_PATH)
+        );
+
+        let embedded_sbom = crate::packers::sbom::extract_and_verify_embedded_sbom(&out)
+            .expect("failed to extract and verify embedded SBOM from packed capsule");
+        let embedded_sbom_sha = sha256_hex(embedded_sbom.as_bytes());
+        assert_eq!(
+            signature
+                .get("sbom")
+                .and_then(|sbom| sbom.get("sha256"))
+                .and_then(|sha| sha.as_str()),
+            Some(embedded_sbom_sha.as_str())
+        );
+        let parsed_sbom: serde_json::Value =
+            serde_json::from_str(&embedded_sbom).expect("parse embedded SBOM");
+        assert_eq!(parsed_sbom["spdxVersion"], "SPDX-2.3");
+        let files = parsed_sbom
+            .get("files")
+            .and_then(|files| files.as_array())
+            .expect("embedded SBOM must contain a files array per SPDX-2.3 specification");
+        assert!(!files.is_empty(), "SBOM files array should not be empty");
 
         let mut decoder =
             zstd::stream::Decoder::new(std::io::Cursor::new(payload_zst)).expect("decode payload");
