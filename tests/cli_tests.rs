@@ -141,7 +141,9 @@ fn test_project_help_shows_experimental_explicit_opt_in_contract() {
         .stdout(predicate::str::contains("ato finalize"))
         .stdout(predicate::str::contains("--launcher-dir <LAUNCHER_DIR>"))
         .stdout(predicate::str::contains("Commands:"))
-        .stdout(predicate::str::contains("ls    List experimental projection state"));
+        .stdout(predicate::str::contains(
+            "ls    List experimental projection state",
+        ));
 }
 
 #[test]
