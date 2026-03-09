@@ -93,6 +93,7 @@ mod init;
 mod install;
 mod ipc;
 mod keygen;
+mod native_delivery;
 mod new;
 mod payload_guard;
 mod process_manager;
@@ -146,6 +147,8 @@ Primary Commands:
   init     Initialize a new project
   build    Pack a project into an immutable .capsule archive
   search   Search the registry for agent skills and packages
+    fetch    Fetch an experimental native delivery artifact into immutable local cache
+    finalize Create a locally derived native artifact from fetched input
 
 Management:
   ps       List running capsules
@@ -385,6 +388,48 @@ enum Commands {
         /// Show selected capsule's capsule.toml in the TUI right panel
         #[arg(long, default_value_t = false)]
         show_manifest: bool,
+    },
+
+    #[command(
+        next_help_heading = "Primary Commands",
+        about = "Fetch an experimental native delivery artifact into immutable local cache"
+    )]
+    Fetch {
+        /// Capsule ref (`publisher/slug[@version]` or `localhost:8080/slug:version`)
+        capsule_ref: String,
+
+        /// Registry URL override (or embed registry in `capsule_ref`)
+        #[arg(long)]
+        registry: Option<String>,
+
+        /// Specific version to fetch (or use publisher/slug@version)
+        #[arg(long)]
+        version: Option<String>,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    #[command(
+        next_help_heading = "Primary Commands",
+        about = "Create a locally derived native artifact from a fetched artifact directory"
+    )]
+    Finalize {
+        /// Path to fetched artifact directory created by `ato fetch`
+        fetched_artifact_dir: PathBuf,
+
+        /// Allow external finalize execution (`codesign`) for this PoC
+        #[arg(long, default_value_t = false)]
+        allow_external_finalize: bool,
+
+        /// Output directory for derived artifacts
+        #[arg(long)]
+        output_dir: PathBuf,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
     },
 
     #[command(next_help_heading = "Management", about = "List running capsules")]
@@ -1546,6 +1591,78 @@ fn run() -> Result<()> {
             no_tui,
             show_manifest,
         ),
+
+        Commands::Fetch {
+            capsule_ref,
+            registry,
+            version,
+            json,
+        } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                if install::is_slug_only_ref(&capsule_ref) {
+                    let suggestions =
+                        install::suggest_scoped_capsules(&capsule_ref, registry.as_deref(), 5)
+                            .await?;
+                    if suggestions.is_empty() {
+                        anyhow::bail!(
+                            "scoped_id_required: '{}' is ambiguous. Use publisher/slug (for example: koh0920/{})",
+                            capsule_ref,
+                            capsule_ref
+                        );
+                    }
+                    let mut message = format!(
+                        "scoped_id_required: '{}' requires publisher scope.\n\nDid you mean one of these?",
+                        capsule_ref
+                    );
+                    for suggestion in suggestions {
+                        message.push_str(&format!(
+                            "\n  - {}  ({} downloads)",
+                            suggestion.scoped_id, suggestion.downloads
+                        ));
+                    }
+                    anyhow::bail!(message);
+                }
+
+                let result = native_delivery::execute_fetch(
+                    &capsule_ref,
+                    registry.as_deref(),
+                    version.as_deref(),
+                )
+                .await?;
+                if cli.json || json {
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                } else {
+                    println!("✅ Fetched to: {}", result.cache_dir.display());
+                    println!("   Scoped ID: {}", result.scoped_id);
+                    println!("   Version:   {}", result.version);
+                    println!("   Digest:    {}", result.parent_digest);
+                }
+                Ok(())
+            })
+        }
+
+        Commands::Finalize {
+            fetched_artifact_dir,
+            allow_external_finalize,
+            output_dir,
+            json,
+        } => {
+            let result = native_delivery::execute_finalize(
+                &fetched_artifact_dir,
+                &output_dir,
+                allow_external_finalize,
+            )?;
+            if cli.json || json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!("✅ Finalized to: {}", result.output_dir.display());
+                println!("   App:      {}", result.derived_app_path.display());
+                println!("   Parent:   {}", result.parent_digest);
+                println!("   Derived:  {}", result.derived_digest);
+            }
+            Ok(())
+        }
 
         Commands::Config { command } => match command {
             ConfigCommands::Engine { command } => match command {
@@ -3574,10 +3691,8 @@ mod tests {
 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  nacelle-v1.2.3-darwin-arm64
 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  nacelle-v1.2.3-linux-x64
 ";
-        let parsed = crate::engine_manager::parse_sha256_for_artifact(
-            body,
-            "nacelle-v1.2.3-linux-x64",
-        );
+        let parsed =
+            crate::engine_manager::parse_sha256_for_artifact(body, "nacelle-v1.2.3-linux-x64");
         assert_eq!(
             parsed.as_deref(),
             Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
@@ -3587,10 +3702,8 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  nacelle-v1.2.3
     #[test]
     fn parse_sha256_for_artifact_supports_bsd_style_format() {
         let body = "SHA256 (nacelle-v1.2.3-darwin-arm64) = CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
-        let parsed = crate::engine_manager::parse_sha256_for_artifact(
-            body,
-            "nacelle-v1.2.3-darwin-arm64",
-        );
+        let parsed =
+            crate::engine_manager::parse_sha256_for_artifact(body, "nacelle-v1.2.3-darwin-arm64");
         assert_eq!(
             parsed.as_deref(),
             Some("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")

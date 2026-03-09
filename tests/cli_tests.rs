@@ -15,7 +15,9 @@ fn test_cli_help() {
         .stdout(predicate::str::contains("install"))
         .stdout(predicate::str::contains("init"))
         .stdout(predicate::str::contains("build"))
-        .stdout(predicate::str::contains("search"));
+        .stdout(predicate::str::contains("search"))
+        .stdout(predicate::str::contains("fetch"))
+        .stdout(predicate::str::contains("finalize"));
 }
 
 #[test]
@@ -99,6 +101,104 @@ fn test_search_help_uses_store_api_default() {
         .stdout(predicate::str::contains(
             "Registry URL (default: https://api.ato.run)",
         ));
+}
+
+#[test]
+fn test_fetch_help_shows_registry_and_version() {
+    let mut cmd = Command::cargo_bin("ato").unwrap();
+    cmd.args(["fetch", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("localhost:8080/slug:version"))
+        .stdout(predicate::str::contains("--registry <REGISTRY>"))
+        .stdout(predicate::str::contains("--version <VERSION>"))
+        .stdout(predicate::str::contains("--json"));
+}
+
+#[test]
+fn test_finalize_help_shows_required_contract() {
+    let mut cmd = Command::cargo_bin("ato").unwrap();
+    cmd.args(["finalize", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Path to fetched artifact directory",
+        ))
+        .stdout(predicate::str::contains("--allow-external-finalize"))
+        .stdout(predicate::str::contains("--output-dir <OUTPUT_DIR>"))
+        .stdout(predicate::str::contains("--json"));
+}
+
+#[test]
+fn test_fetch_accepts_subcommand_json_flag() {
+    let tmp = tempdir().unwrap();
+    let output = Command::cargo_bin("ato")
+        .unwrap()
+        .current_dir(tmp.path())
+        .args([
+            "fetch",
+            "koh0920/does-not-exist",
+            "--json",
+            "--registry",
+            "http://127.0.0.1:9",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        !stderr.contains("unexpected argument '--json'"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn test_finalize_accepts_subcommand_json_flag() {
+    let tmp = tempdir().unwrap();
+    let output_dir = tmp.path().join("dist");
+    let output = Command::cargo_bin("ato")
+        .unwrap()
+        .args([
+            "finalize",
+            tmp.path().to_str().unwrap(),
+            "--json",
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        !stderr.contains("unexpected argument '--json'"),
+        "stderr={stderr}"
+    );
+}
+
+#[test]
+fn test_finalize_requires_opt_in_flag() {
+    let tmp = tempdir().unwrap();
+    let output_dir = tmp.path().join("dist");
+
+    let output = Command::cargo_bin("ato")
+        .unwrap()
+        .args([
+            "finalize",
+            tmp.path().to_str().unwrap(),
+            "--output-dir",
+            output_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("--allow-external-finalize"),
+        "stderr={stderr}"
+    );
 }
 
 #[test]
