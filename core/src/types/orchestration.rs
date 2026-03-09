@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::manifest::ReadinessProbe;
+use super::{manifest::ReadinessProbe, runplan::Mount};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResolvedServiceNetwork {
@@ -43,6 +43,8 @@ pub struct ResolvedTargetRuntime {
     pub port: Option<u16>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_env: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<Mount>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

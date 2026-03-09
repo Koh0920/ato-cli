@@ -156,6 +156,7 @@ impl CapsuleManifest {
                         });
                     }
                 }
+                mounts.extend(state_mounts(self)?);
 
                 RunPlanRuntime::Docker(DockerRuntime {
                     image: target.entrypoint.clone(),
@@ -224,6 +225,48 @@ impl CapsuleManifest {
             egress_allowlist: Vec::new(),
         })
     }
+}
+
+fn state_mounts(manifest: &CapsuleManifest) -> Result<Vec<Mount>, CapsuleError> {
+    let Some(services) = manifest.services.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let Some(main) = services.get("main") else {
+        return Ok(Vec::new());
+    };
+
+    main.state_bindings
+        .iter()
+        .map(|binding| {
+            let state_name = binding.state.trim();
+            let target = binding.target.trim();
+            let requirement = manifest.state.get(state_name).ok_or_else(|| {
+                CapsuleError::ValidationError(format!(
+                    "services.main.state_bindings references unknown state '{}'",
+                    state_name
+                ))
+            })?;
+
+            if requirement.durability != super::StateDurability::Ephemeral {
+                return Err(CapsuleError::ValidationError(format!(
+                    "state '{}' is not supported in run plans until persistent binding support is implemented",
+                    state_name
+                )));
+            }
+            if target.is_empty() || !target.starts_with('/') || target.contains("..") {
+                return Err(CapsuleError::ValidationError(format!(
+                    "services.main.state_bindings target '{}' must be an absolute path",
+                    binding.target
+                )));
+            }
+
+            Ok(Mount {
+                source: manifest.ephemeral_state_source_path(state_name),
+                target: target.to_string(),
+                readonly: false,
+            })
+        })
+        .collect()
 }
 
 fn ordered_env(env: &HashMap<String, String>) -> BTreeMap<String, String> {
@@ -301,6 +344,30 @@ runtime = "oci"
 entrypoint = "ghcr.io/example/hello:latest"
 "#;
 
+    const SAMPLE_DOCKER_STATE_TOML: &str = r#"
+schema_version = "0.2"
+name = "hello-docker"
+version = "0.1.0"
+type = "app"
+default_target = "container"
+
+[targets.container]
+runtime = "oci"
+entrypoint = "ghcr.io/example/hello:latest"
+
+[state.data]
+kind = "filesystem"
+durability = "ephemeral"
+purpose = "primary-data"
+
+[services.main]
+target = "container"
+
+[[services.main.state_bindings]]
+state = "data"
+target = "/var/lib/app"
+"#;
+
     #[test]
     fn runplan_from_source_manifest() {
         let manifest = CapsuleManifest::from_toml(SAMPLE_PYTHON_TOML).unwrap();
@@ -345,5 +412,22 @@ entrypoint = "ghcr.io/example/hello:latest"
         });
 
         assert_eq!(json, expected);
+    }
+
+    #[test]
+    fn runplan_from_docker_manifest_with_ephemeral_state_binding() {
+        let manifest = CapsuleManifest::from_toml(SAMPLE_DOCKER_STATE_TOML).unwrap();
+        manifest.validate().unwrap();
+        let plan = manifest.to_run_plan().unwrap();
+
+        let json = serde_json::to_value(&plan).unwrap();
+        assert_eq!(
+            json["docker"]["mounts"],
+            serde_json::json!([{
+                "source": "/var/lib/ato/state/hello-docker/data",
+                "target": "/var/lib/app",
+                "readonly": false
+            }])
+        );
     }
 }
