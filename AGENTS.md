@@ -139,6 +139,11 @@
 - `ato pack` routes to Source/OCI/WASM via `router` logic.
 - `--skip-l1` and `--skip-validation` are dangerous; use sparingly.
 
+## Temp Files
+- NEVER write to `/tmp` or `/var/tmp`.
+- Always create a `.tmp/` folder in the current working directory for temporary files.
+- Clean up temp files when no longer needed.
+
 ## Useful Paths
 - `~/.ato/config.toml` holds engine registrations.
 - `capsule.toml` is the project manifest used by the CLI.

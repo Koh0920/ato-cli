@@ -530,6 +530,11 @@ jobs:
             release_version="$cargo_version"
           fi
 
+          semver_alias_enabled="0"
+          if [[ "${GITHUB_REF:-}" == "refs/tags/v${cargo_version}" ]]; then
+            semver_alias_enabled="1"
+          fi
+
           deploy_env="staging"
           update_latest="1"
           bucket_input=""
@@ -571,6 +576,7 @@ jobs:
           echo "cargo_version=$cargo_version" >> "$GITHUB_OUTPUT"
           echo "deploy_env=$deploy_env" >> "$GITHUB_OUTPUT"
           echo "update_latest=$update_latest" >> "$GITHUB_OUTPUT"
+          echo "semver_alias_enabled=$semver_alias_enabled" >> "$GITHUB_OUTPUT"
           echo "bucket=$bucket_input" >> "$GITHUB_OUTPUT"
           echo "source_dir=$source_dir" >> "$GITHUB_OUTPUT"
 
@@ -598,7 +604,7 @@ jobs:
         run: ./scripts/upload_release_to_r2.sh
 
       - name: Upload archives to R2 (semver alias for main tag push)
-        if: ${{ steps.tag_main_check.outputs.on_main == 'true' && steps.secrets_check.outputs.available == 'true' }}
+        if: ${{ steps.tag_main_check.outputs.on_main == 'true' && steps.secrets_check.outputs.available == 'true' && steps.prepare.outputs.semver_alias_enabled == '1' }}
         shell: bash
         env:
           VERSION: ${{ steps.prepare.outputs.cargo_version }}
@@ -610,7 +616,7 @@ jobs:
         run: ./scripts/upload_release_to_r2.sh
 
       - name: Upload archives to R2 (production semver alias for main tag push)
-        if: ${{ steps.tag_main_check.outputs.on_main == 'true' && steps.secrets_check.outputs.available == 'true' }}
+        if: ${{ steps.tag_main_check.outputs.on_main == 'true' && steps.secrets_check.outputs.available == 'true' && steps.prepare.outputs.semver_alias_enabled == '1' }}
         shell: bash
         env:
           VERSION: ${{ steps.prepare.outputs.cargo_version }}

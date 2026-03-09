@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::engine;
 use crate::error::{CapsuleError, Result};
@@ -26,6 +27,7 @@ pub struct SourcePackOptions {
     pub nacelle_override: Option<PathBuf>,
     pub standalone: bool,
     pub strict_manifest: bool,
+    pub timings: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -137,12 +139,20 @@ pub fn pack(
     }
     debug!("config.json ready: {}", opts.config_path.display());
 
+    let lockfile_started = Instant::now();
     let lockfile_path = rt.block_on(lockfile::ensure_lockfile(
         &opts.manifest_path,
         &loaded.raw,
         &loaded.raw_text,
         config_reporter,
+        opts.timings,
     ))?;
+    if opts.timings {
+        futures::executor::block_on(reporter.notify(format!(
+            "⏱ [timings] source.ensure_lockfile: {} ms",
+            lockfile_started.elapsed().as_millis()
+        )))?;
+    }
 
     debug!("capsule.lock generated: {}", lockfile_path.display());
 
@@ -153,6 +163,7 @@ pub fn pack(
             manifest_path: Some(opts.manifest_path.clone()),
         })?;
 
+        let bundle_started = Instant::now();
         let bundle_path = rt.block_on(build_bundle(
             PackBundleArgs {
                 manifest_path: opts.manifest_path.clone(),
@@ -162,12 +173,19 @@ pub fn pack(
             },
             reporter.clone(),
         ))?;
+        if opts.timings {
+            futures::executor::block_on(reporter.notify(format!(
+                "⏱ [timings] source.build_bundle: {} ms",
+                bundle_started.elapsed().as_millis()
+            )))?;
+        }
 
         debug!("Self-extracting bundle created: {}", bundle_path.display());
         Ok(bundle_path)
     } else {
         debug!("Phase 3: creating capsule archive");
 
+        let archive_started = Instant::now();
         let artifact_path = rt.block_on(capsule_packer::pack(
             plan,
             capsule_packer::CapsulePackOptions {
@@ -180,6 +198,12 @@ pub fn pack(
             },
             reporter.clone(),
         ))?;
+        if opts.timings {
+            futures::executor::block_on(reporter.notify(format!(
+                "⏱ [timings] source.archive_pack: {} ms",
+                archive_started.elapsed().as_millis()
+            )))?;
+        }
 
         debug!("Capsule archive created: {}", artifact_path.display());
         Ok(artifact_path)
