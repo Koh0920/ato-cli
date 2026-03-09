@@ -240,8 +240,8 @@ fn compute_tree_digest(root: &Path) -> Result<String> {
 }
 
 fn hash_tree_node(path: &Path, relative: &Path, hasher: &mut blake3::Hasher) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("failed to stat {}", path.display()))?;
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
     let file_type = metadata.file_type();
 
     if file_type.is_dir() {
@@ -283,7 +283,10 @@ fn hash_tree_node(path: &Path, relative: &Path, hasher: &mut blake3::Hasher) -> 
         return Ok(());
     }
 
-    anyhow::bail!("unsupported filesystem entry in digest walk: {}", path.display())
+    anyhow::bail!(
+        "unsupported filesystem entry in digest walk: {}",
+        path.display()
+    )
 }
 
 fn update_tree_header(hasher: &mut blake3::Hasher, kind: &[u8], relative: &Path, mode: u32) {
@@ -793,7 +796,10 @@ fn e2e_native_delivery_projection_symlink_lifecycle() -> Result<()> {
         derived_app
     );
     assert!(metadata_path.exists());
-    assert_eq!(compute_tree_digest(&fetched_artifact_dir)?, fetched_digest_before);
+    assert_eq!(
+        compute_tree_digest(&fetched_artifact_dir)?,
+        fetched_digest_before
+    );
     assert_eq!(compute_tree_digest(&derived_app)?, derived_digest_before);
 
     let project_ls = run_ato_with_home(&ato, &["project", "ls", "--json"], tmp.path(), &home_dir)?;
@@ -834,7 +840,9 @@ fn e2e_native_delivery_projection_symlink_lifecycle() -> Result<()> {
     let problems = broken_projection["problems"]
         .as_array()
         .context("broken projection problems missing")?;
-    assert!(problems.iter().any(|problem| problem.as_str() == Some("derived_app_missing")));
+    assert!(problems
+        .iter()
+        .any(|problem| problem.as_str() == Some("derived_app_missing")));
 
     let unproject = run_ato_with_home(
         &ato,
@@ -845,10 +853,16 @@ fn e2e_native_delivery_projection_symlink_lifecycle() -> Result<()> {
     let unproject = require_success(unproject, "unproject broken projection")?;
     let unproject_json: serde_json::Value =
         serde_json::from_slice(&unproject.stdout).context("parse unproject json")?;
-    assert_eq!(unproject_json["projection_id"].as_str(), Some(projection_id.as_str()));
+    assert_eq!(
+        unproject_json["projection_id"].as_str(),
+        Some(projection_id.as_str())
+    );
     assert!(!projected_path.exists());
     assert!(!metadata_path.exists());
-    assert_eq!(compute_tree_digest(&fetched_artifact_dir)?, fetched_digest_before);
+    assert_eq!(
+        compute_tree_digest(&fetched_artifact_dir)?,
+        fetched_digest_before
+    );
 
     let final_ls = run_ato_with_home(&ato, &["project", "ls", "--json"], tmp.path(), &home_dir)?;
     let final_ls = require_success(final_ls, "list projections after unproject")?;

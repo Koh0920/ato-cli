@@ -357,17 +357,24 @@ pub(crate) fn build_capsule_artifact(
     name: &str,
     version: &str,
 ) -> Result<PathBuf> {
+    let manifest_dir = manifest_path.parent().ok_or_else(|| {
+        anyhow::anyhow!("Manifest path has no parent: {}", manifest_path.display())
+    })?;
+    let artifact_dir = std::env::temp_dir().join("ato-ci-artifacts");
+    fs::create_dir_all(&artifact_dir)
+        .with_context(|| format!("Failed to create {}", artifact_dir.display()))?;
+    let artifact_path = artifact_dir.join(format!("{}-{}.capsule", name, version));
+
+    if let Some(plan) = crate::native_delivery::detect_build_strategy(manifest_dir)? {
+        let result = crate::native_delivery::build_native_artifact(&plan, Some(&artifact_path))?;
+        return Ok(result.artifact_path);
+    }
+
     let decision = capsule_core::router::route_manifest(
         manifest_path,
         capsule_core::router::ExecutionProfile::Release,
         None,
     )?;
-
-    let artifact_dir = std::env::temp_dir().join("ato-ci-artifacts");
-    fs::create_dir_all(&artifact_dir)
-        .with_context(|| format!("Failed to create {}", artifact_dir.display()))?;
-
-    let artifact_path = artifact_dir.join(format!("{}-{}.capsule", name, version));
 
     let reporter: std::sync::Arc<dyn capsule_core::reporter::CapsuleReporter + 'static> =
         std::sync::Arc::new(capsule_core::reporter::NoOpReporter);

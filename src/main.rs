@@ -143,14 +143,11 @@ Usage: {usage}
 
 Primary Commands:
   run      Execute a capsule or SKILL.md in a strict Zero-Trust sandbox
-  install  Install a verified package from the registry
-  init     Initialize a new project
   build    Pack a project into an immutable .capsule archive
+  publish  Publish capsule artifacts to a registry
+  install  Install a verified package from the registry
   search   Search the registry for agent skills and packages
-    fetch    Fetch an experimental native delivery artifact into immutable local cache
-    finalize Create a locally derived native artifact from fetched input
-    project  Experimental explicit opt-in symlink projection for finalized native .app bundles
-    unproject Remove an experimental launcher projection without mutating the artifact
+  init     Initialize a new project
 
 Management:
   ps       List running capsules
@@ -163,9 +160,12 @@ Auth:
   whoami   Show current authentication status
 
 Advanced Commands:
+  fetch    Fetch an artifact into local cache for debugging or manual workflows
+  finalize Perform local derivation for a fetched native artifact
+  project  Add a finalized app to launcher surfaces
+  unproject Remove a launcher projection
   key      Manage signing keys
   config   Manage configuration (registry, engine, source)
-  publish  Publish capsule (Dock/private: direct upload, official: CI-first)
   gen-ci   Generate GitHub Actions workflow for OIDC CI publish
   registry Manage registry commands (resolve/list/cache/serve)
 
@@ -279,6 +279,10 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         default: bool,
 
+        /// Skip prompts and approve local finalize / projection
+        #[arg(short = 'y', long = "yes", default_value_t = false)]
+        yes: bool,
+
         /// Deprecated legacy flag (always rejected)
         #[arg(long = "skip-verify", hide = true, default_value_t = false)]
         skip_verify_legacy: bool,
@@ -290,6 +294,14 @@ enum Commands {
         /// Output directory (default: ~/.ato/store/)
         #[arg(long)]
         output: Option<PathBuf>,
+
+        /// Create a launcher projection after install
+        #[arg(long, default_value_t = false, conflicts_with = "no_project")]
+        project: bool,
+
+        /// Do not prompt for or create a launcher projection
+        #[arg(long, default_value_t = false, conflicts_with = "project")]
+        no_project: bool,
 
         /// Emit machine-readable JSON output
         #[arg(long)]
@@ -393,8 +405,8 @@ enum Commands {
     },
 
     #[command(
-        next_help_heading = "Primary Commands",
-        about = "Fetch an experimental native delivery artifact into immutable local cache"
+        next_help_heading = "Advanced Commands",
+        about = "Fetch an artifact into local cache for debugging or manual workflows"
     )]
     Fetch {
         /// Capsule ref (`publisher/slug[@version]` or `localhost:8080/slug:version`)
@@ -414,8 +426,8 @@ enum Commands {
     },
 
     #[command(
-        next_help_heading = "Primary Commands",
-        about = "Create a locally derived native artifact from a fetched artifact directory"
+        next_help_heading = "Advanced Commands",
+        about = "Perform local derivation for a fetched native artifact. Most users should use `ato install`."
     )]
     Finalize {
         /// Path to fetched artifact directory created by `ato fetch`
@@ -435,8 +447,8 @@ enum Commands {
     },
 
     #[command(
-        next_help_heading = "Primary Commands",
-        about = "Experimental explicit opt-in: symlink-project a finalized local native .app into launcher surface"
+        next_help_heading = "Advanced Commands",
+        about = "Add a finalized app to launcher surfaces"
     )]
     Project {
         /// Path to a finalized local derived .app bundle created by `ato finalize`
@@ -455,8 +467,8 @@ enum Commands {
     },
 
     #[command(
-        next_help_heading = "Primary Commands",
-        about = "Experimental explicit opt-in: remove a managed launcher projection without mutating the finalized artifact"
+        next_help_heading = "Advanced Commands",
+        about = "Remove a launcher projection without mutating the finalized artifact"
     )]
     Unproject {
         /// Projection ID, projected symlink path, or finalized derived .app path
@@ -870,7 +882,9 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum ProjectCommands {
-    #[command(about = "List experimental projection state and detect broken projections read-only")]
+    #[command(
+        about = "List experimental projection state and detect broken projections read-only"
+    )]
     Ls {
         /// Emit machine-readable JSON output
         #[arg(long)]
@@ -1408,20 +1422,26 @@ fn run() -> Result<()> {
             keep_failed_artifacts,
             timings,
             strict_v3,
-        } => commands::build::execute_pack_command(
-            dir,
-            init,
-            key,
-            standalone,
-            force_large_payload,
-            keep_failed_artifacts,
-            strict_v3,
-            enforcement.as_str().to_string(),
-            reporter.clone(),
-            timings,
-            cli.json,
-            cli.nacelle,
-        ),
+        } => {
+            let result = commands::build::execute_pack_command(
+                dir,
+                init,
+                key,
+                standalone,
+                force_large_payload,
+                keep_failed_artifacts,
+                strict_v3,
+                enforcement.as_str().to_string(),
+                reporter.clone(),
+                timings,
+                cli.json,
+                cli.nacelle,
+            )?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            }
+            Ok(())
+        }
 
         Commands::Keygen { out, force, json } => {
             keygen::execute(keygen::KeygenArgs { out, force, json }, reporter.clone())
@@ -1462,7 +1482,7 @@ fn run() -> Result<()> {
             strict_v3,
         } => {
             eprintln!("⚠️  'ato pack' is deprecated. Use 'ato build' instead.");
-            commands::build::execute_pack_command(
+            let result = commands::build::execute_pack_command(
                 dir,
                 init,
                 key,
@@ -1475,7 +1495,11 @@ fn run() -> Result<()> {
                 timings,
                 cli.json,
                 cli.nacelle,
-            )
+            )?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            }
+            Ok(())
         }
 
         Commands::Scaffold {
@@ -1548,9 +1572,12 @@ fn run() -> Result<()> {
             registry,
             version,
             default,
+            yes,
             skip_verify_legacy,
             allow_unverified,
             output,
+            project,
+            no_project,
             json,
         } => {
             if skip_verify_legacy {
@@ -1596,9 +1623,21 @@ fn run() -> Result<()> {
                     version.as_deref(),
                     output,
                     default,
+                    yes,
+                    if project {
+                        install::ProjectionPreference::Force
+                    } else if no_project {
+                        install::ProjectionPreference::Skip
+                    } else {
+                        install::ProjectionPreference::Prompt
+                    },
                     allow_unverified,
-                    json,
                     false,
+                    json,
+                    !json && can_prompt_interactively(
+                        std::io::stdin().is_terminal(),
+                        std::io::stderr().is_terminal(),
+                    ),
                 )
                 .await?;
 
@@ -1610,6 +1649,25 @@ fn run() -> Result<()> {
                     println!("   Version: {}", result.version);
                     println!("   Path:    {}", result.path.display());
                     println!("   Hash:    {}", result.content_hash);
+                    if let Some(launchable) = &result.launchable {
+                        match launchable {
+                            install::LaunchableTarget::CapsuleArchive { path } => {
+                                println!("   Launch:  ato run {}", path.display());
+                            }
+                            install::LaunchableTarget::DerivedApp { path } => {
+                                println!("   App:     {}", path.display());
+                            }
+                        }
+                    }
+                    if let Some(projection) = &result.projection {
+                        if projection.performed {
+                            if let Some(projected_path) = &projection.projected_path {
+                                println!("   Launcher: {}", projected_path.display());
+                            }
+                        } else if no_project {
+                            println!("   Launcher: skipped");
+                        }
+                    }
                 }
                 Ok(())
             })
@@ -1715,7 +1773,9 @@ fn run() -> Result<()> {
             json,
             command,
         } => match command {
-            Some(ProjectCommands::Ls { json: subcommand_json }) => {
+            Some(ProjectCommands::Ls {
+                json: subcommand_json,
+            }) => {
                 let result = native_delivery::execute_project_ls()?;
                 if cli.json || json || subcommand_json {
                     println!("{}", serde_json::to_string_pretty(&result)?);
@@ -1723,7 +1783,11 @@ fn run() -> Result<()> {
                     println!("No experimental projections found.");
                 } else {
                     for projection in result.projections {
-                        let marker = if projection.state == "ok" { "✅" } else { "⚠️" };
+                        let marker = if projection.state == "ok" {
+                            "✅"
+                        } else {
+                            "⚠️"
+                        };
                         println!(
                             "{} [{}] {} -> {}",
                             marker,
@@ -1745,10 +1809,8 @@ fn run() -> Result<()> {
                         "ato project requires <DERIVED_APP_PATH> or use `ato project ls` for read-only status"
                     )
                 })?;
-                let result = native_delivery::execute_project(
-                    &derived_app_path,
-                    launcher_dir.as_deref(),
-                )?;
+                let result =
+                    native_delivery::execute_project(&derived_app_path, launcher_dir.as_deref())?;
                 if cli.json || json {
                     println!("{}", serde_json::to_string_pretty(&result)?);
                 } else {
@@ -1773,7 +1835,10 @@ fn run() -> Result<()> {
                 println!("✅ Unprojected: {}", result.projected_path.display());
                 println!("   ID:      {}", result.projection_id);
                 println!("   State:   {}", result.state_before);
-                println!("   Removed: metadata={}, symlink={}", result.removed_metadata, result.removed_projected_path);
+                println!(
+                    "   Removed: metadata={}, symlink={}",
+                    result.removed_metadata, result.removed_projected_path
+                );
             }
             Ok(())
         }
@@ -3162,9 +3227,16 @@ async fn resolve_run_target_or_install(
         Some(installable_version.as_str()),
         None,
         false,
+        yes,
+        install::ProjectionPreference::Skip,
         allow_unverified,
-        json_mode,
         false,
+        json_mode,
+        !json_mode
+            && can_prompt_interactively(
+                std::io::stdin().is_terminal(),
+                std::io::stderr().is_terminal(),
+            ),
     )
     .await?;
     Ok(install_result.path)
