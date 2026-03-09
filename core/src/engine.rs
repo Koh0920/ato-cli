@@ -216,6 +216,7 @@ pub fn run_internal_streaming(engine: &Path, subcommand: &str, payload: &Value) 
     }
 
     let child_slot: Arc<Mutex<Option<std::process::Child>>> = Arc::new(Mutex::new(Some(child)));
+    #[cfg(unix)]
     let child_slot_for_handler = Arc::clone(&child_slot);
 
     // Forward Ctrl-C to the engine process.
