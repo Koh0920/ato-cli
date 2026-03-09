@@ -132,12 +132,12 @@ fn test_finalize_help_shows_required_contract() {
 }
 
 #[test]
-fn test_project_help_shows_experimental_explicit_opt_in_contract() {
+fn test_project_help_shows_launcher_projection_contract() {
     let mut cmd = Command::cargo_bin("ato").unwrap();
     cmd.args(["project", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Experimental explicit opt-in"))
+        .stdout(predicate::str::contains("Add a finalized app to launcher surfaces"))
         .stdout(predicate::str::contains("ato finalize"))
         .stdout(predicate::str::contains("--launcher-dir <LAUNCHER_DIR>"))
         .stdout(predicate::str::contains("Commands:"))
@@ -162,7 +162,9 @@ fn test_unproject_help_shows_projection_reference_contract() {
     cmd.args(["unproject", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Experimental explicit opt-in"))
+        .stdout(predicate::str::contains(
+            "Remove a launcher projection without mutating the finalized artifact",
+        ))
         .stdout(predicate::str::contains("Projection ID"))
         .stdout(predicate::str::contains("--json"));
 }
