@@ -229,6 +229,12 @@
   gap: 6px;
 }
 
+.confirm-extra {
+  margin-top: 10px;
+  display: grid;
+  gap: 6px;
+}
+
 .confirm-auth-label {
   font-size: 11px;
   color: var(--text-2);
@@ -236,6 +242,20 @@
 
 .confirm-auth-input {
   min-height: 32px;
+}
+
+.confirm-note {
+  margin: 0;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.confirm-note.warn {
+  color: var(--yellow);
+}
+
+.confirm-note.error {
+  color: var(--red);
 }
 
 .toast-root {
