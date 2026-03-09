@@ -780,7 +780,7 @@ fn hash_tree_node(path: &Path, relative: &Path, hasher: &mut blake3::Hasher) -> 
             .with_context(|| format!("Failed to read directory {}", path.display()))?
             .collect::<std::io::Result<Vec<_>>>()
             .with_context(|| format!("Failed to enumerate directory {}", path.display()))?;
-        entries.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
+        entries.sort_by_key(|left| left.file_name());
         for entry in entries {
             let child_path = entry.path();
             let child_relative = if relative.as_os_str().is_empty() {
@@ -850,7 +850,7 @@ fn copy_recursively(source: &Path, destination: &Path) -> Result<()> {
             .with_context(|| format!("Failed to read directory {}", source.display()))?
             .collect::<std::io::Result<Vec<_>>>()
             .with_context(|| format!("Failed to enumerate directory {}", source.display()))?;
-        entries.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
+        entries.sort_by_key(|left| left.file_name());
         for entry in entries {
             copy_recursively(&entry.path(), &destination.join(entry.file_name()))?;
         }
