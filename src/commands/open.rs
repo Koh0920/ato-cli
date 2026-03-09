@@ -32,6 +32,8 @@ mod watch;
 
 const BACKGROUND_READY_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const BACKGROUND_READY_WAIT_TIMEOUT_ENV: &str = "ATO_BACKGROUND_READY_WAIT_TIMEOUT_SECS";
+const NACELLE_RELEASE_BASE_URL_ENV: &str = "ATO_NACELLE_RELEASE_BASE_URL";
+const DEFAULT_NACELLE_RELEASE_BASE_URL: &str = "https://dl.ato.run/nacelle";
 
 pub struct OpenArgs {
     pub target: PathBuf,
@@ -1079,6 +1081,7 @@ fn resolve_nacelle_for_tier2(
                 .into());
             }
 
+            ensure_default_nacelle_release_base_url();
             crate::engine_manager::auto_bootstrap_nacelle(&**reporter)
                 .map(|installed| installed.path)
                 .map_err(|bootstrap_err| {
@@ -1091,6 +1094,15 @@ fn resolve_nacelle_for_tier2(
                     .into()
                 })
         }
+    }
+}
+
+fn ensure_default_nacelle_release_base_url() {
+    if std::env::var_os(NACELLE_RELEASE_BASE_URL_ENV).is_none() {
+        std::env::set_var(
+            NACELLE_RELEASE_BASE_URL_ENV,
+            DEFAULT_NACELLE_RELEASE_BASE_URL,
+        );
     }
 }
 
