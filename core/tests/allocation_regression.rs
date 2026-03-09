@@ -88,6 +88,7 @@ entrypoint = "source/main.sh"
             &manifest_raw,
             manifest_text,
             reporter.clone(),
+            false,
         ))
         .expect("first ensure_lockfile")
     });
@@ -98,6 +99,7 @@ entrypoint = "source/main.sh"
             &manifest_raw,
             manifest_text,
             reporter,
+            false,
         ))
         .expect("second ensure_lockfile")
     });

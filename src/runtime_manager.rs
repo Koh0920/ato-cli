@@ -519,6 +519,7 @@ fn find_binary_recursive(root: &Path, candidates: &[&str]) -> Result<Option<Path
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn consumer_paths_do_not_spawn_git_commands() {
@@ -547,5 +548,30 @@ mod tests {
                 absolute.display()
             );
         }
+    }
+
+    #[test]
+    fn select_runtime_artifact_returns_matching_linux_entry() {
+        let targets = HashMap::from([
+            (
+                "aarch64-apple-darwin".to_string(),
+                RuntimeArtifact {
+                    url: "https://example.invalid/deno-aarch64-apple-darwin.zip".to_string(),
+                    sha256: "sha256:mac".to_string(),
+                },
+            ),
+            (
+                "x86_64-unknown-linux-gnu".to_string(),
+                RuntimeArtifact {
+                    url: "https://example.invalid/deno-x86_64-unknown-linux-gnu.zip".to_string(),
+                    sha256: "sha256:linux".to_string(),
+                },
+            ),
+        ]);
+
+        let artifact =
+            select_runtime_artifact(&targets, "x86_64-unknown-linux-gnu", "linux-x86_64")
+                .expect("linux runtime artifact");
+        assert!(artifact.url.contains("x86_64-unknown-linux-gnu"));
     }
 }

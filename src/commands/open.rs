@@ -1112,8 +1112,7 @@ fn should_attempt_nacelle_auto_bootstrap(
         return Ok(false);
     }
 
-    let cfg = capsule_core::config::load_config()?;
-    Ok(cfg.default_engine.is_none())
+    Ok(true)
 }
 
 fn manifest_declares_engine_override(manifest_path: &Path) -> Result<bool> {

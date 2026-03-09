@@ -336,6 +336,10 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         keep_failed_artifacts: bool,
 
+        /// Print per-phase build timings
+        #[arg(long, default_value_t = false)]
+        timings: bool,
+
         /// Disallow fallback when source_digest/CAS(v3 path) is unavailable
         #[arg(long, default_value_t = false)]
         strict_v3: bool,
@@ -681,6 +685,10 @@ enum Commands {
         /// Keep failed build artifacts when smoke test fails
         #[arg(long, hide = true, default_value_t = false)]
         keep_failed_artifacts: bool,
+
+        /// Print per-phase build timings
+        #[arg(long, hide = true, default_value_t = false)]
+        timings: bool,
 
         /// Disallow fallback when source_digest/CAS(v3 path) is unavailable
         #[arg(long, hide = true, default_value_t = false)]
@@ -1307,6 +1315,7 @@ fn run() -> Result<()> {
             force_large_payload,
             enforcement,
             keep_failed_artifacts,
+            timings,
             strict_v3,
         } => commands::build::execute_pack_command(
             dir,
@@ -1318,6 +1327,7 @@ fn run() -> Result<()> {
             strict_v3,
             enforcement.as_str().to_string(),
             reporter.clone(),
+            timings,
             cli.json,
             cli.nacelle,
         ),
@@ -1357,6 +1367,7 @@ fn run() -> Result<()> {
             force_large_payload,
             enforcement,
             keep_failed_artifacts,
+            timings,
             strict_v3,
         } => {
             eprintln!("⚠️  'ato pack' is deprecated. Use 'ato build' instead.");
@@ -1370,6 +1381,7 @@ fn run() -> Result<()> {
                 strict_v3,
                 enforcement.as_str().to_string(),
                 reporter.clone(),
+                timings,
                 cli.json,
                 cli.nacelle,
             )
@@ -2658,170 +2670,21 @@ fn execute_setup_command(
     skip_verify: bool,
     reporter: std::sync::Arc<reporters::CliReporter>,
 ) -> Result<()> {
-    let em = engine_manager::EngineManager::new()?;
-    let requested_version = version.unwrap_or_else(|| "latest".to_string());
-
-    let (resolved_version, url, sha256) = match engine.as_str() {
-        "nacelle" => {
-            let os = if cfg!(target_os = "macos") {
-                "darwin"
-            } else if cfg!(target_os = "linux") {
-                "linux"
-            } else {
-                anyhow::bail!("Unsupported OS");
-            };
-            let arch = if cfg!(target_arch = "x86_64") {
-                "x64"
-            } else if cfg!(target_arch = "aarch64") {
-                "arm64"
-            } else {
-                anyhow::bail!("Unsupported architecture");
-            };
-
-            let resolved = if requested_version == "latest" {
-                fetch_latest_nacelle_version()?
-            } else {
-                requested_version.clone()
-            };
-
-            let binary_name = format!("nacelle-{}-{}-{}", resolved, os, arch);
-            let base_url = format!("https://releases.capsule.dev/nacelle/{}", resolved);
-            let url = format!("{}/{}", base_url, binary_name);
-            let sha256 = if skip_verify {
-                String::new()
-            } else {
-                fetch_release_sha256(&base_url, &binary_name)?
-            };
-            (resolved, url, sha256)
-        }
-        _ => {
-            anyhow::bail!(
-                "Unknown engine: {}. Currently only 'nacelle' is supported.",
-                engine
-            );
-        }
-    };
-
-    let path = em.download_engine(&engine, &resolved_version, &url, &sha256, &*reporter)?;
+    let install = engine_manager::install_engine_release(
+        &engine,
+        version.as_deref(),
+        skip_verify,
+        &*reporter,
+    )?;
 
     futures::executor::block_on(reporter.notify(format!(
-        "✅ Engine {} v{} installed at {}",
+        "✅ Engine {} {} installed at {}",
         engine,
-        resolved_version,
-        path.display()
+        install.version,
+        install.path.display()
     )))?;
 
-    let mut cfg = capsule_core::config::load_config()?;
-    cfg.engines.insert(
-        engine.clone(),
-        capsule_core::config::EngineRegistration {
-            path: path.display().to_string(),
-        },
-    );
-    if cfg.default_engine.is_none() {
-        cfg.default_engine = Some(engine.clone());
-    }
-    capsule_core::config::save_config(&cfg)?;
-
-    futures::executor::block_on(reporter.notify("✅ Registered as default engine".to_string()))?;
-
     Ok(())
-}
-
-fn fetch_latest_nacelle_version() -> Result<String> {
-    let resp = reqwest::blocking::get("https://releases.capsule.dev/nacelle/latest.txt")
-        .context("Failed to fetch latest nacelle version")?
-        .text()?;
-    let version = resp.trim();
-    if version.is_empty() {
-        anyhow::bail!("Latest nacelle version response was empty");
-    }
-    Ok(version.to_string())
-}
-
-fn fetch_release_sha256(base_url: &str, binary_name: &str) -> Result<String> {
-    let checksum_urls = [
-        format!("{}/SHA256SUMS", base_url),
-        format!("{}/SHA256SUMS.txt", base_url),
-        format!("{}/SHASUMS256.txt", base_url),
-        format!("{}/{}.sha256", base_url, binary_name),
-    ];
-
-    for checksum_url in checksum_urls {
-        let response = match reqwest::blocking::get(&checksum_url) {
-            Ok(resp) => resp,
-            Err(_) => continue,
-        };
-
-        if !response.status().is_success() {
-            continue;
-        }
-
-        let body = response
-            .text()
-            .with_context(|| format!("Failed to read checksum file {}", checksum_url))?;
-
-        if let Some(hash) = parse_sha256_for_artifact(&body, binary_name) {
-            return Ok(hash);
-        }
-
-        if checksum_url.ends_with(".sha256") {
-            if let Some(hash) = extract_first_sha256_hex(&body) {
-                return Ok(hash);
-            }
-        }
-    }
-
-    anyhow::bail!(
-        "Failed to resolve SHA256 for {} from release metadata at {}",
-        binary_name,
-        base_url
-    )
-}
-
-fn parse_sha256_for_artifact(checksum_body: &str, binary_name: &str) -> Option<String> {
-    for raw_line in checksum_body.lines() {
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        if let Some(stripped) = line
-            .strip_prefix("SHA256 (")
-            .or_else(|| line.strip_prefix("sha256 ("))
-        {
-            if let Some((name, hash_part)) = stripped.split_once(')') {
-                let hash = hash_part.trim().trim_start_matches('=').trim();
-                if name.trim() == binary_name && is_sha256_hex(hash) {
-                    return Some(hash.to_ascii_lowercase());
-                }
-            }
-        }
-
-        let mut parts = line.split_whitespace();
-        let Some(hash) = parts.next() else {
-            continue;
-        };
-        let Some(name) = parts.last() else {
-            continue;
-        };
-        let normalized_name = name.trim_start_matches('*').trim_start_matches("./");
-        if normalized_name == binary_name && is_sha256_hex(hash) {
-            return Some(hash.to_ascii_lowercase());
-        }
-    }
-
-    None
-}
-
-fn extract_first_sha256_hex(raw: &str) -> Option<String> {
-    raw.split_whitespace()
-        .find(|token| is_sha256_hex(token))
-        .map(|token| token.to_ascii_lowercase())
-}
-
-fn is_sha256_hex(value: &str) -> bool {
-    value.len() == 64 && value.as_bytes().iter().all(|b| b.is_ascii_hexdigit())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3723,7 +3586,10 @@ mod tests {
 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  nacelle-v1.2.3-darwin-arm64
 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  nacelle-v1.2.3-linux-x64
 ";
-        let parsed = parse_sha256_for_artifact(body, "nacelle-v1.2.3-linux-x64");
+        let parsed = crate::engine_manager::parse_sha256_for_artifact(
+            body,
+            "nacelle-v1.2.3-linux-x64",
+        );
         assert_eq!(
             parsed.as_deref(),
             Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
@@ -3733,7 +3599,10 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  nacelle-v1.2.3
     #[test]
     fn parse_sha256_for_artifact_supports_bsd_style_format() {
         let body = "SHA256 (nacelle-v1.2.3-darwin-arm64) = CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
-        let parsed = parse_sha256_for_artifact(body, "nacelle-v1.2.3-darwin-arm64");
+        let parsed = crate::engine_manager::parse_sha256_for_artifact(
+            body,
+            "nacelle-v1.2.3-darwin-arm64",
+        );
         assert_eq!(
             parsed.as_deref(),
             Some("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
@@ -3743,7 +3612,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  nacelle-v1.2.3
     #[test]
     fn extract_first_sha256_hex_reads_single_file_checksum() {
         let body = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd  nacelle-v1.2.3-darwin-arm64";
-        let parsed = extract_first_sha256_hex(body);
+        let parsed = crate::engine_manager::extract_first_sha256_hex(body);
         assert_eq!(
             parsed.as_deref(),
             Some("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd")

@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 
 use crate::manifest;
 use crate::policy::egress_resolver::{resolve_egress_policy, EgressRule};
+use crate::router::{self, ExecutionProfile};
+use crate::types::{ResolvedService, ResolvedServiceRuntime, ResolvedTargetRuntime};
 
 const CONFIG_VERSION: &str = "1.0.0";
 
@@ -150,6 +152,10 @@ type CommandResolution = (
 
 #[derive(Debug, Clone, Deserialize)]
 struct ManifestService {
+    #[serde(default)]
+    target: Option<String>,
+
+    #[serde(default)]
     entrypoint: String,
     #[serde(default)]
     depends_on: Option<Vec<String>>,
@@ -187,6 +193,7 @@ pub fn generate_config(
     let manifest = loaded.raw;
 
     let config = build_config_json(
+        manifest_path,
         &manifest,
         &manifest_content,
         enforcement_override,
@@ -241,29 +248,13 @@ fn sort_json_object_keys(value: &mut serde_json::Value) {
 }
 
 fn build_config_json(
+    manifest_path: &Path,
     manifest: &toml::Value,
     manifest_raw: &str,
     enforcement_override: Option<String>,
     standalone: bool,
 ) -> Result<ConfigJson> {
     let mut services = HashMap::new();
-    let entrypoint = read_entrypoint(manifest)?;
-    let command = read_command(manifest);
-    let (executable, args, env, signals) =
-        resolve_command(&entrypoint, command.as_deref(), manifest, standalone);
-    let main_spec = ServiceSpec {
-        executable,
-        args,
-        cwd: Some("source".to_string()),
-        env,
-        user: None,
-        signals,
-        depends_on: None,
-        health_check: read_health_check(manifest),
-        ports: None,
-    };
-    services.insert("main".to_string(), main_spec);
-
     let manifest_services = manifest
         .get("services")
         .and_then(|s| s.as_table())
@@ -277,7 +268,28 @@ fn build_config_json(
         })
         .unwrap_or_default();
 
-    if !manifest_services.is_empty() {
+    if uses_target_based_services(&manifest_services) {
+        services = build_target_based_services(manifest_path, standalone)?;
+    } else {
+        let entrypoint = read_entrypoint(manifest)?;
+        let command = read_command(manifest);
+        let (executable, args, env, signals) =
+            resolve_command(&entrypoint, command.as_deref(), manifest, standalone);
+        let main_spec = ServiceSpec {
+            executable,
+            args,
+            cwd: Some("source".to_string()),
+            env,
+            user: None,
+            signals,
+            depends_on: None,
+            health_check: read_health_check(manifest),
+            ports: None,
+        };
+        services.insert("main".to_string(), main_spec);
+    }
+
+    if !manifest_services.is_empty() && !uses_target_based_services(&manifest_services) {
         for (name, svc) in &manifest_services {
             if name == "main" {
                 anyhow::bail!(
@@ -350,6 +362,201 @@ fn build_config_json(
         annotations: None,
         sidecar,
     })
+}
+
+fn uses_target_based_services(services: &HashMap<String, ManifestService>) -> bool {
+    services.values().any(|service| {
+        service
+            .target
+            .as_deref()
+            .map(|target| !target.trim().is_empty())
+            .unwrap_or(false)
+    })
+}
+
+fn build_target_based_services(
+    manifest_path: &Path,
+    standalone: bool,
+) -> Result<HashMap<String, ServiceSpec>> {
+    let decision = router::route_manifest(manifest_path, ExecutionProfile::Release, None)?;
+    let orchestration = decision.plan.resolve_services()?;
+    let mut services = HashMap::new();
+
+    for service in orchestration.services {
+        services.insert(
+            service.name.clone(),
+            build_target_service_spec(&service, standalone)?,
+        );
+    }
+
+    Ok(services)
+}
+
+fn build_target_service_spec(service: &ResolvedService, standalone: bool) -> Result<ServiceSpec> {
+    let runtime = match &service.runtime {
+        ResolvedServiceRuntime::Managed(runtime) => runtime,
+        ResolvedServiceRuntime::Oci(runtime) => {
+            anyhow::bail!(
+                "target-based config.json generation does not yet support runtime=oci services (service='{}', target='{}')",
+                service.name,
+                runtime.target
+            )
+        }
+    };
+
+    let (executable, args, env) = resolve_target_command(runtime, standalone);
+    let mut merged_env = env.unwrap_or_default();
+    for connection in &service.connections {
+        merged_env.insert(connection.host_env.clone(), "127.0.0.1".to_string());
+        if let Some(port) = connection.container_port {
+            merged_env.insert(connection.port_env.clone(), port.to_string());
+        }
+    }
+
+    Ok(ServiceSpec {
+        executable,
+        args,
+        cwd: Some(source_cwd(runtime.working_dir.as_deref())),
+        env: if merged_env.is_empty() {
+            None
+        } else {
+            Some(merged_env)
+        },
+        user: None,
+        signals: None,
+        depends_on: if service.depends_on.is_empty() {
+            None
+        } else {
+            Some(service.depends_on.clone())
+        },
+        health_check: service.readiness_probe.as_ref().map(|probe| HealthCheck {
+            http_get: probe.http_get.clone(),
+            tcp_connect: probe.tcp_connect.clone(),
+            port: probe.port.clone(),
+            interval_secs: None,
+            timeout_secs: None,
+        }),
+        ports: None,
+    })
+}
+
+fn resolve_target_command(
+    runtime: &ResolvedTargetRuntime,
+    standalone: bool,
+) -> (String, Vec<String>, Option<HashMap<String, String>>) {
+    let entrypoint = runtime.entrypoint.as_str();
+    let tokens = shell_words::split(entrypoint).unwrap_or_else(|_| vec![entrypoint.to_string()]);
+    let program = tokens
+        .first()
+        .cloned()
+        .unwrap_or_else(|| entrypoint.to_string());
+
+    let language = runtime
+        .driver
+        .as_deref()
+        .map(normalize_language)
+        .or_else(|| detect_language_from_program(&program))
+        .or_else(|| detect_language_from_entrypoint(entrypoint));
+
+    let mut env = runtime.env.clone();
+
+    let (executable, mut args) = if let Some(lang) = language.as_deref() {
+        match lang {
+            "python" => {
+                let mut args = tokens.get(1..).unwrap_or(&[]).to_vec();
+                if tokens.len() <= 1 {
+                    args = vec![program.clone()];
+                }
+                env.insert("PYTHONDONTWRITEBYTECODE".to_string(), "1".to_string());
+                if standalone {
+                    env.insert("PYTHONHOME".to_string(), "runtime/python".to_string());
+                    env.insert("PYTHONPATH".to_string(), "source".to_string());
+                    ("runtime/python/bin/python3".to_string(), args)
+                } else {
+                    let mut uv_args = vec![
+                        "run".to_string(),
+                        "--offline".to_string(),
+                        "python3".to_string(),
+                    ];
+                    uv_args.extend(args);
+                    ("uv".to_string(), uv_args)
+                }
+            }
+            "node" => {
+                let mut args = tokens.get(1..).unwrap_or(&[]).to_vec();
+                if tokens.len() <= 1 {
+                    args = vec![program.clone()];
+                }
+                if standalone {
+                    ("runtime/node/bin/node".to_string(), args)
+                } else {
+                    ("node".to_string(), args)
+                }
+            }
+            "deno" => {
+                let mut args = tokens.get(1..).unwrap_or(&[]).to_vec();
+                if tokens.len() <= 1 {
+                    args = vec!["run".to_string(), "-A".to_string(), program.clone()];
+                }
+                if standalone {
+                    ("runtime/deno/bin/deno".to_string(), args)
+                } else {
+                    ("deno".to_string(), args)
+                }
+            }
+            "bun" => {
+                let mut args = tokens.get(1..).unwrap_or(&[]).to_vec();
+                if tokens.len() <= 1 {
+                    args = vec![program.clone()];
+                }
+                if standalone {
+                    ("runtime/bun/bin/bun".to_string(), args)
+                } else {
+                    ("bun".to_string(), args)
+                }
+            }
+            _ => (
+                normalize_program(&program, standalone),
+                tokens.get(1..).unwrap_or(&[]).to_vec(),
+            ),
+        }
+    } else {
+        (
+            normalize_program(&program, standalone),
+            tokens.get(1..).unwrap_or(&[]).to_vec(),
+        )
+    };
+
+    if !runtime.cmd.is_empty() {
+        args.extend(runtime.cmd.clone());
+    }
+
+    if !args.is_empty() {
+        args = args
+            .into_iter()
+            .map(|arg| normalize_arg(&arg, standalone))
+            .collect();
+    }
+
+    (
+        executable,
+        args,
+        if env.is_empty() { None } else { Some(env) },
+    )
+}
+
+fn source_cwd(working_dir: Option<&str>) -> String {
+    match working_dir.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(dir) => {
+            let normalized = dir.trim_start_matches("./").trim_matches('/');
+            if normalized.is_empty() || normalized == "." {
+                "source".to_string()
+            } else {
+                format!("source/{normalized}")
+            }
+        }
+        None => "source".to_string(),
+    }
 }
 
 fn validate_config_json(config: &ConfigJson) -> Result<()> {
@@ -1178,6 +1385,79 @@ egress_allow = ["1.1.1.1"]
         assert_eq!(config.services["main"].executable, "node");
         assert_eq!(config.services["main"].args, vec!["index.js"]);
         assert_eq!(config.services["main"].cwd, Some("source".to_string()));
+    }
+
+    #[test]
+    fn test_target_based_services_config_generation() {
+        let tmp = tempdir().unwrap();
+        let manifest_path = tmp.path().join("capsule.toml");
+
+        let manifest = r#"
+schema_version = "0.2"
+name = "svc-demo"
+version = "0.1.0"
+type = "app"
+default_target = "dashboard"
+
+[services.main]
+target = "dashboard"
+depends_on = ["control_plane"]
+readiness_probe = { http_get = "/", port = "4173" }
+
+[services.control_plane]
+target = "control_plane"
+readiness_probe = { http_get = "/healthz", port = "8081" }
+
+[targets.dashboard]
+runtime = "web"
+driver = "node"
+runtime_version = "20.11.0"
+entrypoint = "apps/dashboard/server.js"
+port = 4173
+working_dir = "."
+env = { PORT = "4173" }
+
+[targets.control_plane]
+runtime = "source"
+driver = "python"
+runtime_version = "3.11.10"
+entrypoint = "python -m uvicorn control_plane.modal_webhook:app --port 8081"
+working_dir = "apps/control-plane"
+port = 8081
+env = { PYTHONPATH = "src" }
+"#;
+
+        std::fs::write(&manifest_path, manifest).unwrap();
+
+        let config_path = generate_and_write_config(&manifest_path, None, false).unwrap();
+        let config_raw = std::fs::read_to_string(config_path).unwrap();
+        let config: ConfigJson = serde_json::from_str(&config_raw).unwrap();
+
+        assert_eq!(config.services["main"].executable, "node");
+        assert_eq!(
+            config.services["main"].args,
+            vec!["apps/dashboard/server.js"]
+        );
+        assert_eq!(config.services["main"].cwd, Some("source".to_string()));
+
+        assert_eq!(config.services["control_plane"].executable, "uv");
+        assert_eq!(
+            config.services["control_plane"].args,
+            vec![
+                "run",
+                "--offline",
+                "python3",
+                "-m",
+                "uvicorn",
+                "control_plane.modal_webhook:app",
+                "--port",
+                "8081"
+            ]
+        );
+        assert_eq!(
+            config.services["control_plane"].cwd,
+            Some("source/apps/control-plane".to_string())
+        );
     }
 
     #[test]
