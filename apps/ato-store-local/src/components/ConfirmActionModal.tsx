@@ -4,6 +4,7 @@ interface ConfirmActionModalProps {
   open: boolean;
   title: string;
   lines: string[];
+  extraContent?: JSX.Element | null;
   authRequired: boolean;
   authToken: string;
   isSubmitting: boolean;
@@ -18,6 +19,7 @@ export function ConfirmActionModal({
   open,
   title,
   lines,
+  extraContent,
   authRequired,
   authToken,
   isSubmitting,
@@ -61,6 +63,7 @@ export function ConfirmActionModal({
             <div key={`${index}-${line}`}>{line}</div>
           ))}
         </div>
+        {extraContent}
         {authRequired ? (
           <div className="confirm-auth">
             <label className="confirm-auth-label" htmlFor="confirm-auth-token">

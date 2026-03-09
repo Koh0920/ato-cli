@@ -401,9 +401,7 @@ pub fn run_ipc_invoke(
     {
         let response: JsonRpcResponse = match &target.endpoint {
             IpcTransport::UnixSocket(socket_path) => invoke_over_unix_socket(socket_path, &request)
-                .unwrap_or_else(|err| {
-                    exit_with_invoke_error(request_id.clone(), err, json_output)
-                }),
+                .unwrap_or_else(|err| exit_with_invoke_error(request_id.clone(), err, json_output)),
             transport => exit_with_invoke_error(
                 request_id,
                 JsonRpcError::service_unavailable(&format!(

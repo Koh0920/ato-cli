@@ -106,6 +106,7 @@ mod publish_prepare;
 mod publish_private;
 mod registry;
 mod registry_delete;
+mod registry_http;
 mod registry_serve;
 mod registry_store;
 mod registry_yank;
@@ -2638,20 +2639,7 @@ fn resolve_publish_registry_url(cli_registry: Option<String>) -> Result<String> 
 }
 
 fn normalize_registry_url(raw: &str) -> Result<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        anyhow::bail!("Registry URL cannot be empty");
-    }
-    let parsed =
-        reqwest::Url::parse(trimmed).with_context(|| format!("Invalid registry URL: {}", raw))?;
-    let scheme = parsed.scheme().to_ascii_lowercase();
-    if scheme != "http" && scheme != "https" {
-        anyhow::bail!(
-            "Registry URL must use http or https scheme (got '{}')",
-            parsed.scheme()
-        );
-    }
-    Ok(trimmed.trim_end_matches('/').to_string())
+    crate::registry_http::normalize_registry_url(raw, "registry")
 }
 
 fn is_official_publish_registry(url: &str) -> bool {

@@ -33,7 +33,9 @@ pub fn yank_manifest(args: RegistryYankArgs) -> Result<RegistryYankResult> {
         "target_manifest_hash": args.manifest_hash,
     });
 
-    let request = reqwest::blocking::Client::new()
+    let request = crate::registry_http::blocking_client_builder(&base_url)
+        .build()
+        .context("Failed to create registry yank client")?
         .post(&endpoint)
         .json(&payload);
     let request = if let Some(token) = read_ato_token() {
@@ -44,7 +46,7 @@ pub fn yank_manifest(args: RegistryYankArgs) -> Result<RegistryYankResult> {
 
     let response = request
         .send()
-        .with_context(|| format!("Failed to yank manifest via {}", endpoint))?;
+        .map_err(|err| anyhow::anyhow!("Failed to yank manifest via {}: {}", endpoint, err))?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -59,17 +61,7 @@ pub fn yank_manifest(args: RegistryYankArgs) -> Result<RegistryYankResult> {
 }
 
 fn normalize_registry_url(raw: &str) -> Result<String> {
-    let trimmed = raw.trim();
-    let parsed = reqwest::Url::parse(trimmed)
-        .with_context(|| format!("Invalid --registry URL for yank: {}", raw))?;
-    let scheme = parsed.scheme().to_ascii_lowercase();
-    if scheme != "http" && scheme != "https" {
-        bail!(
-            "Registry URL must use http or https scheme (got '{}')",
-            parsed.scheme()
-        );
-    }
-    Ok(trimmed.trim_end_matches('/').to_string())
+    crate::registry_http::normalize_registry_url(raw, "--registry")
 }
 
 fn parse_error_message(status: StatusCode, body: &str) -> String {
