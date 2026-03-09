@@ -253,7 +253,7 @@ fn state_mounts(manifest: &CapsuleManifest) -> Result<Vec<Mount>, CapsuleError> 
                     state_name
                 )));
             }
-            if target.is_empty() || !target.starts_with('/') || target.contains("..") {
+            if !super::is_valid_mount_path(target) {
                 return Err(CapsuleError::ValidationError(format!(
                     "services.main.state_bindings target '{}' must be an absolute path",
                     binding.target
@@ -261,7 +261,7 @@ fn state_mounts(manifest: &CapsuleManifest) -> Result<Vec<Mount>, CapsuleError> 
             }
 
             Ok(Mount {
-                source: manifest.ephemeral_state_source_path(state_name),
+                source: manifest.ephemeral_state_source_path(state_name)?,
                 target: target.to_string(),
                 readonly: false,
             })

@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path};
 
 use super::error::CapsuleError;
 use super::utils::parse_memory_string;
@@ -1789,9 +1789,18 @@ impl CapsuleManifest {
             }
         }
 
-        let services = self.services.as_ref().cloned().unwrap_or_default();
         if !self.state.is_empty() {
-            if services.is_empty() {
+            if self
+                .services
+                .as_ref()
+                .map(|services| {
+                    services.is_empty()
+                        || !services
+                            .values()
+                            .any(|service| !service.state_bindings.is_empty())
+                })
+                .unwrap_or(true)
+            {
                 errors.push(ValidationError::InvalidState(
                     "state".to_string(),
                     "services.*.state_bindings are required when [state] is declared".to_string(),
@@ -1848,99 +1857,101 @@ impl CapsuleManifest {
                 }
             }
 
-            for (service_name, service) in &services {
-                if service.state_bindings.is_empty() {
-                    continue;
-                }
-
-                let Some(target_label) = service
-                    .target
-                    .as_ref()
-                    .map(|value| value.trim())
-                    .filter(|value| !value.is_empty())
-                else {
-                    errors.push(ValidationError::InvalidStateBinding(
-                        service_name.clone(),
-                        "state_bindings require target-based services".to_string(),
-                    ));
-                    continue;
-                };
-
-                if let Some(target) = named_targets.get(target_label) {
-                    if !target.runtime.eq_ignore_ascii_case("oci") {
-                        errors.push(ValidationError::InvalidStateBinding(
-                            service_name.clone(),
-                            format!(
-                                "state_bindings are only supported for OCI targets in this PoC (target '{}')",
-                                target_label
-                            ),
-                        ));
+            if let Some(services) = self.services.as_ref() {
+                for (service_name, service) in services {
+                    if service.state_bindings.is_empty() {
+                        continue;
                     }
-                }
 
-                let mut bound_states = std::collections::HashSet::new();
-                let mut bound_targets = std::collections::HashSet::new();
-                for binding in &service.state_bindings {
-                    let state_name = binding.state.trim();
-                    let target = binding.target.trim();
-
-                    if state_name.is_empty() {
+                    let Some(target_label) = service
+                        .target
+                        .as_ref()
+                        .map(|value| value.trim())
+                        .filter(|value| !value.is_empty())
+                    else {
                         errors.push(ValidationError::InvalidStateBinding(
                             service_name.clone(),
-                            "binding.state is required".to_string(),
+                            "state_bindings require target-based services".to_string(),
                         ));
-                    } else {
-                        if !bound_states.insert(state_name.to_string()) {
+                        continue;
+                    };
+
+                    if let Some(target) = named_targets.get(target_label) {
+                        if !target.runtime.eq_ignore_ascii_case("oci") {
                             errors.push(ValidationError::InvalidStateBinding(
                                 service_name.clone(),
-                                format!("state '{}' is bound more than once", state_name),
+                                format!(
+                                    "state_bindings are only supported for OCI targets in this PoC (target '{}')",
+                                    target_label
+                                ),
                             ));
-                        }
-
-                        if let Some(previous_service) = shared_state_bindings
-                            .insert(state_name.to_string(), service_name.clone())
-                        {
-                            if previous_service != *service_name {
-                                errors.push(ValidationError::InvalidStateBinding(
-                                    service_name.clone(),
-                                    format!(
-                                        "state '{}' is already bound by service '{}'; shared mutable state is not supported in this PoC",
-                                        state_name, previous_service
-                                    ),
-                                ));
-                            }
-                        }
-
-                        match self.state.get(state_name) {
-                            Some(requirement)
-                                if requirement.durability == StateDurability::Persistent =>
-                            {
-                                errors.push(ValidationError::InvalidStateBinding(
-                                    service_name.clone(),
-                                    format!(
-                                        "state '{}' is persistent and cannot be attached until explicit binding support is implemented",
-                                        state_name
-                                    ),
-                                ));
-                            }
-                            Some(_) => {}
-                            None => errors.push(ValidationError::InvalidStateBinding(
-                                service_name.clone(),
-                                format!("state '{}' is not declared under [state]", state_name),
-                            )),
                         }
                     }
 
-                    if !is_valid_mount_path(target) {
-                        errors.push(ValidationError::InvalidStateBinding(
-                            service_name.clone(),
-                            format!("target '{}' must be an absolute path", binding.target),
-                        ));
-                    } else if !bound_targets.insert(target.to_string()) {
-                        errors.push(ValidationError::InvalidStateBinding(
-                            service_name.clone(),
-                            format!("target '{}' is bound more than once", target),
-                        ));
+                    let mut bound_states = std::collections::HashSet::new();
+                    let mut bound_targets = std::collections::HashSet::new();
+                    for binding in &service.state_bindings {
+                        let state_name = binding.state.trim();
+                        let target = binding.target.trim();
+
+                        if state_name.is_empty() {
+                            errors.push(ValidationError::InvalidStateBinding(
+                                service_name.clone(),
+                                "binding.state is required".to_string(),
+                            ));
+                        } else {
+                            if !bound_states.insert(state_name.to_string()) {
+                                errors.push(ValidationError::InvalidStateBinding(
+                                    service_name.clone(),
+                                    format!("state '{}' is bound more than once", state_name),
+                                ));
+                            }
+
+                            if let Some(previous_service) = shared_state_bindings
+                                .insert(state_name.to_string(), service_name.clone())
+                            {
+                                if previous_service != *service_name {
+                                    errors.push(ValidationError::InvalidStateBinding(
+                                        service_name.clone(),
+                                        format!(
+                                            "state '{}' is already bound by service '{}'; shared mutable state is not supported in this PoC",
+                                            state_name, previous_service
+                                        ),
+                                    ));
+                                }
+                            }
+
+                            match self.state.get(state_name) {
+                                Some(requirement)
+                                    if requirement.durability == StateDurability::Persistent =>
+                                {
+                                    errors.push(ValidationError::InvalidStateBinding(
+                                        service_name.clone(),
+                                        format!(
+                                            "state '{}' is persistent and cannot be attached until explicit binding support is implemented",
+                                            state_name
+                                        ),
+                                    ));
+                                }
+                                Some(_) => {}
+                                None => errors.push(ValidationError::InvalidStateBinding(
+                                    service_name.clone(),
+                                    format!("state '{}' is not declared under [state]", state_name),
+                                )),
+                            }
+                        }
+
+                        if !is_valid_mount_path(target) {
+                            errors.push(ValidationError::InvalidStateBinding(
+                                service_name.clone(),
+                                format!("target '{}' must be an absolute path", binding.target),
+                            ));
+                        } else if !bound_targets.insert(target.to_string()) {
+                            errors.push(ValidationError::InvalidStateBinding(
+                                service_name.clone(),
+                                format!("target '{}' is bound more than once", target),
+                            ));
+                        }
                     }
                 }
             }
@@ -2001,13 +2012,21 @@ impl CapsuleManifest {
         self.routing.fallback_to_cloud && self.routing.cloud_capsule.is_some()
     }
 
-    pub fn ephemeral_state_source_path(&self, state_name: &str) -> String {
-        format!(
+    pub fn ephemeral_state_source_path(&self, state_name: &str) -> Result<String, CapsuleError> {
+        let state_name = state_name.trim();
+        if !is_kebab_case(state_name) {
+            return Err(CapsuleError::ValidationError(format!(
+                "state '{}' must be kebab-case before deriving an ephemeral state path",
+                state_name
+            )));
+        }
+
+        Ok(format!(
             "{}/{}/{}",
             default_ephemeral_state_base().trim_end_matches('/'),
             self.name,
-            state_name.trim()
-        )
+            state_name
+        ))
     }
 }
 
@@ -2163,8 +2182,15 @@ fn is_semver(s: &str) -> bool {
     version_nums.iter().all(|n| n.parse::<u32>().is_ok())
 }
 
-fn is_valid_mount_path(path: &str) -> bool {
-    !path.is_empty() && path.starts_with('/') && !path.contains("..")
+pub(crate) fn is_valid_mount_path(path: &str) -> bool {
+    let path = Path::new(path);
+    path.is_absolute()
+        && path.components().all(|component| {
+            !matches!(
+                component,
+                Component::ParentDir | Component::CurDir | Component::Prefix(_)
+            )
+        })
 }
 
 fn infer_source_driver(target: &NamedTarget, entrypoint: &str) -> Option<String> {
