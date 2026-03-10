@@ -361,12 +361,9 @@ pub fn sync_service_bindings_for_process(process_id: &str) -> Result<Vec<Service
 pub fn cleanup_service_bindings_for_process_info(
     process: &ProcessInfo,
 ) -> Result<Vec<ServiceBindingRecord>> {
-    let manifest_path = process.manifest_path.as_deref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "process '{}' does not record a manifest path required for service binding cleanup",
-            process.id
-        )
-    })?;
+    let Some(manifest_path) = process.manifest_path.as_deref() else {
+        return Ok(Vec::new());
+    };
     let manifest = load_manifest(manifest_path)?;
     let owner_scope = host_service_binding_scope(&manifest)?;
     let store = open_binding_store()?;

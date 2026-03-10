@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::sync::Arc;
 
+use crate::binding;
 use crate::process_manager::{format_duration, get_process_uptime, ProcessManager, ProcessStatus};
 use crate::reporters::CliReporter;
 use capsule_core::CapsuleReporter;
@@ -12,7 +13,10 @@ pub struct PsArgs {
 
 pub fn execute(args: PsArgs, reporter: Arc<CliReporter>) -> Result<()> {
     let pm = ProcessManager::new()?;
-    pm.cleanup_dead_processes()?;
+    let cleaned = pm.cleanup_dead_processes_with_details()?;
+    for process in &cleaned {
+        let _ = binding::cleanup_service_bindings_for_process_info(process);
+    }
     let mut processes = pm.list_processes()?;
 
     if !args.all {

@@ -264,6 +264,8 @@ struct DeleteCapsuleResponse {
     removed_versions: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     removed_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    removed_service_binding_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2830,6 +2832,10 @@ async fn handle_delete_local_capsule(
             "capsule is running; stop active process before delete",
         );
     }
+    let inactive_processes = processes
+        .into_iter()
+        .filter(|process| process.scoped_id.as_deref() == Some(scoped_id.as_str()))
+        .collect::<Vec<_>>();
 
     let _guard = state.lock.lock().await;
     let store = match RegistryStore::open(&state.data_dir) {
@@ -2865,6 +2871,7 @@ async fn handle_delete_local_capsule(
             }
         };
 
+    let mut removed_service_binding_ids = Vec::new();
     if outcome.removed_capsule {
         if let Err(err) = store.delete_store_metadata(&scoped_id) {
             return json_error(
@@ -2884,6 +2891,26 @@ async fn handle_delete_local_capsule(
                 &err.to_string(),
             );
         }
+        for process in &inactive_processes {
+            match binding::cleanup_service_bindings_for_process_info(process) {
+                Ok(records) => removed_service_binding_ids
+                    .extend(records.into_iter().map(|record| record.binding_id)),
+                Err(err) => {
+                    return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "service_binding_cleanup_failed",
+                        &err.to_string(),
+                    );
+                }
+            }
+            if let Err(err) = process_manager.delete_pid(&process.id) {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "process_cleanup_failed",
+                    &err.to_string(),
+                );
+            }
+        }
     }
 
     cleanup_removed_artifacts(
@@ -2900,6 +2927,7 @@ async fn handle_delete_local_capsule(
             removed_capsule: outcome.removed_capsule,
             removed_versions: outcome.removed_releases.len(),
             removed_version: outcome.removed_version,
+            removed_service_binding_ids,
         }),
     )
         .into_response()
@@ -2916,6 +2944,25 @@ async fn handle_list_local_processes() -> impl IntoResponse {
             )
         }
     };
+    let cleaned = match pm.cleanup_dead_processes_with_details() {
+        Ok(cleaned) => cleaned,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "process_cleanup_failed",
+                &err.to_string(),
+            )
+        }
+    };
+    for process in &cleaned {
+        if let Err(err) = binding::cleanup_service_bindings_for_process_info(process) {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "service_binding_cleanup_failed",
+                &err.to_string(),
+            );
+        }
+    }
     let mut processes = match pm.list_processes() {
         Ok(processes) => processes,
         Err(err) => {
