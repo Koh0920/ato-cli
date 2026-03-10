@@ -414,6 +414,12 @@ pub struct CapsuleManifest {
     #[serde(default)]
     pub state: HashMap<String, StateRequirement>,
 
+    /// Optional opaque owner scope used for persistent state registry identity.
+    ///
+    /// When omitted, `name` remains the default owner scope for backward compatibility.
+    #[serde(default)]
+    pub state_owner_scope: Option<String>,
+
     /// Routing configuration
     #[serde(default)]
     pub routing: CapsuleRouting,
@@ -1227,6 +1233,17 @@ impl CapsuleManifest {
     /// Validate the manifest
     pub fn validate(&self) -> Result<(), Vec<ValidationError>> {
         let mut errors = Vec::new();
+
+        if self
+            .state_owner_scope
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            errors.push(ValidationError::InvalidState(
+                "state_owner_scope".to_string(),
+                "state_owner_scope cannot be empty".to_string(),
+            ));
+        }
 
         // Schema version must be "0.2"
         if !is_supported_schema_version(&self.schema_version) {
@@ -2069,6 +2086,23 @@ impl CapsuleManifest {
                 (!name.is_empty()).then(|| name.to_string())
             })
     }
+
+    /// Resolve the owner scope used by the local persistent state registry.
+    ///
+    /// `state_owner_scope` is treated as an opaque, user-controlled identity string. When it
+    /// is omitted, the manifest name remains the fail-closed default so existing manifests keep
+    /// their current behavior.
+    pub fn persistent_state_owner_scope(&self) -> Option<String> {
+        self.state_owner_scope
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                let name = self.name.trim();
+                (!name.is_empty()).then(|| name.to_string())
+            })
+    }
 }
 
 /// Validation error types
@@ -2765,6 +2799,78 @@ target = "/var/lib/app"
 "#;
         let manifest = CapsuleManifest::from_toml(toml).unwrap();
         assert!(manifest.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_empty_state_owner_scope() {
+        let toml = r#"
+schema_version = "0.2"
+name = "stateful-app"
+version = "0.1.0"
+type = "app"
+default_target = "app"
+state_owner_scope = "   "
+
+[targets.app]
+runtime = "oci"
+image = "ghcr.io/example/app:latest"
+
+[state.data]
+kind = "filesystem"
+durability = "persistent"
+purpose = "primary-data"
+attach = "explicit"
+schema_id = "vaultwarden/data/v1"
+
+[services.main]
+target = "app"
+
+[[services.main.state_bindings]]
+state = "data"
+target = "/var/lib/app"
+"#;
+        let manifest = CapsuleManifest::from_toml(toml).unwrap();
+        let errors = manifest.validate().unwrap_err();
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            ValidationError::InvalidState(name, message)
+                if name == "state_owner_scope" && message.contains("cannot be empty")
+        )));
+    }
+
+    #[test]
+    fn test_persistent_state_owner_scope_prefers_explicit_field() {
+        let toml = r#"
+schema_version = "0.2"
+name = "stateful-app"
+version = "0.1.0"
+type = "app"
+default_target = "app"
+state_owner_scope = "tenant/acme/prod"
+
+[targets.app]
+runtime = "oci"
+image = "ghcr.io/example/app:latest"
+
+[state.data]
+kind = "filesystem"
+durability = "persistent"
+purpose = "primary-data"
+attach = "explicit"
+schema_id = "vaultwarden/data/v1"
+
+[services.main]
+target = "app"
+
+[[services.main.state_bindings]]
+state = "data"
+target = "/var/lib/app"
+"#;
+        let manifest = CapsuleManifest::from_toml(toml).unwrap();
+        assert_eq!(
+            manifest.persistent_state_owner_scope().as_deref(),
+            Some("tenant/acme/prod")
+        );
     }
 
     #[test]

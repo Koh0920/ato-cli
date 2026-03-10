@@ -32,6 +32,7 @@ const SCHEMA_MIGRATION_0003: &str = "2026-03-05-0003-gc-indexes";
 const SCHEMA_MIGRATION_0004: &str = "2026-03-05-0004-auto-vacuum-incremental";
 const SCHEMA_MIGRATION_0005: &str = "2026-03-05-0005-manifests-yanked";
 const SCHEMA_MIGRATION_0006: &str = "2026-03-10-0006-persistent-state-registry";
+const SCHEMA_MIGRATION_0007: &str = "2026-03-10-0007-persistent-state-kind-columns";
 
 fn manifest_distribution(
     manifest: &CapsuleManifest,
@@ -98,11 +99,13 @@ pub struct RegistryStoreMetadataRecord {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistentStateRecord {
     pub state_id: String,
     pub owner_scope: String,
     pub state_name: String,
+    pub kind: String,
+    pub backend_kind: String,
     pub backend_locator: String,
     pub producer: String,
     pub purpose: String,
@@ -115,6 +118,8 @@ pub struct PersistentStateRecord {
 pub struct NewPersistentStateRecord {
     pub owner_scope: String,
     pub state_name: String,
+    pub kind: String,
+    pub backend_kind: String,
     pub backend_locator: String,
     pub producer: String,
     pub purpose: String,
@@ -375,7 +380,7 @@ impl RegistryStore {
     ) -> Result<Option<PersistentStateRecord>> {
         let conn = self.connect()?;
         conn.query_row(
-            "SELECT state_id, owner_scope, state_name, backend_locator, producer, purpose, schema_id, created_at, updated_at
+            "SELECT state_id, owner_scope, state_name, kind, backend_kind, backend_locator, producer, purpose, schema_id, created_at, updated_at
              FROM persistent_states
              WHERE owner_scope=?1 AND backend_locator=?2",
             params![owner_scope, backend_locator],
@@ -383,6 +388,76 @@ impl RegistryStore {
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    pub fn find_persistent_state_by_id(
+        &self,
+        state_id: &str,
+    ) -> Result<Option<PersistentStateRecord>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT state_id, owner_scope, state_name, kind, backend_kind, backend_locator, producer, purpose, schema_id, created_at, updated_at
+             FROM persistent_states
+             WHERE state_id=?1",
+            params![state_id],
+            Self::map_persistent_state_row,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn list_persistent_states(
+        &self,
+        owner_scope: Option<&str>,
+        state_name: Option<&str>,
+    ) -> Result<Vec<PersistentStateRecord>> {
+        let conn = self.connect()?;
+        let sql = match (owner_scope, state_name) {
+            (Some(_), Some(_)) => {
+                "SELECT state_id, owner_scope, state_name, kind, backend_kind, backend_locator, producer, purpose, schema_id, created_at, updated_at
+                 FROM persistent_states
+                 WHERE owner_scope=?1 AND state_name=?2
+                 ORDER BY updated_at DESC, state_id ASC"
+            }
+            (Some(_), None) => {
+                "SELECT state_id, owner_scope, state_name, kind, backend_kind, backend_locator, producer, purpose, schema_id, created_at, updated_at
+                 FROM persistent_states
+                 WHERE owner_scope=?1
+                 ORDER BY updated_at DESC, state_id ASC"
+            }
+            (None, Some(_)) => {
+                "SELECT state_id, owner_scope, state_name, kind, backend_kind, backend_locator, producer, purpose, schema_id, created_at, updated_at
+                 FROM persistent_states
+                 WHERE state_name=?1
+                 ORDER BY updated_at DESC, state_id ASC"
+            }
+            (None, None) => {
+                "SELECT state_id, owner_scope, state_name, kind, backend_kind, backend_locator, producer, purpose, schema_id, created_at, updated_at
+                 FROM persistent_states
+                 ORDER BY updated_at DESC, state_id ASC"
+            }
+        };
+
+        let mut stmt = conn.prepare(sql)?;
+        let rows = match (owner_scope, state_name) {
+            (Some(owner_scope), Some(state_name)) => stmt.query_map(
+                params![owner_scope, state_name],
+                Self::map_persistent_state_row,
+            )?,
+            (Some(owner_scope), None) => {
+                stmt.query_map(params![owner_scope], Self::map_persistent_state_row)?
+            }
+            (None, Some(state_name)) => {
+                stmt.query_map(params![state_name], Self::map_persistent_state_row)?
+            }
+            (None, None) => stmt.query_map([], Self::map_persistent_state_row)?,
+        };
+
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row?);
+        }
+        Ok(records)
     }
 
     pub fn register_persistent_state(
@@ -395,12 +470,14 @@ impl RegistryStore {
             let state_id = generate_random_state_id();
             match conn.execute(
                 "INSERT INTO persistent_states(
-                    state_id, owner_scope, state_name, backend_locator, producer, purpose, schema_id, created_at, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+                    state_id, owner_scope, state_name, kind, backend_kind, backend_locator, producer, purpose, schema_id, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
                 params![
                     state_id,
                     record.owner_scope,
                     record.state_name,
+                    record.kind,
+                    record.backend_kind,
                     record.backend_locator,
                     record.producer,
                     record.purpose,
@@ -448,12 +525,14 @@ impl RegistryStore {
             state_id: row.get(0)?,
             owner_scope: row.get(1)?,
             state_name: row.get(2)?,
-            backend_locator: row.get(3)?,
-            producer: row.get(4)?,
-            purpose: row.get(5)?,
-            schema_id: row.get(6)?,
-            created_at: row.get(7)?,
-            updated_at: row.get(8)?,
+            kind: row.get(3)?,
+            backend_kind: row.get(4)?,
+            backend_locator: row.get(5)?,
+            producer: row.get(6)?,
+            purpose: row.get(7)?,
+            schema_id: row.get(8)?,
+            created_at: row.get(9)?,
+            updated_at: row.get(10)?,
         })
     }
 
@@ -2283,6 +2362,8 @@ impl RegistryStore {
               state_id TEXT PRIMARY KEY,
               owner_scope TEXT NOT NULL,
               state_name TEXT NOT NULL,
+                            kind TEXT NOT NULL,
+                            backend_kind TEXT NOT NULL,
               backend_locator TEXT NOT NULL,
               producer TEXT NOT NULL,
               purpose TEXT NOT NULL,
@@ -2397,6 +2478,10 @@ impl RegistryStore {
                   state_id TEXT PRIMARY KEY,
                   owner_scope TEXT NOT NULL,
                   state_name TEXT NOT NULL,
+                                    kind TEXT NOT NULL,
+                                    backend_kind TEXT NOT NULL,
+                                    kind TEXT NOT NULL,
+                                    backend_kind TEXT NOT NULL,
                   backend_locator TEXT NOT NULL,
                   producer TEXT NOT NULL,
                   purpose TEXT NOT NULL,
@@ -2410,6 +2495,22 @@ impl RegistryStore {
                 ",
             )?;
             self.mark_migration_applied(conn, SCHEMA_MIGRATION_0006)?;
+        }
+
+        if !self.is_migration_applied(conn, SCHEMA_MIGRATION_0007)? {
+            if !self.column_exists(conn, "persistent_states", "kind")? {
+                conn.execute(
+                    "ALTER TABLE persistent_states ADD COLUMN kind TEXT NOT NULL DEFAULT 'filesystem'",
+                    [],
+                )?;
+            }
+            if !self.column_exists(conn, "persistent_states", "backend_kind")? {
+                conn.execute(
+                    "ALTER TABLE persistent_states ADD COLUMN backend_kind TEXT NOT NULL DEFAULT 'host_path'",
+                    [],
+                )?;
+            }
+            self.mark_migration_applied(conn, SCHEMA_MIGRATION_0007)?;
         }
 
         Ok(())
@@ -3490,6 +3591,8 @@ default_target = "cli"
             .register_persistent_state(&NewPersistentStateRecord {
                 owner_scope: "demo-app".to_string(),
                 state_name: "data".to_string(),
+                kind: "filesystem".to_string(),
+                backend_kind: "host_path".to_string(),
                 backend_locator: "/var/lib/ato/persistent/demo-app/data".to_string(),
                 producer: "demo-app".to_string(),
                 purpose: "primary-data".to_string(),
@@ -3508,6 +3611,17 @@ default_target = "cli"
             .expect("lookup")
             .expect("record");
         assert_eq!(fetched, record);
+
+        let by_id = store
+            .find_persistent_state_by_id(&record.state_id)
+            .expect("lookup by id")
+            .expect("record by id");
+        assert_eq!(by_id, record);
+
+        let listed = store
+            .list_persistent_states(Some("demo-app"), Some("data"))
+            .expect("list states");
+        assert_eq!(listed, vec![record]);
     }
 
     #[test]

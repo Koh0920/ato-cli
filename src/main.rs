@@ -121,6 +121,7 @@ mod sign;
 mod skill;
 mod skill_resolver;
 mod source;
+mod state;
 mod tui;
 mod verify;
 
@@ -153,6 +154,7 @@ Management:
   ps       List running capsules
   stop     Stop a running capsule
   logs     Show logs of a running capsule
+    state    Inspect or register persistent state bindings
 
 Auth:
   login    Login to Ato registry
@@ -227,8 +229,8 @@ enum Commands {
         #[arg(long)]
         registry: Option<String>,
 
-        /// Explicitly bind a manifest [state.<name>] entry to a host path using STATE=/absolute/path
-        #[arg(long = "state", value_name = "STATE=/ABS/PATH")]
+        /// Explicitly bind a manifest [state.<name>] entry using STATE=/absolute/path or STATE=state-...
+        #[arg(long = "state", value_name = "STATE=/ABS/PATH|STATE=state-...")]
         state: Vec<String>,
 
         /// Network enforcement mode
@@ -559,6 +561,15 @@ enum Commands {
         tail: Option<usize>,
     },
 
+    #[command(
+        next_help_heading = "Management",
+        about = "Inspect or register persistent state bindings"
+    )]
+    State {
+        #[command(subcommand)]
+        command: StateCommands,
+    },
+
     #[command(next_help_heading = "Auth", about = "Login to Ato registry")]
     Login {
         /// GitHub Personal Access Token (legacy fallback, scope: read:user)
@@ -723,8 +734,8 @@ enum Commands {
         #[arg(long)]
         registry: Option<String>,
 
-        /// Explicitly bind a manifest [state.<name>] entry to a host path using STATE=/absolute/path
-        #[arg(long = "state", value_name = "STATE=/ABS/PATH")]
+        /// Explicitly bind a manifest [state.<name>] entry using STATE=/absolute/path or STATE=state-...
+        #[arg(long = "state", value_name = "STATE=/ABS/PATH|STATE=state-...")]
         state: Vec<String>,
 
         /// Network enforcement mode
@@ -1263,6 +1274,54 @@ enum RegistryCommands {
         /// Bearer token required for write API (recommended when exposing non-loopback host)
         #[arg(long)]
         auth_token: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum StateCommands {
+    /// List registered persistent states
+    #[command(visible_alias = "ls")]
+    List {
+        /// Filter by owner scope
+        #[arg(long)]
+        owner_scope: Option<String>,
+
+        /// Filter by manifest state name
+        #[arg(long)]
+        state_name: Option<String>,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Inspect one persistent state by state-id or ato-state:// URI
+    Inspect {
+        /// State reference (`state-...` or `ato-state://state-...`)
+        state_ref: String,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Register a persistent state from a manifest contract
+    Register {
+        /// Path to capsule directory or capsule.toml
+        #[arg(long, default_value = ".")]
+        manifest: PathBuf,
+
+        /// State name from [state.<name>]
+        #[arg(long = "name")]
+        state_name: String,
+
+        /// Absolute host directory to bind to this state contract
+        #[arg(long = "path", value_name = "/ABS/PATH")]
+        path: PathBuf,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -2121,6 +2180,8 @@ fn run() -> Result<()> {
             reporter.clone(),
         ),
 
+        Commands::State { command } => execute_state_command(command),
+
         Commands::Guest { sync_path } => {
             commands::guest::execute(commands::guest::GuestArgs { sync_path })
         }
@@ -2308,6 +2369,28 @@ fn execute_registry_command(command: RegistryCommands) -> Result<()> {
             }
         }
     })
+}
+
+fn execute_state_command(command: StateCommands) -> Result<()> {
+    match command {
+        StateCommands::List {
+            owner_scope,
+            state_name,
+            json,
+        } => state::list_states(owner_scope.as_deref(), state_name.as_deref(), json),
+        StateCommands::Inspect { state_ref, json } => state::inspect_state(&state_ref, json),
+        StateCommands::Register {
+            manifest,
+            state_name,
+            path,
+            json,
+        } => state::register_state_from_manifest(
+            &manifest,
+            &state_name,
+            path.to_string_lossy().as_ref(),
+            json,
+        ),
+    }
 }
 
 fn execute_publish_ci_command(
@@ -3076,11 +3159,12 @@ fn execute_setup_command(
     skip_verify: bool,
     reporter: std::sync::Arc<reporters::CliReporter>,
 ) -> Result<()> {
+    let capsule_reporter: &dyn capsule_core::CapsuleReporter = reporter.as_ref();
     let install = engine_manager::install_engine_release(
         &engine,
         version.as_deref(),
         skip_verify,
-        &*reporter,
+        capsule_reporter,
     )?;
 
     futures::executor::block_on(reporter.notify(format!(
@@ -4019,6 +4103,52 @@ mod tests {
                     "cache=/var/lib/ato/persistent/cache".to_string()
                 ]
             ),
+            other => panic!("unexpected command: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn state_command_parses_register_and_inspect_forms() {
+        let register = Cli::try_parse_from([
+            "ato",
+            "state",
+            "register",
+            "--manifest",
+            ".",
+            "--name",
+            "data",
+            "--path",
+            "/var/lib/ato/persistent/demo",
+        ])
+        .expect("parse register");
+
+        match register.command {
+            Commands::State {
+                command:
+                    StateCommands::Register {
+                        manifest,
+                        state_name,
+                        path,
+                        json,
+                    },
+            } => {
+                assert_eq!(manifest, PathBuf::from("."));
+                assert_eq!(state_name, "data");
+                assert_eq!(path, PathBuf::from("/var/lib/ato/persistent/demo"));
+                assert!(!json);
+            }
+            other => panic!("unexpected command: {:?}", std::mem::discriminant(&other)),
+        }
+
+        let inspect =
+            Cli::try_parse_from(["ato", "state", "inspect", "state-demo"]).expect("parse inspect");
+        match inspect.command {
+            Commands::State {
+                command: StateCommands::Inspect { state_ref, json },
+            } => {
+                assert_eq!(state_ref, "state-demo");
+                assert!(!json);
+            }
             other => panic!("unexpected command: {:?}", std::mem::discriminant(&other)),
         }
     }
