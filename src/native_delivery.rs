@@ -20,7 +20,9 @@ const FETCH_METADATA_FILE: &str = "fetch.json";
 const FETCH_SOURCE_ARTIFACT_FILE: &str = "artifact.capsule";
 const DELIVERY_CONFIG_FILE: &str = "ato.delivery.toml";
 const PROVENANCE_FILE: &str = "local-derivation.json";
-const DELIVERY_SCHEMA_VERSION: &str = "exp-0.1";
+const DELIVERY_SCHEMA_VERSION_STABLE: &str = "0.1";
+const DELIVERY_SCHEMA_VERSION_LEGACY: &str = "exp-0.1";
+const DELIVERY_SCHEMA_VERSION: &str = DELIVERY_SCHEMA_VERSION_STABLE;
 const DELIVERY_FRAMEWORK: &str = "tauri";
 const DELIVERY_STAGE: &str = "unsigned";
 const DELIVERY_TARGET: &str = "darwin/arm64";
@@ -32,6 +34,7 @@ const DEFAULT_DERIVED_APPS_DIR: &str = ".ato/apps";
 
 #[derive(Debug, Serialize)]
 pub struct FetchResult {
+    pub schema_version: String,
     pub scoped_id: String,
     pub version: String,
     pub cache_dir: PathBuf,
@@ -44,7 +47,8 @@ pub struct FetchResult {
 pub struct NativeBuildPlan {
     pub manifest_path: PathBuf,
     pub manifest_dir: PathBuf,
-    pub delivery_config_path: PathBuf,
+    pub delivery_config_path: Option<PathBuf>,
+    pub staged_delivery_config_toml: String,
     pub source_app_path: PathBuf,
     pub input_relative: PathBuf,
     pub framework: String,
@@ -57,6 +61,7 @@ pub struct NativeBuildResult {
     pub build_strategy: String,
     pub target: String,
     pub derived_from: PathBuf,
+    pub schema_version: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -75,6 +80,7 @@ pub struct FinalizeResult {
     pub provenance_path: PathBuf,
     pub parent_digest: String,
     pub derived_digest: String,
+    pub schema_version: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -89,6 +95,7 @@ pub struct ProjectResult {
     pub state: String,
     pub problems: Vec<String>,
     pub created: bool,
+    pub schema_version: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -100,6 +107,7 @@ pub struct UnprojectResult {
     pub removed_metadata: bool,
     pub state_before: String,
     pub problems_before: Vec<String>,
+    pub schema_version: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -122,6 +130,7 @@ pub struct ProjectionStatus {
     pub problems: Vec<String>,
     pub projected_at: String,
     pub projection_kind: String,
+    pub schema_version: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -147,14 +156,14 @@ struct ReleaseInfo {
     version: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct DeliveryConfig {
     schema_version: String,
     artifact: DeliveryArtifact,
     finalize: DeliveryFinalize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct DeliveryArtifact {
     framework: String,
     stage: String,
@@ -162,7 +171,7 @@ struct DeliveryArtifact {
     input: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct DeliveryFinalize {
     tool: String,
     args: Vec<String>,
@@ -170,6 +179,16 @@ struct DeliveryFinalize {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct LocalDerivationProvenance {
+    #[serde(default = "default_delivery_schema_version")]
+    schema_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scoped_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    registry: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    artifact_blake3: Option<String>,
     parent_digest: String,
     derived_digest: String,
     framework: String,
@@ -198,6 +217,14 @@ struct ProjectionMetadata {
     provenance_path: PathBuf,
     parent_digest: String,
     derived_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scoped_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    registry: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    artifact_blake3: Option<String>,
     framework: String,
     target: String,
     finalized_at: String,
@@ -209,6 +236,10 @@ struct ProjectionSource {
     provenance_path: PathBuf,
     parent_digest: String,
     derived_digest: String,
+    scoped_id: Option<String>,
+    version: Option<String>,
+    registry: Option<String>,
+    artifact_blake3: Option<String>,
     framework: String,
     target: String,
     finalized_at: String,
@@ -223,11 +254,30 @@ struct StoredProjection {
 pub(crate) fn detect_build_strategy(manifest_dir: &Path) -> Result<Option<NativeBuildPlan>> {
     let manifest_path = manifest_dir.join("capsule.toml");
     let delivery_config_path = manifest_dir.join(DELIVERY_CONFIG_FILE);
-    if !manifest_path.exists() || !delivery_config_path.exists() {
+    if !manifest_path.exists() {
         return Ok(None);
     }
 
-    let config = load_delivery_config(&delivery_config_path)?;
+    let manifest_raw = fs::read_to_string(&manifest_path)
+        .with_context(|| format!("Failed to read {}", manifest_path.display()))?;
+    let manifest = capsule_core::types::CapsuleManifest::from_toml(&manifest_raw)
+        .map_err(|err| anyhow::anyhow!("Failed to parse {}: {}", manifest_path.display(), err))?;
+
+    let canonical_config = detect_native_manifest_contract(&manifest)?;
+    let (config, config_path) = match (canonical_config, delivery_config_path.exists()) {
+        (Some(config), true) => {
+            let existing = load_delivery_config(&delivery_config_path)?;
+            ensure_delivery_config_compatible(&existing, &config, &delivery_config_path)?;
+            (config, Some(delivery_config_path))
+        }
+        (Some(config), false) => (config, None),
+        (None, true) => {
+            let existing = load_delivery_config(&delivery_config_path)?;
+            (existing, Some(delivery_config_path))
+        }
+        (None, false) => return Ok(None),
+    };
+
     let input_relative = PathBuf::from(config.artifact.input.trim());
     validate_relative_input_path(&input_relative)?;
     let source_app_path = manifest_dir.join(&input_relative);
@@ -247,7 +297,8 @@ pub(crate) fn detect_build_strategy(manifest_dir: &Path) -> Result<Option<Native
     Ok(Some(NativeBuildPlan {
         manifest_path,
         manifest_dir: manifest_dir.to_path_buf(),
-        delivery_config_path,
+        delivery_config_path: config_path,
+        staged_delivery_config_toml: serialize_delivery_config(&config)?,
         source_app_path,
         input_relative,
         framework: config.artifact.framework,
@@ -311,11 +362,11 @@ where
         strip_signature(&staged_app_path)?;
         validate_minimal_macos_app_permissions(&staged_app_path)?;
 
-        fs::copy(
-            &plan.delivery_config_path,
+        fs::write(
             payload_root.join(DELIVERY_CONFIG_FILE),
+            &plan.staged_delivery_config_toml,
         )
-        .with_context(|| format!("Failed to stage {}", plan.delivery_config_path.display()))?;
+        .context("Failed to stage native delivery compatibility metadata")?;
 
         let payload_tar = create_payload_tar_from_directory(&payload_root)?;
         let payload_tar_zst = zstd::stream::encode_all(Cursor::new(payload_tar), 3)
@@ -329,6 +380,7 @@ where
             build_strategy: "native-delivery".to_string(),
             target: plan.target.clone(),
             derived_from: plan.source_app_path.clone(),
+            schema_version: DELIVERY_SCHEMA_VERSION.to_string(),
         })
     })();
 
@@ -576,6 +628,110 @@ fn normalize_registry_url(input: &str) -> String {
     input.trim().trim_end_matches('/').to_ascii_lowercase()
 }
 
+fn default_delivery_schema_version() -> String {
+    DELIVERY_SCHEMA_VERSION_STABLE.to_string()
+}
+
+pub(crate) fn delivery_schema_version() -> &'static str {
+    DELIVERY_SCHEMA_VERSION_STABLE
+}
+
+fn delivery_config_from_input(input: &str) -> DeliveryConfig {
+    DeliveryConfig {
+        schema_version: DELIVERY_SCHEMA_VERSION_STABLE.to_string(),
+        artifact: DeliveryArtifact {
+            framework: DELIVERY_FRAMEWORK.to_string(),
+            stage: DELIVERY_STAGE.to_string(),
+            target: DELIVERY_TARGET.to_string(),
+            input: input.to_string(),
+        },
+        finalize: DeliveryFinalize {
+            tool: FINALIZE_TOOL.to_string(),
+            args: vec![
+                "--deep".to_string(),
+                "--force".to_string(),
+                "--sign".to_string(),
+                "-".to_string(),
+                input.to_string(),
+            ],
+        },
+    }
+}
+
+fn detect_native_manifest_contract(
+    manifest: &capsule_core::types::CapsuleManifest,
+) -> Result<Option<DeliveryConfig>> {
+    let Ok(target) = manifest.resolve_default_target() else {
+        return Ok(None);
+    };
+    if target.driver.as_deref() != Some("native") {
+        return Ok(None);
+    }
+
+    let input = target.entrypoint.trim();
+    if input.is_empty() {
+        bail!(
+            "Native delivery target '{}' must set entrypoint to a relative .app bundle path",
+            manifest.default_target
+        );
+    }
+
+    let input_path = PathBuf::from(input);
+    validate_relative_input_path(&input_path)?;
+    if input_path.extension().and_then(|ext| ext.to_str()) != Some("app") {
+        bail!(
+            "Native delivery target '{}' entrypoint must point to a .app bundle: {}",
+            manifest.default_target,
+            input
+        );
+    }
+
+    Ok(Some(delivery_config_from_input(input)))
+}
+
+fn ensure_delivery_config_compatible(
+    actual: &DeliveryConfig,
+    expected: &DeliveryConfig,
+    path: &Path,
+) -> Result<()> {
+    if actual.artifact.framework != expected.artifact.framework
+        || actual.artifact.stage != expected.artifact.stage
+        || actual.artifact.target != expected.artifact.target
+        || actual.artifact.input != expected.artifact.input
+        || actual.finalize.tool != expected.finalize.tool
+        || actual.finalize.args != expected.finalize.args
+    {
+        bail!(
+            "{} conflicts with capsule.toml native target contract. Update capsule.toml or remove the compatibility sidecar.",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn serialize_delivery_config(config: &DeliveryConfig) -> Result<String> {
+    toml::to_string_pretty(config)
+        .context("Failed to serialize native delivery compatibility metadata")
+}
+
+fn is_supported_delivery_schema(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed == DELIVERY_SCHEMA_VERSION_STABLE || trimmed == DELIVERY_SCHEMA_VERSION_LEGACY
+}
+
+fn validate_delivery_schema(value: &str, context: &str) -> Result<()> {
+    if is_supported_delivery_schema(value) {
+        return Ok(());
+    }
+    bail!(
+        "Unsupported {} schema_version '{}'; expected '{}' (stable) or '{}' (legacy)",
+        context,
+        value,
+        DELIVERY_SCHEMA_VERSION_STABLE,
+        DELIVERY_SCHEMA_VERSION_LEGACY
+    );
+}
+
 pub fn execute_finalize(
     fetched_dir: &Path,
     output_dir: &Path,
@@ -693,6 +849,11 @@ where
         validate_minimal_macos_app_permissions(&derived_app_path)?;
         let derived_digest = compute_tree_digest(&derived_app_path)?;
         let provenance = LocalDerivationProvenance {
+            schema_version: DELIVERY_SCHEMA_VERSION.to_string(),
+            scoped_id: Some(metadata.scoped_id.clone()),
+            version: Some(metadata.version.clone()),
+            registry: Some(metadata.registry.clone()),
+            artifact_blake3: Some(metadata.artifact_blake3.clone()),
             parent_digest: parent_digest.clone(),
             derived_digest: derived_digest.clone(),
             framework: config.artifact.framework.clone(),
@@ -710,6 +871,7 @@ where
             provenance_path,
             parent_digest,
             derived_digest,
+            schema_version: DELIVERY_SCHEMA_VERSION.to_string(),
         })
     })();
 
@@ -768,6 +930,7 @@ fn project_with_roots(
                     state: status.state,
                     problems: status.problems,
                     created: false,
+                    schema_version: record.metadata.schema_version.clone(),
                 });
             }
             break;
@@ -802,6 +965,7 @@ fn project_with_roots(
                 state: "ok".to_string(),
                 problems: Vec::new(),
                 created: false,
+                schema_version: DELIVERY_SCHEMA_VERSION.to_string(),
             });
         }
         bail!(
@@ -821,6 +985,10 @@ fn project_with_roots(
         provenance_path: source.provenance_path.clone(),
         parent_digest: source.parent_digest.clone(),
         derived_digest: source.derived_digest.clone(),
+        scoped_id: source.scoped_id.clone(),
+        version: source.version.clone(),
+        registry: source.registry.clone(),
+        artifact_blake3: source.artifact_blake3.clone(),
         framework: source.framework.clone(),
         target: source.target.clone(),
         finalized_at: source.finalized_at.clone(),
@@ -849,6 +1017,7 @@ fn project_with_roots(
             state: status.state,
             problems: status.problems,
             created: true,
+            schema_version: metadata.schema_version.clone(),
         })
     })();
 
@@ -878,6 +1047,7 @@ fn list_projections(metadata_root: &Path) -> Result<ProjectionListResult> {
 fn unproject_with_metadata_root(reference: &str, metadata_root: &Path) -> Result<UnprojectResult> {
     let record = find_projection_record(reference, metadata_root)?;
     let status = inspect_projection(&record.metadata, &record.metadata_path)?;
+    let schema_version = record.metadata.schema_version.clone();
 
     let mut removed_projected_path = false;
     match fs::symlink_metadata(&record.metadata.projected_path) {
@@ -922,6 +1092,7 @@ fn unproject_with_metadata_root(reference: &str, metadata_root: &Path) -> Result
         removed_metadata: true,
         state_before: status.state,
         problems_before: status.problems,
+        schema_version,
     })
 }
 
@@ -962,7 +1133,12 @@ fn materialize_fetch_cache(
                 .as_ref()
                 .map(|value| value.version.clone())
                 .unwrap_or_else(|| version.to_string());
+            let existing_schema = existing
+                .as_ref()
+                .map(|value| value.schema_version.clone())
+                .unwrap_or_else(|| DELIVERY_SCHEMA_VERSION.to_string());
             return Ok(FetchResult {
+                schema_version: existing_schema,
                 scoped_id: scoped_id.to_string(),
                 version: existing_version,
                 cache_dir: final_dir,
@@ -996,6 +1172,7 @@ fn materialize_fetch_cache(
             Err(_err) if final_dir.exists() => {
                 let _ = fs::remove_dir_all(&temp_dir);
                 return Ok(FetchResult {
+                    schema_version: DELIVERY_SCHEMA_VERSION.to_string(),
                     scoped_id: scoped_id.to_string(),
                     version: version.to_string(),
                     cache_dir: final_dir,
@@ -1016,6 +1193,7 @@ fn materialize_fetch_cache(
         }
 
         Ok(FetchResult {
+            schema_version: metadata.schema_version.clone(),
             scoped_id: scoped_id.to_string(),
             version: version.to_string(),
             cache_dir: final_dir,
@@ -1044,12 +1222,14 @@ fn load_fetch_metadata(fetched_dir: &Path) -> Result<FetchMetadata> {
     let metadata_path = fetched_dir.join(FETCH_METADATA_FILE);
     let raw = fs::read_to_string(&metadata_path)
         .with_context(|| format!("Failed to read fetch metadata: {}", metadata_path.display()))?;
-    serde_json::from_str(&raw).with_context(|| {
+    let metadata: FetchMetadata = serde_json::from_str(&raw).with_context(|| {
         format!(
             "Failed to parse fetch metadata: {}",
             metadata_path.display()
         )
-    })
+    })?;
+    validate_delivery_schema(&metadata.schema_version, "fetch.json")?;
+    Ok(metadata)
 }
 
 fn load_projection_source(derived_app_path: &Path) -> Result<ProjectionSource> {
@@ -1089,6 +1269,7 @@ fn load_projection_source(derived_app_path: &Path) -> Result<ProjectionSource> {
             provenance_path.display()
         )
     })?;
+    validate_delivery_schema(&provenance.schema_version, "local-derivation.json")?;
     if !provenance.finalized_locally {
         bail!("Projection input must be finalized locally via `ato finalize`");
     }
@@ -1128,6 +1309,10 @@ fn load_projection_source(derived_app_path: &Path) -> Result<ProjectionSource> {
         provenance_path,
         parent_digest: provenance.parent_digest,
         derived_digest: provenance.derived_digest,
+        scoped_id: provenance.scoped_id,
+        version: provenance.version,
+        registry: provenance.registry,
+        artifact_blake3: provenance.artifact_blake3,
         framework: provenance.framework,
         target: provenance.target,
         finalized_at: provenance.finalized_at,
@@ -1202,7 +1387,7 @@ fn inspect_projection(
     metadata_path: &Path,
 ) -> Result<ProjectionStatus> {
     let mut problems = Vec::new();
-    if metadata.schema_version != DELIVERY_SCHEMA_VERSION {
+    if !is_supported_delivery_schema(&metadata.schema_version) {
         problems.push(format!(
             "unsupported_schema_version:{}",
             metadata.schema_version
@@ -1283,6 +1468,7 @@ fn inspect_projection(
         problems,
         projected_at: metadata.projected_at.clone(),
         projection_kind: metadata.projection_kind.clone(),
+        schema_version: metadata.schema_version.clone(),
     })
 }
 
@@ -1326,13 +1512,7 @@ fn extract_native_artifact_spec_from_payload_tar(
 }
 
 fn validate_delivery_config(config: &DeliveryConfig) -> Result<()> {
-    if config.schema_version != DELIVERY_SCHEMA_VERSION {
-        bail!(
-            "Unsupported ato.delivery.toml schema_version '{}'; expected '{}'",
-            config.schema_version,
-            DELIVERY_SCHEMA_VERSION
-        );
-    }
+    validate_delivery_schema(&config.schema_version, "ato.delivery.toml")?;
     if config.artifact.framework != DELIVERY_FRAMEWORK {
         bail!(
             "Unsupported artifact.framework '{}'; expected '{}'",
@@ -2018,7 +2198,7 @@ fn create_projection_symlink(target: &Path, destination: &Path) -> std::io::Resu
     symlink_dir(target, destination)
 }
 
-fn host_supports_finalize() -> bool {
+pub(crate) fn host_supports_finalize() -> bool {
     cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64"
 }
 
@@ -2049,7 +2229,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     fn sample_delivery_toml() -> &'static str {
-        r#"schema_version = "exp-0.1"
+        r#"schema_version = "0.1"
 [artifact]
 framework = "tauri"
 stage = "unsigned"
@@ -2172,6 +2352,11 @@ entrypoint = "MyApp.app"
             fs::set_permissions(&binary, permissions)?;
         }
         let provenance = LocalDerivationProvenance {
+            schema_version: DELIVERY_SCHEMA_VERSION.to_string(),
+            scoped_id: None,
+            version: None,
+            registry: None,
+            artifact_blake3: None,
             parent_digest: "blake3:parent-digest".to_string(),
             derived_digest: compute_tree_digest(&derived_app)?,
             framework: DELIVERY_FRAMEWORK.to_string(),
@@ -2187,7 +2372,7 @@ entrypoint = "MyApp.app"
     #[test]
     fn delivery_config_rejects_non_codesign_tool() {
         let config: DeliveryConfig = toml::from_str(
-            r#"schema_version = "exp-0.1"
+            r#"schema_version = "0.1"
 [artifact]
     framework = "tauri"
     stage = "unsigned"

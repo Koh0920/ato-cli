@@ -370,7 +370,7 @@ fn create_pack_project(tmp: &TempDir, built_app: &Path) -> Result<PathBuf> {
 
     fs::write(
         pack_dir.join("ato.delivery.toml"),
-        r#"schema_version = "exp-0.1"
+        r#"schema_version = "0.1"
 [artifact]
 framework = "tauri"
 stage = "unsigned"
@@ -523,6 +523,130 @@ fn e2e_native_delivery_sample_tauri_unsigned_finalize() -> Result<()> {
     )?;
     require_success(publish, "publish native capsule")?;
 
+    let install_without_yes = run_ato_with_home(
+        &ato,
+        &[
+            "install",
+            "local/sample-native-capsule",
+            "--registry",
+            &base_url,
+            "--json",
+        ],
+        tmp.path(),
+        &home_dir,
+    )?;
+    assert!(
+        !install_without_yes.status.success(),
+        "install without --yes should fail closed in non-interactive mode"
+    );
+    let install_without_yes_stderr = String::from_utf8(install_without_yes.stderr)
+        .context("parse install without yes stderr")?;
+    assert!(
+        install_without_yes_stderr.contains("Re-run with --yes."),
+        "stderr={install_without_yes_stderr}"
+    );
+
+    let install = run_ato_with_home(
+        &ato,
+        &[
+            "install",
+            "local/sample-native-capsule",
+            "--registry",
+            &base_url,
+            "--yes",
+            "--no-project",
+            "--json",
+        ],
+        tmp.path(),
+        &home_dir,
+    )?;
+    let install = require_success(install, "install native capsule")?;
+    let install_json: serde_json::Value =
+        serde_json::from_slice(&install.stdout).context("parse install json")?;
+    let local_derivation = install_json["local_derivation"]
+        .as_object()
+        .context("install local_derivation missing")?;
+    assert_eq!(
+        local_derivation.get("performed").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        local_derivation
+            .get("schema_version")
+            .and_then(|v| v.as_str()),
+        Some("0.1")
+    );
+    let projection = install_json["projection"]
+        .as_object()
+        .context("install projection missing")?;
+    assert_eq!(
+        projection.get("performed").and_then(|v| v.as_bool()),
+        Some(false)
+    );
+    assert_eq!(
+        projection.get("state").and_then(|v| v.as_str()),
+        Some("skipped")
+    );
+    assert_eq!(
+        projection.get("schema_version").and_then(|v| v.as_str()),
+        Some("0.1")
+    );
+
+    let install_with_project = run_ato_with_home(
+        &ato,
+        &[
+            "install",
+            "local/sample-native-capsule",
+            "--registry",
+            &base_url,
+            "--yes",
+            "--project",
+            "--json",
+        ],
+        tmp.path(),
+        &home_dir,
+    )?;
+    let install_with_project = require_success(
+        install_with_project,
+        "install native capsule with projection",
+    )?;
+    let install_with_project_json: serde_json::Value =
+        serde_json::from_slice(&install_with_project.stdout)
+            .context("parse install-with-project json")?;
+    let install_projection = install_with_project_json["projection"]
+        .as_object()
+        .context("install-with-project projection missing")?;
+    assert_eq!(
+        install_projection
+            .get("performed")
+            .and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        install_projection.get("state").and_then(|v| v.as_str()),
+        Some("ok")
+    );
+    assert_eq!(
+        install_projection
+            .get("schema_version")
+            .and_then(|v| v.as_str()),
+        Some("0.1")
+    );
+    let projected_path = PathBuf::from(
+        install_projection
+            .get("projected_path")
+            .and_then(|v| v.as_str())
+            .context("install projected_path missing")?,
+    );
+    let metadata_path = PathBuf::from(
+        install_projection
+            .get("metadata_path")
+            .and_then(|v| v.as_str())
+            .context("install metadata_path missing")?,
+    );
+    assert!(projected_path.exists());
+    assert!(metadata_path.exists());
+
     let fetch_ref = format!(
         "127.0.0.1:{}/sample-native-capsule:0.1.1",
         base_url.rsplit(':').next().unwrap_or_default()
@@ -536,14 +660,53 @@ fn e2e_native_delivery_sample_tauri_unsigned_finalize() -> Result<()> {
     let fetch = require_success(fetch, "fetch native capsule")?;
     let fetch_json: serde_json::Value =
         serde_json::from_slice(&fetch.stdout).context("parse fetch json")?;
+    assert_eq!(fetch_json["schema_version"].as_str(), Some("0.1"));
     let fetched_dir = PathBuf::from(
         fetch_json["cache_dir"]
             .as_str()
             .context("fetch cache_dir missing")?,
     );
+    let fetch_metadata_path = fetched_dir.join("fetch.json");
+    let fetch_metadata: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&fetch_metadata_path)
+            .with_context(|| format!("failed to read {}", fetch_metadata_path.display()))?,
+    )
+    .context("parse fetch metadata json")?;
+    assert_eq!(fetch_metadata["schema_version"].as_str(), Some("0.1"));
+    assert_eq!(
+        fetch_metadata["scoped_id"].as_str(),
+        Some("local/sample-native-capsule")
+    );
+    assert_eq!(fetch_metadata["version"].as_str(), Some("0.1.1"));
+    assert_eq!(fetch_metadata["registry"].as_str(), Some(base_url.as_str()));
+    let _artifact_blake3 = fetch_metadata["artifact_blake3"]
+        .as_str()
+        .context("fetch artifact_blake3 missing")?
+        .to_string();
     let parent_digest = fetch_json["parent_digest"]
         .as_str()
         .context("fetch parent_digest missing")?
+        .to_string();
+    let fetch_metadata_path = fetched_dir.join("fetch.json");
+    let fetch_metadata: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&fetch_metadata_path)
+            .with_context(|| format!("failed to read {}", fetch_metadata_path.display()))?,
+    )
+    .context("parse fetch metadata json")?;
+    assert_eq!(fetch_metadata["schema_version"].as_str(), Some("0.1"));
+    assert_eq!(
+        fetch_metadata["scoped_id"].as_str(),
+        Some("local/sample-native-capsule")
+    );
+    assert_eq!(fetch_metadata["version"].as_str(), Some("0.1.1"));
+    assert_eq!(fetch_metadata["registry"].as_str(), Some(base_url.as_str()));
+    assert_eq!(
+        fetch_metadata["parent_digest"].as_str(),
+        Some(parent_digest.as_str())
+    );
+    let artifact_blake3 = fetch_metadata["artifact_blake3"]
+        .as_str()
+        .context("fetch artifact_blake3 missing")?
         .to_string();
 
     let parent_app = fetched_dir.join("artifact/sample-native-capsule.app");
@@ -576,6 +739,7 @@ fn e2e_native_delivery_sample_tauri_unsigned_finalize() -> Result<()> {
     let finalize = require_success(finalize, "finalize native capsule")?;
     let finalize_json: serde_json::Value =
         serde_json::from_slice(&finalize.stdout).context("parse finalize json")?;
+    assert_eq!(finalize_json["schema_version"].as_str(), Some("0.1"));
     let derived_app = PathBuf::from(
         finalize_json["derived_app_path"]
             .as_str()
@@ -610,6 +774,17 @@ fn e2e_native_delivery_sample_tauri_unsigned_finalize() -> Result<()> {
             .with_context(|| format!("failed to read {}", provenance_path.display()))?,
     )
     .context("parse provenance json")?;
+    assert_eq!(provenance["schema_version"].as_str(), Some("0.1"));
+    assert_eq!(
+        provenance["scoped_id"].as_str(),
+        Some("local/sample-native-capsule")
+    );
+    assert_eq!(provenance["version"].as_str(), Some("0.1.1"));
+    assert_eq!(provenance["registry"].as_str(), Some(base_url.as_str()));
+    assert_eq!(
+        provenance["artifact_blake3"].as_str(),
+        Some(artifact_blake3.as_str())
+    );
     assert_eq!(
         provenance["parent_digest"].as_str(),
         Some(parent_digest.as_str())
@@ -724,11 +899,22 @@ fn e2e_native_delivery_projection_symlink_lifecycle() -> Result<()> {
     let fetch = require_success(fetch, "fetch native capsule")?;
     let fetch_json: serde_json::Value =
         serde_json::from_slice(&fetch.stdout).context("parse fetch json")?;
+    assert_eq!(fetch_json["schema_version"].as_str(), Some("0.1"));
     let fetched_dir = PathBuf::from(
         fetch_json["cache_dir"]
             .as_str()
             .context("fetch cache_dir missing")?,
     );
+    let fetch_metadata_path = fetched_dir.join("fetch.json");
+    let fetch_metadata: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&fetch_metadata_path)
+            .with_context(|| format!("failed to read {}", fetch_metadata_path.display()))?,
+    )
+    .context("parse fetch metadata json")?;
+    let artifact_blake3 = fetch_metadata["artifact_blake3"]
+        .as_str()
+        .context("fetch artifact_blake3 missing")?
+        .to_string();
 
     let dist_dir = tmp.path().join("dist");
     let finalize = run_ato_with_home(
@@ -772,6 +958,7 @@ fn e2e_native_delivery_projection_symlink_lifecycle() -> Result<()> {
     let project = require_success(project, "project finalized native capsule")?;
     let project_json: serde_json::Value =
         serde_json::from_slice(&project.stdout).context("parse project json")?;
+    assert_eq!(project_json["schema_version"].as_str(), Some("0.1"));
     let projection_id = project_json["projection_id"]
         .as_str()
         .context("projection_id missing")?
@@ -785,6 +972,25 @@ fn e2e_native_delivery_projection_symlink_lifecycle() -> Result<()> {
         project_json["metadata_path"]
             .as_str()
             .context("metadata_path missing")?,
+    );
+    let projection_metadata: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&metadata_path)
+            .with_context(|| format!("failed to read {}", metadata_path.display()))?,
+    )
+    .context("parse projection metadata json")?;
+    assert_eq!(projection_metadata["schema_version"].as_str(), Some("0.1"));
+    assert_eq!(
+        projection_metadata["scoped_id"].as_str(),
+        Some("local/sample-native-capsule")
+    );
+    assert_eq!(projection_metadata["version"].as_str(), Some("0.1.1"));
+    assert_eq!(
+        projection_metadata["registry"].as_str(),
+        Some(base_url.as_str())
+    );
+    assert_eq!(
+        projection_metadata["artifact_blake3"].as_str(),
+        Some(artifact_blake3.as_str())
     );
 
     let projected_meta = fs::symlink_metadata(&projected_path)
@@ -853,6 +1059,7 @@ fn e2e_native_delivery_projection_symlink_lifecycle() -> Result<()> {
     let unproject = require_success(unproject, "unproject broken projection")?;
     let unproject_json: serde_json::Value =
         serde_json::from_slice(&unproject.stdout).context("parse unproject json")?;
+    assert_eq!(unproject_json["schema_version"].as_str(), Some("0.1"));
     assert_eq!(
         unproject_json["projection_id"].as_str(),
         Some(projection_id.as_str())

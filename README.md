@@ -28,6 +28,15 @@ ato setup --engine nacelle [--version <ver>] # compatibility command (deprecated
 ato registry serve --host 127.0.0.1 --port 18787 [--auth-token <token>]
 ```
 
+## Native Delivery (Experimental)
+
+- Primary product surface stays `ato build`, `ato publish`, and `ato install`.
+- For the current Tauri darwin/arm64 PoC, `capsule.toml` is the canonical project manifest. A default target with `driver = "native"` and a `.app` `entrypoint` is enough for native build detection.
+- `ato.delivery.toml` is still accepted as a compatibility sidecar. When present, it must match the `capsule.toml` native target contract; the build rewrites/stages compatibility metadata into the artifact.
+- Native install JSON exposes `local_derivation` and `projection` envelopes. For this contract generation, `schema_version = "0.1"` is the stable machine-readable version for fetch/finalize/project/unproject/install metadata.
+- `fetch`, `finalize`, `project`, and `unproject` remain advanced/debug surfaces. Most users should stay on the integrated `build` / `publish` / `install` flow.
+- Local finalize is currently fail-closed and limited to macOS darwin/arm64 with `codesign`.
+
 ## Quick Start (Local)
 
 ```bash
@@ -151,6 +160,7 @@ ato run <publisher>/<slug> --registry http://127.0.0.1:18787 --yes
 ```
 
 Notes:
+
 - Write operations (`publish`) require `ATO_TOKEN` when `registry serve --auth-token` is enabled.
 - Read operations (search/install/download) can remain unauthenticated.
 - Use `18787` in local verification to avoid collision with app services that also use `8787` (for example, worker HTTP ports).
@@ -313,6 +323,7 @@ ato run <publisher>/<slug> --registry http://127.0.0.1:18787
 ```
 
 Notes:
+
 - For Next.js standalone, copy `.next/static` (and `public` if used) into standalone output before `ato build`.
 - `ato run` stops before startup if `required_env` keys are missing.
 - `services.main` is required in services mode and receives `PORT=<targets.<label>.port`.
@@ -331,6 +342,7 @@ Notes:
 - `source/native`: Tier2 (`--sandbox` recommended)
 
 Notes:
+
 - Node is Tier1 and does not require `--unsafe`.
 - Tier2 (`source/native|python`, `web/python`) requires the `nacelle` engine.
   If not configured, execution stops fail-closed. Configure via `ato engine register`, `--nacelle`, or `NACELLE_PATH`.
@@ -384,6 +396,7 @@ ato whoami
 ```
 
 Default endpoints:
+
 - `ATO_STORE_API_URL` (default: `https://api.ato.run`)
 - `ATO_STORE_SITE_URL` (default: `https://store.ato.run`)
 - `ATO_TOKEN`

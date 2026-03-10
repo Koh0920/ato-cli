@@ -1,4 +1,4 @@
-//! `ato init` - initialize an existing project as a capsule.
+//! Project init helpers for prompt generation and interactive manifest creation.
 
 use anyhow::{Context, Result};
 use std::fs;
@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use capsule_core::CapsuleReporter;
 
 pub mod detect;
+pub mod prompt;
 pub mod recipe;
 
 pub struct InitArgs {
@@ -15,7 +16,18 @@ pub struct InitArgs {
     pub yes: bool,
 }
 
-pub fn execute(
+pub struct PromptArgs {
+    pub path: Option<PathBuf>,
+}
+
+pub fn execute_prompt(
+    args: PromptArgs,
+    reporter: std::sync::Arc<crate::reporters::CliReporter>,
+) -> Result<()> {
+    prompt::execute(args, reporter)
+}
+
+pub fn execute_manifest_init(
     args: InitArgs,
     reporter: std::sync::Arc<crate::reporters::CliReporter>,
 ) -> Result<()> {
@@ -76,7 +88,7 @@ pub fn execute(
     let manifest_content = recipe::generate_manifest(
         &info,
         recipe::ManifestMeta {
-            generated_by: "ato init",
+            generated_by: "ato build --init",
             description: &description,
         },
     );

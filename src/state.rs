@@ -259,6 +259,10 @@ pub fn list_states(owner_scope: Option<&str>, state_name: Option<&str>, json: bo
             record.backend_kind,
             record.backend_locator,
         );
+        println!("   producer: {}", record.producer);
+        println!("   purpose:  {}", record.purpose);
+        println!("   schema:   {}", record.schema_id);
+        println!();
     }
     Ok(())
 }
