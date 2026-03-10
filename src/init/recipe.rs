@@ -3,7 +3,7 @@ use anyhow::Result;
 use std::fs;
 use std::path::Path;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ProjectInfo {
     pub name: String,
     pub project_type: ProjectType,

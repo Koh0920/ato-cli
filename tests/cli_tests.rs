@@ -6,6 +6,22 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use tempfile::tempdir;
 
+fn run_init_in(dir: &std::path::Path) -> String {
+    let output = Command::cargo_bin("ato")
+        .unwrap()
+        .current_dir(dir)
+        .arg("init")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
 #[test]
 fn test_cli_help() {
     let mut cmd = Command::cargo_bin("ato").unwrap();
@@ -143,19 +159,7 @@ fn test_init_outputs_agent_prompt_for_next_project_without_writing_manifest() {
     fs::create_dir_all(tmp.path().join("app")).unwrap();
     fs::create_dir_all(tmp.path().join("public")).unwrap();
 
-    let output = Command::cargo_bin("ato")
-        .unwrap()
-        .current_dir(tmp.path())
-        .arg("init")
-        .output()
-        .unwrap();
-
-    assert!(
-        output.status.success(),
-        "stderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stdout = run_init_in(tmp.path());
     assert!(
         stdout.contains("Generated an agent-ready prompt for capsule.toml creation."),
         "stdout={stdout}"
@@ -171,6 +175,203 @@ fn test_init_outputs_agent_prompt_for_next_project_without_writing_manifest() {
     );
     assert!(stdout.contains("```toml"), "stdout={stdout}");
     assert!(!tmp.path().join("capsule.toml").exists());
+}
+
+#[test]
+fn test_init_detects_astro_project_and_config_facts() {
+    let tmp = tempdir().unwrap();
+    fs::write(
+        tmp.path().join("package.json"),
+        r#"{
+  "dependencies": {
+    "astro": "^4.0.0"
+  },
+  "scripts": {
+    "build": "astro build"
+  }
+}"#,
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("astro.config.mjs"),
+        "export default { output: 'static' };",
+    )
+    .unwrap();
+    fs::create_dir_all(tmp.path().join("dist")).unwrap();
+
+    let stdout = run_init_in(tmp.path());
+    assert!(stdout.contains("Astro"), "stdout={stdout}");
+    assert!(stdout.contains("astro.config.mjs"), "stdout={stdout}");
+    assert!(stdout.contains("dist"), "stdout={stdout}");
+}
+
+#[test]
+fn test_init_detects_nuxt_ambiguity() {
+    let tmp = tempdir().unwrap();
+    fs::write(
+        tmp.path().join("package.json"),
+        r#"{
+  "dependencies": {
+    "nuxt": "^3.0.0"
+  }
+}"#,
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("nuxt.config.ts"),
+        "export default defineNuxtConfig({});",
+    )
+    .unwrap();
+
+    let stdout = run_init_in(tmp.path());
+    assert!(stdout.contains("Nuxt"), "stdout={stdout}");
+    assert!(
+        stdout.contains("static generate build or a server deployment"),
+        "stdout={stdout}"
+    );
+}
+
+#[test]
+fn test_init_detects_react_vite_static_facts() {
+    let tmp = tempdir().unwrap();
+    fs::write(
+        tmp.path().join("package.json"),
+        r#"{
+  "dependencies": {
+    "react": "^19.0.0",
+    "vite": "^5.0.0"
+  },
+  "scripts": {
+    "build": "vite build",
+    "preview": "vite preview"
+  }
+}"#,
+    )
+    .unwrap();
+    fs::write(tmp.path().join("vite.config.ts"), "export default {};").unwrap();
+    fs::create_dir_all(tmp.path().join("dist")).unwrap();
+    fs::create_dir_all(tmp.path().join("src")).unwrap();
+    fs::write(tmp.path().join("src/main.ts"), "console.log('hi');").unwrap();
+
+    let stdout = run_init_in(tmp.path());
+    assert!(stdout.contains("React + Vite"), "stdout={stdout}");
+    assert!(stdout.contains("vite.config.ts"), "stdout={stdout}");
+    assert!(stdout.contains("`dist`"), "stdout={stdout}");
+    assert!(stdout.contains("pure Vite static build"), "stdout={stdout}");
+}
+
+#[test]
+fn test_init_detects_express_server_entry_hints() {
+    let tmp = tempdir().unwrap();
+    fs::write(
+        tmp.path().join("package.json"),
+        r#"{
+  "dependencies": {
+    "express": "^4.0.0"
+  },
+  "scripts": {
+    "start": "node dist/server.js"
+  }
+}"#,
+    )
+    .unwrap();
+    fs::create_dir_all(tmp.path().join("dist")).unwrap();
+    fs::write(tmp.path().join("dist/server.js"), "console.log('server');").unwrap();
+
+    let stdout = run_init_in(tmp.path());
+    assert!(stdout.contains("Express"), "stdout={stdout}");
+    assert!(stdout.contains("dist/server.js"), "stdout={stdout}");
+    assert!(stdout.contains("`npm start`"), "stdout={stdout}");
+}
+
+#[test]
+fn test_init_detects_tauri_native_facts_and_ambiguity() {
+    let tmp = tempdir().unwrap();
+    fs::create_dir_all(
+        tmp.path()
+            .join("src-tauri/target/release/bundle/macos/sample.app"),
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("src-tauri/Cargo.toml"),
+        "[package]\nname = \"sample-tauri\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(tmp.path().join("tauri.conf.json"), "{}").unwrap();
+
+    let stdout = run_init_in(tmp.path());
+    assert!(stdout.contains("Tauri"), "stdout={stdout}");
+    assert!(stdout.contains("src-tauri/Cargo.toml"), "stdout={stdout}");
+    assert!(stdout.contains("tauri.conf.json"), "stdout={stdout}");
+    assert!(stdout.contains("sample.app"), "stdout={stdout}");
+    assert!(
+        stdout.contains("embedded in the desktop app"),
+        "stdout={stdout}"
+    );
+}
+
+#[test]
+fn test_init_detects_electron_native_ambiguity() {
+    let tmp = tempdir().unwrap();
+    fs::write(
+        tmp.path().join("package.json"),
+        r#"{
+  "main": "electron/main.js",
+  "devDependencies": {
+    "electron": "^30.0.0",
+    "electron-builder": "^24.0.0"
+  }
+}"#,
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("electron-builder.yml"),
+        "appId: com.example.demo\n",
+    )
+    .unwrap();
+
+    let stdout = run_init_in(tmp.path());
+    assert!(stdout.contains("Electron"), "stdout={stdout}");
+    assert!(stdout.contains("electron-builder.yml"), "stdout={stdout}");
+    assert!(
+        stdout.contains("packaged desktop artifact"),
+        "stdout={stdout}"
+    );
+}
+
+#[test]
+fn test_init_detects_fastapi_and_module_ambiguity() {
+    let tmp = tempdir().unwrap();
+    fs::write(tmp.path().join("requirements.txt"), "fastapi\nuvicorn\n").unwrap();
+    fs::write(
+        tmp.path().join("server.py"),
+        "from fastapi import FastAPI\napp = FastAPI()\n",
+    )
+    .unwrap();
+
+    let stdout = run_init_in(tmp.path());
+    assert!(stdout.contains("FastAPI"), "stdout={stdout}");
+    assert!(
+        stdout.contains("uvicorn module:app") || stdout.contains("app object"),
+        "stdout={stdout}"
+    );
+}
+
+#[test]
+fn test_init_detects_plain_rust_binary_facts() {
+    let tmp = tempdir().unwrap();
+    fs::create_dir_all(tmp.path().join("src")).unwrap();
+    fs::write(
+        tmp.path().join("Cargo.toml"),
+        "[package]\nname = \"demo-rust\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(tmp.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+
+    let stdout = run_init_in(tmp.path());
+    assert!(stdout.contains("Rust binary"), "stdout={stdout}");
+    assert!(stdout.contains("Cargo.toml"), "stdout={stdout}");
+    assert!(stdout.contains("src/main.rs"), "stdout={stdout}");
 }
 
 #[test]
