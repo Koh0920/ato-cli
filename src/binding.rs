@@ -276,6 +276,36 @@ pub fn register_service_binding_from_process(
     Ok(())
 }
 
+pub fn sync_service_bindings_from_process(process_id: &str, json: bool) -> Result<()> {
+    let records = sync_service_bindings_for_process(process_id)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&records)?);
+        return Ok(());
+    }
+
+    if records.is_empty() {
+        println!(
+            "No auto-bindable local services were found for process {}.",
+            process_id
+        );
+        return Ok(());
+    }
+
+    println!(
+        "✅ Registered {} local service binding(s) for {}",
+        records.len(),
+        process_id
+    );
+    for record in records {
+        println!(
+            "   {} -> {} ({})",
+            record.service_name, record.endpoint_locator, record.binding_id
+        );
+    }
+    Ok(())
+}
+
 pub fn register_service_binding_for_process(
     process_id: &str,
     service_name: &str,
@@ -306,6 +336,43 @@ pub fn register_service_binding_for_process(
         port.or(process.requested_port),
     )?;
     register_service_binding_from_parts(&manifest, service_name, endpoint)
+}
+
+pub fn sync_service_bindings_for_process(process_id: &str) -> Result<Vec<ServiceBindingRecord>> {
+    let process = ProcessManager::new()?
+        .read_pid(process_id)
+        .with_context(|| format!("failed to read process record '{}'", process_id))?;
+    if !process.status.is_active() {
+        anyhow::bail!(
+            "process '{}' is not active (status={})",
+            process_id,
+            process.status
+        );
+    }
+
+    let manifest_path = process.manifest_path.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "process '{}' does not record a manifest path required for service binding registration",
+            process_id
+        )
+    })?;
+    let manifest = load_manifest(manifest_path)?;
+
+    let mut records = Vec::new();
+    for service_name in auto_bindable_service_names(&manifest) {
+        let endpoint = derive_service_endpoint_locator(
+            &manifest,
+            &service_name,
+            process.target_label.as_deref(),
+            process.requested_port,
+        )?;
+        records.push(register_service_binding_from_parts(
+            &manifest,
+            &service_name,
+            endpoint,
+        )?);
+    }
+    Ok(records)
 }
 
 fn register_service_binding_from_parts(
@@ -604,6 +671,27 @@ fn local_service_binding_contract(
     Ok(contract)
 }
 
+fn auto_bindable_service_names(manifest: &CapsuleManifest) -> Vec<String> {
+    let Some(services) = manifest.services.as_ref() else {
+        return Vec::new();
+    };
+
+    let mut names = services
+        .iter()
+        .filter_map(|(service_name, service)| {
+            let network = service.network.as_ref();
+            let should_register = service_name == "main"
+                || network.map(|network| network.publish).unwrap_or(false)
+                || network
+                    .map(|network| !network.allow_from.is_empty())
+                    .unwrap_or(false);
+            should_register.then(|| service_name.clone())
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
 fn derive_service_upstream_locator(
     manifest: &CapsuleManifest,
     service_name: &str,
@@ -661,8 +749,9 @@ fn derive_service_endpoint_locator(
 #[cfg(test)]
 mod tests {
     use super::{
-        derive_service_endpoint_locator, derive_service_upstream_locator, ingress_binding_contract,
-        load_manifest, local_service_binding_contract, normalize_endpoint_locator,
+        auto_bindable_service_names, derive_service_endpoint_locator,
+        derive_service_upstream_locator, ingress_binding_contract, load_manifest,
+        local_service_binding_contract, normalize_endpoint_locator,
         normalize_local_service_locator, parse_binding_reference, SERVICE_BINDING_KIND_SERVICE,
     };
     use capsule_core::types::CapsuleManifest;
@@ -841,5 +930,35 @@ network = { publish = true }
 
         let loaded = load_manifest(&capsule_path).expect("load artifact manifest");
         assert_eq!(loaded.name, "demo-app");
+    }
+
+    #[test]
+    fn auto_bindable_service_names_select_publish_and_allow_from() {
+        let manifest = CapsuleManifest::from_toml(
+            r#"
+schema_version = "0.2"
+name = "demo-app"
+version = "0.1.0"
+type = "app"
+default_target = "app"
+
+[targets.app]
+runtime = "oci"
+image = "ghcr.io/example/app:latest"
+port = 4310
+
+[services.main]
+network = { publish = true }
+
+[services.api]
+network = { allow_from = ["main"] }
+
+[services.worker]
+network = {}
+"#,
+        )
+        .expect("manifest");
+
+        assert_eq!(auto_bindable_service_names(&manifest), vec!["api", "main"]);
     }
 }

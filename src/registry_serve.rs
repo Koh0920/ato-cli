@@ -293,6 +293,8 @@ struct RunCapsuleResponse {
     requested_target: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     requested_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    registered_service_binding_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2732,6 +2734,22 @@ async fn handle_run_local_capsule(
             &format!("failed to persist process record: {}", err),
         );
     }
+    let registered_service_binding_ids =
+        match binding::sync_service_bindings_for_process(&process_id) {
+            Ok(records) => records
+                .into_iter()
+                .map(|record| record.binding_id)
+                .collect(),
+            Err(err) => {
+                let _ = child.kill();
+                let _ = process_manager.delete_pid(&process_id);
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "service_binding_register_failed",
+                    &err.to_string(),
+                );
+            }
+        };
     std::thread::spawn(move || {
         let _ = child.wait();
     });
@@ -2743,6 +2761,7 @@ async fn handle_run_local_capsule(
             scoped_id,
             requested_target: effective_target,
             requested_port: effective_port,
+            registered_service_binding_ids,
         }),
     )
         .into_response()
