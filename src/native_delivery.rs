@@ -196,12 +196,11 @@ enum NativeArtifactKind {
 
 impl NativeArtifactKind {
     fn from_path(path: &Path) -> Self {
-        if path.extension().and_then(|ext| ext.to_str()) == Some("app") {
-            Self::MacOsAppBundle
-        } else if path.extension().and_then(|ext| ext.to_str()) == Some("exe") || path.is_file() {
-            Self::File
-        } else {
-            Self::Directory
+        match path.extension().and_then(|ext| ext.to_str()) {
+            Some("app") => Self::MacOsAppBundle,
+            Some("exe") => Self::File,
+            _ if path.is_file() => Self::File,
+            _ => Self::Directory,
         }
     }
 }
@@ -3050,7 +3049,10 @@ input = "dist/time-management-desktop.app"
         let result = build_native_artifact_with_strip(&plan, Some(&artifact_path), |_app| Ok(()))?;
 
         assert_eq!(result.build_strategy, "native-delivery");
-        assert_eq!(result.target, default_delivery_target_for_input("MyApp.app"));
+        assert_eq!(
+            result.target,
+            default_delivery_target_for_input("MyApp.app")
+        );
         assert_eq!(result.derived_from, plan.source_app_path);
         assert_eq!(
             compute_tree_digest(&plan.source_app_path)?,
