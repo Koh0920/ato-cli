@@ -1175,7 +1175,7 @@ mod tests {
         fs::create_dir_all(tmp.path().join("src-tauri")).unwrap();
         fs::write(
             tmp.path().join("src-tauri/Cargo.toml"),
-            "[package]\nname='demo'\n",
+            "[package]\nname = \"demo\"\n",
         )
         .unwrap();
 

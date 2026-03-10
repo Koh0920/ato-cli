@@ -352,7 +352,8 @@ fn test_init_detects_fastapi_and_module_ambiguity() {
     let stdout = run_init_in(tmp.path());
     assert!(stdout.contains("FastAPI"), "stdout={stdout}");
     assert!(
-        stdout.contains("uvicorn module:app") || stdout.contains("app object"),
+        stdout.contains("uvicorn module:app")
+            && stdout.contains("which module and app object should be used"),
         "stdout={stdout}"
     );
 }
