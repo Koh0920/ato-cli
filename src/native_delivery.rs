@@ -1150,16 +1150,14 @@ fn project_with_roots(
                 record.metadata.projection_id
             );
         }
-        if projected_candidates
-            .iter()
-            .try_fold(false, |matched, candidate| {
-                if matched {
-                    Ok(true)
-                } else {
-                    paths_match(&record.metadata.projected_path, candidate)
-                }
-            })?
-        {
+        let mut candidate_conflict = false;
+        for candidate in &projected_candidates {
+            if paths_match(&record.metadata.projected_path, candidate)? {
+                candidate_conflict = true;
+                break;
+            }
+        }
+        if candidate_conflict {
             bail!(
                 "Projection name conflict: '{}' is already managed by projection {}",
                 record.metadata.projected_path.display(),
@@ -2754,7 +2752,17 @@ fn inspect_projection_path(path: &Path, target: &Path) -> Result<ProjectionPathS
             });
         }
         if is_projection_shortcut(path, &metadata) {
-            return Ok(ProjectionPathStatus::MatchesTarget);
+            let shortcut_target = resolve_projection_shortcut_target(path).with_context(|| {
+                format!(
+                    "Failed to validate projection shortcut target for {}",
+                    path.display()
+                )
+            })?;
+            return Ok(if paths_match(&shortcut_target, target)? {
+                ProjectionPathStatus::MatchesTarget
+            } else {
+                ProjectionPathStatus::TargetMismatch
+            });
         }
     }
 
@@ -2820,7 +2828,7 @@ fn create_projection_symlink(target: &Path, destination: &Path) -> std::io::Resu
                     Err(shortcut_err) => Err(io::Error::new(
                         shortcut_err.kind(),
                         format!(
-                            "symlink failed: {}; junction failed: {}; shortcut failed: {}",
+                            "Failed to create projection after attempting symlink, junction, and shortcut fallbacks: symlink failed: {}; junction failed: {}; shortcut failed: {}",
                             symlink_err, junction_err, shortcut_err
                         ),
                     )),
@@ -2842,18 +2850,82 @@ fn remove_projection_symlink(path: &Path) -> io::Result<()> {
 
 #[cfg(windows)]
 fn projection_shortcut_path(path: &Path) -> PathBuf {
-    match path.extension().and_then(|value| value.to_str()) {
-        Some(extension) if !extension.is_empty() => path.with_extension(format!("{extension}.lnk")),
-        _ => path.with_extension("lnk"),
-    }
+    let file_name = path
+        .file_name()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "projection".to_string());
+    path.with_file_name(format!("{file_name}.lnk"))
 }
 
 #[cfg(windows)]
 fn create_projection_shortcut(target: &Path, destination: &Path) -> io::Result<()> {
-    let shortcut = ShellLink::new(target).map_err(|err| io::Error::other(err.to_string()))?;
-    shortcut
-        .create_lnk(destination)
-        .map_err(|err| io::Error::other(err.to_string()))
+    let shortcut = ShellLink::new(target).map_err(|err| {
+        io::Error::other(format!(
+            "Failed to prepare shortcut target {}: {}",
+            target.display(),
+            err
+        ))
+    })?;
+    shortcut.create_lnk(destination).map_err(|err| {
+        io::Error::other(format!(
+            "Failed to write shortcut {}: {}",
+            destination.display(),
+            err
+        ))
+    })
+}
+
+#[cfg(windows)]
+fn resolve_projection_shortcut_target(path: &Path) -> Result<PathBuf> {
+    if !path.is_file() {
+        bail!(
+            "Projection shortcut does not exist as a file: {}",
+            path.display()
+        );
+    }
+    let output = powershell_command()
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$ws = New-Object -ComObject WScript.Shell; $shortcut = $ws.CreateShortcut($args[0]); if (-not $shortcut.TargetPath) { exit 1 }; [Console]::Out.Write($shortcut.TargetPath)",
+        ])
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("Failed to resolve projection shortcut {}", path.display()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "Failed to resolve projection shortcut {}: {}",
+            path.display(),
+            stderr.trim()
+        );
+    }
+    let target = String::from_utf8_lossy(&output.stdout)
+        .trim_end_matches(&['\r', '\n'][..])
+        .to_string();
+    if target.is_empty() {
+        bail!("Projection shortcut target is empty: {}", path.display());
+    }
+    Ok(PathBuf::from(target))
+}
+
+#[cfg(windows)]
+fn powershell_command() -> Command {
+    if let Ok(system_root) = std::env::var("SYSTEMROOT") {
+        let candidate = PathBuf::from(system_root)
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+        if candidate.is_file() {
+            return Command::new(candidate);
+        }
+    }
+    Command::new("powershell")
 }
 
 #[cfg(windows)]
@@ -3798,6 +3870,41 @@ input = "dist/time-management-desktop.app"
         assert!(supports_projection_target("windows/x86_64"));
         assert!(!supports_projection_target("linux/x86_64"));
         assert!(!supports_projection_target(""));
+    }
+
+    #[test]
+    fn first_existing_projection_candidate_returns_none_for_missing_paths() -> Result<()> {
+        let tmp = tempdir()?;
+        let missing = tmp.path().join("Applications").join("MissingApp");
+        assert_eq!(first_existing_projection_candidate(&missing)?, None);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shortcut_roundtrip_resolves_expected_target() -> Result<()> {
+        let tmp = tempdir()?;
+        let target = tmp.path().join("MyApp");
+        fs::create_dir_all(&target)?;
+        let shortcut = projection_shortcut_path(&tmp.path().join("Launcher").join("MyApp"));
+        let shortcut_parent = shortcut
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("shortcut path missing parent"))?;
+        fs::create_dir_all(shortcut_parent)?;
+
+        create_projection_shortcut(&target, &shortcut)?;
+
+        assert!(shortcut.is_file());
+        assert!(is_projection_shortcut(&shortcut, &fs::metadata(&shortcut)?));
+        assert!(paths_match(
+            &resolve_projection_shortcut_target(&shortcut)?,
+            &target
+        )?);
+        assert_eq!(
+            first_existing_projection_candidate(&tmp.path().join("Launcher").join("MyApp"))?,
+            Some(shortcut)
+        );
+        Ok(())
     }
 
     #[test]
