@@ -1355,7 +1355,7 @@ impl CapsuleManifest {
                     errors.push(ValidationError::InvalidTarget(label.clone()));
                     continue;
                 }
-                let effective_driver = infer_source_driver(&target, entrypoint);
+                let effective_driver = infer_source_driver(target, entrypoint);
                 if matches!(
                     effective_driver.as_deref(),
                     Some("deno") | Some("node") | Some("python")
