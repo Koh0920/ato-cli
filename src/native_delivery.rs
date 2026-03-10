@@ -670,20 +670,13 @@ fn detect_native_manifest_contract(
 
     let input = target.entrypoint.trim();
     if input.is_empty() {
-        bail!(
-            "Native delivery target '{}' must set entrypoint to a relative .app bundle path",
-            manifest.default_target
-        );
+        return Ok(None);
     }
 
     let input_path = PathBuf::from(input);
     validate_relative_input_path(&input_path)?;
     if input_path.extension().and_then(|ext| ext.to_str()) != Some("app") {
-        bail!(
-            "Native delivery target '{}' entrypoint must point to a .app bundle: {}",
-            manifest.default_target,
-            input
-        );
+        return Ok(None);
     }
 
     Ok(Some(delivery_config_from_input(input)))
