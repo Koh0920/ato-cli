@@ -725,7 +725,7 @@ fn resolve_state_source_overrides(
     for raw in raw_bindings {
         let (state_name, locator) = raw.split_once('=').ok_or_else(|| {
             anyhow::anyhow!(
-                "invalid --state binding '{}'; expected STATE=/absolute/path",
+                "invalid --state binding '{}'; expected data=/absolute/path",
                 raw
             )
         })?;
@@ -733,7 +733,7 @@ fn resolve_state_source_overrides(
         let locator = locator.trim();
         if state_name.is_empty() || locator.is_empty() {
             anyhow::bail!(
-                "invalid --state binding '{}'; expected STATE=/absolute/path",
+                "invalid --state binding '{}'; expected data=/absolute/path",
                 raw
             );
         }
@@ -781,7 +781,7 @@ fn resolve_state_source_overrides(
     let schema_registry = SchemaRegistry::load()?;
     let store_dir = capsule_core::config::config_dir()?.join("state");
     let store = RegistryStore::open(&store_dir)?;
-    let owner_scope = persistent_state_owner_scope(manifest);
+    let owner_scope = persistent_state_owner_scope(manifest)?;
     let mut resolved = std::collections::HashMap::new();
 
     for (state_name, requirement) in persistent_states {
@@ -841,10 +841,24 @@ fn resolve_state_source_overrides(
     Ok(resolved)
 }
 
-fn persistent_state_owner_scope(manifest: &CapsuleManifest) -> String {
-    manifest.name.trim().to_string()
+/// Resolve the registry owner scope for persistent state entries.
+///
+/// The current thin registry keeps ownership scoped to the capsule manifest name so a
+/// state entry cannot be silently reused by a different capsule identity. Manifest
+/// validation already requires a non-empty capsule name, so the thin registry reuses
+/// that stable manifest identity directly.
+fn persistent_state_owner_scope(manifest: &CapsuleManifest) -> Result<String> {
+    let owner_scope = manifest.name.trim().to_string();
+    if owner_scope.is_empty() {
+        anyhow::bail!("manifest name is required before persistent state can be attached");
+    }
+    Ok(owner_scope)
 }
 
+/// Validate, create if needed, and canonicalize a host path used for persistent state.
+///
+/// On Unix, newly created directories are restricted to mode `0o700`. On non-Unix
+/// platforms the OS-default directory ACLs are used.
 fn prepare_backend_locator(locator: &str) -> Result<String> {
     let path = PathBuf::from(locator);
     if !path.is_absolute() {
@@ -864,14 +878,34 @@ fn prepare_backend_locator(locator: &str) -> Result<String> {
             );
         }
     } else {
-        fs::create_dir_all(&path)
-            .with_context(|| format!("failed to create state directory: {}", path.display()))?;
+        create_state_directory(&path)?;
     }
 
     Ok(fs::canonicalize(&path)
         .with_context(|| format!("failed to canonicalize state path: {}", path.display()))?
         .to_string_lossy()
         .to_string())
+}
+
+fn create_state_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder
+            .create(path)
+            .with_context(|| format!("failed to create state directory: {}", path.display()))?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path)
+            .with_context(|| format!("failed to create state directory: {}", path.display()))?;
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1792,12 +1826,37 @@ mod tests {
     use crate::executors::source::NacelleExecEvent;
     use capsule_core::router::{ExecutionProfile, ManifestData};
     use capsule_core::types::CapsuleManifest;
+    use std::ffi::OsString;
     use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock};
 
+    /// Serialize tests that mutate process-global environment variables like `HOME`.
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// RAII helper that restores the previous `HOME` environment variable on drop.
+    struct HomeGuard {
+        previous: Option<OsString>,
+    }
+
+    impl HomeGuard {
+        fn set(path: &std::path::Path) -> Self {
+            let previous = std::env::var_os("HOME");
+            std::env::set_var("HOME", path);
+            Self { previous }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var("HOME", previous);
+            } else {
+                std::env::remove_var("HOME");
+            }
+        }
     }
 
     #[test]
@@ -1904,7 +1963,7 @@ mod tests {
     fn resolve_state_source_overrides_registers_persistent_state_binding() {
         let _guard = env_lock().lock().unwrap();
         let home = tempfile::tempdir().expect("home");
-        std::env::set_var("HOME", home.path());
+        let _home_guard = HomeGuard::set(home.path());
 
         let manifest = CapsuleManifest::from_toml(
             r#"
@@ -1945,14 +2004,13 @@ target = "/var/lib/app"
             Some(bind_dir.canonicalize().unwrap().to_string_lossy().as_ref())
         );
         assert!(home.path().join(".ato/state/registry.sqlite3").exists());
-        std::env::remove_var("HOME");
     }
 
     #[test]
     fn resolve_state_source_overrides_rejects_incompatible_registry_entry() {
         let _guard = env_lock().lock().unwrap();
         let home = tempfile::tempdir().expect("home");
-        std::env::set_var("HOME", home.path());
+        let _home_guard = HomeGuard::set(home.path());
 
         let manifest_a = CapsuleManifest::from_toml(
             r#"
@@ -2021,7 +2079,6 @@ target = "/var/lib/app"
         assert!(err
             .to_string()
             .contains("producer/purpose/schema_id must match exactly"));
-        std::env::remove_var("HOME");
     }
 
     fn manifest_with_required_env(keys: Vec<&str>) -> ManifestData {
