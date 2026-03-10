@@ -1,7 +1,0 @@
-version = "1"
-
-[meta]
-created_at = "2026-03-10T15:20:22.925510447+00:00"
-manifest_hash = "blake3:35a51aa211a1b5321b2af791709e32351ebb09b6306c7383a401cc28efe8ed32"
-
-[targets]
