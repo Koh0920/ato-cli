@@ -481,7 +481,7 @@ enum Commands {
 
     #[command(
         next_help_heading = "Advanced Commands",
-        about = "Add a finalized app to launcher surfaces"
+        about = "Add a finalized app to launcher surfaces (experimental)"
     )]
     Project {
         /// Path to a finalized local derived .app bundle created by `ato finalize`
@@ -501,7 +501,7 @@ enum Commands {
 
     #[command(
         next_help_heading = "Advanced Commands",
-        about = "Remove a launcher projection without mutating the finalized artifact"
+        about = "Remove an experimental launcher projection without mutating the finalized artifact"
     )]
     Unproject {
         /// Projection ID, projected symlink path, or finalized derived .app path
