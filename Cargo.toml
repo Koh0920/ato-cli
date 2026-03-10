@@ -7,10 +7,11 @@ resolver = "2"
 
 [package]
 name = "ato-cli"
-version = "0.4.11"
+version = "0.4.12"
 edition = "2021"
 description = "ato CLI (meta-runtime)"
 license = "Apache-2.0"
+repository = "https://github.com/Koh0920/ato-cli"
 build = "build.rs"
 
 [[bin]]
@@ -74,6 +75,7 @@ tui-input = "0.12"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+axoupdater = "0.10.0"
 
 
 [dev-dependencies]
@@ -91,3 +93,8 @@ wasi-common = "16.0"
 [features]
 default = []
 provisioning-tests = []
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

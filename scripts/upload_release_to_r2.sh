@@ -16,7 +16,8 @@ set -euo pipefail
 #   DEFAULT_BUCKET_STAGING     optional fallback bucket when DEPLOY_ENV=staging|stg
 #   DEFAULT_BUCKET_PRODUCTION  optional fallback bucket when DEPLOY_ENV=production|prod
 #   SOURCE_DIR          default: /tmp/ato-release/$VERSION
-#   TARGETS             default: infer from SOURCE_DIR/ato-*.tar.gz|ato-*.zip
+#   TARGETS             default: infer from SOURCE_DIR/<ASSET_PREFIX>-*.tar.xz|<ASSET_PREFIX>-*.tar.gz|<ASSET_PREFIX>-*.zip
+#   ASSET_PREFIX        default: ato
 #   UPDATE_LATEST       default: 1
 #   PREFIX              default: ato
 #   WRANGLER_CONFIG     optional (if empty, use wrangler default resolution)
@@ -41,6 +42,21 @@ resolve_bucket_from_env() {
   esac
 }
 
+resolve_wrangler_cmd() {
+  if command -v wrangler >/dev/null 2>&1; then
+    WRANGLER_CMD=(wrangler)
+    return 0
+  fi
+
+  if command -v npx >/dev/null 2>&1; then
+    WRANGLER_CMD=(npx --yes wrangler@4)
+    return 0
+  fi
+
+  echo "error: required command not found: wrangler (or npx for fallback)" >&2
+  exit 1
+}
+
 put_object() {
   local object_key="$1"
   local source_file="$2"
@@ -49,7 +65,7 @@ put_object() {
   local -a cmd
   local cmd_output
 
-  cmd=(wrangler)
+  cmd=("${WRANGLER_CMD[@]}")
   if [[ -n "$WRANGLER_CONFIG" ]]; then
     cmd+=(--config "$WRANGLER_CONFIG")
   fi
@@ -100,16 +116,25 @@ put_object() {
 
 find_archive_for_target() {
   local target="$1"
-  local tar_file="$SOURCE_DIR/ato-$target.tar.gz"
-  local zip_file="$SOURCE_DIR/ato-$target.zip"
-  if [[ -f "$tar_file" ]]; then
-    echo "$tar_file"
-    return 0
-  fi
-  if [[ -f "$zip_file" ]]; then
-    echo "$zip_file"
-    return 0
-  fi
+  # Try cargo-dist format first: <ASSET_PREFIX>-<version>-<target>.tar.xz|tar.gz|zip
+
+  # Find files matching the pattern for this target
+  for file in "$SOURCE_DIR"/*; do
+    if [[ -f "$file" ]]; then
+      local filename="$(basename "$file")"
+      # Check if it's a cargo-dist format file for this target
+      if [[ "$filename" =~ ^${ASSET_PREFIX}-[^-]+-${target}\.(tar\.xz|tar\.gz|zip)$ ]]; then
+        echo "$file"
+        return 0
+      fi
+      # Also check old format for backward compatibility
+      if [[ "$filename" == "${ASSET_PREFIX}-${target}.tar.xz" || "$filename" == "${ASSET_PREFIX}-${target}.tar.gz" || "$filename" == "${ASSET_PREFIX}-${target}.zip" ]]; then
+        echo "$file"
+        return 0
+      fi
+    fi
+  done
+
   return 1
 }
 
@@ -158,8 +183,8 @@ verify_checksums() {
   )
 }
 
-need_cmd wrangler
 need_cmd find
+resolve_wrangler_cmd
 
 VERSION="${VERSION:-}"
 DEPLOY_ENV="${DEPLOY_ENV:-}"
@@ -177,6 +202,7 @@ fi
 
 SOURCE_DIR="${SOURCE_DIR:-/tmp/ato-release/${VERSION}}"
 TARGETS="${TARGETS:-}"
+ASSET_PREFIX="${ASSET_PREFIX:-ato}"
 UPDATE_LATEST="${UPDATE_LATEST:-1}"
 PREFIX="${PREFIX:-ato}"
 WRANGLER_CONFIG="${WRANGLER_CONFIG:-}"
@@ -204,15 +230,23 @@ if [[ -n "$TARGETS" ]]; then
 else
   while IFS= read -r archive; do
     archive_name="$(basename "$archive")"
-    target="${archive_name#ato-}"
-    target="${target%.tar.gz}"
-    target="${target%.zip}"
+    # Handle both old format (<ASSET_PREFIX>-<target>.<ext>) and new cargo-dist format (<ASSET_PREFIX>-<version>-<target>.<ext>)
+    if [[ "$archive_name" =~ ^${ASSET_PREFIX}-[^-]+-(.+)\.(tar\.xz|tar\.gz|zip)$ ]]; then
+      # cargo-dist format: <ASSET_PREFIX>-<version>-<target>.<ext>
+      target="${BASH_REMATCH[1]}"
+    else
+      # old format: <ASSET_PREFIX>-<target>.<ext>
+      target="${archive_name#${ASSET_PREFIX}-}"
+      target="${target%.tar.xz}"
+      target="${target%.tar.gz}"
+      target="${target%.zip}"
+    fi
     target_list+=("$target")
-  done < <(find "$SOURCE_DIR" -maxdepth 1 -type f \( -name 'ato-*.tar.gz' -o -name 'ato-*.zip' \) | sort)
+  done < <(find "$SOURCE_DIR" -maxdepth 1 -type f \( -name "${ASSET_PREFIX}-*.tar.xz" -o -name "${ASSET_PREFIX}-*.tar.gz" -o -name "${ASSET_PREFIX}-*.zip" \) | sort)
 fi
 
 if [[ "${#target_list[@]}" -eq 0 ]]; then
-  echo "error: no targets detected. Set TARGETS or place ato-<target>.tar.gz / ato-<target>.zip in $SOURCE_DIR" >&2
+  echo "error: no targets detected. Set TARGETS or place ${ASSET_PREFIX}-<target>.tar.xz / ${ASSET_PREFIX}-<target>.tar.gz / ${ASSET_PREFIX}-<target>.zip in $SOURCE_DIR" >&2
   exit 1
 fi
 
@@ -230,7 +264,7 @@ fi
 
 for target in "${target_list[@]}"; do
   if ! archive_file="$(find_archive_for_target "$target")"; then
-    echo "error: archive not found for target '$target': $SOURCE_DIR/ato-$target.tar.gz|.zip" >&2
+    echo "error: archive not found for target '$target': $SOURCE_DIR/${ASSET_PREFIX}-$target.tar.xz|.tar.gz|.zip" >&2
     exit 1
   fi
   archive_name="$(basename "$archive_file")"
@@ -244,7 +278,7 @@ verify_checksums "$checksum_file" "$SOURCE_DIR"
 
 for target in "${target_list[@]}"; do
   if ! archive_file="$(find_archive_for_target "$target")"; then
-    echo "error: archive not found for target '$target': $SOURCE_DIR/ato-$target.tar.gz|.zip" >&2
+    echo "error: archive not found for target '$target': $SOURCE_DIR/${ASSET_PREFIX}-$target.tar.xz|.tar.gz|.zip" >&2
     exit 1
   fi
   archive_name="$(basename "$archive_file")"
