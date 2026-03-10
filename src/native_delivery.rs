@@ -2292,8 +2292,7 @@ entrypoint = "MyApp.app"
     }
 
     #[test]
-    fn build_native_artifact_rejects_missing_executable_bit_without_mutating_source() -> Result<()>
-    {
+    fn test_build_rejects_non_executable_without_mutation() -> Result<()> {
         let tmp = tempdir()?;
         let plan = sample_native_build_plan(tmp.path(), 0o644)?;
         let source_digest_before = compute_tree_digest(&plan.source_app_path)?;
