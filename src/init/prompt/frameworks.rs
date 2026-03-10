@@ -44,10 +44,11 @@ pub(super) fn detect_node_frameworks(inputs: &PromptInputs) -> Result<Vec<Framew
         direct_match(package_json, "@nestjs/core", "NestJS", "api-server", 95),
         direct_match(package_json, "hono", "Hono", "api-server", 90),
         direct_match(package_json, "electron", "Electron", "native-desktop", 95),
-    ] {
-        if let Some(framework) = framework {
-            frameworks.push(framework);
-        }
+    ]
+    .into_iter()
+    .flatten()
+    {
+        frameworks.push(framework);
     }
 
     if has_package_dependency(package_json, "react") && has_package_dependency(package_json, "vite")
