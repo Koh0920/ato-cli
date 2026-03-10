@@ -115,7 +115,7 @@ if __name__ == "__main__":
         "# Add your dependencies here\n",
     )?;
 
-    // Generate capsule.toml via the same detect+recipe path as `ato init`.
+    // Generate capsule.toml via the shared detect+recipe path.
     let detected = detect::detect_project(dir)?;
     let mut info = recipe::project_info_from_detection(&detected)?;
     info.name = name.to_string();
@@ -199,7 +199,7 @@ console.log(`Started server http://localhost:${process.env.PORT ?? 8000}`);
 "#;
     fs::write(dir.join("dist/server.js"), dist_js)?;
 
-    // Generate capsule.toml via the same detect+recipe path as `ato init`.
+    // Generate capsule.toml via the shared detect+recipe path.
     let detected = detect::detect_project(dir)?;
     let mut info = recipe::project_info_from_detection(&detected)?;
     info.name = name.to_string();
@@ -290,7 +290,7 @@ console.log(`Started server http://localhost:${process.env.PORT ?? 8000}`);
 "#;
     fs::write(dir.join("dist/server.js"), dist_js)?;
 
-    // Generate capsule.toml via the same detect+recipe path as `ato init`.
+    // Generate capsule.toml via the shared detect+recipe path.
     let detected = detect::detect_project(dir)?;
     let mut info = recipe::project_info_from_detection(&detected)?;
     info.name = name.to_string();
@@ -338,7 +338,7 @@ edition = "2021"
 "#;
     fs::write(dir.join("src/main.rs"), main_rs)?;
 
-    // Generate capsule.toml via the same detect+recipe path as `ato init`.
+    // Generate capsule.toml via the shared detect+recipe path.
     let detected = detect::detect_project(dir)?;
     let mut info = recipe::project_info_from_detection(&detected)?;
     info.name = name.to_string();
@@ -382,7 +382,7 @@ func main() {
 "#;
     fs::write(dir.join("main.go"), main_go)?;
 
-    // Generate capsule.toml via the same detect+recipe path as `ato init`.
+    // Generate capsule.toml via the shared detect+recipe path.
     let detected = detect::detect_project(dir)?;
     let mut info = recipe::project_info_from_detection(&detected)?;
     info.name = name.to_string();
