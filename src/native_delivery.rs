@@ -205,6 +205,16 @@ impl NativeArtifactKind {
     }
 }
 
+impl std::fmt::Display for NativeArtifactKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MacOsAppBundle => write!(f, "macOS app bundle"),
+            Self::Directory => write!(f, "directory"),
+            Self::File => write!(f, "single-file artifact"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FinalizeRunnerKind {
     Codesign,
@@ -417,6 +427,7 @@ where
     }
 
     validate_native_bundle_directory(&plan.source_app_path)?;
+    ensure_local_native_artifact_supported(&plan.source_app_path, "build")?;
     let manifest_raw = fs::read_to_string(&plan.manifest_path).with_context(|| {
         format!(
             "Failed to read capsule manifest for native build: {}",
@@ -998,6 +1009,7 @@ where
     validate_relative_input_path(&input_relative)?;
     let input_app_path = artifact_root.join(&input_relative);
     validate_native_bundle_directory(&input_app_path)?;
+    ensure_local_native_artifact_supported(&input_app_path, "finalize")?;
 
     fs::create_dir_all(output_dir).with_context(|| {
         format!(
@@ -1444,6 +1456,12 @@ fn load_projection_source(derived_app_path: &Path) -> Result<ProjectionSource> {
     if !provenance.finalized_locally {
         bail!("Projection input must be finalized locally via `ato finalize`");
     }
+    if !supports_projection_target(&provenance.target) {
+        bail!(
+            "Projection input target '{}' is unsupported; expected a darwin/<arch> target",
+            provenance.target
+        );
+    }
 
     let actual_digest = compute_tree_digest(&derived_app_path)?;
     if actual_digest != provenance.derived_digest {
@@ -1548,6 +1566,9 @@ fn inspect_projection(
             "unsupported_projection_kind:{}",
             metadata.projection_kind
         ));
+    }
+    if !supports_projection_target(&metadata.target) {
+        problems.push(format!("unsupported_target:{}", metadata.target));
     }
 
     match fs::symlink_metadata(&metadata.projected_path) {
@@ -1781,6 +1802,29 @@ fn rebase_delivery_config_for_finalize(
         }
     }
     Ok(derived_config)
+}
+
+fn ensure_local_native_artifact_supported(path: &Path, action: &str) -> Result<NativeArtifactKind> {
+    let kind = NativeArtifactKind::from_path(path);
+    if kind == NativeArtifactKind::File {
+        bail!(
+            "Native delivery {} does not support single-file artifacts yet: {}",
+            action,
+            path.display()
+        );
+    }
+    Ok(kind)
+}
+
+fn delivery_target_os_family(target: &str) -> Option<&str> {
+    target
+        .split('/')
+        .next()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn supports_projection_target(target: &str) -> bool {
+    matches!(delivery_target_os_family(target), Some("darwin"))
 }
 
 fn resolve_native_build_working_dir(
@@ -2625,6 +2669,19 @@ args = ["--deep", "--force", "--sign", "-", "src-tauri/target/release/bundle/mac
 "#
     }
 
+    fn sample_file_delivery_toml() -> &'static str {
+        r#"schema_version = "0.1"
+[artifact]
+framework = "tauri"
+stage = "unsigned"
+target = "windows/x86_64"
+input = "dist/MyApp.exe"
+[finalize]
+tool = "signtool"
+args = ["sign", "/fd", "SHA256", "dist/MyApp.exe"]
+"#
+    }
+
     fn sample_native_build_plan(root: &Path, mode: u32) -> Result<NativeBuildPlan> {
         let manifest_dir = root.join("native-build-project");
         let source_app_path = manifest_dir.join("MyApp.app");
@@ -2655,6 +2712,37 @@ entrypoint = "MyApp.app"
             permissions.set_mode(mode);
             fs::set_permissions(&binary_path, permissions)?;
         }
+
+        detect_build_strategy(&manifest_dir)?.context("expected native delivery build plan")
+    }
+
+    fn sample_file_native_build_plan(root: &Path) -> Result<NativeBuildPlan> {
+        let manifest_dir = root.join("native-file-build-project");
+        let source_file_path = manifest_dir.join("dist/MyApp.exe");
+        fs::create_dir_all(
+            source_file_path
+                .parent()
+                .context("source file parent missing")?,
+        )?;
+        fs::write(
+            manifest_dir.join("capsule.toml"),
+            r#"schema_version = "0.2"
+name = "my-app"
+version = "0.1.0"
+type = "app"
+default_target = "cli"
+
+[targets.cli]
+runtime = "source"
+driver = "native"
+entrypoint = "dist/MyApp.exe"
+"#,
+        )?;
+        fs::write(
+            manifest_dir.join(DELIVERY_CONFIG_FILE),
+            sample_file_delivery_toml(),
+        )?;
+        fs::write(&source_file_path, b"unsigned-exe")?;
 
         detect_build_strategy(&manifest_dir)?.context("expected native delivery build plan")
     }
@@ -2829,6 +2917,22 @@ input = "dist/time-management-desktop.app"
         Ok(())
     }
 
+    #[test]
+    fn build_rejects_single_file_native_artifacts_with_explicit_error() -> Result<()> {
+        let tmp = tempdir()?;
+        let plan = sample_file_native_build_plan(tmp.path())?;
+        let artifact_path = tmp.path().join("out/my-app-0.1.0.capsule");
+
+        let err = build_native_artifact_with_strip(&plan, Some(&artifact_path), |_path| Ok(()))
+            .expect_err("single-file native artifacts should fail closed during build");
+
+        assert!(err
+            .to_string()
+            .contains("Native delivery build does not support single-file artifacts yet"));
+        assert!(!artifact_path.exists());
+        Ok(())
+    }
+
     fn read_payload_entry_modes(artifact_path: &Path) -> Result<BTreeMap<String, u32>> {
         let capsule_bytes = fs::read(artifact_path)?;
         let mut capsule = tar::Archive::new(Cursor::new(capsule_bytes));
@@ -2903,6 +3007,29 @@ input = "dist/time-management-desktop.app"
         Ok(fetched_dir)
     }
 
+    fn sample_file_fetch_dir(root: &Path) -> Result<PathBuf> {
+        let fetched_dir = root.join("fetched-file");
+        let artifact_dir = fetched_dir.join(FETCH_ARTIFACT_DIR);
+        fs::create_dir_all(artifact_dir.join("dist"))?;
+        fs::write(
+            artifact_dir.join(DELIVERY_CONFIG_FILE),
+            sample_file_delivery_toml(),
+        )?;
+        fs::write(artifact_dir.join("dist/MyApp.exe"), b"unsigned-exe")?;
+        let metadata = FetchMetadata {
+            schema_version: DELIVERY_SCHEMA_VERSION.to_string(),
+            scoped_id: "local/my-app".to_string(),
+            version: "0.1.0".to_string(),
+            registry: "http://127.0.0.1:8787".to_string(),
+            fetched_at: "2026-03-09T00:00:00Z".to_string(),
+            parent_digest: compute_tree_digest(&artifact_dir)?,
+            artifact_blake3: compute_blake3(b"artifact"),
+        };
+        fs::create_dir_all(&fetched_dir)?;
+        write_json_pretty(&fetched_dir.join(FETCH_METADATA_FILE), &metadata)?;
+        Ok(fetched_dir)
+    }
+
     fn sample_nested_fetch_dir(root: &Path) -> Result<PathBuf> {
         let fetched_dir = root.join("fetched-nested");
         let artifact_dir = fetched_dir.join(FETCH_ARTIFACT_DIR);
@@ -2935,6 +3062,10 @@ input = "dist/time-management-desktop.app"
     }
 
     fn sample_finalized_app(root: &Path) -> Result<(PathBuf, PathBuf)> {
+        sample_finalized_app_with_target(root, "darwin/arm64")
+    }
+
+    fn sample_finalized_app_with_target(root: &Path, target: &str) -> Result<(PathBuf, PathBuf)> {
         let derived_dir = root.join("derived-output");
         let derived_app = derived_dir.join("MyApp.app");
         fs::create_dir_all(derived_app.join("Contents/MacOS"))?;
@@ -2955,7 +3086,7 @@ input = "dist/time-management-desktop.app"
             parent_digest: "blake3:parent-digest".to_string(),
             derived_digest: compute_tree_digest(&derived_app)?,
             framework: DEFAULT_DELIVERY_FRAMEWORK.to_string(),
-            target: default_delivery_target(),
+            target: target.to_string(),
             finalized_locally: true,
             finalize_tool: DEFAULT_FINALIZE_TOOL.to_string(),
             finalized_at: "2026-03-09T00:00:00Z".to_string(),
@@ -3151,6 +3282,21 @@ input = "dist/time-management-desktop.app"
         } else {
             result.expect("non-macOS hosts currently skip app permission enforcement");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn finalize_rejects_single_file_native_artifacts_with_explicit_error() -> Result<()> {
+        let tmp = tempdir()?;
+        let fetched_dir = sample_file_fetch_dir(tmp.path())?;
+        let output_root = tmp.path().join("dist");
+
+        let err = finalize_with_runner(&fetched_dir, &output_root, |_derived_dir, _config| Ok(()))
+            .expect_err("single-file native artifacts should fail closed during finalize");
+
+        assert!(err
+            .to_string()
+            .contains("Native delivery finalize does not support single-file artifacts yet"));
         Ok(())
     }
 
@@ -3385,6 +3531,21 @@ input = "dist/time-management-desktop.app"
             .expect_err("projection must reject digest mismatches");
         assert!(err.to_string().contains("Derived artifact digest mismatch"));
         assert!(derived_dir.join(PROVENANCE_FILE).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn project_rejects_non_darwin_targets_even_with_app_bundle_shape() -> Result<()> {
+        let tmp = tempdir()?;
+        let metadata_root = tmp.path().join("projection-metadata");
+        let launcher_dir = tmp.path().join("Applications");
+        let (_derived_dir, derived_app) =
+            sample_finalized_app_with_target(tmp.path(), "windows/x86_64")?;
+
+        let err = project_with_roots(&derived_app, &launcher_dir, &metadata_root)
+            .expect_err("projection must fail closed for non-darwin targets");
+
+        assert!(err.to_string().contains("expected a darwin/<arch> target"));
         Ok(())
     }
 
