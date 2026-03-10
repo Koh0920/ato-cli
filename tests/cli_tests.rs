@@ -663,7 +663,7 @@ fn test_build_routes_native_delivery_projects() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    if cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64" {
+    if cfg!(target_os = "macos") {
         assert!(
             output.status.success(),
             "stdout:\n{stdout}\nstderr:\n{stderr}"
@@ -696,7 +696,7 @@ fn test_build_routes_native_delivery_projects() {
         );
         let combined = format!("{stdout}\n{stderr}");
         assert!(
-            combined.contains("native delivery build currently supports tauri darwin/arm64 only"),
+            combined.contains("native delivery build currently supports macOS hosts only"),
             "combined output:\n{combined}"
         );
     }
@@ -714,7 +714,7 @@ fn test_build_routes_native_delivery_projects_without_delivery_sidecar() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    if cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64" {
+    if cfg!(target_os = "macos") {
         assert!(
             output.status.success(),
             "stdout:\n{stdout}\nstderr:\n{stderr}"
@@ -734,7 +734,7 @@ fn test_build_routes_native_delivery_projects_without_delivery_sidecar() {
         );
         let combined = format!("{stdout}\n{stderr}");
         assert!(
-            combined.contains("native delivery build currently supports tauri darwin/arm64 only"),
+            combined.contains("native delivery build currently supports macOS hosts only"),
             "combined output:\n{combined}"
         );
     }
@@ -799,7 +799,7 @@ fn test_build_routes_native_delivery_command_mode_projects() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    if cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64" {
+    if cfg!(target_os = "macos") {
         assert!(
             output.status.success(),
             "stdout:\n{stdout}\nstderr:\n{stderr}"
@@ -833,7 +833,7 @@ fn test_build_routes_native_delivery_command_mode_projects() {
         );
         let combined = format!("{stdout}\n{stderr}");
         assert!(
-            combined.contains("native delivery build currently supports tauri darwin/arm64 only"),
+            combined.contains("native delivery build currently supports macOS hosts only"),
             "combined output:\n{combined}"
         );
     }
@@ -851,7 +851,7 @@ fn test_build_routes_inline_native_delivery_command_mode_projects() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    if cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64" {
+    if cfg!(target_os = "macos") {
         assert!(
             output.status.success(),
             "stdout:\n{stdout}\nstderr:\n{stderr}"
@@ -879,7 +879,7 @@ fn test_build_routes_inline_native_delivery_command_mode_projects() {
         );
         let combined = format!("{stdout}\n{stderr}");
         assert!(
-            combined.contains("native delivery build currently supports tauri darwin/arm64 only"),
+            combined.contains("native delivery build currently supports macOS hosts only"),
             "combined output:\n{combined}"
         );
     }

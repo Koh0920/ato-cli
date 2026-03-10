@@ -463,8 +463,8 @@ path = "sample-native-capsule.app"
 
 #[test]
 fn e2e_native_delivery_sample_tauri_unsigned_finalize() -> Result<()> {
-    if !cfg!(target_os = "macos") || std::env::consts::ARCH != "aarch64" {
-        eprintln!("skipping e2e_native_delivery_sample_tauri_unsigned_finalize: darwin/arm64 only");
+    if !cfg!(target_os = "macos") {
+        eprintln!("skipping e2e_native_delivery_sample_tauri_unsigned_finalize: macOS only");
         return Ok(());
     }
     if !sample_project_dir().exists() {
@@ -826,8 +826,8 @@ fn e2e_native_delivery_sample_tauri_unsigned_finalize() -> Result<()> {
 
 #[test]
 fn e2e_native_delivery_projection_symlink_lifecycle() -> Result<()> {
-    if !cfg!(target_os = "macos") || std::env::consts::ARCH != "aarch64" {
-        eprintln!("skipping e2e_native_delivery_projection_symlink_lifecycle: darwin/arm64 only");
+    if !cfg!(target_os = "macos") {
+        eprintln!("skipping e2e_native_delivery_projection_symlink_lifecycle: macOS only");
         return Ok(());
     }
     if !sample_project_dir().exists() {
