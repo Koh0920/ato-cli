@@ -60,7 +60,7 @@ fn parse_json(bytes: &[u8]) -> Value {
     serde_json::from_slice(bytes).expect("valid json")
 }
 
-fn start_capsule_detail_server(expected_path: &'static str, body: String) -> String {
+fn spawn_capsule_detail_server(expected_path: &'static str, body: String) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind local server");
     let addr = listener.local_addr().expect("listener addr");
 
@@ -155,7 +155,7 @@ fn inspect_requirements_json_succeeds_for_local_manifest() {
 fn inspect_requirements_json_succeeds_for_remote_manifest() {
     let manifest = requirements_manifest("inspect-remote");
     let expected_path = "/v1/manifest/capsules/by/demo/inspect-remote";
-    let base_url = start_capsule_detail_server(
+    let base_url = spawn_capsule_detail_server(
         expected_path,
         serde_json::json!({
             "id": "capsule-demo-inspect-remote",
