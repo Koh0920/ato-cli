@@ -79,6 +79,7 @@ impl Drop for SidecarCleanup {
 
 mod ato_error_jsonl;
 mod auth;
+mod binding;
 mod commands;
 mod common;
 mod consent_store;
@@ -155,6 +156,7 @@ Management:
   stop     Stop a running capsule
   logs     Show logs of a running capsule
     state    Inspect or register persistent state bindings
+    binding  Inspect or register host-side service bindings
 
 Auth:
   login    Login to Ato registry
@@ -568,6 +570,15 @@ enum Commands {
     State {
         #[command(subcommand)]
         command: StateCommands,
+    },
+
+    #[command(
+        next_help_heading = "Management",
+        about = "Inspect or register host-side service bindings"
+    )]
+    Binding {
+        #[command(subcommand)]
+        command: BindingCommands,
     },
 
     #[command(next_help_heading = "Auth", about = "Login to Ato registry")]
@@ -1318,6 +1329,54 @@ enum StateCommands {
         /// Absolute host directory to bind to this state contract
         #[arg(long = "path", value_name = "/ABS/PATH")]
         path: PathBuf,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum BindingCommands {
+    /// List registered host-side service bindings
+    #[command(visible_alias = "ls")]
+    List {
+        /// Filter by owner scope
+        #[arg(long)]
+        owner_scope: Option<String>,
+
+        /// Filter by service name
+        #[arg(long)]
+        service_name: Option<String>,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Inspect one host-side service binding by binding-id
+    Inspect {
+        /// Binding reference (`binding-...`)
+        binding_ref: String,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Register a host-side ingress binding from a manifest service
+    RegisterIngress {
+        /// Path to capsule directory or capsule.toml
+        #[arg(long, default_value = ".")]
+        manifest: PathBuf,
+
+        /// Service name from [services.<name>]
+        #[arg(long)]
+        service_name: String,
+
+        /// Host-side ingress URL (http:// or https://)
+        #[arg(long)]
+        url: String,
 
         /// Emit machine-readable JSON output
         #[arg(long)]
@@ -2182,6 +2241,8 @@ fn run() -> Result<()> {
 
         Commands::State { command } => execute_state_command(command),
 
+        Commands::Binding { command } => execute_binding_command(command),
+
         Commands::Guest { sync_path } => {
             commands::guest::execute(commands::guest::GuestArgs { sync_path })
         }
@@ -2390,6 +2451,25 @@ fn execute_state_command(command: StateCommands) -> Result<()> {
             path.to_string_lossy().as_ref(),
             json,
         ),
+    }
+}
+
+fn execute_binding_command(command: BindingCommands) -> Result<()> {
+    match command {
+        BindingCommands::List {
+            owner_scope,
+            service_name,
+            json,
+        } => binding::list_bindings(owner_scope.as_deref(), service_name.as_deref(), json),
+        BindingCommands::Inspect { binding_ref, json } => {
+            binding::inspect_binding(&binding_ref, json)
+        }
+        BindingCommands::RegisterIngress {
+            manifest,
+            service_name,
+            url,
+            json,
+        } => binding::register_ingress_binding_from_manifest(&manifest, &service_name, &url, json),
     }
 }
 
