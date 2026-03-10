@@ -291,8 +291,8 @@ impl ProcessManager {
         }
     }
 
-    pub fn cleanup_dead_processes(&self) -> Result<usize> {
-        let mut cleaned = 0;
+    pub fn cleanup_dead_processes_with_details(&self) -> Result<Vec<ProcessInfo>> {
+        let mut cleaned = Vec::new();
         for entry in fs::read_dir(&self.run_dir)
             .with_context(|| format!("Failed to read run directory: {}", self.run_dir.display()))?
         {
@@ -312,7 +312,7 @@ impl ProcessManager {
                                         || !process_identity_matches(&info)))
                             {
                                 let _ = fs::remove_file(&path);
-                                cleaned += 1;
+                                cleaned.push(info);
                             }
                         }
                     }
