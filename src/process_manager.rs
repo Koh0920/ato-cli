@@ -26,6 +26,8 @@ pub struct ProcessInfo {
     #[serde(default)]
     pub target_label: Option<String>,
     #[serde(default)]
+    pub requested_port: Option<u16>,
+    #[serde(default)]
     pub log_path: Option<PathBuf>,
     #[serde(default)]
     pub ready_at: Option<SystemTime>,
@@ -600,6 +602,7 @@ mod tests {
             manifest_path: Some(PathBuf::from("/path/to/capsule.toml")),
             scoped_id: Some("dev/test".to_string()),
             target_label: Some("default".to_string()),
+            requested_port: Some(4310),
             log_path: Some(PathBuf::from("/tmp/test.log")),
             ready_at: Some(SystemTime::UNIX_EPOCH),
             last_event: Some("spawned".to_string()),
@@ -619,6 +622,7 @@ mod tests {
         assert_eq!(info.manifest_path, deserialized.manifest_path);
         assert_eq!(info.scoped_id, deserialized.scoped_id);
         assert_eq!(info.target_label, deserialized.target_label);
+        assert_eq!(info.requested_port, deserialized.requested_port);
         assert_eq!(info.log_path, deserialized.log_path);
         assert_eq!(info.ready_at, deserialized.ready_at);
         assert_eq!(info.last_event, deserialized.last_event);
@@ -639,6 +643,7 @@ mod tests {
             manifest_path: None,
             scoped_id: None,
             target_label: None,
+            requested_port: None,
             log_path: None,
             ready_at: None,
             last_event: None,
@@ -651,6 +656,7 @@ mod tests {
 
         assert_eq!(info.id, deserialized.id);
         assert!(deserialized.manifest_path.is_none());
+        assert!(deserialized.requested_port.is_none());
     }
 
     #[test]
@@ -671,6 +677,7 @@ mod tests {
             manifest_path: None,
             scoped_id: Some("dev/demo".to_string()),
             target_label: None,
+            requested_port: None,
             log_path: None,
             ready_at: None,
             last_event: None,
@@ -688,6 +695,7 @@ mod tests {
             manifest_path: None,
             scoped_id: Some("dev/other".to_string()),
             target_label: None,
+            requested_port: None,
             log_path: None,
             ready_at: None,
             last_event: None,

@@ -1453,7 +1453,15 @@ enum BindingCommands {
 
         /// Loopback URL for the running local service (http://localhost:PORT or http://127.0.0.1:PORT)
         #[arg(long)]
-        url: String,
+        url: Option<String>,
+
+        /// Running local process id to derive manifest and target metadata from
+        #[arg(long)]
+        process_id: Option<String>,
+
+        /// Override the loopback port when registering from a running process
+        #[arg(long)]
+        port: Option<u16>,
 
         /// Emit machine-readable JSON output
         #[arg(long)]
@@ -2575,8 +2583,21 @@ fn execute_binding_command(command: BindingCommands) -> Result<()> {
             manifest,
             service_name,
             url,
+            process_id,
+            port,
             json,
-        } => binding::register_service_binding_from_manifest(&manifest, &service_name, &url, json),
+        } => match (url.as_deref(), process_id.as_deref()) {
+            (Some(url), _) => {
+                binding::register_service_binding_from_manifest(&manifest, &service_name, url, json)
+            }
+            (None, Some(process_id)) => binding::register_service_binding_from_process(
+                process_id,
+                &service_name,
+                port,
+                json,
+            ),
+            (None, None) => anyhow::bail!("register-service requires either --url or --process-id"),
+        },
     }
 }
 
