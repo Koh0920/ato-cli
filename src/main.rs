@@ -150,7 +150,7 @@ Primary Commands:
   publish  Publish capsule artifacts to a registry
   install  Install a verified package from the registry
   search   Search the registry for agent skills and packages
-  init     Initialize a new project
+  init     Analyze the current project and print an agent-ready capsule.toml prompt
 
 Management:
   ps       List running capsules
@@ -320,16 +320,9 @@ enum Commands {
 
     #[command(
         next_help_heading = "Primary Commands",
-        about = "Initialize a new project"
+        about = "Analyze the current project and print an agent-ready capsule.toml prompt"
     )]
-    Init {
-        /// Project name
-        name: String,
-
-        /// Template type: python, node, hono, rust, go, shell
-        #[arg(long, default_value = "python")]
-        template: String,
-    },
+    Init,
 
     #[command(
         next_help_heading = "Primary Commands",
@@ -1698,13 +1691,7 @@ fn run() -> Result<()> {
             reporter.clone(),
         ),
 
-        Commands::Init { name, template } => new::execute(
-            new::NewArgs {
-                name,
-                template: Some(template),
-            },
-            reporter.clone(),
-        ),
+        Commands::Init => init::execute_prompt(init::PromptArgs { path: None }, reporter.clone()),
 
         Commands::New { name, template } => new::execute(
             new::NewArgs {
