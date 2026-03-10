@@ -7,7 +7,7 @@ use capsule_core::CapsuleReporter;
 const ATO_RELEASE_BASE_URL: &str = "https://dl.ato.run";
 const ENV_RELEASE_BASE_URL: &str = "ATO_RELEASE_BASE_URL";
 const WORKFLOW_REL_PATH: &str = ".github/workflows/ato-publish.yml";
-const TARGET_ARCHIVE: &str = "ato-x86_64-unknown-linux-gnu.tar.gz";
+const TARGET_ARCHIVE: &str = "ato-cli-x86_64-unknown-linux-gnu.tar.xz";
 const VERSIONED_CHECKSUM_PATH: &str = "/ato/releases/{version}/SHA256SUMS";
 const LATEST_CHECKSUM_PATH: &str = "/ato/latest/SHA256SUMS";
 
@@ -131,7 +131,7 @@ fn resolve_release_checksum(
     match fetch_checksum_from_path(release_base_url, &versioned_path, target_archive) {
         Ok(checksum) => Ok(ChecksumResolution {
             checksum,
-            archive_path: "/ato/releases/${ATO_VERSION}/ato-x86_64-unknown-linux-gnu.tar.gz"
+            archive_path: "/ato/releases/${ATO_VERSION}/ato-cli-x86_64-unknown-linux-gnu.tar.xz"
                 .to_string(),
             used_latest_fallback: false,
         }),
@@ -145,7 +145,7 @@ fn resolve_release_checksum(
                     })?;
             Ok(ChecksumResolution {
                 checksum,
-                archive_path: "/ato/releases/${ATO_VERSION}/ato-x86_64-unknown-linux-gnu.tar.gz"
+                archive_path: "/ato/releases/${ATO_VERSION}/ato-cli-x86_64-unknown-linux-gnu.tar.xz"
                     .to_string(),
                 used_latest_fallback: true,
             })
@@ -250,12 +250,14 @@ jobs:
           ATO_CHECKSUM: "{ato_checksum}"
         run: |
           set -euo pipefail
-          curl -fsSL -o ato.tar.gz "{release_base_url}{archive_path}"
-          echo "${{ATO_CHECKSUM}}  ato.tar.gz" | sha256sum -c -
-          tar -xzf ato.tar.gz
-          chmod +x ./ato
-          sudo mv ./ato /usr/local/bin/ato
-          rm -f ato.tar.gz
+                    archive_name="$(basename "{archive_path}")"
+                    archive_dir="${{archive_name%.tar.xz}}"
+                    curl -fsSL -o "$archive_name" "{release_base_url}{archive_path}"
+                    echo "${{{{ATO_CHECKSUM}}}}  $archive_name" | sha256sum -c -
+                    tar -xJf "$archive_name"
+                    chmod +x "./${{archive_dir}}/ato"
+                    sudo mv "./${{archive_dir}}/ato" /usr/local/bin/ato
+                    rm -rf "$archive_name" "$archive_dir"
 
       - name: Publish to Ato Store
         run: ato publish --ci
@@ -269,9 +271,9 @@ mod tests {
 
     #[test]
     fn parses_matching_checksum_line() {
-        let input = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  ato-x86_64-unknown-linux-gnu.tar.gz\n";
+        let input = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  ato-cli-x86_64-unknown-linux-gnu.tar.xz\n";
         let hash =
-            parse_checksum_line(input, "ato-x86_64-unknown-linux-gnu.tar.gz").expect("must parse");
+            parse_checksum_line(input, "ato-cli-x86_64-unknown-linux-gnu.tar.xz").expect("must parse");
         assert_eq!(
             hash,
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -280,9 +282,9 @@ mod tests {
 
     #[test]
     fn supports_gnu_style_star_prefix() {
-        let input = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *ato-x86_64-unknown-linux-gnu.tar.gz\n";
+        let input = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *ato-cli-x86_64-unknown-linux-gnu.tar.xz\n";
         let hash =
-            parse_checksum_line(input, "ato-x86_64-unknown-linux-gnu.tar.gz").expect("must parse");
+            parse_checksum_line(input, "ato-cli-x86_64-unknown-linux-gnu.tar.xz").expect("must parse");
         assert_eq!(
             hash,
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
