@@ -5,6 +5,7 @@ use std::fs;
 use std::io::{Cursor, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use walkdir::WalkDir;
 
 use crate::install;
 use crate::registry::RegistryResolver;
@@ -44,6 +45,13 @@ pub struct FetchResult {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct NativeBuildCommand {
+    pub program: String,
+    pub args: Vec<String>,
+    pub working_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct NativeBuildPlan {
     pub manifest_path: PathBuf,
     pub manifest_dir: PathBuf,
@@ -51,6 +59,8 @@ pub struct NativeBuildPlan {
     pub staged_delivery_config_toml: String,
     pub source_app_path: PathBuf,
     pub input_relative: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_command: Option<NativeBuildCommand>,
     pub framework: String,
     pub target: String,
 }
@@ -262,36 +272,51 @@ pub(crate) fn detect_build_strategy(manifest_dir: &Path) -> Result<Option<Native
         .with_context(|| format!("Failed to read {}", manifest_path.display()))?;
     let manifest = capsule_core::types::CapsuleManifest::from_toml(&manifest_raw)
         .map_err(|err| anyhow::anyhow!("Failed to parse {}: {}", manifest_path.display(), err))?;
-
-    let canonical_config = detect_native_manifest_contract(&manifest)?;
-    let (config, config_path) = match (canonical_config, delivery_config_path.exists()) {
-        (Some(config), true) => {
-            let existing = load_delivery_config(&delivery_config_path)?;
-            ensure_delivery_config_compatible(&existing, &config, &delivery_config_path)?;
-            (config, Some(delivery_config_path))
-        }
-        (Some(config), false) => (config, None),
-        (None, true) => {
-            let existing = load_delivery_config(&delivery_config_path)?;
-            (existing, Some(delivery_config_path))
-        }
-        (None, false) => return Ok(None),
+    let Ok(target) = manifest.resolve_default_target() else {
+        return Ok(None);
     };
+
+    let canonical_config = detect_native_manifest_contract(target)?;
+    let inline_config = load_inline_delivery_config(&manifest_raw, &manifest_path)?;
+    let explicit_config = match (delivery_config_path.exists(), inline_config) {
+        (true, Some(inline)) => {
+            let existing = load_delivery_config(&delivery_config_path)?;
+            ensure_delivery_config_compatible(&existing, &inline, &delivery_config_path)?;
+            existing
+        }
+        (true, None) => load_delivery_config(&delivery_config_path)?,
+        (false, Some(inline)) => inline,
+        (false, None) => match canonical_config.clone() {
+            Some(config) => config,
+            None => return Ok(None),
+        },
+    };
+    if let Some(canonical) = &canonical_config {
+        ensure_delivery_config_matches_context(&explicit_config, canonical, &manifest_path)?;
+    }
+    let config_path = if delivery_config_path.exists() {
+        Some(delivery_config_path)
+    } else {
+        None
+    };
+    let config = explicit_config;
 
     let input_relative = PathBuf::from(config.artifact.input.trim());
     validate_relative_input_path(&input_relative)?;
-    let source_app_path = manifest_dir.join(&input_relative);
-    if !source_app_path.is_dir() {
+    if input_relative.extension().and_then(|ext| ext.to_str()) != Some("app") {
         bail!(
-            "Native delivery build input is not a .app directory: {}",
-            source_app_path.display()
+            "Native delivery artifact.input must point to a .app bundle: {}",
+            input_relative.display()
         );
     }
-    if source_app_path.extension().and_then(|ext| ext.to_str()) != Some("app") {
-        bail!(
-            "Native delivery build input must be a .app bundle: {}",
-            source_app_path.display()
-        );
+    let source_app_path = manifest_dir.join(&input_relative);
+    let build_command = detect_native_build_command(
+        target,
+        manifest_dir,
+        config_path.is_some() || canonical_config.is_none(),
+    )?;
+    if build_command.is_none() {
+        validate_native_bundle_directory(&source_app_path)?;
     }
 
     Ok(Some(NativeBuildPlan {
@@ -301,6 +326,7 @@ pub(crate) fn detect_build_strategy(manifest_dir: &Path) -> Result<Option<Native
         staged_delivery_config_toml: serialize_delivery_config(&config)?,
         source_app_path,
         input_relative,
+        build_command,
         framework: config.artifact.framework,
         target: config.artifact.target,
     }))
@@ -325,6 +351,11 @@ fn build_native_artifact_with_strip<F>(
 where
     F: Fn(&Path) -> Result<()>,
 {
+    if let Some(build_command) = &plan.build_command {
+        run_native_build_command(build_command)?;
+    }
+
+    validate_native_bundle_directory(&plan.source_app_path)?;
     let manifest_raw = fs::read_to_string(&plan.manifest_path).with_context(|| {
         format!(
             "Failed to read capsule manifest for native build: {}",
@@ -369,9 +400,9 @@ where
         .context("Failed to stage native delivery compatibility metadata")?;
 
         let payload_tar = create_payload_tar_from_directory(&payload_root)?;
-        let payload_tar_zst = zstd::stream::encode_all(Cursor::new(payload_tar), 3)
+        let payload_tar_zst = zstd::stream::encode_all(Cursor::new(&payload_tar), 3)
             .context("Failed to encode native payload.tar.zst")?;
-        let capsule_bytes = build_capsule_archive(&manifest_raw, &payload_tar_zst)?;
+        let capsule_bytes = build_capsule_archive(&manifest, &payload_tar_zst, &payload_tar)?;
         fs::write(&artifact_path, &capsule_bytes)
             .with_context(|| format!("Failed to write {}", artifact_path.display()))?;
 
@@ -659,11 +690,8 @@ fn delivery_config_from_input(input: &str) -> DeliveryConfig {
 }
 
 fn detect_native_manifest_contract(
-    manifest: &capsule_core::types::CapsuleManifest,
+    target: &capsule_core::types::NamedTarget,
 ) -> Result<Option<DeliveryConfig>> {
-    let Ok(target) = manifest.resolve_default_target() else {
-        return Ok(None);
-    };
     if target.driver.as_deref() != Some("native") {
         return Ok(None);
     }
@@ -682,6 +710,35 @@ fn detect_native_manifest_contract(
     Ok(Some(delivery_config_from_input(input)))
 }
 
+fn detect_native_build_command(
+    target: &capsule_core::types::NamedTarget,
+    manifest_dir: &Path,
+    has_explicit_delivery_config: bool,
+) -> Result<Option<NativeBuildCommand>> {
+    if target.driver.as_deref() != Some("native") || !has_explicit_delivery_config {
+        return Ok(None);
+    }
+
+    let program = target.entrypoint.trim();
+    if program.is_empty() || target.cmd.is_empty() {
+        return Ok(None);
+    }
+
+    let program_path = Path::new(program);
+    if program_path.extension().and_then(|ext| ext.to_str()) == Some("app") {
+        return Ok(None);
+    }
+
+    let working_dir =
+        resolve_native_build_working_dir(manifest_dir, target.working_dir.as_deref())?;
+
+    Ok(Some(NativeBuildCommand {
+        program: program.to_string(),
+        args: target.cmd.clone(),
+        working_dir,
+    }))
+}
+
 fn ensure_delivery_config_compatible(
     actual: &DeliveryConfig,
     expected: &DeliveryConfig,
@@ -697,6 +754,24 @@ fn ensure_delivery_config_compatible(
         bail!(
             "{} conflicts with capsule.toml native target contract. Update capsule.toml or remove the compatibility sidecar.",
             path.display()
+        );
+    }
+    Ok(())
+}
+
+fn ensure_delivery_config_matches_context(
+    actual: &DeliveryConfig,
+    expected: &DeliveryConfig,
+    manifest_path: &Path,
+) -> Result<()> {
+    if actual.artifact.framework != expected.artifact.framework
+        || actual.artifact.stage != expected.artifact.stage
+        || actual.artifact.target != expected.artifact.target
+        || actual.finalize.tool != expected.finalize.tool
+    {
+        bail!(
+            "{} native delivery config conflicts with the default target contract",
+            manifest_path.display()
         );
     }
     Ok(())
@@ -1474,6 +1549,47 @@ fn load_delivery_config(path: &Path) -> Result<DeliveryConfig> {
     Ok(config)
 }
 
+fn load_inline_delivery_config(
+    manifest_raw: &str,
+    manifest_path: &Path,
+) -> Result<Option<DeliveryConfig>> {
+    let parsed: toml::Value = toml::from_str(manifest_raw)
+        .with_context(|| format!("Failed to parse {}", manifest_path.display()))?;
+    let artifact = parsed.get("artifact").cloned();
+    let finalize = parsed.get("finalize").cloned();
+
+    match (artifact, finalize) {
+        (None, None) => Ok(None),
+        (Some(_), None) => bail!(
+            "{} defines [artifact] without [finalize] for native delivery",
+            manifest_path.display()
+        ),
+        (None, Some(_)) => bail!(
+            "{} defines [finalize] without [artifact] for native delivery",
+            manifest_path.display()
+        ),
+        (Some(artifact), Some(finalize)) => {
+            let config = DeliveryConfig {
+                schema_version: DELIVERY_SCHEMA_VERSION_STABLE.to_string(),
+                artifact: artifact.try_into().with_context(|| {
+                    format!(
+                        "Failed to parse [artifact] from {}",
+                        manifest_path.display()
+                    )
+                })?,
+                finalize: finalize.try_into().with_context(|| {
+                    format!(
+                        "Failed to parse [finalize] from {}",
+                        manifest_path.display()
+                    )
+                })?,
+            };
+            validate_delivery_config(&config)?;
+            Ok(Some(config))
+        }
+    }
+}
+
 fn extract_native_artifact_spec_from_payload_tar(
     payload_tar: &[u8],
 ) -> Result<Option<NativeArtifactSpec>> {
@@ -1567,6 +1683,153 @@ fn validate_relative_input_path(path: &Path) -> Result<()> {
         bail!("artifact.input must not escape fetched artifact root");
     }
     Ok(())
+}
+
+fn validate_relative_project_path(path: &Path, field_name: &str) -> Result<()> {
+    if path.is_absolute() {
+        bail!("{field_name} must be a relative path inside the project root");
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        bail!("{field_name} must not escape the project root");
+    }
+    Ok(())
+}
+
+fn resolve_native_build_working_dir(
+    manifest_dir: &Path,
+    working_dir: Option<&str>,
+) -> Result<PathBuf> {
+    let relative = working_dir
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(".");
+    let relative_path = PathBuf::from(relative);
+    validate_relative_project_path(&relative_path, "targets.<default>.working_dir")?;
+    let resolved = manifest_dir.join(relative_path);
+    if !resolved.is_dir() {
+        bail!(
+            "targets.<default>.working_dir is not a directory: {}",
+            resolved.display()
+        );
+    }
+    Ok(resolved)
+}
+
+fn validate_native_bundle_directory(source_app_path: &Path) -> Result<()> {
+    if !source_app_path.is_dir() {
+        let candidates = discover_nearby_app_bundles(source_app_path, 6);
+        bail!(
+            "Native delivery build input is not a .app directory: {}{}",
+            source_app_path.display(),
+            format_app_bundle_candidates(&candidates)
+        );
+    }
+    if source_app_path.extension().and_then(|ext| ext.to_str()) != Some("app") {
+        bail!(
+            "Native delivery build input must be a .app bundle: {}",
+            source_app_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn discover_nearby_app_bundles(expected_app_path: &Path, max_depth: usize) -> Vec<PathBuf> {
+    let Some(search_root) = nearest_existing_directory(expected_app_path) else {
+        return Vec::new();
+    };
+
+    let mut bundles = WalkDir::new(&search_root)
+        .max_depth(max_depth)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_dir())
+        .map(|entry| entry.into_path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("app"))
+        .collect::<Vec<_>>();
+    bundles.sort();
+    bundles.dedup();
+    bundles.truncate(5);
+    bundles
+}
+
+fn nearest_existing_directory(path: &Path) -> Option<PathBuf> {
+    let mut current = Some(path);
+    while let Some(candidate) = current {
+        if candidate.is_dir() {
+            return Some(candidate.to_path_buf());
+        }
+        current = candidate.parent();
+    }
+    None
+}
+
+fn format_app_bundle_candidates(candidates: &[PathBuf]) -> String {
+    if candidates.is_empty() {
+        return "\nHint: confirm that [artifact].input matches the actual Tauri .app output path."
+            .to_string();
+    }
+
+    let formatted = candidates
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "\nFound nearby .app bundle candidates: {}\nHint: update [artifact].input to the correct bundle path.",
+        formatted
+    )
+}
+
+fn format_native_build_command(command: &NativeBuildCommand) -> String {
+    std::iter::once(command.program.as_str())
+        .chain(command.args.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn run_native_build_command(command: &NativeBuildCommand) -> Result<()> {
+    let mut process = Command::new(&command.program);
+    process
+        .args(&command.args)
+        .current_dir(&command.working_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = process.output().with_context(|| {
+        format!(
+            "Failed to execute native delivery build command '{}' in {}",
+            format_native_build_command(command),
+            command.working_dir.display()
+        )
+    })?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let details = if !stderr.trim().is_empty() {
+        stderr.trim().to_string()
+    } else {
+        stdout.trim().to_string()
+    };
+    bail!(
+        "Native delivery build command failed with status {}: {}{}",
+        output
+            .status
+            .code()
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "signal".to_string()),
+        format_native_build_command(command),
+        if details.is_empty() {
+            String::new()
+        } else {
+            format!("\n{}", details)
+        }
+    );
 }
 
 fn run_codesign_command(derived_dir: &Path, config: &DeliveryConfig) -> Result<()> {
@@ -1939,11 +2202,19 @@ fn append_tar_entry(
     Ok(())
 }
 
-fn build_capsule_archive(manifest_raw: &str, payload_tar_zst: &[u8]) -> Result<Vec<u8>> {
+fn build_capsule_archive(
+    manifest: &capsule_core::types::CapsuleManifest,
+    payload_tar_zst: &[u8],
+    payload_tar: &[u8],
+) -> Result<Vec<u8>> {
+    let (_distribution_manifest, manifest_toml_bytes) =
+        capsule_core::packers::payload::build_distribution_manifest(manifest, payload_tar)
+            .map_err(anyhow::Error::from)
+            .context("Failed to build distribution metadata for native capsule")?;
     let mut out = Vec::new();
     {
         let mut builder = tar::Builder::new(&mut out);
-        append_tar_entry(&mut builder, "capsule.toml", manifest_raw.as_bytes(), 0o644)?;
+        append_tar_entry(&mut builder, "capsule.toml", &manifest_toml_bytes, 0o644)?;
         append_tar_entry(&mut builder, "payload.tar.zst", payload_tar_zst, 0o644)?;
         builder.finish()?;
     }
@@ -2272,6 +2543,162 @@ entrypoint = "MyApp.app"
         detect_build_strategy(&manifest_dir)?.context("expected native delivery build plan")
     }
 
+    #[test]
+    fn detect_build_strategy_accepts_command_mode_with_explicit_delivery_sidecar() -> Result<()> {
+        let tmp = tempdir()?;
+        let manifest_dir = tmp.path().join("command-build-project");
+        fs::create_dir_all(&manifest_dir)?;
+        fs::write(
+            manifest_dir.join("capsule.toml"),
+            r#"schema_version = "0.2"
+name = "my-app"
+version = "0.1.0"
+type = "app"
+default_target = "cli"
+
+[targets.cli]
+runtime = "source"
+driver = "native"
+entrypoint = "sh"
+cmd = ["build-app.sh"]
+working_dir = "."
+"#,
+        )?;
+        fs::write(
+            manifest_dir.join(DELIVERY_CONFIG_FILE),
+            sample_delivery_toml(),
+        )?;
+
+        let plan =
+            detect_build_strategy(&manifest_dir)?.context("expected native delivery build plan")?;
+        let build_command = plan.build_command.context("expected build command")?;
+        assert_eq!(build_command.program, "sh");
+        assert_eq!(build_command.args, vec!["build-app.sh".to_string()]);
+        assert_eq!(build_command.working_dir, manifest_dir);
+        assert_eq!(plan.source_app_path, plan.manifest_dir.join("MyApp.app"));
+        Ok(())
+    }
+
+    #[test]
+    fn detect_build_strategy_ignores_command_mode_without_delivery_sidecar() -> Result<()> {
+        let tmp = tempdir()?;
+        let manifest_dir = tmp.path().join("command-build-project");
+        fs::create_dir_all(&manifest_dir)?;
+        fs::write(
+            manifest_dir.join("capsule.toml"),
+            r#"schema_version = "0.2"
+name = "my-app"
+version = "0.1.0"
+type = "app"
+default_target = "cli"
+
+[targets.cli]
+runtime = "source"
+driver = "native"
+entrypoint = "sh"
+cmd = ["build-app.sh"]
+working_dir = "."
+"#,
+        )?;
+
+        assert!(detect_build_strategy(&manifest_dir)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn detect_build_strategy_accepts_inline_delivery_config() -> Result<()> {
+        let tmp = tempdir()?;
+        let manifest_dir = tmp.path().join("inline-command-build-project");
+        fs::create_dir_all(&manifest_dir)?;
+        fs::write(
+            manifest_dir.join("capsule.toml"),
+            r#"schema_version = "0.2"
+name = "time-management-desktop"
+version = "0.1.0"
+type = "app"
+default_target = "desktop"
+
+[targets.desktop]
+runtime = "source"
+driver = "native"
+entrypoint = "sh"
+cmd = ["build-app.sh"]
+working_dir = "."
+
+[artifact]
+framework = "tauri"
+stage = "unsigned"
+target = "darwin/arm64"
+input = "dist/time-management-desktop.app"
+
+[finalize]
+tool = "codesign"
+args = ["--deep", "--force", "--sign", "-", "dist/time-management-desktop.app"]
+"#,
+        )?;
+
+        let plan =
+            detect_build_strategy(&manifest_dir)?.context("expected native delivery build plan")?;
+        let build_command = plan.build_command.context("expected build command")?;
+        assert_eq!(build_command.program, "sh");
+        assert_eq!(build_command.args, vec!["build-app.sh".to_string()]);
+        assert_eq!(
+            plan.source_app_path,
+            manifest_dir.join("dist/time-management-desktop.app")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn detect_build_strategy_rejects_partial_inline_delivery_config() {
+        let tmp = tempdir().expect("tmp dir");
+        let manifest_dir = tmp.path().join("inline-command-build-project");
+        fs::create_dir_all(&manifest_dir).expect("create manifest dir");
+        fs::write(
+            manifest_dir.join("capsule.toml"),
+            r#"schema_version = "0.2"
+name = "time-management-desktop"
+version = "0.1.0"
+type = "app"
+default_target = "desktop"
+
+[targets.desktop]
+runtime = "source"
+driver = "native"
+entrypoint = "sh"
+cmd = ["build-app.sh"]
+
+[artifact]
+framework = "tauri"
+stage = "unsigned"
+target = "darwin/arm64"
+input = "dist/time-management-desktop.app"
+"#,
+        )
+        .expect("write manifest");
+
+        let err =
+            detect_build_strategy(&manifest_dir).expect_err("should reject partial inline config");
+        assert!(err
+            .to_string()
+            .contains("defines [artifact] without [finalize]"));
+    }
+
+    #[test]
+    fn validate_native_bundle_directory_reports_nearby_candidates() -> Result<()> {
+        let tmp = tempdir()?;
+        let macos_dir = tmp.path().join("src-tauri/target/release/bundle/macos");
+        let candidate = macos_dir.join("Time Management Desktop.app");
+        fs::create_dir_all(&candidate)?;
+
+        let err = validate_native_bundle_directory(&macos_dir.join("time-management-desktop.app"))
+            .expect_err("missing exact app path should fail");
+        let message = err.to_string();
+        assert!(message.contains("Found nearby .app bundle candidates"));
+        assert!(message.contains("Time Management Desktop.app"));
+        Ok(())
+    }
+
     fn read_payload_entry_modes(artifact_path: &Path) -> Result<BTreeMap<String, u32>> {
         let capsule_bytes = fs::read(artifact_path)?;
         let mut capsule = tar::Archive::new(Cursor::new(capsule_bytes));
@@ -2297,6 +2724,20 @@ entrypoint = "MyApp.app"
             entry_modes.insert(path, entry.header().mode()?);
         }
         Ok(entry_modes)
+    }
+
+    fn read_capsule_manifest_value(artifact_path: &Path) -> Result<toml::Value> {
+        let capsule_bytes = fs::read(artifact_path)?;
+        let mut capsule = tar::Archive::new(Cursor::new(capsule_bytes));
+        for entry in capsule.entries()? {
+            let mut entry = entry?;
+            if entry.path()?.as_ref() == Path::new("capsule.toml") {
+                let mut raw = String::new();
+                entry.read_to_string(&mut raw)?;
+                return toml::from_str(&raw).map_err(anyhow::Error::from);
+            }
+        }
+        bail!("capsule.toml missing from capsule")
     }
 
     fn sample_fetch_dir_with_mode(root: &Path, mode: u32) -> Result<PathBuf> {
@@ -2466,6 +2907,11 @@ entrypoint = "MyApp.app"
                 & 0o111,
             0o111
         );
+        let manifest_value = read_capsule_manifest_value(&artifact_path)?;
+        assert!(manifest_value
+            .get("distribution")
+            .and_then(|value| value.as_table())
+            .is_some());
         Ok(())
     }
 
