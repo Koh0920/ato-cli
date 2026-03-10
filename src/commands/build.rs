@@ -1,13 +1,29 @@
 use anyhow::{Context, Result};
 use capsule_core::execution_plan::error::AtoExecutionError;
 use capsule_core::CapsuleReporter;
+use serde::Serialize;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tracing::debug;
 
 use crate::init;
+use crate::native_delivery;
 use crate::reporters;
+
+#[derive(Debug, Serialize)]
+pub struct BuildResult {
+    pub ok: bool,
+    pub kind: String,
+    pub artifact: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    pub build_strategy: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub derived_from: Option<PathBuf>,
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn execute_pack_command(
@@ -23,7 +39,7 @@ pub fn execute_pack_command(
     timings: bool,
     cli_json: bool,
     nacelle_override: Option<PathBuf>,
-) -> Result<()> {
+) -> Result<BuildResult> {
     let total_started = Instant::now();
     let mut timing_entries = Vec::new();
     let dir = dir
@@ -119,7 +135,36 @@ pub fn execute_pack_command(
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
 
-    match decision.kind {
+    if let Some(plan) = native_delivery::detect_build_strategy(&manifest_dir)? {
+        let build_started = Instant::now();
+        let result = native_delivery::build_native_artifact(&plan, None)?;
+        record_timing(&mut timing_entries, "build.pack", build_started.elapsed());
+        crate::payload_guard::ensure_payload_size(
+            &result.artifact_path,
+            force_large_payload,
+            "--force-large-payload",
+        )?;
+        let _ = sign_if_requested(&result.artifact_path, key.as_ref(), reporter.clone())?;
+        let size = std::fs::metadata(&result.artifact_path)?.len();
+        futures::executor::block_on(reporter.notify(format!(
+            "✅ Successfully built: {} ({:.1} KB)",
+            result.artifact_path.display(),
+            size as f64 / 1024.0
+        )))?;
+        record_timing(&mut timing_entries, "build.total", total_started.elapsed());
+        emit_timings(reporter.clone(), timings, &timing_entries)?;
+        return Ok(BuildResult {
+            ok: true,
+            kind: "capsule".to_string(),
+            artifact: Some(result.artifact_path),
+            image: None,
+            build_strategy: result.build_strategy,
+            target: Some(result.target),
+            derived_from: Some(result.derived_from),
+        });
+    }
+
+    let result = match decision.kind {
         capsule_core::router::RuntimeKind::Source => {
             let prepare_started = Instant::now();
             let prepared_config = capsule_core::packers::source::prepare_source_config(
@@ -219,17 +264,27 @@ pub fn execute_pack_command(
                 artifact_path.display(),
                 size as f64 / 1024.0
             )))?;
+            BuildResult {
+                ok: true,
+                kind: "capsule".to_string(),
+                artifact: Some(artifact_path),
+                image: None,
+                build_strategy: "source".to_string(),
+                target: None,
+                derived_from: None,
+            }
         }
         capsule_core::router::RuntimeKind::Oci => {
             let result = capsule_core::packers::oci::pack(&decision.plan, None, reporter.as_ref())?;
-            if let Some(path) = result.archive {
+            let archive = result.archive.clone();
+            if let Some(ref path) = archive {
                 crate::payload_guard::ensure_payload_size(
-                    &path,
+                    path,
                     force_large_payload,
                     "--force-large-payload",
                 )?;
-                let _ = sign_if_requested(&path, key.as_ref(), reporter.clone())?;
-                let size = std::fs::metadata(&path)?.len();
+                let _ = sign_if_requested(path, key.as_ref(), reporter.clone())?;
+                let size = std::fs::metadata(path)?.len();
                 futures::executor::block_on(reporter.notify(format!(
                     "✅ Successfully built: {} ({:.1} KB)",
                     path.display(),
@@ -245,6 +300,19 @@ pub fn execute_pack_command(
                 futures::executor::block_on(
                     reporter.notify(format!("✅ Pack complete: {}", result.image)),
                 )?;
+            }
+            BuildResult {
+                ok: true,
+                kind: if archive.is_some() {
+                    "capsule".to_string()
+                } else {
+                    "image".to_string()
+                },
+                artifact: archive,
+                image: Some(result.image),
+                build_strategy: "oci".to_string(),
+                target: None,
+                derived_from: None,
             }
         }
         capsule_core::router::RuntimeKind::Wasm => {
@@ -262,6 +330,15 @@ pub fn execute_pack_command(
                 size as f64 / 1024.0
             )))?;
             let _ = sign_if_requested(&result.artifact, key.as_ref(), reporter.clone())?;
+            BuildResult {
+                ok: true,
+                kind: "capsule".to_string(),
+                artifact: Some(result.artifact),
+                image: None,
+                build_strategy: "wasm".to_string(),
+                target: None,
+                derived_from: None,
+            }
         }
         capsule_core::router::RuntimeKind::Web => {
             let driver = decision
@@ -345,13 +422,22 @@ pub fn execute_pack_command(
                 artifact_path.display(),
                 size as f64 / 1024.0
             )))?;
+            BuildResult {
+                ok: true,
+                kind: "capsule".to_string(),
+                artifact: Some(artifact_path),
+                image: None,
+                build_strategy: "web".to_string(),
+                target: None,
+                derived_from: None,
+            }
         }
-    }
+    };
 
     record_timing(&mut timing_entries, "build.total", total_started.elapsed());
     emit_timings(reporter.clone(), timings, &timing_entries)?;
 
-    Ok(())
+    Ok(result)
 }
 
 fn record_timing(entries: &mut Vec<(String, Duration)>, label: &str, elapsed: Duration) {

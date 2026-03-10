@@ -232,18 +232,28 @@ impl AuthManager {
     }
 
     fn load_keyring_token(&self, account: &str) -> Result<Option<String>> {
-        let entry = self.keyring_entry(account)?;
+        let entry = match self.keyring_entry(account) {
+            Ok(entry) => entry,
+            Err(err) if self.is_nonfatal_keyring_access_error(err.as_ref()) => return Ok(None),
+            Err(err) => return Err(err),
+        };
         match entry.get_password() {
             Ok(value) => Ok(Some(value)),
             Err(KeyringError::NoEntry) => Ok(None),
+            Err(err) if self.is_nonfatal_keyring_error(&err) => Ok(None),
             Err(err) => Err(self.keyring_error(err, "load")),
         }
     }
 
     fn delete_keyring_token(&self, account: &str) -> Result<()> {
-        let entry = self.keyring_entry(account)?;
+        let entry = match self.keyring_entry(account) {
+            Ok(entry) => entry,
+            Err(err) if self.is_nonfatal_keyring_access_error(err.as_ref()) => return Ok(()),
+            Err(err) => return Err(err),
+        };
         match entry.delete_password() {
             Ok(_) | Err(KeyringError::NoEntry) => Ok(()),
+            Err(err) if self.is_nonfatal_keyring_error(&err) => Ok(()),
             Err(err) => Err(self.keyring_error(err, "delete")),
         }
     }
@@ -253,6 +263,19 @@ impl AuthManager {
             "Failed to {} token in OS keyring ({err}). Security requirements prohibit plaintext fallback. Use ATO_TOKEN for this environment.",
             action
         )
+    }
+
+    fn is_nonfatal_keyring_error(&self, err: &KeyringError) -> bool {
+        matches!(
+            err,
+            KeyringError::PlatformFailure(_) | KeyringError::NoStorageAccess(_)
+        )
+    }
+
+    fn is_nonfatal_keyring_access_error(&self, err: &(dyn std::error::Error + 'static)) -> bool {
+        err.downcast_ref::<KeyringError>()
+            .map(|inner| self.is_nonfatal_keyring_error(inner))
+            .unwrap_or(false)
     }
 }
 

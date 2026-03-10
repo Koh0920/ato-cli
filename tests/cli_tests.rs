@@ -1,5 +1,7 @@
 #![allow(deprecated)]
 
+use std::fs;
+
 use assert_cmd::Command;
 use predicates::prelude::*;
 use tempfile::tempdir;
@@ -132,16 +134,20 @@ fn test_finalize_help_shows_required_contract() {
 }
 
 #[test]
-fn test_project_help_shows_experimental_explicit_opt_in_contract() {
+fn test_project_help_shows_launcher_projection_contract() {
     let mut cmd = Command::cargo_bin("ato").unwrap();
     cmd.args(["project", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Experimental explicit opt-in"))
+        .stdout(predicate::str::contains(
+            "Add a finalized app to launcher surfaces",
+        ))
         .stdout(predicate::str::contains("ato finalize"))
         .stdout(predicate::str::contains("--launcher-dir <LAUNCHER_DIR>"))
         .stdout(predicate::str::contains("Commands:"))
-        .stdout(predicate::str::contains("ls    List experimental projection state"));
+        .stdout(predicate::str::contains(
+            "ls    List experimental projection state",
+        ));
 }
 
 #[test]
@@ -160,7 +166,9 @@ fn test_unproject_help_shows_projection_reference_contract() {
     cmd.args(["unproject", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Experimental explicit opt-in"))
+        .stdout(predicate::str::contains(
+            "Remove a launcher projection without mutating the finalized artifact",
+        ))
         .stdout(predicate::str::contains("Projection ID"))
         .stdout(predicate::str::contains("--json"));
 }
@@ -190,6 +198,20 @@ fn test_fetch_accepts_subcommand_json_flag() {
 }
 
 #[test]
+fn test_inspect_requirements_help_shows_json_and_registry() {
+    let mut cmd = Command::cargo_bin("ato").unwrap();
+    cmd.args(["inspect", "requirements", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Inspect runtime requirements from capsule.toml",
+        ))
+        .stdout(predicate::str::contains("publisher/slug"))
+        .stdout(predicate::str::contains("--registry <REGISTRY>"))
+        .stdout(predicate::str::contains("--json"));
+}
+
+#[test]
 fn test_finalize_accepts_subcommand_json_flag() {
     let tmp = tempdir().unwrap();
     let output_dir = tmp.path().join("dist");
@@ -211,6 +233,98 @@ fn test_finalize_accepts_subcommand_json_flag() {
         !stderr.contains("unexpected argument '--json'"),
         "stderr={stderr}"
     );
+}
+
+fn write_native_build_fixture(root: &std::path::Path, executable: bool) {
+    fs::create_dir_all(root.join("MyApp.app/Contents/MacOS")).unwrap();
+    fs::write(
+        root.join("capsule.toml"),
+        r#"schema_version = "0.2"
+name = "my-app"
+version = "0.1.0"
+type = "app"
+default_target = "cli"
+
+[targets.cli]
+runtime = "source"
+driver = "native"
+entrypoint = "MyApp.app"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("ato.delivery.toml"),
+        r#"schema_version = "exp-0.1"
+[artifact]
+framework = "tauri"
+stage = "unsigned"
+target = "darwin/arm64"
+input = "MyApp.app"
+[finalize]
+tool = "codesign"
+args = ["--deep", "--force", "--sign", "-", "MyApp.app"]
+"#,
+    )
+    .unwrap();
+    let binary = root.join("MyApp.app/Contents/MacOS/MyApp");
+    fs::write(&binary, b"#!/bin/sh\necho native\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(&binary).unwrap().permissions();
+        permissions.set_mode(if executable { 0o755 } else { 0o644 });
+        fs::set_permissions(&binary, permissions).unwrap();
+    }
+    #[cfg(not(unix))]
+    let _ = executable;
+}
+
+#[test]
+fn test_build_routes_native_delivery_projects() {
+    let tmp = tempdir().unwrap();
+    write_native_build_fixture(tmp.path(), true);
+    let mut cmd = Command::cargo_bin("ato").unwrap();
+    let output = cmd
+        .args(["--json", "build", tmp.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64" {
+        assert!(
+            output.status.success(),
+            "stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let derived_from = tmp.path().join("MyApp.app");
+        assert!(
+            stdout.contains("\"build_strategy\": \"native-delivery\""),
+            "stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("\"target\": \"darwin/arm64\""),
+            "stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!(
+                "\"derived_from\": \"{}\"",
+                derived_from.to_string_lossy()
+            )),
+            "stdout:\n{stdout}"
+        );
+        assert!(stdout.contains("\"artifact\": "), "stdout:\n{stdout}");
+    } else {
+        assert!(
+            !output.status.success(),
+            "stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let combined = format!("{stdout}\n{stderr}");
+        assert!(
+            combined.contains("native delivery build currently supports tauri darwin/arm64 only"),
+            "combined output:\n{combined}"
+        );
+    }
 }
 
 #[test]

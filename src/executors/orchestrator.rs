@@ -12,8 +12,8 @@ use anyhow::{Context, Result};
 use capsule_core::execution_plan::guard::ExecutorKind;
 use capsule_core::router::ManifestData;
 use capsule_core::runtime::oci::{
-    BollardOciRuntimeClient, OciContainerRequest, OciLogChunk, OciNetworkRequest, OciPortSpec,
-    OciRuntimeClient,
+    BollardOciRuntimeClient, OciContainerRequest, OciLogChunk, OciMountSpec, OciNetworkRequest,
+    OciPortSpec, OciRuntimeClient,
 };
 use capsule_core::types::{
     OrchestrationPlan, ReadinessProbe, ResolvedService, ResolvedServiceRuntime,
@@ -241,7 +241,15 @@ async fn start_service<C: OciRuntimeClient>(
                     env: env.clone(),
                     working_dir: runtime.working_dir.clone(),
                     labels: container_labels(plan, &service.name, session_id, &runtime.target),
-                    mounts: Vec::new(),
+                    mounts: runtime
+                        .mounts
+                        .iter()
+                        .map(|mount| OciMountSpec {
+                            source: mount.source.clone(),
+                            target: mount.target.clone(),
+                            readonly: mount.readonly,
+                        })
+                        .collect(),
                     ports,
                     network: network_name.map(str::to_string),
                     aliases: service.network.aliases.clone(),
@@ -1151,6 +1159,7 @@ mod tests {
         exit_code: i64,
         inspect_calls: usize,
         host_ports: HashMap<u16, u16>,
+        mounts: Vec<(String, String, bool)>,
     }
 
     #[async_trait::async_trait]
@@ -1208,6 +1217,11 @@ mod tests {
                                 port.host_port.unwrap_or(port.container_port),
                             )
                         })
+                        .collect(),
+                    mounts: request
+                        .mounts
+                        .iter()
+                        .map(|mount| (mount.source.clone(), mount.target.clone(), mount.readonly))
                         .collect(),
                 },
             );
@@ -1291,6 +1305,7 @@ mod tests {
             manifest_dir: PathBuf::from("/tmp"),
             profile: capsule_core::router::ExecutionProfile::Dev,
             selected_target: "app".to_string(),
+            state_source_overrides: HashMap::new(),
         }
     }
 
@@ -1314,9 +1329,18 @@ runtime = "oci"
 image = "mysql:8"
 port = 3306
 
+[state.data]
+kind = "filesystem"
+durability = "ephemeral"
+purpose = "primary-data"
+
 [services.main]
 target = "app"
 depends_on = ["db"]
+
+[[services.main.state_bindings]]
+state = "data"
+target = "/var/lib/app"
 
 [services.db]
 target = "db"
@@ -1360,5 +1384,19 @@ target = "db"
             .position(|event| event.starts_with("network:remove:"))
             .expect("network remove");
         assert!(stop_db < remove_network);
+
+        let states = client.states.lock().unwrap();
+        let app_state = states
+            .values()
+            .find(|state| state.service == "main")
+            .expect("main state");
+        assert_eq!(
+            app_state.mounts,
+            vec![(
+                "/var/lib/ato/state/demo-app/data".to_string(),
+                "/var/lib/app".to_string(),
+                false,
+            )]
+        );
     }
 }
