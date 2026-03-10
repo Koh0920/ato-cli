@@ -1795,13 +1795,13 @@ fn validate_delivery_target(target: &str) -> Result<()> {
 }
 
 fn validate_finalize_tool(tool: &str) -> Result<()> {
-    if !tool.chars().any(char::is_control) {
-        return Ok(());
+    if tool.chars().any(char::is_control) {
+        bail!(
+            "finalize.tool '{}' must not contain control characters",
+            tool
+        );
     }
-    bail!(
-        "finalize.tool '{}' must not contain control characters",
-        tool
-    );
+    Ok(())
 }
 
 fn validate_finalize_args(tool: &str, args: &[String], input: &str) -> Result<()> {
@@ -1865,8 +1865,10 @@ fn validate_codesign_finalize_args(args: &[String], input: &str) -> Result<()> {
 }
 
 fn validate_signtool_finalize_args(args: &[String], input: &str) -> Result<()> {
+    // Common `signtool sign` switches that do not take a following value.
     const SIGNTOOL_BOOLEAN_SWITCHES: &[&str] =
         &["a", "as", "debug", "nph", "ph", "q", "sm", "uw", "v"];
+    // Common `signtool sign` switches that require one following value.
     const SIGNTOOL_VALUE_SWITCHES: &[&str] = &[
         "ac", "c", "csp", "d", "dg", "di", "ds", "du", "f", "fd", "i", "kc", "n", "p", "p7ce",
         "p7co", "pg", "r", "s", "sha1", "t", "td", "tr", "u",
@@ -1910,7 +1912,7 @@ fn validate_signtool_finalize_args(args: &[String], input: &str) -> Result<()> {
                 "signtool"
             );
         };
-        let normalized = option.trim().to_ascii_lowercase();
+        let normalized = option.to_ascii_lowercase();
         if SIGNTOOL_BOOLEAN_SWITCHES.contains(&normalized.as_str()) {
             continue;
         }
