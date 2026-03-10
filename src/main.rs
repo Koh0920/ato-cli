@@ -364,6 +364,20 @@ enum Commands {
     },
 
     #[command(
+        next_help_heading = "Advanced Commands",
+        about = "Validate capsule build/run inputs without executing"
+    )]
+    Validate {
+        /// Directory containing capsule.toml or the manifest file itself (default: ".")
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    #[command(
         next_help_heading = "Primary Commands",
         about = "Search the store for packages"
     )]
@@ -1050,6 +1064,37 @@ enum IpcCommands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Validate and send a JSON-RPC invoke request
+    Invoke {
+        /// Path to capsule directory or capsule.toml
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Override exported service name
+        #[arg(long)]
+        service: Option<String>,
+
+        /// Method name to invoke
+        #[arg(long)]
+        method: String,
+
+        /// JSON arguments payload
+        #[arg(long)]
+        args: String,
+
+        /// JSON-RPC request id
+        #[arg(long, default_value = "invoke-1")]
+        id: String,
+
+        /// Maximum serialized message size in bytes
+        #[arg(long)]
+        max_message_size: Option<usize>,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1440,6 +1485,11 @@ fn run() -> Result<()> {
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             }
+            Ok(())
+        }
+
+        Commands::Validate { path, json } => {
+            commands::validate::execute(path, cli.json || json)?;
             Ok(())
         }
 
@@ -2027,6 +2077,19 @@ fn run() -> Result<()> {
         Commands::Ipc {
             command: IpcCommands::Stop { name, force, json },
         } => commands::ipc::run_ipc_stop(name, force, json),
+
+        Commands::Ipc {
+            command:
+                IpcCommands::Invoke {
+                    path,
+                    service,
+                    method,
+                    args,
+                    id,
+                    max_message_size,
+                    json,
+                },
+        } => commands::ipc::run_ipc_invoke(path, service, method, args, id, max_message_size, json),
 
         Commands::Login { token, headless } => {
             let rt = tokio::runtime::Runtime::new()?;

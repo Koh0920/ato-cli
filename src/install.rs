@@ -563,46 +563,8 @@ pub async fn install_app(
         }
     }
 
-    let store_root = output_dir.unwrap_or_else(|| {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(DEFAULT_STORE_DIR)
-    });
-    let install_dir = store_root
-        .join(&scoped_ref.publisher)
-        .join(&scoped_ref.slug)
-        .join(target_version);
-    std::fs::create_dir_all(&install_dir).with_context(|| {
-        format!(
-            "Failed to create store directory: {}",
-            install_dir.display()
-        )
-    })?;
-
-    let output_path = install_dir.join(normalized_file_name);
-    sweep_stale_tmp_capsules(&install_dir)?;
-    write_capsule_atomic(&output_path, &bytes, &computed_blake3)?;
-    runtime_tree::prepare_runtime_tree(
-        &scoped_ref.publisher,
-        &scoped_ref.slug,
-        target_version,
-        &bytes,
-    )?;
-
-    if !json_output {
-        eprintln!("✅ Installed to: {}", output_path.display());
-        eprintln!("   To run: ato run {}", output_path.display());
-    }
-
     let native_spec = crate::native_delivery::detect_install_requires_local_derivation(&bytes)?;
     if let Some(_native_spec) = native_spec {
-        let fetch_result = crate::native_delivery::materialize_fetch_cache_from_artifact(
-            &scoped_ref.scoped_id,
-            target_version,
-            &registry,
-            &bytes,
-        )?;
-
         let finalize_allowed = if yes {
             true
         } else if can_prompt_interactively && !json_output {
@@ -620,11 +582,28 @@ pub async fn install_app(
             );
         }
 
+        let fetch_result = crate::native_delivery::materialize_fetch_cache_from_artifact(
+            &scoped_ref.scoped_id,
+            target_version,
+            &registry,
+            &bytes,
+        )?;
+
         if !json_output {
             eprintln!("Running local finalize...");
         }
         let finalize_result =
             crate::native_delivery::finalize_fetched_artifact(&fetch_result.cache_dir)?;
+
+        let output_path = persist_installed_artifact(
+            output_dir.clone(),
+            &scoped_ref.publisher,
+            &scoped_ref.slug,
+            target_version,
+            &normalized_file_name,
+            &bytes,
+            &computed_blake3,
+        )?;
 
         let projection = match projection_preference {
             ProjectionPreference::Skip => {
@@ -742,6 +721,21 @@ pub async fn install_app(
         });
     }
 
+    let output_path = persist_installed_artifact(
+        output_dir,
+        &scoped_ref.publisher,
+        &scoped_ref.slug,
+        target_version,
+        &normalized_file_name,
+        &bytes,
+        &computed_blake3,
+    )?;
+
+    if !json_output {
+        eprintln!("✅ Installed to: {}", output_path.display());
+        eprintln!("   To run: ato run {}", output_path.display());
+    }
+
     Ok(InstallResult {
         capsule_id: capsule.id,
         scoped_id: scoped_ref.scoped_id.clone(),
@@ -757,6 +751,35 @@ pub async fn install_app(
         local_derivation: None,
         projection: None,
     })
+}
+
+fn persist_installed_artifact(
+    output_dir: Option<PathBuf>,
+    publisher: &str,
+    slug: &str,
+    version: &str,
+    normalized_file_name: &str,
+    bytes: &[u8],
+    content_hash: &str,
+) -> Result<PathBuf> {
+    let store_root = output_dir.unwrap_or_else(|| {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(DEFAULT_STORE_DIR)
+    });
+    let install_dir = store_root.join(publisher).join(slug).join(version);
+    std::fs::create_dir_all(&install_dir).with_context(|| {
+        format!(
+            "Failed to create store directory: {}",
+            install_dir.display()
+        )
+    })?;
+
+    let output_path = install_dir.join(normalized_file_name);
+    sweep_stale_tmp_capsules(&install_dir)?;
+    write_capsule_atomic(&output_path, bytes, content_hash)?;
+    runtime_tree::prepare_runtime_tree(publisher, slug, version, bytes)?;
+    Ok(output_path)
 }
 
 fn prompt_for_confirmation(prompt: &str, default_yes: bool) -> Result<bool> {
