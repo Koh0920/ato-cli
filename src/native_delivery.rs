@@ -2511,6 +2511,17 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    fn assert_json_object_has_keys(value: &serde_json::Value, keys: &[&str]) {
+        let object = value.as_object().expect("expected JSON object");
+        for key in keys {
+            assert!(
+                object.contains_key(*key),
+                "expected key '{}' in JSON object: {object:?}",
+                key
+            );
+        }
+    }
+
     fn sample_delivery_toml() -> &'static str {
         r#"schema_version = "0.1"
 [artifact]
@@ -3046,6 +3057,109 @@ input = "dist/time-management-desktop.app"
         fs::write(left.join("a/b/file.txt"), b"hello")?;
         fs::write(right.join("a/b/file.txt"), b"hello")?;
         assert_eq!(compute_tree_digest(&left)?, compute_tree_digest(&right)?);
+        Ok(())
+    }
+
+    #[test]
+    fn native_delivery_documented_json_contract_fields_are_present() -> Result<()> {
+        let tmp = tempdir()?;
+
+        let fetched_dir = sample_fetch_dir(tmp.path())?;
+        let fetch_metadata = load_fetch_metadata(&fetched_dir)?;
+        let fetch_json = serde_json::to_value(&fetch_metadata)?;
+        assert_json_object_has_keys(
+            &fetch_json,
+            &[
+                "schema_version",
+                "scoped_id",
+                "version",
+                "registry",
+                "parent_digest",
+            ],
+        );
+
+        let build_json = serde_json::to_value(NativeBuildResult {
+            artifact_path: tmp.path().join("out/my-app-0.1.0.capsule"),
+            build_strategy: "native-delivery".to_string(),
+            target: DELIVERY_TARGET.to_string(),
+            derived_from: tmp.path().join("MyApp.app"),
+            schema_version: DELIVERY_SCHEMA_VERSION.to_string(),
+        })?;
+        assert_json_object_has_keys(
+            &build_json,
+            &["build_strategy", "schema_version", "target", "derived_from"],
+        );
+
+        let (derived_dir, derived_app) = sample_finalized_app(tmp.path())?;
+        let provenance_json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(derived_dir.join(PROVENANCE_FILE))?)?;
+        assert_json_object_has_keys(
+            &provenance_json,
+            &[
+                "schema_version",
+                "parent_digest",
+                "derived_digest",
+                "framework",
+                "target",
+                "finalize_tool",
+                "finalized_at",
+            ],
+        );
+
+        let finalize_json = serde_json::to_value(FinalizeResult {
+            fetched_dir: fetched_dir.clone(),
+            output_dir: derived_dir.clone(),
+            derived_app_path: derived_app.clone(),
+            provenance_path: derived_dir.join(PROVENANCE_FILE),
+            parent_digest: "blake3:parent-digest".to_string(),
+            derived_digest: "blake3:derived-digest".to_string(),
+            schema_version: DELIVERY_SCHEMA_VERSION.to_string(),
+        })?;
+        assert_json_object_has_keys(
+            &finalize_json,
+            &[
+                "schema_version",
+                "derived_app_path",
+                "provenance_path",
+                "parent_digest",
+                "derived_digest",
+            ],
+        );
+
+        let launcher_dir = tmp.path().join("Applications");
+        let metadata_root = tmp.path().join("projection-metadata");
+        let project_result = project_with_roots(&derived_app, &launcher_dir, &metadata_root)?;
+        let project_json = serde_json::to_value(&project_result)?;
+        assert_json_object_has_keys(
+            &project_json,
+            &[
+                "schema_version",
+                "projection_id",
+                "metadata_path",
+                "projected_path",
+                "derived_app_path",
+                "parent_digest",
+                "derived_digest",
+                "state",
+            ],
+        );
+
+        let unproject_result =
+            unproject_with_metadata_root(&project_result.projection_id, &metadata_root)?;
+        let unproject_json = serde_json::to_value(&unproject_result)?;
+        assert_json_object_has_keys(
+            &unproject_json,
+            &[
+                "schema_version",
+                "projection_id",
+                "metadata_path",
+                "projected_path",
+                "removed_projected_path",
+                "removed_metadata",
+                "state_before",
+            ],
+        );
+
         Ok(())
     }
 

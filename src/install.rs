@@ -2415,6 +2415,17 @@ mod tests {
     const TEST_VERSION: &str = "1.0.0";
     const TEST_LEASE_ID: &str = "lease-test-1";
 
+    fn assert_json_object_has_keys(value: &serde_json::Value, keys: &[&str]) {
+        let object = value.as_object().expect("expected JSON object");
+        for key in keys {
+            assert!(
+                object.contains_key(*key),
+                "expected key '{}' in JSON object: {object:?}",
+                key
+            );
+        }
+    }
+
     fn test_env_lock() -> &'static tokio::sync::Mutex<()> {
         static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
@@ -2451,6 +2462,66 @@ mod tests {
                 std::env::remove_var(&self.key);
             }
         }
+    }
+
+    #[test]
+    fn native_install_documented_json_contract_fields_are_present() {
+        let value = serde_json::to_value(InstallResult {
+            capsule_id: "capsule-123".to_string(),
+            scoped_id: "koh0920/sample".to_string(),
+            publisher: "koh0920".to_string(),
+            slug: "sample".to_string(),
+            version: "1.0.0".to_string(),
+            path: PathBuf::from("/tmp/sample.capsule"),
+            content_hash: "blake3:artifact".to_string(),
+            install_kind: InstallKind::NativeRequiresLocalDerivation,
+            launchable: Some(LaunchableTarget::DerivedApp {
+                path: PathBuf::from("/tmp/MyApp.app"),
+            }),
+            local_derivation: Some(LocalDerivationInfo {
+                schema_version: "0.1".to_string(),
+                performed: true,
+                fetched_dir: PathBuf::from("/tmp/fetch"),
+                derived_app_path: Some(PathBuf::from("/tmp/MyApp.app")),
+                provenance_path: Some(PathBuf::from("/tmp/local-derivation.json")),
+                parent_digest: Some("blake3:parent".to_string()),
+                derived_digest: Some("blake3:derived".to_string()),
+            }),
+            projection: Some(ProjectionInfo {
+                performed: true,
+                projection_id: Some("projection-123".to_string()),
+                projected_path: Some(PathBuf::from("/Applications/MyApp.app")),
+                state: Some("ok".to_string()),
+                schema_version: Some("0.1".to_string()),
+                metadata_path: Some(PathBuf::from("/tmp/projection.json")),
+            }),
+        })
+        .expect("serialize install result");
+
+        assert_json_object_has_keys(
+            &value,
+            &[
+                "install_kind",
+                "launchable",
+                "local_derivation",
+                "projection",
+            ],
+        );
+
+        assert_json_object_has_keys(
+            &value["local_derivation"],
+            &[
+                "schema_version",
+                "provenance_path",
+                "parent_digest",
+                "derived_digest",
+            ],
+        );
+
+        assert_json_object_has_keys(
+            &value["projection"],
+            &["schema_version", "metadata_path", "state"],
+        );
     }
 
     fn test_scoped_ref() -> ScopedCapsuleRef {

@@ -74,18 +74,21 @@ If the native target is command-driven (`entrypoint = "sh"` plus `cmd = [...]`),
 
 ### Stable vs experimental machine-readable contract
 
-Stable in `schema_version = "0.1"`:
+For the current `schema_version = "0.1"` generation, the repo documents and test-guards the presence of these machine-readable fields:
 
 - `fetch.json`: `schema_version`, `scoped_id`, `version`, `registry`, `parent_digest`
 - build JSON: `build_strategy = "native-delivery"`, `schema_version`, `target`, `derived_from`
 - finalize JSON: `schema_version`, `derived_app_path`, `provenance_path`, `parent_digest`, `derived_digest`
 - `local-derivation.json`: `schema_version`, `parent_digest`, `derived_digest`, `framework`, `target`, `finalize_tool`, `finalized_at`
-- project / unproject JSON: `schema_version`, `projection_id`, `metadata_path`, `projected_path`, `derived_app_path`, `parent_digest`, `derived_digest`, `state`
+- project JSON: `schema_version`, `projection_id`, `metadata_path`, `projected_path`, `derived_app_path`, `parent_digest`, `derived_digest`, `state`
+- unproject JSON: `schema_version`, `projection_id`, `metadata_path`, `projected_path`, `removed_projected_path`, `removed_metadata`, `state_before`
 - install JSON: `install_kind`, `launchable`, `local_derivation`, `projection`
   - `install_kind = "NativeRequiresLocalDerivation"` means install succeeded, but the launchable path is the locally derived app bundle, not the stored `.capsule`
   - `launchable.path` is the path a caller should use to open/run
   - `local_derivation.provenance_path`, `parent_digest`, and `derived_digest` are the stable linkage between fetch/finalize/project/install
   - `projection.metadata_path` is the stable recovery handle for `ato unproject` and for launcher state inspection
+
+These guarantees are intentionally narrow: additive fields may still appear, but removing or renaming the documented fields should be treated as a schema-version change.
 
 Still experimental:
 
