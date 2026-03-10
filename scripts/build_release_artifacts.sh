@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build and package ato release archives for one or more Rust targets.
+# Build and package ato-cli release archives for one or more Rust targets.
 #
 # Example:
 #   TARGETS="aarch64-apple-darwin" ./scripts/build_release_artifacts.sh
@@ -132,14 +132,14 @@ for target in "${target_list[@]}"; do
   chmod 0755 "$staging_dir/$binary_name"
 
   if [[ "$target" == *"-windows-"* ]]; then
-    archive_path="$OUT_DIR/ato-$target.zip"
+    archive_path="$OUT_DIR/ato-cli-$target.zip"
     (
       cd "$staging_dir"
       zip -q "$archive_path" "$binary_name"
     )
   else
-    archive_path="$OUT_DIR/ato-$target.tar.gz"
-    tar -C "$staging_dir" -czf "$archive_path" "$binary_name"
+    archive_path="$OUT_DIR/ato-cli-$target.tar.xz"
+    tar -C "$staging_dir" -cJf "$archive_path" "$binary_name"
   fi
   rm -rf "$staging_dir"
 
@@ -149,7 +149,7 @@ done
 (
   cd "$OUT_DIR"
   shopt -s nullglob
-  archives=(ato-*.tar.gz ato-*.zip)
+  archives=(ato-cli-*.tar.xz ato-cli-*.zip)
   if [[ "${#archives[@]}" -eq 0 ]]; then
     echo "error: no packaged archives found in $OUT_DIR" >&2
     exit 1

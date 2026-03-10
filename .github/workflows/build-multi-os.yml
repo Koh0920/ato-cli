@@ -181,11 +181,11 @@ jobs:
           cp "$binary_path" "dist/payload/${{ matrix.binary_name }}"
 
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            archive_name="ato-${resolved_target}.zip"
+            archive_name="ato-cli-${resolved_target}.zip"
             powershell.exe -NoProfile -Command "Push-Location 'dist/payload'; Compress-Archive -Path '${{ matrix.binary_name }}' -DestinationPath '../${archive_name}' -Force; Pop-Location"
           else
-            archive_name="ato-${resolved_target}.tar.gz"
-            tar -C dist/payload -czf "dist/${archive_name}" "${{ matrix.binary_name }}"
+            archive_name="ato-cli-${resolved_target}.tar.xz"
+            tar -C dist/payload -cJf "dist/${archive_name}" "${{ matrix.binary_name }}"
           fi
 
           archive_path="dist/${archive_name}"
@@ -212,8 +212,8 @@ jobs:
         with:
           name: release-${{ matrix.artifact_name }}
           path: |
-            dist/ato-*.tar.gz
-            dist/ato-*.zip
+            dist/ato-cli-*.tar.xz
+            dist/ato-cli-*.zip
             dist/SHA256SUMS
             dist/target-triple.txt
           if-no-files-found: error
@@ -256,7 +256,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p ato-bin
-          archive="$(find ato-smoke -maxdepth 1 -type f \( -name 'ato-*.tar.gz' -o -name 'ato-*.zip' \) | head -n1)"
+          archive="$(find ato-smoke -maxdepth 1 -type f \( -name 'ato-cli-*.tar.xz' -o -name 'ato-cli-*.zip' \) | head -n1)"
           if [[ -z "$archive" ]]; then
             echo "No archive found in ato-smoke" >&2
             exit 1
@@ -267,7 +267,7 @@ jobs:
             dest_win="$(cygpath -w "$PWD/ato-bin")"
             powershell.exe -NoProfile -Command "Expand-Archive -Path '$archive_win' -DestinationPath '$dest_win' -Force"
           else
-            tar -C ato-bin -xzf "$archive"
+            tar -C ato-bin -xJf "$archive"
           fi
 
           binary_path="$PWD/ato-bin/${{ matrix.binary_name }}"
