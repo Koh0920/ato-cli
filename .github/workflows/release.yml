@@ -285,7 +285,6 @@ jobs:
           DEFAULT_BUCKET_STAGING: ${{ secrets.R2_BUCKET_STAGING }}
           DEFAULT_BUCKET_PRODUCTION: ${{ secrets.R2_BUCKET_PRODUCTION }}
         run: |
-          # Extract version from tag
           if [[ "${{ needs.plan.outputs.tag }}" =~ ^v(.+)$ ]]; then
             VERSION="${BASH_REMATCH[1]}"
           else
@@ -293,18 +292,17 @@ jobs:
             exit 1
           fi
 
-          # Prepare source directory with artifacts
-          SOURCE_DIR="/tmp/ato-release/${VERSION}"
+          SOURCE_DIR="${GITHUB_WORKSPACE}/.tmp/ato-release/${VERSION}"
           mkdir -p "$SOURCE_DIR"
 
-          # Copy artifacts to source directory
           cp artifacts/* "$SOURCE_DIR/" 2>/dev/null || true
 
-          # Generate SHA256SUMS
-          (cd "$SOURCE_DIR" && sha256sum ato-*.tar.gz ato-*.zip 2>/dev/null || true) > "$SOURCE_DIR/SHA256SUMS" || true
+          (
+            cd "$SOURCE_DIR"
+            shasum -a 256 ato-*.tar.xz ato-*.tar.gz ato-*.zip 2>/dev/null || true
+          ) > "$SOURCE_DIR/SHA256SUMS" || true
 
-          # Upload to R2 (production environment for releases)
-          DEPLOY_ENV=production ./scripts/upload_release_to_r2.sh
+          VERSION="$VERSION" SOURCE_DIR="$SOURCE_DIR" DEPLOY_ENV=production ./scripts/upload_release_to_r2.sh
 
   announce:
     needs:

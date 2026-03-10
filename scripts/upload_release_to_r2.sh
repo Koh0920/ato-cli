@@ -16,7 +16,7 @@ set -euo pipefail
 #   DEFAULT_BUCKET_STAGING     optional fallback bucket when DEPLOY_ENV=staging|stg
 #   DEFAULT_BUCKET_PRODUCTION  optional fallback bucket when DEPLOY_ENV=production|prod
 #   SOURCE_DIR          default: /tmp/ato-release/$VERSION
-#   TARGETS             default: infer from SOURCE_DIR/ato-*.tar.gz|ato-*.zip
+#   TARGETS             default: infer from SOURCE_DIR/ato-*.tar.xz|ato-*.tar.gz|ato-*.zip
 #   UPDATE_LATEST       default: 1
 #   PREFIX              default: ato
 #   WRANGLER_CONFIG     optional (if empty, use wrangler default resolution)
@@ -100,21 +100,19 @@ put_object() {
 
 find_archive_for_target() {
   local target="$1"
-  # Try cargo-dist format first: ato-<version>-<target>.tar.gz
-  local tar_file
-  local zip_file
+  # Try cargo-dist format first: ato-<version>-<target>.tar.xz|tar.gz|zip
 
   # Find files matching the pattern for this target
   for file in "$SOURCE_DIR"/*; do
     if [[ -f "$file" ]]; then
       local filename="$(basename "$file")"
       # Check if it's a cargo-dist format file for this target
-      if [[ "$filename" =~ ^ato-[^-]+-${target}\.(tar\.gz|zip)$ ]]; then
+      if [[ "$filename" =~ ^ato-[^-]+-${target}\.(tar\.xz|tar\.gz|zip)$ ]]; then
         echo "$file"
         return 0
       fi
       # Also check old format for backward compatibility
-      if [[ "$filename" == "ato-${target}.tar.gz" || "$filename" == "ato-${target}.zip" ]]; then
+      if [[ "$filename" == "ato-${target}.tar.xz" || "$filename" == "ato-${target}.tar.gz" || "$filename" == "ato-${target}.zip" ]]; then
         echo "$file"
         return 0
       fi
@@ -215,22 +213,23 @@ if [[ -n "$TARGETS" ]]; then
 else
   while IFS= read -r archive; do
     archive_name="$(basename "$archive")"
-    # Handle both old format (ato-<target>.tar.gz) and new cargo-dist format (ato-<version>-<target>.tar.gz)
-    if [[ "$archive_name" =~ ^ato-[^-]+-(.+)\.(tar\.gz|zip)$ ]]; then
-      # cargo-dist format: ato-<version>-<target>.tar.gz
+    # Handle both old format (ato-<target>.<ext>) and new cargo-dist format (ato-<version>-<target>.<ext>)
+    if [[ "$archive_name" =~ ^ato-[^-]+-(.+)\.(tar\.xz|tar\.gz|zip)$ ]]; then
+      # cargo-dist format: ato-<version>-<target>.<ext>
       target="${BASH_REMATCH[1]}"
     else
-      # old format: ato-<target>.tar.gz
+      # old format: ato-<target>.<ext>
       target="${archive_name#ato-}"
+      target="${target%.tar.xz}"
       target="${target%.tar.gz}"
       target="${target%.zip}"
     fi
     target_list+=("$target")
-  done < <(find "$SOURCE_DIR" -maxdepth 1 -type f \( -name 'ato-*.tar.gz' -o -name 'ato-*.zip' \) | sort)
+  done < <(find "$SOURCE_DIR" -maxdepth 1 -type f \( -name 'ato-*.tar.xz' -o -name 'ato-*.tar.gz' -o -name 'ato-*.zip' \) | sort)
 fi
 
 if [[ "${#target_list[@]}" -eq 0 ]]; then
-  echo "error: no targets detected. Set TARGETS or place ato-<target>.tar.gz / ato-<target>.zip in $SOURCE_DIR" >&2
+  echo "error: no targets detected. Set TARGETS or place ato-<target>.tar.xz / ato-<target>.tar.gz / ato-<target>.zip in $SOURCE_DIR" >&2
   exit 1
 fi
 
@@ -248,7 +247,7 @@ fi
 
 for target in "${target_list[@]}"; do
   if ! archive_file="$(find_archive_for_target "$target")"; then
-    echo "error: archive not found for target '$target': $SOURCE_DIR/ato-$target.tar.gz|.zip" >&2
+    echo "error: archive not found for target '$target': $SOURCE_DIR/ato-$target.tar.xz|.tar.gz|.zip" >&2
     exit 1
   fi
   archive_name="$(basename "$archive_file")"
@@ -262,7 +261,7 @@ verify_checksums "$checksum_file" "$SOURCE_DIR"
 
 for target in "${target_list[@]}"; do
   if ! archive_file="$(find_archive_for_target "$target")"; then
-    echo "error: archive not found for target '$target': $SOURCE_DIR/ato-$target.tar.gz|.zip" >&2
+    echo "error: archive not found for target '$target': $SOURCE_DIR/ato-$target.tar.xz|.tar.gz|.zip" >&2
     exit 1
   fi
   archive_name="$(basename "$archive_file")"
