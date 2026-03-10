@@ -100,16 +100,27 @@ put_object() {
 
 find_archive_for_target() {
   local target="$1"
-  local tar_file="$SOURCE_DIR/ato-$target.tar.gz"
-  local zip_file="$SOURCE_DIR/ato-$target.zip"
-  if [[ -f "$tar_file" ]]; then
-    echo "$tar_file"
-    return 0
-  fi
-  if [[ -f "$zip_file" ]]; then
-    echo "$zip_file"
-    return 0
-  fi
+  # Try cargo-dist format first: ato-<version>-<target>.tar.gz
+  local tar_file
+  local zip_file
+
+  # Find files matching the pattern for this target
+  for file in "$SOURCE_DIR"/*; do
+    if [[ -f "$file" ]]; then
+      local filename="$(basename "$file")"
+      # Check if it's a cargo-dist format file for this target
+      if [[ "$filename" =~ ^ato-[^-]+-${target}\.(tar\.gz|zip)$ ]]; then
+        echo "$file"
+        return 0
+      fi
+      # Also check old format for backward compatibility
+      if [[ "$filename" == "ato-${target}.tar.gz" || "$filename" == "ato-${target}.zip" ]]; then
+        echo "$file"
+        return 0
+      fi
+    fi
+  done
+
   return 1
 }
 
@@ -204,9 +215,16 @@ if [[ -n "$TARGETS" ]]; then
 else
   while IFS= read -r archive; do
     archive_name="$(basename "$archive")"
-    target="${archive_name#ato-}"
-    target="${target%.tar.gz}"
-    target="${target%.zip}"
+    # Handle both old format (ato-<target>.tar.gz) and new cargo-dist format (ato-<version>-<target>.tar.gz)
+    if [[ "$archive_name" =~ ^ato-[^-]+-(.+)\.(tar\.gz|zip)$ ]]; then
+      # cargo-dist format: ato-<version>-<target>.tar.gz
+      target="${BASH_REMATCH[1]}"
+    else
+      # old format: ato-<target>.tar.gz
+      target="${archive_name#ato-}"
+      target="${target%.tar.gz}"
+      target="${target%.zip}"
+    fi
     target_list+=("$target")
   done < <(find "$SOURCE_DIR" -maxdepth 1 -type f \( -name 'ato-*.tar.gz' -o -name 'ato-*.zip' \) | sort)
 fi

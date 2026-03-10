@@ -382,6 +382,12 @@ enum Commands {
 
     #[command(
         next_help_heading = "Advanced Commands",
+        about = "Update ato CLI to the latest version"
+    )]
+    Update,
+
+    #[command(
+        next_help_heading = "Advanced Commands",
         about = "Inspect capsule metadata and runtime requirements"
     )]
     Inspect {
@@ -1734,6 +1740,11 @@ fn run() -> Result<()> {
 
         Commands::Validate { path, json } => {
             commands::validate::execute(path, cli.json || json)?;
+            Ok(())
+        }
+
+        Commands::Update => {
+            commands::update::update()?;
             Ok(())
         }
 
