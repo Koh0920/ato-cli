@@ -445,8 +445,7 @@ fn build_state_requirements(manifest: &CapsuleManifest) -> Vec<StateRequirementI
         .map(|(key, requirement)| StateRequirementItem {
             key: key.clone(),
             required: true,
-            description: (!requirement.purpose.trim().is_empty())
-                .then(|| requirement.purpose.clone()),
+            description: None,
             kind: Some(requirement.kind),
             durability: Some(requirement.durability),
             purpose: (!requirement.purpose.trim().is_empty()).then(|| requirement.purpose.clone()),
@@ -679,6 +678,7 @@ fn is_explicit_local_path_input(raw: &str) -> bool {
         return true;
     }
 
+    // Check for Windows absolute path: "C:\path" or "C:/path".
     raw.len() >= 3
         && raw.as_bytes()[1] == b':'
         && (raw.as_bytes()[2] == b'/' || raw.as_bytes()[2] == b'\\')
