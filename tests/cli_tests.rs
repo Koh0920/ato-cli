@@ -554,6 +554,103 @@ args = ["--deep", "--force", "--sign", "-", "MyApp.app"]
     let _ = executable;
 }
 
+fn write_native_command_build_fixture(root: &std::path::Path) {
+    fs::create_dir_all(root).unwrap();
+    fs::write(
+        root.join("capsule.toml"),
+        r#"schema_version = "0.2"
+name = "my-app"
+version = "0.1.0"
+type = "app"
+default_target = "cli"
+
+[targets.cli]
+runtime = "source"
+driver = "native"
+entrypoint = "sh"
+cmd = ["build-app.sh"]
+working_dir = "."
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("ato.delivery.toml"),
+        r#"schema_version = "0.1"
+[artifact]
+framework = "tauri"
+stage = "unsigned"
+target = "darwin/arm64"
+input = "dist/MyApp.app"
+[finalize]
+tool = "codesign"
+args = ["--deep", "--force", "--sign", "-", "dist/MyApp.app"]
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("build-app.sh"),
+        "#!/bin/sh\nset -eu\nmkdir -p dist/MyApp.app/Contents/MacOS\nprintf '#!/bin/sh\necho native\n' > dist/MyApp.app/Contents/MacOS/MyApp\nchmod 755 dist/MyApp.app/Contents/MacOS/MyApp\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(root.join("build-app.sh"))
+            .unwrap()
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(root.join("build-app.sh"), permissions).unwrap();
+    }
+}
+
+fn write_inline_native_command_build_fixture(root: &std::path::Path) {
+    fs::create_dir_all(root).unwrap();
+    fs::write(
+        root.join("capsule.toml"),
+        r#"schema_version = "0.2"
+name = "time-management-desktop"
+version = "0.1.0"
+description = "Tauri desktop app for time management"
+type = "app"
+default_target = "desktop"
+
+[targets.desktop]
+runtime = "source"
+driver = "native"
+entrypoint = "sh"
+cmd = ["build-app.sh"]
+working_dir = "."
+
+[artifact]
+framework = "tauri"
+stage = "unsigned"
+target = "darwin/arm64"
+input = "src-tauri/target/release/bundle/macos/time-management-desktop.app"
+
+[finalize]
+tool = "codesign"
+args = ["--deep", "--force", "--sign", "-", "src-tauri/target/release/bundle/macos/time-management-desktop.app"]
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("build-app.sh"),
+        "#!/bin/sh\nset -eu\nmkdir -p src-tauri/target/release/bundle/macos/time-management-desktop.app/Contents/MacOS\nprintf '#!/bin/sh\necho native\n' > src-tauri/target/release/bundle/macos/time-management-desktop.app/Contents/MacOS/time-management-desktop\nchmod 755 src-tauri/target/release/bundle/macos/time-management-desktop.app/Contents/MacOS/time-management-desktop\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(root.join("build-app.sh"))
+            .unwrap()
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(root.join("build-app.sh"), permissions).unwrap();
+    }
+}
+
 #[test]
 fn test_build_routes_native_delivery_projects() {
     let tmp = tempdir().unwrap();
@@ -688,6 +785,104 @@ entrypoint = "source/main.py"
         !stderr.contains("Native delivery target 'cli' entrypoint must point to a .app bundle"),
         "stderr:\n{stderr}"
     );
+}
+
+#[test]
+fn test_build_routes_native_delivery_command_mode_projects() {
+    let tmp = tempdir().unwrap();
+    write_native_command_build_fixture(tmp.path());
+    let output = Command::cargo_bin("ato")
+        .unwrap()
+        .args(["--json", "build", tmp.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64" {
+        assert!(
+            output.status.success(),
+            "stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let derived_from = tmp.path().canonicalize().unwrap().join("dist/MyApp.app");
+        assert!(
+            stdout.contains("\"build_strategy\": \"native-delivery\""),
+            "stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("\"schema_version\": \"0.1\""),
+            "stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!(
+                "\"derived_from\": \"{}\"",
+                derived_from.to_string_lossy()
+            )),
+            "stdout:\n{stdout}"
+        );
+        assert!(
+            tmp.path()
+                .join("dist/MyApp.app/Contents/MacOS/MyApp")
+                .exists(),
+            "built app should exist after command-mode native build"
+        );
+    } else {
+        assert!(
+            !output.status.success(),
+            "stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let combined = format!("{stdout}\n{stderr}");
+        assert!(
+            combined.contains("native delivery build currently supports tauri darwin/arm64 only"),
+            "combined output:\n{combined}"
+        );
+    }
+}
+
+#[test]
+fn test_build_routes_inline_native_delivery_command_mode_projects() {
+    let tmp = tempdir().unwrap();
+    write_inline_native_command_build_fixture(tmp.path());
+    let output = Command::cargo_bin("ato")
+        .unwrap()
+        .args(["--json", "build", tmp.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64" {
+        assert!(
+            output.status.success(),
+            "stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let derived_from = tmp
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("src-tauri/target/release/bundle/macos/time-management-desktop.app");
+        assert!(
+            stdout.contains("\"build_strategy\": \"native-delivery\""),
+            "stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!(
+                "\"derived_from\": \"{}\"",
+                derived_from.to_string_lossy()
+            )),
+            "stdout:\n{stdout}"
+        );
+    } else {
+        assert!(
+            !output.status.success(),
+            "stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let combined = format!("{stdout}\n{stderr}");
+        assert!(
+            combined.contains("native delivery build currently supports tauri darwin/arm64 only"),
+            "combined output:\n{combined}"
+        );
+    }
 }
 
 #[test]
