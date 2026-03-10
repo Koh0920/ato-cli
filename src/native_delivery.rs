@@ -1765,9 +1765,7 @@ fn validate_delivery_config(config: &DeliveryConfig) -> Result<()> {
     if input.is_empty() {
         bail!("artifact.input must not be empty");
     }
-    if config.finalize.tool.trim().is_empty() {
-        bail!("finalize.tool must not be empty");
-    }
+    validate_finalize_tool(config.finalize.tool.trim())?;
     if config
         .finalize
         .args
@@ -1785,6 +1783,13 @@ fn validate_delivery_target(target: &str) -> Result<()> {
     let arch = segments.next().unwrap_or_default().trim();
     if os.is_empty() || arch.is_empty() || segments.next().is_some() {
         bail!("artifact.target must use the '<os>/<arch>' format");
+    }
+    Ok(())
+}
+
+fn validate_finalize_tool(tool: &str) -> Result<()> {
+    if tool.is_empty() {
+        bail!("finalize.tool must not be empty");
     }
     Ok(())
 }
@@ -3383,6 +3388,42 @@ input = "dist/time-management-desktop.app"
 [finalize]
     tool = "signtool"
     args = ["sign", "/fd", "SHA256", "MyApp.app"]
+"#,
+        )
+        .expect("config parse");
+        validate_delivery_config(&config).expect("config should be accepted");
+    }
+
+    #[test]
+    fn delivery_config_accepts_linux_target_with_noop_finalize_tool() {
+        let config: DeliveryConfig = toml::from_str(
+            r#"schema_version = "0.1"
+[artifact]
+    framework = "tauri"
+    stage = "unsigned"
+    target = "linux/x86_64"
+    input = "dist/my-app"
+[finalize]
+    tool = "none"
+    args = []
+"#,
+        )
+        .expect("config parse");
+        validate_delivery_config(&config).expect("config should be accepted");
+    }
+
+    #[test]
+    fn delivery_config_accepts_linux_aarch64_with_chmod_finalize_tool() {
+        let config: DeliveryConfig = toml::from_str(
+            r#"schema_version = "0.1"
+[artifact]
+    framework = "tauri"
+    stage = "unsigned"
+    target = "linux/aarch64"
+    input = "dist/my-app"
+[finalize]
+    tool = "chmod"
+    args = ["0755", "dist/my-app"]
 "#,
         )
         .expect("config parse");
