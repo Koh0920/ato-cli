@@ -263,6 +263,17 @@ pub(crate) fn build_native_artifact(
         bail!("native delivery build currently supports tauri darwin/arm64 only");
     }
 
+    build_native_artifact_with_strip(plan, output_path, strip_codesign_signature)
+}
+
+fn build_native_artifact_with_strip<F>(
+    plan: &NativeBuildPlan,
+    output_path: Option<&Path>,
+    strip_signature: F,
+) -> Result<NativeBuildResult>
+where
+    F: Fn(&Path) -> Result<()>,
+{
     let manifest_raw = fs::read_to_string(&plan.manifest_path).with_context(|| {
         format!(
             "Failed to read capsule manifest for native build: {}",
@@ -297,7 +308,7 @@ pub(crate) fn build_native_artifact(
                 .with_context(|| format!("Failed to create {}", parent.display()))?;
         }
         copy_recursively(&plan.source_app_path, &staged_app_path)?;
-        strip_codesign_signature(&staged_app_path)?;
+        strip_signature(&staged_app_path)?;
         validate_minimal_macos_app_permissions(&staged_app_path)?;
 
         fs::copy(
@@ -2029,6 +2040,8 @@ fn mode_bits(_metadata: &fs::Metadata) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use tempfile::tempdir;
 
@@ -2050,6 +2063,67 @@ args = ["--deep", "--force", "--sign", "-", "MyApp.app"]
 
     fn sample_fetch_dir(root: &Path) -> Result<PathBuf> {
         sample_fetch_dir_with_mode(root, 0o755)
+    }
+
+    fn sample_native_build_plan(root: &Path, mode: u32) -> Result<NativeBuildPlan> {
+        let manifest_dir = root.join("native-build-project");
+        let source_app_path = manifest_dir.join("MyApp.app");
+        let binary_path = source_app_path.join("Contents/MacOS/MyApp");
+        fs::create_dir_all(binary_path.parent().context("binary parent missing")?)?;
+        fs::write(
+            manifest_dir.join("capsule.toml"),
+            r#"schema_version = "0.2"
+name = "my-app"
+version = "0.1.0"
+type = "app"
+default_target = "cli"
+
+[targets.cli]
+runtime = "source"
+driver = "native"
+entrypoint = "MyApp.app"
+"#,
+        )?;
+        fs::write(
+            manifest_dir.join(DELIVERY_CONFIG_FILE),
+            sample_delivery_toml(),
+        )?;
+        fs::write(&binary_path, b"unsigned-app")?;
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&binary_path)?.permissions();
+            permissions.set_mode(mode);
+            fs::set_permissions(&binary_path, permissions)?;
+        }
+
+        detect_build_strategy(&manifest_dir)?.context("expected native delivery build plan")
+    }
+
+    fn read_payload_entry_modes(artifact_path: &Path) -> Result<BTreeMap<String, u32>> {
+        let capsule_bytes = fs::read(artifact_path)?;
+        let mut capsule = tar::Archive::new(Cursor::new(capsule_bytes));
+        let mut payload_tar_zst = None;
+        for entry in capsule.entries()? {
+            let mut entry = entry?;
+            let path = entry.path()?.to_path_buf();
+            if path == Path::new("payload.tar.zst") {
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes)?;
+                payload_tar_zst = Some(bytes);
+                break;
+            }
+        }
+
+        let payload_tar_zst = payload_tar_zst.context("payload.tar.zst missing from capsule")?;
+        let payload_tar = zstd::stream::decode_all(Cursor::new(payload_tar_zst))?;
+        let mut payload = tar::Archive::new(Cursor::new(payload_tar));
+        let mut entry_modes = BTreeMap::new();
+        for entry in payload.entries()? {
+            let entry = entry?;
+            let path = entry.path()?.display().to_string();
+            entry_modes.insert(path, entry.header().mode()?);
+        }
+        Ok(entry_modes)
     }
 
     fn sample_fetch_dir_with_mode(root: &Path, mode: u32) -> Result<PathBuf> {
@@ -2183,6 +2257,56 @@ args = ["--deep", "--force", "--sign", "-", "MyApp.app"]
         fs::write(left.join("a/b/file.txt"), b"hello")?;
         fs::write(right.join("a/b/file.txt"), b"hello")?;
         assert_eq!(compute_tree_digest(&left)?, compute_tree_digest(&right)?);
+        Ok(())
+    }
+
+    #[test]
+    fn build_native_artifact_preserves_source_and_payload_executable_mode() -> Result<()> {
+        let tmp = tempdir()?;
+        let plan = sample_native_build_plan(tmp.path(), 0o755)?;
+        let source_digest_before = compute_tree_digest(&plan.source_app_path)?;
+        let artifact_path = tmp.path().join("out/my-app-0.1.0.capsule");
+
+        let result = build_native_artifact_with_strip(&plan, Some(&artifact_path), |_app| Ok(()))?;
+
+        assert_eq!(result.build_strategy, "native-delivery");
+        assert_eq!(result.target, DELIVERY_TARGET);
+        assert_eq!(result.derived_from, plan.source_app_path);
+        assert_eq!(
+            compute_tree_digest(&plan.source_app_path)?,
+            source_digest_before
+        );
+
+        let entry_modes = read_payload_entry_modes(&artifact_path)?;
+        assert!(entry_modes.contains_key(DELIVERY_CONFIG_FILE));
+        #[cfg(unix)]
+        assert_eq!(
+            entry_modes
+                .get("MyApp.app/Contents/MacOS/MyApp")
+                .copied()
+                .unwrap_or_default()
+                & 0o111,
+            0o111
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_rejects_non_executable_without_mutation() -> Result<()> {
+        let tmp = tempdir()?;
+        let plan = sample_native_build_plan(tmp.path(), 0o644)?;
+        let source_digest_before = compute_tree_digest(&plan.source_app_path)?;
+        let artifact_path = tmp.path().join("out/my-app-0.1.0.capsule");
+
+        let err = build_native_artifact_with_strip(&plan, Some(&artifact_path), |_app| Ok(()))
+            .expect_err("build must fail closed when executable bit is missing");
+
+        assert!(err.to_string().contains("Executable bit is missing"));
+        assert_eq!(
+            compute_tree_digest(&plan.source_app_path)?,
+            source_digest_before
+        );
+        assert!(!artifact_path.exists());
         Ok(())
     }
 
