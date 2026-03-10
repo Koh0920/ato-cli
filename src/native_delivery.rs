@@ -36,6 +36,7 @@ const PROJECTIONS_DIR: &str = ".ato/native-delivery/projections";
 const PROJECTION_KIND_SYMLINK: &str = "symlink";
 const PROJECTION_KIND_LINUX_DESKTOP_ENTRY: &str = "linux-desktop-entry";
 const DEFAULT_DERIVED_APPS_DIR: &str = ".ato/apps";
+const LINUX_PROJECTION_EXEC_SEARCH_MAX_DEPTH: usize = 3;
 
 #[derive(Debug, Serialize)]
 pub struct FetchResult {
@@ -1687,7 +1688,7 @@ fn resolve_linux_projection_command_target(derived_app_path: &Path) -> Result<Pa
 
     let mut candidates = WalkDir::new(derived_app_path)
         .min_depth(1)
-        .max_depth(3)
+        .max_depth(LINUX_PROJECTION_EXEC_SEARCH_MAX_DEPTH)
         .into_iter()
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.file_type().is_file())
@@ -1698,7 +1699,8 @@ fn resolve_linux_projection_command_target(derived_app_path: &Path) -> Result<Pa
     match candidates.len() {
         1 => Ok(candidates.remove(0)),
         0 => bail!(
-            "Projection input is missing an executable command within {}",
+            "Projection input is missing an executable command within {} levels of {}",
+            LINUX_PROJECTION_EXEC_SEARCH_MAX_DEPTH,
             derived_app_path.display()
         ),
         _ => {
@@ -1713,7 +1715,8 @@ fn resolve_linux_projection_command_target(derived_app_path: &Path) -> Result<Pa
                 .collect::<Vec<_>>()
                 .join(", ");
             bail!(
-                "Projection input contains multiple executable command candidates in {}: {}",
+                "Projection input contains multiple executable command candidates within {} levels of {}: {}",
+                LINUX_PROJECTION_EXEC_SEARCH_MAX_DEPTH,
                 derived_app_path.display(),
                 joined
             )
@@ -3116,7 +3119,7 @@ fn sanitize_projection_segment(value: &str) -> String {
     let mut out = String::new();
     let mut previous_dash = false;
     for ch in value.chars() {
-        let normalized = if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+        let normalized = if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
             ch.to_ascii_lowercase()
         } else {
             '-'
@@ -3145,19 +3148,25 @@ fn render_linux_desktop_entry(
     derived_app_path: &Path,
 ) -> String {
     format!(
-        "[Desktop Entry]\nType=Application\nVersion=1.0\nName={display_name}\nExec={}\nPath={}\nTerminal=false\n",
-        escape_desktop_entry_value(projected_command_path),
-        escape_desktop_entry_value(derived_app_path),
+        "[Desktop Entry]\nType=Application\nVersion=1.0\nName={}\nExec={}\nPath={}\nTerminal=false\n",
+        escape_desktop_entry_string_value(display_name),
+        escape_desktop_entry_exec_value(projected_command_path),
+        escape_desktop_entry_string_value(&derived_app_path.to_string_lossy()),
     )
 }
 
-fn escape_desktop_entry_value(path: &Path) -> String {
-    let value = path.to_string_lossy();
-    if value.contains([' ', '"', '\\']) {
-        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
-    } else {
-        value.into_owned()
-    }
+fn escape_desktop_entry_string_value(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
+fn escape_desktop_entry_exec_value(path: &Path) -> String {
+    escape_desktop_entry_string_value(&path.to_string_lossy())
+        .replace(' ', "\\ ")
+        .replace('"', "\\\"")
 }
 
 fn remove_projected_path(path: &Path, projection_kind: &str) -> Result<bool> {
@@ -3875,6 +3884,91 @@ input = "dist/time-management-desktop.app"
         } else {
             derived_app.join("my-app")
         }
+    }
+
+    #[test]
+    fn sanitize_projection_segment_normalizes_special_characters() {
+        assert_eq!(sanitize_projection_segment("My App"), "my-app");
+        assert_eq!(sanitize_projection_segment("---"), "ato-app");
+        assert_eq!(sanitize_projection_segment("my___app"), "my___app");
+        assert_eq!(sanitize_projection_segment("My.App"), "my-app");
+    }
+
+    #[test]
+    fn projection_name_helpers_prefer_scoped_slug_when_available() -> Result<()> {
+        let derived_app_path = Path::new("/tmp/Time Management Desktop.app");
+        assert_eq!(
+            projection_display_name(derived_app_path, Some("koh0920/time-management-desktop"))?,
+            "Time Management Desktop"
+        );
+        assert_eq!(
+            projection_command_name(derived_app_path, Some("koh0920/time-management-desktop"))?,
+            "time-management-desktop"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn render_linux_desktop_entry_escapes_special_characters() {
+        let rendered = render_linux_desktop_entry(
+            "My App\nTabbed\tName",
+            Path::new("/tmp/My App/bin/my\"app"),
+            Path::new("/tmp/My App/root"),
+        );
+        assert!(rendered.contains("Name=My App\\nTabbed\\tName"));
+        assert!(rendered.contains("Exec=/tmp/My\\ App/bin/my\\\"app"));
+        assert!(rendered.contains("Path=/tmp/My App/root"));
+    }
+
+    #[test]
+    fn resolve_linux_projection_command_target_prefers_named_binary() -> Result<()> {
+        let tmp = tempdir()?;
+        let app_dir = tmp.path().join("my-app");
+        let preferred = app_dir.join("my-app");
+        let other = app_dir.join("bin/helper");
+        fs::create_dir_all(other.parent().context("helper parent missing")?)?;
+        fs::write(&preferred, b"#!/bin/sh\n")?;
+        fs::write(&other, b"#!/bin/sh\n")?;
+        #[cfg(unix)]
+        {
+            for path in [&preferred, &other] {
+                let mut permissions = fs::metadata(path)?.permissions();
+                permissions.set_mode(0o755);
+                fs::set_permissions(path, permissions)?;
+            }
+        }
+
+        assert_eq!(
+            resolve_linux_projection_command_target(&app_dir)?,
+            preferred
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_linux_projection_command_target_rejects_multiple_candidates() -> Result<()> {
+        let tmp = tempdir()?;
+        let app_dir = tmp.path().join("my-app");
+        let first = app_dir.join("bin/alpha");
+        let second = app_dir.join("bin/beta");
+        fs::create_dir_all(first.parent().context("bin parent missing")?)?;
+        fs::write(&first, b"#!/bin/sh\n")?;
+        fs::write(&second, b"#!/bin/sh\n")?;
+        #[cfg(unix)]
+        {
+            for path in [&first, &second] {
+                let mut permissions = fs::metadata(path)?.permissions();
+                permissions.set_mode(0o755);
+                fs::set_permissions(path, permissions)?;
+            }
+        }
+
+        let err = resolve_linux_projection_command_target(&app_dir)
+            .expect_err("multiple executable candidates should fail");
+        assert!(err
+            .to_string()
+            .contains("multiple executable command candidates"));
+        Ok(())
     }
 
     #[test]
