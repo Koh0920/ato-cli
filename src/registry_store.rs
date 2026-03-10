@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use ed25519_dalek::{Signer, SigningKey};
+use rand::rngs::OsRng;
 use rand::RngCore;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use semver::Version;
@@ -22,6 +23,9 @@ const ACTIVE_KEY_FILE: &str = "active";
 const DEFAULT_LEASE_TTL_SECS: u64 = 900;
 const DEFAULT_GC_DEFER_SECS: i64 = 30;
 const RETENTION_PINNED_RELEASES: i64 = 5;
+// 128-bit random ids already make collisions vanishingly unlikely, but a small retry
+// budget keeps the insert path fail-closed if SQLite reports a uniqueness race.
+const MAX_STATE_ID_GENERATION_ATTEMPTS: usize = 10;
 const SCHEMA_MIGRATION_0001: &str = "2026-03-05-0001-manifests-tombstoned";
 const SCHEMA_MIGRATION_0002: &str = "2026-03-05-0002-leases-composite";
 const SCHEMA_MIGRATION_0003: &str = "2026-03-05-0003-gc-indexes";
@@ -40,9 +44,9 @@ fn manifest_distribution(
     })
 }
 
-fn generate_state_id() -> String {
+fn generate_random_state_id() -> String {
     let mut bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    OsRng.fill_bytes(&mut bytes);
     format!("state-{}", hex::encode(bytes))
 }
 
@@ -386,28 +390,55 @@ impl RegistryStore {
         record: &NewPersistentStateRecord,
     ) -> Result<PersistentStateRecord> {
         let now = chrono::Utc::now().to_rfc3339();
-        let state_id = generate_state_id();
         let conn = self.connect()?;
-        conn.execute(
-            "INSERT INTO persistent_states(
-                state_id, owner_scope, state_name, backend_locator, producer, purpose, schema_id, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
-            params![
-                state_id,
-                record.owner_scope,
-                record.state_name,
-                record.backend_locator,
-                record.producer,
-                record.purpose,
-                record.schema_id,
-                now,
-            ],
-        )?;
-        self.find_persistent_state_by_owner_and_locator(
-            &record.owner_scope,
-            &record.backend_locator,
-        )?
-        .ok_or_else(|| anyhow::anyhow!("persistent state registration did not persist"))
+        for _ in 0..MAX_STATE_ID_GENERATION_ATTEMPTS {
+            let state_id = generate_random_state_id();
+            match conn.execute(
+                "INSERT INTO persistent_states(
+                    state_id, owner_scope, state_name, backend_locator, producer, purpose, schema_id, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+                params![
+                    state_id,
+                    record.owner_scope,
+                    record.state_name,
+                    record.backend_locator,
+                    record.producer,
+                    record.purpose,
+                    record.schema_id,
+                    now,
+                ],
+            ) {
+                Ok(_) => {
+                    return self
+                        .find_persistent_state_by_owner_and_locator(
+                            &record.owner_scope,
+                            &record.backend_locator,
+                        )?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "failed to retrieve persistent state after registration - database inconsistency detected"
+                            )
+                        });
+                }
+                Err(rusqlite::Error::SqliteFailure(err, _))
+                    if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+                {
+                    if let Some(existing) = self.find_persistent_state_by_owner_and_locator(
+                        &record.owner_scope,
+                        &record.backend_locator,
+                    )? {
+                        return Ok(existing);
+                    }
+                    continue;
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        anyhow::bail!(
+            "failed to allocate a unique persistent state id after {} attempts",
+            MAX_STATE_ID_GENERATION_ATTEMPTS
+        );
     }
 
     fn map_persistent_state_row(

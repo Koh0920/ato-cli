@@ -2049,9 +2049,17 @@ impl CapsuleManifest {
         }
     }
 
+    /// Resolve the producer identity for a state requirement.
+    ///
+    /// When `producer` is omitted on `[state.<name>]`, the manifest name is used as the
+    /// default producer identity so persistent attach checks remain fail-closed. When
+    /// both are empty, this returns `None`; callers should treat that as a validation
+    /// failure and reject the attach.
     pub fn state_producer(&self, state_name: &str) -> Option<String> {
         self.state
             .get(state_name.trim())
+            // Prefer an explicit producer on the state requirement; otherwise fall back to the
+            // manifest identity so persistent attach compatibility remains fail-closed by default.
             .and_then(|requirement| requirement.producer.as_deref())
             .map(str::trim)
             .filter(|producer| !producer.is_empty())
