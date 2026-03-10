@@ -21,9 +21,7 @@ pub fn update() -> Result<()> {
 
     let mut updater = AxoUpdater::new_for("ato");
     if let Err(receipt_err) = updater.load_receipt() {
-        eprintln!(
-            "ℹ️  install receipt が見つからないため installer fallback で更新します..."
-        );
+        eprintln!("ℹ️  install receipt が見つからないため installer fallback で更新します...");
         return fallback_update_via_installer().with_context(|| {
             format!(
                 "ato のインストール情報を読み込めませんでした: {}",
@@ -71,7 +69,9 @@ fn resolve_latest_release_api_url() -> Result<String> {
         .strip_prefix("https://github.com/")
         .or_else(|| repository.strip_prefix("http://github.com/"))
         .or_else(|| repository.strip_prefix("git@github.com:"))
-        .ok_or_else(|| anyhow::anyhow!("unsupported repository url for update source: {repository}"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("unsupported repository url for update source: {repository}")
+        })?;
     let path = path.trim_end_matches(".git");
     let mut segments = path.split('/');
     let owner = segments.next().unwrap_or("").trim();
@@ -127,13 +127,12 @@ fn fallback_update_via_installer() -> Result<()> {
             );
         }
         Err(err) => {
-            eprintln!(
-                "⚠️  最新版の確認に失敗したため installer fallback を継続します: {err}"
-            );
+            eprintln!("⚠️  最新版の確認に失敗したため installer fallback を継続します: {err}");
         }
     }
 
-    let current_exe = std::env::current_exe().context("現在の ato 実行パスを取得できませんでした")?;
+    let current_exe =
+        std::env::current_exe().context("現在の ato 実行パスを取得できませんでした")?;
     let install_dir = current_exe.parent().ok_or_else(|| {
         anyhow::anyhow!(
             "現在の ato 実行パスから install directory を解決できませんでした: {}",
@@ -153,10 +152,15 @@ fn fallback_update_via_installer() -> Result<()> {
         .text()
         .with_context(|| format!("installer の応答を読み取れませんでした: {installer_url}"))?;
 
-    let temp_dir = tempfile::tempdir().context("installer 実行用の一時ディレクトリを作成できませんでした")?;
+    let temp_dir =
+        tempfile::tempdir().context("installer 実行用の一時ディレクトリを作成できませんでした")?;
     let installer_path = temp_dir.path().join("ato-install.sh");
-    fs::write(&installer_path, installer_body)
-        .with_context(|| format!("installer を保存できませんでした: {}", installer_path.display()))?;
+    fs::write(&installer_path, installer_body).with_context(|| {
+        format!(
+            "installer を保存できませんでした: {}",
+            installer_path.display()
+        )
+    })?;
 
     let status = Command::new("sh")
         .arg(&installer_path)

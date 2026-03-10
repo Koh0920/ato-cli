@@ -36,6 +36,7 @@ ato registry serve --host 127.0.0.1 --port 18787 [--auth-token <token>]
 - Native install JSON exposes `local_derivation` and `projection` envelopes. For this contract generation, `schema_version = "0.1"` is the stable machine-readable version for fetch/finalize/project/unproject/install metadata.
 - `fetch`, `finalize`, `project`, and `unproject` remain advanced/debug surfaces. Most users should stay on the integrated `build` / `publish` / `install` flow.
 - Local finalize is currently fail-closed and limited to macOS darwin/arm64 with `codesign`.
+- Projection currently creates a macOS `~/Applications` symlink on macOS hosts, and a Linux `.desktop` launcher plus `~/.local/bin` symlink on Linux hosts.
 
 ## Quick Start (Local)
 
