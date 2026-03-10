@@ -2,12 +2,11 @@ name: Build (Multi OS)
 
 on:
   workflow_dispatch:
+  pull_request:
   push:
     branches:
       - dev
       - main
-    tags:
-      - "v*.*.*"
 
 permissions:
   contents: read
