@@ -427,7 +427,7 @@ where
     }
 
     validate_native_bundle_directory(&plan.source_app_path)?;
-    ensure_local_native_artifact_supported(&plan.source_app_path, "build")?;
+    ensure_native_artifact_kind_supported(&plan.source_app_path, "build")?;
     let manifest_raw = fs::read_to_string(&plan.manifest_path).with_context(|| {
         format!(
             "Failed to read capsule manifest for native build: {}",
@@ -1009,7 +1009,7 @@ where
     validate_relative_input_path(&input_relative)?;
     let input_app_path = artifact_root.join(&input_relative);
     validate_native_bundle_directory(&input_app_path)?;
-    ensure_local_native_artifact_supported(&input_app_path, "finalize")?;
+    ensure_native_artifact_kind_supported(&input_app_path, "finalize")?;
 
     fs::create_dir_all(output_dir).with_context(|| {
         format!(
@@ -1804,7 +1804,7 @@ fn rebase_delivery_config_for_finalize(
     Ok(derived_config)
 }
 
-fn ensure_local_native_artifact_supported(path: &Path, action: &str) -> Result<NativeArtifactKind> {
+fn ensure_native_artifact_kind_supported(path: &Path, action: &str) -> Result<NativeArtifactKind> {
     let kind = NativeArtifactKind::from_path(path);
     if kind == NativeArtifactKind::File {
         bail!(
@@ -3344,6 +3344,23 @@ input = "dist/time-management-desktop.app"
         assert_eq!(rebased.finalize.args[3], "MyApp.exe");
         assert_eq!(rebased.finalize.args[5], "http://tsa.test/dist/MyApp.exe");
         Ok(())
+    }
+
+    #[test]
+    fn delivery_target_os_family_parses_expected_values() {
+        assert_eq!(delivery_target_os_family("darwin/arm64"), Some("darwin"));
+        assert_eq!(delivery_target_os_family("windows/x86_64"), Some("windows"));
+        assert_eq!(delivery_target_os_family(""), None);
+        assert_eq!(delivery_target_os_family("/arm64"), None);
+    }
+
+    #[test]
+    fn supports_projection_target_accepts_darwin_only() {
+        assert!(supports_projection_target("darwin/arm64"));
+        assert!(supports_projection_target("darwin/x86_64"));
+        assert!(!supports_projection_target("windows/x86_64"));
+        assert!(!supports_projection_target("linux/x86_64"));
+        assert!(!supports_projection_target(""));
     }
 
     #[test]
