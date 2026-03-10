@@ -471,6 +471,7 @@ fn extract_exit_code(metrics: &capsule_core::UnifiedMetrics) -> i32 {
 mod tests {
     use super::*;
     use crate::ipc::inject::{IpcContext, SessionActivationMode};
+    use std::collections::HashMap;
     use tempfile::tempdir;
 
     #[test]
@@ -530,6 +531,7 @@ mod tests {
             manifest_dir: dir.path().to_path_buf(),
             profile: capsule_core::router::ExecutionProfile::Dev,
             selected_target: "dev".to_string(),
+            state_source_overrides: HashMap::new(),
         };
 
         let normalized_path = write_normalized_manifest(&plan).unwrap();
@@ -561,6 +563,7 @@ mod tests {
             manifest_dir: dir.path().to_path_buf(),
             profile: capsule_core::router::ExecutionProfile::Dev,
             selected_target: "dev".to_string(),
+            state_source_overrides: HashMap::new(),
         };
         let launch_ctx = RuntimeLaunchContext::from_ipc(IpcContext {
             env_vars: std::collections::HashMap::from([(
