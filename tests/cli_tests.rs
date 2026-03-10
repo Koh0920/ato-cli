@@ -140,7 +140,7 @@ fn test_project_help_shows_launcher_projection_contract() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "Add a finalized app to launcher surfaces",
+            "Add a finalized app to launcher surfaces (experimental)",
         ))
         .stdout(predicate::str::contains("ato finalize"))
         .stdout(predicate::str::contains("--launcher-dir <LAUNCHER_DIR>"))
@@ -167,7 +167,7 @@ fn test_unproject_help_shows_projection_reference_contract() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "Remove a launcher projection without mutating the finalized artifact",
+            "Remove an experimental launcher projection without mutating the finalized artifact",
         ))
         .stdout(predicate::str::contains("Projection ID"))
         .stdout(predicate::str::contains("--json"));
@@ -235,7 +235,11 @@ fn test_finalize_accepts_subcommand_json_flag() {
     );
 }
 
-fn write_native_build_fixture(root: &std::path::Path, executable: bool) {
+fn write_native_build_fixture(
+    root: &std::path::Path,
+    executable: bool,
+    include_delivery_sidecar: bool,
+) {
     fs::create_dir_all(root.join("MyApp.app/Contents/MacOS")).unwrap();
     fs::write(
         root.join("capsule.toml"),
@@ -252,9 +256,10 @@ entrypoint = "MyApp.app"
 "#,
     )
     .unwrap();
-    fs::write(
-        root.join("ato.delivery.toml"),
-        r#"schema_version = "exp-0.1"
+    if include_delivery_sidecar {
+        fs::write(
+            root.join("ato.delivery.toml"),
+            r#"schema_version = "0.1"
 [artifact]
 framework = "tauri"
 stage = "unsigned"
@@ -264,8 +269,9 @@ input = "MyApp.app"
 tool = "codesign"
 args = ["--deep", "--force", "--sign", "-", "MyApp.app"]
 "#,
-    )
-    .unwrap();
+        )
+        .unwrap();
+    }
     let binary = root.join("MyApp.app/Contents/MacOS/MyApp");
     fs::write(&binary, b"#!/bin/sh\necho native\n").unwrap();
     #[cfg(unix)]
@@ -283,7 +289,7 @@ args = ["--deep", "--force", "--sign", "-", "MyApp.app"]
 #[test]
 fn test_build_routes_native_delivery_projects() {
     let tmp = tempdir().unwrap();
-    write_native_build_fixture(tmp.path(), true);
+    write_native_build_fixture(tmp.path(), true, true);
     let mut cmd = Command::cargo_bin("ato").unwrap();
     let output = cmd
         .args(["--json", "build", tmp.path().to_str().unwrap()])
@@ -297,9 +303,13 @@ fn test_build_routes_native_delivery_projects() {
             output.status.success(),
             "stdout:\n{stdout}\nstderr:\n{stderr}"
         );
-        let derived_from = tmp.path().join("MyApp.app");
+        let derived_from = tmp.path().canonicalize().unwrap().join("MyApp.app");
         assert!(
             stdout.contains("\"build_strategy\": \"native-delivery\""),
+            "stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("\"schema_version\": \"0.1\""),
             "stdout:\n{stdout}"
         );
         assert!(
@@ -325,6 +335,56 @@ fn test_build_routes_native_delivery_projects() {
             "combined output:\n{combined}"
         );
     }
+}
+
+#[test]
+fn test_build_routes_native_delivery_projects_without_delivery_sidecar() {
+    let tmp = tempdir().unwrap();
+    write_native_build_fixture(tmp.path(), true, false);
+    let output = Command::cargo_bin("ato")
+        .unwrap()
+        .args(["--json", "build", tmp.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64" {
+        assert!(
+            output.status.success(),
+            "stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stdout.contains("\"build_strategy\": \"native-delivery\""),
+            "stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("\"schema_version\": \"0.1\""),
+            "stdout:\n{stdout}"
+        );
+    } else {
+        assert!(
+            !output.status.success(),
+            "stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let combined = format!("{stdout}\n{stderr}");
+        assert!(
+            combined.contains("native delivery build currently supports tauri darwin/arm64 only"),
+            "combined output:\n{combined}"
+        );
+    }
+}
+
+#[test]
+fn test_install_help_shows_native_projection_controls() {
+    let mut cmd = Command::cargo_bin("ato").unwrap();
+    cmd.args(["install", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--yes"))
+        .stdout(predicate::str::contains("--project"))
+        .stdout(predicate::str::contains("--no-project"))
+        .stdout(predicate::str::contains("local finalize / projection"));
 }
 
 #[test]

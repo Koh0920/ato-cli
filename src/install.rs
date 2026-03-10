@@ -63,6 +63,7 @@ pub enum LaunchableTarget {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LocalDerivationInfo {
+    pub schema_version: String,
     pub performed: bool,
     pub fetched_dir: PathBuf,
     pub derived_app_path: Option<PathBuf>,
@@ -77,6 +78,8 @@ pub struct ProjectionInfo {
     pub projection_id: Option<String>,
     pub projected_path: Option<PathBuf>,
     pub state: Option<String>,
+    pub schema_version: Option<String>,
+    pub metadata_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -565,6 +568,12 @@ pub async fn install_app(
 
     let native_spec = crate::native_delivery::detect_install_requires_local_derivation(&bytes)?;
     if let Some(_native_spec) = native_spec {
+        if !crate::native_delivery::host_supports_finalize() {
+            bail!(
+                "This app requires local finalize, but this host does not support native finalize (macOS darwin/arm64 only)."
+            );
+        }
+
         let finalize_allowed = if yes {
             true
         } else if can_prompt_interactively && !json_output {
@@ -614,7 +623,11 @@ pub async fn install_app(
                     performed: false,
                     projection_id: None,
                     projected_path: None,
-                    state: None,
+                    state: Some("skipped".to_string()),
+                    schema_version: Some(
+                        crate::native_delivery::delivery_schema_version().to_string(),
+                    ),
+                    metadata_path: None,
                 }
             }
             ProjectionPreference::Force => {
@@ -627,6 +640,10 @@ pub async fn install_app(
                         projection_id: Some(result.projection_id),
                         projected_path: Some(result.projected_path),
                         state: Some(result.state),
+                        schema_version: Some(
+                            crate::native_delivery::delivery_schema_version().to_string(),
+                        ),
+                        metadata_path: Some(result.metadata_path),
                     },
                     Err(err) => {
                         if !json_output {
@@ -641,6 +658,10 @@ pub async fn install_app(
                             projection_id: None,
                             projected_path: None,
                             state: Some("failed".to_string()),
+                            schema_version: Some(
+                                crate::native_delivery::delivery_schema_version().to_string(),
+                            ),
+                            metadata_path: None,
                         }
                     }
                 }
@@ -666,6 +687,10 @@ pub async fn install_app(
                             projection_id: Some(result.projection_id),
                             projected_path: Some(result.projected_path),
                             state: Some(result.state),
+                            schema_version: Some(
+                                crate::native_delivery::delivery_schema_version().to_string(),
+                            ),
+                            metadata_path: Some(result.metadata_path),
                         },
                         Err(err) => {
                             if !json_output {
@@ -680,6 +705,10 @@ pub async fn install_app(
                                 projection_id: None,
                                 projected_path: None,
                                 state: Some("failed".to_string()),
+                                schema_version: Some(
+                                    crate::native_delivery::delivery_schema_version().to_string(),
+                                ),
+                                metadata_path: None,
                             }
                         }
                     }
@@ -691,7 +720,11 @@ pub async fn install_app(
                         performed: false,
                         projection_id: None,
                         projected_path: None,
-                        state: None,
+                        state: Some("skipped".to_string()),
+                        schema_version: Some(
+                            crate::native_delivery::delivery_schema_version().to_string(),
+                        ),
+                        metadata_path: None,
                     }
                 }
             }
@@ -710,6 +743,7 @@ pub async fn install_app(
                 path: finalize_result.derived_app_path.clone(),
             }),
             local_derivation: Some(LocalDerivationInfo {
+                schema_version: crate::native_delivery::delivery_schema_version().to_string(),
                 performed: true,
                 fetched_dir: fetch_result.cache_dir,
                 derived_app_path: Some(finalize_result.derived_app_path),

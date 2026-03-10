@@ -20,6 +20,8 @@ pub struct BuildResult {
     pub image: Option<String>,
     pub build_strategy: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub derived_from: Option<PathBuf>,
@@ -159,6 +161,7 @@ pub fn execute_pack_command(
             artifact: Some(result.artifact_path),
             image: None,
             build_strategy: result.build_strategy,
+            schema_version: Some(result.schema_version),
             target: Some(result.target),
             derived_from: Some(result.derived_from),
         });
@@ -270,6 +273,7 @@ pub fn execute_pack_command(
                 artifact: Some(artifact_path),
                 image: None,
                 build_strategy: "source".to_string(),
+                schema_version: None,
                 target: None,
                 derived_from: None,
             }
@@ -311,6 +315,7 @@ pub fn execute_pack_command(
                 artifact: archive,
                 image: Some(result.image),
                 build_strategy: "oci".to_string(),
+                schema_version: None,
                 target: None,
                 derived_from: None,
             }
@@ -336,6 +341,7 @@ pub fn execute_pack_command(
                 artifact: Some(result.artifact),
                 image: None,
                 build_strategy: "wasm".to_string(),
+                schema_version: None,
                 target: None,
                 derived_from: None,
             }
@@ -428,6 +434,7 @@ pub fn execute_pack_command(
                 artifact: Some(artifact_path),
                 image: None,
                 build_strategy: "web".to_string(),
+                schema_version: None,
                 target: None,
                 derived_from: None,
             }
