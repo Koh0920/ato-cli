@@ -1440,6 +1440,25 @@ enum BindingCommands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Register a local cross-capsule service binding for a separately launched service
+    RegisterService {
+        /// Path to capsule directory or capsule.toml
+        #[arg(long, default_value = ".")]
+        manifest: PathBuf,
+
+        /// Service name from [services.<name>]
+        #[arg(long)]
+        service_name: String,
+
+        /// Loopback URL for the running local service (http://localhost:PORT or http://127.0.0.1:PORT)
+        #[arg(long)]
+        url: String,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2552,6 +2571,12 @@ fn execute_binding_command(command: BindingCommands) -> Result<()> {
             url,
             json,
         } => binding::register_ingress_binding_from_manifest(&manifest, &service_name, &url, json),
+        BindingCommands::RegisterService {
+            manifest,
+            service_name,
+            url,
+            json,
+        } => binding::register_service_binding_from_manifest(&manifest, &service_name, &url, json),
     }
 }
 

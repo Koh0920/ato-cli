@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::net::IpAddr;
 use std::path::Path;
 
 use crate::ingress_proxy;
@@ -6,7 +7,9 @@ use crate::registry_store::{NewServiceBindingRecord, RegistryStore, ServiceBindi
 use capsule_core::types::CapsuleManifest;
 
 pub const SERVICE_BINDING_KIND_INGRESS: &str = "ingress";
+pub const SERVICE_BINDING_KIND_SERVICE: &str = "service";
 pub const SERVICE_BINDING_ADAPTER_REVERSE_PROXY: &str = "reverse_proxy";
+pub const SERVICE_BINDING_ADAPTER_LOCAL_SERVICE: &str = "local_service";
 pub const SERVICE_BINDING_TLS_MODE_DISABLED: &str = "disabled";
 pub const SERVICE_BINDING_TLS_MODE_EXPLICIT: &str = "explicit";
 
@@ -205,7 +208,49 @@ pub fn register_ingress_binding(
 ) -> Result<ServiceBindingRecord> {
     let manifest = load_manifest(manifest_path)?;
     let endpoint = normalize_endpoint_locator(url)?;
-    let contract = service_binding_contract(&manifest, service_name, &endpoint)?;
+    let contract = ingress_binding_contract(&manifest, service_name, &endpoint)?;
+    open_binding_store()?.register_service_binding(&NewServiceBindingRecord {
+        owner_scope: contract.owner_scope,
+        service_name: contract.service_name,
+        binding_kind: contract.binding_kind,
+        transport_kind: contract.transport_kind,
+        adapter_kind: contract.adapter_kind,
+        endpoint_locator: endpoint,
+        tls_mode: contract.tls_mode,
+        allowed_callers: contract.allowed_callers,
+        target_hint: contract.target_hint,
+    })
+}
+
+pub fn register_service_binding_from_manifest(
+    manifest_path: &Path,
+    service_name: &str,
+    url: &str,
+    json: bool,
+) -> Result<()> {
+    let record = register_service_binding(manifest_path, service_name, url)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&record)?);
+        return Ok(());
+    }
+
+    println!("✅ Registered local service binding {}", record.binding_id);
+    println!("   owner_scope: {}", record.owner_scope);
+    println!("   service_name: {}", record.service_name);
+    println!("   endpoint_locator: {}", record.endpoint_locator);
+    println!("   tls_mode: {}", record.tls_mode);
+    Ok(())
+}
+
+pub fn register_service_binding(
+    manifest_path: &Path,
+    service_name: &str,
+    url: &str,
+) -> Result<ServiceBindingRecord> {
+    let manifest = load_manifest(manifest_path)?;
+    let endpoint = normalize_local_service_locator(url)?;
+    let contract = local_service_binding_contract(&manifest, service_name, &endpoint)?;
     open_binding_store()?.register_service_binding(&NewServiceBindingRecord {
         owner_scope: contract.owner_scope,
         service_name: contract.service_name,
@@ -331,13 +376,60 @@ fn normalize_endpoint_locator(raw: &str) -> Result<String> {
     match parsed.scheme() {
         "http" | "https" => Ok(parsed.to_string()),
         scheme => anyhow::bail!(
-            "host-side ingress endpoint must use http or https scheme (got '{}')",
+            "host-side service binding endpoint must use http or https scheme (got '{}')",
             scheme
         ),
     }
 }
 
-fn service_binding_contract(
+fn normalize_local_service_locator(raw: &str) -> Result<String> {
+    let normalized = normalize_endpoint_locator(raw)?;
+    let parsed = reqwest::Url::parse(&normalized)?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("local service binding endpoint is missing a host"))?;
+    let is_loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false);
+    if !is_loopback {
+        anyhow::bail!(
+            "local service binding endpoint must use a loopback host such as localhost or 127.0.0.1"
+        );
+    }
+    Ok(normalized)
+}
+
+fn service_contract(
+    manifest: &CapsuleManifest,
+    service_name: &str,
+) -> Result<ServiceBindingContract> {
+    let service = manifest
+        .services
+        .as_ref()
+        .and_then(|services| services.get(service_name))
+        .ok_or_else(|| {
+            anyhow::anyhow!("service '{}' is not declared in the manifest", service_name)
+        })?;
+
+    Ok(ServiceBindingContract {
+        owner_scope: host_service_binding_scope(manifest)?,
+        service_name: service_name.to_string(),
+        binding_kind: String::new(),
+        transport_kind: String::new(),
+        adapter_kind: String::new(),
+        tls_mode: String::new(),
+        allowed_callers: service
+            .network
+            .as_ref()
+            .map(|network| network.allow_from.clone())
+            .unwrap_or_default(),
+        target_hint: service.target.clone(),
+    })
+}
+
+fn ingress_binding_contract(
     manifest: &CapsuleManifest,
     service_name: &str,
     endpoint_locator: &str,
@@ -375,20 +467,36 @@ fn service_binding_contract(
         SERVICE_BINDING_TLS_MODE_DISABLED
     };
 
-    Ok(ServiceBindingContract {
-        owner_scope: host_service_binding_scope(manifest)?,
-        service_name: service_name.to_string(),
-        binding_kind: SERVICE_BINDING_KIND_INGRESS.to_string(),
-        transport_kind: transport_kind.to_string(),
-        adapter_kind: SERVICE_BINDING_ADAPTER_REVERSE_PROXY.to_string(),
-        tls_mode: tls_mode.to_string(),
-        allowed_callers: service
-            .network
-            .as_ref()
-            .map(|network| network.allow_from.clone())
-            .unwrap_or_default(),
-        target_hint: service.target.clone(),
-    })
+    let mut contract = service_contract(manifest, service_name)?;
+    contract.binding_kind = SERVICE_BINDING_KIND_INGRESS.to_string();
+    contract.transport_kind = transport_kind.to_string();
+    contract.adapter_kind = SERVICE_BINDING_ADAPTER_REVERSE_PROXY.to_string();
+    contract.tls_mode = tls_mode.to_string();
+    Ok(contract)
+}
+
+fn local_service_binding_contract(
+    manifest: &CapsuleManifest,
+    service_name: &str,
+    endpoint_locator: &str,
+) -> Result<ServiceBindingContract> {
+    let transport_kind = if endpoint_locator.starts_with("https://") {
+        "https"
+    } else {
+        "http"
+    };
+    let tls_mode = if transport_kind == "https" {
+        SERVICE_BINDING_TLS_MODE_EXPLICIT
+    } else {
+        SERVICE_BINDING_TLS_MODE_DISABLED
+    };
+
+    let mut contract = service_contract(manifest, service_name)?;
+    contract.binding_kind = SERVICE_BINDING_KIND_SERVICE.to_string();
+    contract.transport_kind = transport_kind.to_string();
+    contract.adapter_kind = SERVICE_BINDING_ADAPTER_LOCAL_SERVICE.to_string();
+    contract.tls_mode = tls_mode.to_string();
+    Ok(contract)
 }
 
 fn derive_service_upstream_locator(
@@ -436,8 +544,9 @@ fn derive_service_upstream_locator(
 #[cfg(test)]
 mod tests {
     use super::{
-        derive_service_upstream_locator, normalize_endpoint_locator, parse_binding_reference,
-        service_binding_contract,
+        derive_service_upstream_locator, ingress_binding_contract, local_service_binding_contract,
+        normalize_endpoint_locator, normalize_local_service_locator, parse_binding_reference,
+        SERVICE_BINDING_KIND_SERVICE,
     };
     use capsule_core::types::CapsuleManifest;
 
@@ -460,7 +569,16 @@ mod tests {
     }
 
     #[test]
-    fn service_binding_contract_carries_allow_from_metadata() {
+    fn normalize_local_service_locator_requires_loopback_host() {
+        assert_eq!(
+            normalize_local_service_locator("http://127.0.0.1:8080/").expect("loopback"),
+            "http://127.0.0.1:8080/"
+        );
+        assert!(normalize_local_service_locator("https://example.com/api").is_err());
+    }
+
+    #[test]
+    fn ingress_binding_contract_carries_allow_from_metadata() {
         let manifest = CapsuleManifest::from_toml(
             r#"
 schema_version = "0.2"
@@ -481,8 +599,35 @@ network = { publish = true, allow_from = ["web", "worker"] }
         .expect("manifest");
 
         let contract =
-            service_binding_contract(&manifest, "api", "https://demo.local/").expect("contract");
+            ingress_binding_contract(&manifest, "api", "https://demo.local/").expect("contract");
         assert_eq!(contract.allowed_callers, vec!["web", "worker"]);
+    }
+
+    #[test]
+    fn local_service_binding_contract_allows_non_published_services() {
+        let manifest = CapsuleManifest::from_toml(
+            r#"
+schema_version = "0.2"
+name = "demo-app"
+version = "0.1.0"
+type = "app"
+default_target = "app"
+
+[targets.app]
+runtime = "oci"
+image = "ghcr.io/example/app:latest"
+
+[services.api]
+target = "app"
+network = { allow_from = ["web"] }
+"#,
+        )
+        .expect("manifest");
+
+        let contract = local_service_binding_contract(&manifest, "api", "http://127.0.0.1:4310/")
+            .expect("contract");
+        assert_eq!(contract.binding_kind, SERVICE_BINDING_KIND_SERVICE);
+        assert_eq!(contract.allowed_callers, vec!["web"]);
     }
 
     #[test]
