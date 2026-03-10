@@ -33,6 +33,16 @@ const DEFAULT_LAUNCHER_DIR: &str = "Applications";
 const PROJECTIONS_DIR: &str = ".ato/native-delivery/projections";
 const PROJECTION_KIND: &str = "symlink";
 const DEFAULT_DERIVED_APPS_DIR: &str = ".ato/apps";
+#[cfg(windows)]
+const WINDOWS_SDK_SEARCH_MAX_DEPTH: usize = 5;
+#[cfg(windows)]
+const SIGNTOOL_ARCH_RANK_ARM64: usize = 3;
+#[cfg(windows)]
+const SIGNTOOL_ARCH_RANK_X64: usize = 2;
+#[cfg(windows)]
+const SIGNTOOL_ARCH_RANK_X86: usize = 1;
+#[cfg(windows)]
+const SIGNTOOL_ARCH_RANK_UNKNOWN: usize = 0;
 
 #[derive(Debug, Serialize)]
 pub struct FetchResult {
@@ -235,13 +245,7 @@ impl FinalizeRunner {
         let trimmed = config.finalize.tool.trim();
         let kind = if tool_name_matches(trimmed, "codesign") {
             FinalizeRunnerKind::Codesign
-        } else if tool_name_matches(trimmed, "signtool")
-            || path_has_extension(Path::new(config.artifact.input.trim()), "exe")
-            || matches!(
-                delivery_target_os_family(config.artifact.target.trim()),
-                Some("windows")
-            )
-        {
+        } else if should_use_signtool(config) {
             FinalizeRunnerKind::Signtool
         } else {
             FinalizeRunnerKind::ExternalStub
@@ -1795,7 +1799,7 @@ fn validate_delivery_target(target: &str) -> Result<()> {
     let os = segments.next().unwrap_or_default().trim();
     let arch = segments.next().unwrap_or_default().trim();
     if os.is_empty() || arch.is_empty() || segments.next().is_some() {
-        bail!("artifact.target must use the '<os>/<arch>' format");
+        bail!("artifact.target must use the '<os>/<arch>' format (for example 'darwin/arm64' or 'windows/x86_64')");
     }
     Ok(())
 }
@@ -2168,7 +2172,7 @@ fn discover_windows_sdk_signtool() -> Option<PathBuf> {
         .filter(|root| root.exists())
         .flat_map(|root| {
             WalkDir::new(root)
-                .max_depth(5)
+                .max_depth(WINDOWS_SDK_SEARCH_MAX_DEPTH)
                 .into_iter()
                 .filter_map(|entry| entry.ok())
                 .map(|entry| entry.into_path())
@@ -2184,10 +2188,11 @@ fn discover_windows_sdk_signtool() -> Option<PathBuf> {
         })
         .collect::<Vec<_>>();
 
-    candidates.sort_by(|left, right| {
-        signtool_candidate_rank(right)
-            .cmp(&signtool_candidate_rank(left))
-            .then_with(|| left.cmp(right))
+    candidates.sort_by_cached_key(|path| {
+        (
+            std::cmp::Reverse(signtool_candidate_rank(path)),
+            path.clone(),
+        )
     });
     candidates.into_iter().next()
 }
@@ -2201,13 +2206,13 @@ fn discover_windows_sdk_signtool() -> Option<PathBuf> {
 fn signtool_candidate_rank(path: &Path) -> (usize, usize) {
     let lowered = path.to_string_lossy().to_ascii_lowercase();
     let arch_rank = if lowered.contains("\\arm64\\") {
-        3
+        SIGNTOOL_ARCH_RANK_ARM64
     } else if lowered.contains("\\x64\\") {
-        2
+        SIGNTOOL_ARCH_RANK_X64
     } else if lowered.contains("\\x86\\") {
-        1
+        SIGNTOOL_ARCH_RANK_X86
     } else {
-        0
+        SIGNTOOL_ARCH_RANK_UNKNOWN
     };
     (arch_rank, lowered.len())
 }
@@ -2224,6 +2229,15 @@ fn tool_name_matches(tool: &str, expected: &str) -> bool {
         .unwrap_or(trimmed);
     file_name.eq_ignore_ascii_case(expected)
         || file_name.eq_ignore_ascii_case(&format!("{expected}.exe"))
+}
+
+fn should_use_signtool(config: &DeliveryConfig) -> bool {
+    tool_name_matches(config.finalize.tool.trim(), "signtool")
+        || path_has_extension(Path::new(config.artifact.input.trim()), "exe")
+        || matches!(
+            delivery_target_os_family(config.artifact.target.trim()),
+            Some("windows")
+        )
 }
 
 fn strip_codesign_signature(tool: &str, app_path: &Path) -> Result<()> {
