@@ -15,6 +15,7 @@ jobs:
       contents: read
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      ASSET_PREFIX: ato-cli
     steps:
       - uses: actions/checkout@v6
         with:
@@ -48,7 +49,7 @@ jobs:
 
           (
             cd "$SOURCE_DIR"
-            shasum -a 256 ato-*.tar.xz ato-*.tar.gz ato-*.zip 2>/dev/null || true
+            shasum -a 256 "$ASSET_PREFIX"-*.tar.xz "$ASSET_PREFIX"-*.tar.gz "$ASSET_PREFIX"-*.zip 2>/dev/null || true
           ) > "$SOURCE_DIR/SHA256SUMS" || true
 
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -63,5 +64,6 @@ jobs:
         run: |
           VERSION="${{ steps.download.outputs.version }}" \
           SOURCE_DIR="${{ steps.download.outputs.source_dir }}" \
+          ASSET_PREFIX="$ASSET_PREFIX" \
           DEPLOY_ENV=production \
           ./scripts/upload_release_to_r2.sh
