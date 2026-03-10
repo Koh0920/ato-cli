@@ -1093,6 +1093,45 @@ pub async fn fetch_capsule_detail(
     })
 }
 
+pub async fn fetch_capsule_manifest_toml(
+    capsule_ref: &str,
+    registry_url: Option<&str>,
+) -> Result<String> {
+    let scoped_ref = parse_capsule_ref(capsule_ref)?;
+    let registry = resolve_registry_url(registry_url, false).await?;
+    let client = reqwest::Client::new();
+    let capsule_url = format!(
+        "{}/v1/manifest/capsules/by/{}/{}",
+        registry,
+        urlencoding::encode(&scoped_ref.publisher),
+        urlencoding::encode(&scoped_ref.slug)
+    );
+    let response = client
+        .get(&capsule_url)
+        .send()
+        .await
+        .with_context(|| format!("Failed to connect to registry: {}", registry))?;
+
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        bail!("Capsule not found: {}", scoped_ref.scoped_id);
+    }
+
+    let capsule: CapsuleDetail = response
+        .error_for_status()
+        .with_context(|| format!("Failed to fetch capsule detail: {}", scoped_ref.scoped_id))?
+        .json()
+        .await
+        .with_context(|| format!("Invalid registry response for {}", scoped_ref.scoped_id))?;
+
+    capsule
+        .manifest_toml
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("capsule.toml was not returned by registry"))
+}
+
 async fn resolve_registry_url(registry_url: Option<&str>, emit_log: bool) -> Result<String> {
     if let Some(url) = registry_url {
         return Ok(url.to_string());
