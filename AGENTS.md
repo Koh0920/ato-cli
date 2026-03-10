@@ -134,6 +134,12 @@
 - Keep commits focused; mention relevant feature flags.
 - Run format and targeted tests when possible.
 
+## Release Process
+- For versioned releases, update `Cargo.toml` first on the working branch.
+- Send the version bump through a PR into `main`; do not treat a branch-only version bump as releasable.
+- After the PR is merged, confirm that `main` contains the intended version string before creating or pushing the release tag.
+- Push the release tag only after `main` and the tagged commit are aligned.
+
 ## Gotchas
 - `ato` delegates to the external `nacelle` binary.
 - `ato pack` routes to Source/OCI/WASM via `router` logic.
