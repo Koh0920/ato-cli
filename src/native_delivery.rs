@@ -24,10 +24,10 @@ const PROVENANCE_FILE: &str = "local-derivation.json";
 const DELIVERY_SCHEMA_VERSION_STABLE: &str = "0.1";
 const DELIVERY_SCHEMA_VERSION_LEGACY: &str = "exp-0.1";
 const DELIVERY_SCHEMA_VERSION: &str = DELIVERY_SCHEMA_VERSION_STABLE;
-const DELIVERY_FRAMEWORK: &str = "tauri";
+const DEFAULT_DELIVERY_FRAMEWORK: &str = "tauri";
 const DELIVERY_STAGE: &str = "unsigned";
-const DELIVERY_TARGET: &str = "darwin/arm64";
-const FINALIZE_TOOL: &str = "codesign";
+const DEFAULT_DELIVERY_TARGET: &str = "darwin/arm64";
+const DEFAULT_FINALIZE_TOOL: &str = "codesign";
 const DEFAULT_LAUNCHER_DIR: &str = "Applications";
 const PROJECTIONS_DIR: &str = ".ato/native-delivery/projections";
 const PROJECTION_KIND: &str = "symlink";
@@ -187,6 +187,69 @@ struct DeliveryFinalize {
     args: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeArtifactKind {
+    MacOsAppBundle,
+    Directory,
+    File,
+}
+
+impl NativeArtifactKind {
+    fn from_path(path: &Path) -> Self {
+        if path.extension().and_then(|ext| ext.to_str()) == Some("app") {
+            Self::MacOsAppBundle
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("exe") || path.is_file() {
+            Self::File
+        } else {
+            Self::Directory
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalizeRunnerKind {
+    Codesign,
+    ExternalStub,
+}
+
+#[derive(Debug, Clone)]
+struct FinalizeRunner {
+    tool: String,
+    kind: FinalizeRunnerKind,
+}
+
+impl FinalizeRunner {
+    fn for_tool(tool: &str) -> Self {
+        let trimmed = tool.trim();
+        let kind = if trimmed.eq_ignore_ascii_case("codesign") {
+            FinalizeRunnerKind::Codesign
+        } else {
+            FinalizeRunnerKind::ExternalStub
+        };
+        Self {
+            tool: trimmed.to_string(),
+            kind,
+        }
+    }
+
+    fn strip_existing_signature(&self, artifact_path: &Path) -> Result<()> {
+        match self.kind {
+            FinalizeRunnerKind::Codesign => strip_codesign_signature(&self.tool, artifact_path),
+            FinalizeRunnerKind::ExternalStub => Ok(()),
+        }
+    }
+
+    fn run(&self, derived_dir: &Path, config: &DeliveryConfig) -> Result<()> {
+        match self.kind {
+            FinalizeRunnerKind::Codesign => run_codesign_command(derived_dir, config),
+            FinalizeRunnerKind::ExternalStub => bail!(
+                "finalize tool '{}' is not implemented for this host yet",
+                self.tool
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct LocalDerivationProvenance {
     #[serde(default = "default_delivery_schema_version")]
@@ -303,12 +366,6 @@ pub(crate) fn detect_build_strategy(manifest_dir: &Path) -> Result<Option<Native
 
     let input_relative = PathBuf::from(config.artifact.input.trim());
     validate_relative_input_path(&input_relative)?;
-    if input_relative.extension().and_then(|ext| ext.to_str()) != Some("app") {
-        bail!(
-            "Native delivery artifact.input must point to a .app bundle: {}",
-            input_relative.display()
-        );
-    }
     let source_app_path = manifest_dir.join(&input_relative);
     let build_command = detect_native_build_command(
         target,
@@ -337,10 +394,14 @@ pub(crate) fn build_native_artifact(
     output_path: Option<&Path>,
 ) -> Result<NativeBuildResult> {
     if !host_supports_finalize() {
-        bail!("native delivery build currently supports tauri darwin/arm64 only");
+        bail!("native delivery build currently supports macOS hosts only");
     }
 
-    build_native_artifact_with_strip(plan, output_path, strip_codesign_signature)
+    let config = staged_delivery_config(plan)?;
+    let runner = FinalizeRunner::for_tool(&config.finalize.tool);
+    build_native_artifact_with_strip(plan, output_path, |artifact_path| {
+        runner.strip_existing_signature(artifact_path)
+    })
 }
 
 fn build_native_artifact_with_strip<F>(
@@ -351,6 +412,7 @@ fn build_native_artifact_with_strip<F>(
 where
     F: Fn(&Path) -> Result<()>,
 {
+    let _config = staged_delivery_config(plan)?;
     if let Some(build_command) = &plan.build_command {
         run_native_build_command(build_command)?;
     }
@@ -375,7 +437,7 @@ where
             .with_context(|| format!("Failed to create {}", parent.display()))?;
     }
 
-    validate_minimal_macos_app_permissions(&plan.source_app_path)?;
+    validate_minimal_app_permissions(&plan.source_app_path)?;
 
     let tmp_root = plan.manifest_dir.join(".tmp");
     fs::create_dir_all(&tmp_root)
@@ -391,7 +453,7 @@ where
         }
         copy_recursively(&plan.source_app_path, &staged_app_path)?;
         strip_signature(&staged_app_path)?;
-        validate_minimal_macos_app_permissions(&staged_app_path)?;
+        validate_minimal_app_permissions(&staged_app_path)?;
 
         fs::write(
             payload_root.join(DELIVERY_CONFIG_FILE),
@@ -667,17 +729,63 @@ pub(crate) fn delivery_schema_version() -> &'static str {
     DELIVERY_SCHEMA_VERSION_STABLE
 }
 
+fn default_delivery_framework() -> &'static str {
+    DEFAULT_DELIVERY_FRAMEWORK
+}
+
+fn normalize_delivery_os(os: &str) -> &str {
+    match os {
+        "macos" => "darwin",
+        other => other,
+    }
+}
+
+fn normalize_delivery_arch(arch: &str) -> &str {
+    match arch {
+        "aarch64" => "arm64",
+        other => other,
+    }
+}
+
+fn default_delivery_target() -> String {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => DEFAULT_DELIVERY_TARGET.to_string(),
+        ("macos", "x86_64") => "darwin/x86_64".to_string(),
+        ("windows", "x86_64") => "windows/x86_64".to_string(),
+        ("linux", "x86_64") => "linux/x86_64".to_string(),
+        (os, arch) => {
+            let os = normalize_delivery_os(os);
+            let arch = normalize_delivery_arch(arch);
+            format!("{os}/{arch}")
+        }
+    }
+}
+
+fn default_delivery_target_for_input(input: &str) -> String {
+    if Path::new(input).extension().and_then(|ext| ext.to_str()) == Some("app") {
+        if cfg!(target_os = "macos") && std::env::consts::ARCH == "x86_64" {
+            return "darwin/x86_64".to_string();
+        }
+        return DEFAULT_DELIVERY_TARGET.to_string();
+    }
+    default_delivery_target()
+}
+
+fn default_finalize_tool() -> &'static str {
+    DEFAULT_FINALIZE_TOOL
+}
+
 fn delivery_config_from_input(input: &str) -> DeliveryConfig {
     DeliveryConfig {
         schema_version: DELIVERY_SCHEMA_VERSION_STABLE.to_string(),
         artifact: DeliveryArtifact {
-            framework: DELIVERY_FRAMEWORK.to_string(),
+            framework: default_delivery_framework().to_string(),
             stage: DELIVERY_STAGE.to_string(),
-            target: DELIVERY_TARGET.to_string(),
+            target: default_delivery_target_for_input(input),
             input: input.to_string(),
         },
         finalize: DeliveryFinalize {
-            tool: FINALIZE_TOOL.to_string(),
+            tool: default_finalize_tool().to_string(),
             args: vec![
                 "--deep".to_string(),
                 "--force".to_string(),
@@ -810,10 +918,10 @@ pub fn execute_finalize(
     }
 
     if !host_supports_finalize() {
-        bail!("ato finalize PoC currently supports macOS darwin/arm64 only");
+        bail!("ato finalize currently supports macOS hosts only");
     }
 
-    finalize_with_runner(fetched_dir, output_dir, run_codesign_command)
+    finalize_with_dispatch(fetched_dir, output_dir)
 }
 
 pub(crate) fn finalize_fetched_artifact(fetched_dir: &Path) -> Result<FinalizeResult> {
@@ -821,7 +929,7 @@ pub(crate) fn finalize_fetched_artifact(fetched_dir: &Path) -> Result<FinalizeRe
     let output_root = derived_apps_root(&metadata.scoped_id, &metadata.parent_digest)?;
     fs::create_dir_all(&output_root)
         .with_context(|| format!("Failed to create {}", output_root.display()))?;
-    finalize_with_runner(fetched_dir, &output_root, run_codesign_command)
+    finalize_with_dispatch(fetched_dir, &output_root)
 }
 
 pub fn execute_project(
@@ -829,7 +937,7 @@ pub fn execute_project(
     launcher_dir: Option<&Path>,
 ) -> Result<ProjectResult> {
     if !host_supports_finalize() {
-        bail!("ato project PoC currently supports macOS darwin/arm64 only");
+        bail!("ato project currently supports macOS hosts only");
     }
 
     let launcher_dir = resolve_launcher_dir(launcher_dir)?;
@@ -839,7 +947,7 @@ pub fn execute_project(
 
 pub fn execute_project_ls() -> Result<ProjectionListResult> {
     if !host_supports_finalize() {
-        bail!("ato project ls PoC currently supports macOS darwin/arm64 only");
+        bail!("ato project ls currently supports macOS hosts only");
     }
 
     list_projections(&projections_root()?)
@@ -847,10 +955,16 @@ pub fn execute_project_ls() -> Result<ProjectionListResult> {
 
 pub fn execute_unproject(reference: &str) -> Result<UnprojectResult> {
     if !host_supports_finalize() {
-        bail!("ato unproject PoC currently supports macOS darwin/arm64 only");
+        bail!("ato unproject currently supports macOS hosts only");
     }
 
     unproject_with_metadata_root(reference, &projections_root()?)
+}
+
+fn finalize_with_dispatch(fetched_dir: &Path, output_dir: &Path) -> Result<FinalizeResult> {
+    finalize_with_runner(fetched_dir, output_dir, |derived_dir, config| {
+        FinalizeRunner::for_tool(&config.finalize.tool).run(derived_dir, config)
+    })
 }
 
 fn finalize_with_runner<F>(
@@ -884,18 +998,7 @@ where
     let input_relative = PathBuf::from(config.artifact.input.trim());
     validate_relative_input_path(&input_relative)?;
     let input_app_path = artifact_root.join(&input_relative);
-    if !input_app_path.is_dir() {
-        bail!(
-            "Finalize input is not a .app directory: {}",
-            input_app_path.display()
-        );
-    }
-    if input_app_path.extension().and_then(|ext| ext.to_str()) != Some("app") {
-        bail!(
-            "Finalize input must be a .app bundle: {}",
-            input_app_path.display()
-        );
-    }
+    validate_native_bundle_directory(&input_app_path)?;
 
     fs::create_dir_all(output_dir).with_context(|| {
         format!(
@@ -910,12 +1013,12 @@ where
     let derived_app_path = derived_dir.join(input_name);
 
     let result = (|| -> Result<FinalizeResult> {
-        validate_minimal_macos_app_permissions(&input_app_path)?;
+        validate_minimal_app_permissions(&input_app_path)?;
         copy_recursively(&input_app_path, &derived_app_path)?;
-        validate_minimal_macos_app_permissions(&derived_app_path)?;
+        validate_minimal_app_permissions(&derived_app_path)?;
         let derived_config = rebase_delivery_config_for_finalize(&config, &derived_app_path)?;
         runner(&derived_dir, &derived_config)?;
-        validate_minimal_macos_app_permissions(&derived_app_path)?;
+        validate_minimal_app_permissions(&derived_app_path)?;
         let derived_digest = compute_tree_digest(&derived_app_path)?;
         let provenance = LocalDerivationProvenance {
             schema_version: DELIVERY_SCHEMA_VERSION.to_string(),
@@ -1342,27 +1445,6 @@ fn load_projection_source(derived_app_path: &Path) -> Result<ProjectionSource> {
     if !provenance.finalized_locally {
         bail!("Projection input must be finalized locally via `ato finalize`");
     }
-    if provenance.finalize_tool != FINALIZE_TOOL {
-        bail!(
-            "Projection input requires finalize_tool '{}' but found '{}'",
-            FINALIZE_TOOL,
-            provenance.finalize_tool
-        );
-    }
-    if provenance.framework != DELIVERY_FRAMEWORK {
-        bail!(
-            "Projection input framework '{}' is unsupported; expected '{}'",
-            provenance.framework,
-            DELIVERY_FRAMEWORK
-        );
-    }
-    if provenance.target != DELIVERY_TARGET {
-        bail!(
-            "Projection input target '{}' is unsupported; expected '{}'",
-            provenance.target,
-            DELIVERY_TARGET
-        );
-    }
 
     let actual_digest = compute_tree_digest(&derived_app_path)?;
     if actual_digest != provenance.derived_digest {
@@ -1467,12 +1549,6 @@ fn inspect_projection(
             "unsupported_projection_kind:{}",
             metadata.projection_kind
         ));
-    }
-    if metadata.framework != DELIVERY_FRAMEWORK {
-        problems.push(format!("unsupported_framework:{}", metadata.framework));
-    }
-    if metadata.target != DELIVERY_TARGET {
-        problems.push(format!("unsupported_target:{}", metadata.target));
     }
 
     match fs::symlink_metadata(&metadata.projected_path) {
@@ -1623,12 +1699,8 @@ fn extract_native_artifact_spec_from_payload_tar(
 
 fn validate_delivery_config(config: &DeliveryConfig) -> Result<()> {
     validate_delivery_schema(&config.schema_version, "ato.delivery.toml")?;
-    if config.artifact.framework != DELIVERY_FRAMEWORK {
-        bail!(
-            "Unsupported artifact.framework '{}'; expected '{}'",
-            config.artifact.framework,
-            DELIVERY_FRAMEWORK
-        );
+    if config.artifact.framework.trim().is_empty() {
+        bail!("artifact.framework must not be empty");
     }
     if config.artifact.stage != DELIVERY_STAGE {
         bail!(
@@ -1637,38 +1709,31 @@ fn validate_delivery_config(config: &DeliveryConfig) -> Result<()> {
             DELIVERY_STAGE
         );
     }
-    if config.artifact.target != DELIVERY_TARGET {
-        bail!(
-            "Unsupported artifact.target '{}'; expected '{}'",
-            config.artifact.target,
-            DELIVERY_TARGET
-        );
-    }
-    if config.finalize.tool != FINALIZE_TOOL {
-        bail!(
-            "Unsupported finalize.tool '{}'; PoC requires '{}'",
-            config.finalize.tool,
-            FINALIZE_TOOL
-        );
-    }
+    validate_delivery_target(config.artifact.target.trim())?;
     let input = config.artifact.input.trim();
     if input.is_empty() {
         bail!("artifact.input must not be empty");
     }
-    let expected_args = ["--deep", "--force", "--sign", "-"];
-    if config.finalize.args.len() != 5 {
-        bail!("finalize.args must be exactly [\"--deep\", \"--force\", \"--sign\", \"-\", <input>] for this PoC");
+    if config.finalize.tool.trim().is_empty() {
+        bail!("finalize.tool must not be empty");
     }
-    for (idx, expected) in expected_args.iter().enumerate() {
-        if config.finalize.args[idx] != *expected {
-            bail!("finalize.args[{}] must be '{}' for this PoC", idx, expected);
-        }
+    if config
+        .finalize
+        .args
+        .iter()
+        .any(|argument| argument.trim().is_empty())
+    {
+        bail!("finalize.args must not contain empty arguments");
     }
-    if config.finalize.args[4] != input {
-        bail!(
-            "finalize.args[4] must exactly match artifact.input ('{}')",
-            input
-        );
+    Ok(())
+}
+
+fn validate_delivery_target(target: &str) -> Result<()> {
+    let mut segments = target.split('/');
+    let os = segments.next().unwrap_or_default().trim();
+    let arch = segments.next().unwrap_or_default().trim();
+    if os.is_empty() || arch.is_empty() || segments.next().is_some() {
+        bail!("artifact.target must use the '<os>/<arch>' format");
     }
     Ok(())
 }
@@ -1707,10 +1772,14 @@ fn rebase_delivery_config_for_finalize(
         .file_name()
         .and_then(|value| value.to_str())
         .ok_or_else(|| anyhow::anyhow!("Derived app path has no terminal app name"))?;
+    let rebased_input = input_name.to_string();
+    let original_input = config.artifact.input.clone();
     let mut derived_config = config.clone();
-    derived_config.artifact.input = input_name.to_string();
-    if let Some(last) = derived_config.finalize.args.last_mut() {
-        *last = input_name.to_string();
+    derived_config.artifact.input = rebased_input.clone();
+    for argument in &mut derived_config.finalize.args {
+        if *argument == original_input {
+            *argument = rebased_input.clone();
+        }
     }
     Ok(derived_config)
 }
@@ -1736,19 +1805,33 @@ fn resolve_native_build_working_dir(
 }
 
 fn validate_native_bundle_directory(source_app_path: &Path) -> Result<()> {
-    if !source_app_path.is_dir() {
-        let candidates = discover_nearby_app_bundles(source_app_path, 6);
-        bail!(
-            "Native delivery build input is not a .app directory: {}{}",
-            source_app_path.display(),
-            format_app_bundle_candidates(&candidates)
-        );
-    }
-    if source_app_path.extension().and_then(|ext| ext.to_str()) != Some("app") {
-        bail!(
-            "Native delivery build input must be a .app bundle: {}",
-            source_app_path.display()
-        );
+    match NativeArtifactKind::from_path(source_app_path) {
+        NativeArtifactKind::MacOsAppBundle => {
+            if !source_app_path.is_dir() {
+                let candidates = discover_nearby_app_bundles(source_app_path, 6);
+                bail!(
+                    "Native delivery build input is not a .app directory: {}{}",
+                    source_app_path.display(),
+                    format_app_bundle_candidates(&candidates)
+                );
+            }
+        }
+        NativeArtifactKind::Directory => {
+            if !source_app_path.is_dir() {
+                bail!(
+                    "Native delivery build input must be a directory: {}",
+                    source_app_path.display()
+                );
+            }
+        }
+        NativeArtifactKind::File => {
+            if !source_app_path.is_file() {
+                bail!(
+                    "Native delivery build input must be a file: {}",
+                    source_app_path.display()
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -1849,21 +1932,25 @@ fn run_native_build_command(command: &NativeBuildCommand) -> Result<()> {
     );
 }
 
+fn staged_delivery_config(plan: &NativeBuildPlan) -> Result<DeliveryConfig> {
+    let config: DeliveryConfig = toml::from_str(&plan.staged_delivery_config_toml)
+        .context("Failed to parse staged native delivery metadata")?;
+    validate_delivery_config(&config)?;
+    Ok(config)
+}
+
 fn run_codesign_command(derived_dir: &Path, config: &DeliveryConfig) -> Result<()> {
-    let mut command = Command::new(FINALIZE_TOOL);
+    let tool = config.finalize.tool.trim();
+    let mut command = Command::new(tool);
     command
         .args(&config.finalize.args)
         .current_dir(derived_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let output = command.output().with_context(|| {
-        format!(
-            "Failed to execute {} in {}",
-            FINALIZE_TOOL,
-            derived_dir.display()
-        )
-    })?;
+    let output = command
+        .output()
+        .with_context(|| format!("Failed to execute {} in {}", tool, derived_dir.display()))?;
     if output.status.success() {
         return Ok(());
     }
@@ -1875,7 +1962,8 @@ fn run_codesign_command(derived_dir: &Path, config: &DeliveryConfig) -> Result<(
         stdout.trim().to_string()
     };
     bail!(
-        "codesign failed with status {}{}",
+        "{} failed with status {}{}",
+        tool,
         output
             .status
             .code()
@@ -1885,25 +1973,19 @@ fn run_codesign_command(derived_dir: &Path, config: &DeliveryConfig) -> Result<(
             String::new()
         } else {
             format!(": {}", details)
-        }
+        },
     )
 }
 
-fn strip_codesign_signature(app_path: &Path) -> Result<()> {
-    let output = Command::new(FINALIZE_TOOL)
+fn strip_codesign_signature(tool: &str, app_path: &Path) -> Result<()> {
+    let output = Command::new(tool)
         .arg("--remove-signature")
         .arg(app_path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .with_context(|| {
-            format!(
-                "Failed to execute {} for {}",
-                FINALIZE_TOOL,
-                app_path.display()
-            )
-        })?;
+        .with_context(|| format!("Failed to execute {} for {}", tool, app_path.display()))?;
     if output.status.success() {
         return Ok(());
     }
@@ -1920,7 +2002,8 @@ fn strip_codesign_signature(app_path: &Path) -> Result<()> {
     }
 
     bail!(
-        "codesign --remove-signature failed for {}{}",
+        "{} --remove-signature failed for {}{}",
+        tool,
         app_path.display(),
         if details.is_empty() {
             String::new()
@@ -2149,7 +2232,11 @@ fn copy_recursively(source: &Path, destination: &Path) -> Result<()> {
     )
 }
 
-fn validate_minimal_macos_app_permissions(app_dir: &Path) -> Result<()> {
+fn validate_minimal_app_permissions(app_dir: &Path) -> Result<()> {
+    if !cfg!(target_os = "macos") {
+        return Ok(());
+    }
+
     let macos_dir = app_dir.join("Contents").join("MacOS");
     if !macos_dir.is_dir() {
         return Ok(());
@@ -2480,7 +2567,7 @@ fn create_projection_symlink(target: &Path, destination: &Path) -> std::io::Resu
 }
 
 pub(crate) fn host_supports_finalize() -> bool {
-    cfg!(target_os = "macos") && std::env::consts::ARCH == "aarch64"
+    cfg!(target_os = "macos")
 }
 
 fn random_hex(len_bytes: usize) -> String {
@@ -2729,6 +2816,20 @@ input = "dist/time-management-desktop.app"
         Ok(())
     }
 
+    #[test]
+    fn validate_native_bundle_directory_accepts_generic_directory_and_file() -> Result<()> {
+        let tmp = tempdir()?;
+        let linux_dir = tmp.path().join("dist/linux");
+        let windows_exe = tmp.path().join("dist/MyApp.exe");
+        fs::create_dir_all(&linux_dir)?;
+        fs::create_dir_all(windows_exe.parent().context("missing exe parent")?)?;
+        fs::write(&windows_exe, b"windows-binary")?;
+
+        validate_native_bundle_directory(&linux_dir)?;
+        validate_native_bundle_directory(&windows_exe)?;
+        Ok(())
+    }
+
     fn read_payload_entry_modes(artifact_path: &Path) -> Result<BTreeMap<String, u32>> {
         let capsule_bytes = fs::read(artifact_path)?;
         let mut capsule = tar::Archive::new(Cursor::new(capsule_bytes));
@@ -2854,10 +2955,10 @@ input = "dist/time-management-desktop.app"
             artifact_blake3: None,
             parent_digest: "blake3:parent-digest".to_string(),
             derived_digest: compute_tree_digest(&derived_app)?,
-            framework: DELIVERY_FRAMEWORK.to_string(),
-            target: DELIVERY_TARGET.to_string(),
+            framework: DEFAULT_DELIVERY_FRAMEWORK.to_string(),
+            target: default_delivery_target(),
             finalized_locally: true,
-            finalize_tool: FINALIZE_TOOL.to_string(),
+            finalize_tool: DEFAULT_FINALIZE_TOOL.to_string(),
             finalized_at: "2026-03-09T00:00:00Z".to_string(),
         };
         write_json_pretty(&derived_dir.join(PROVENANCE_FILE), &provenance)?;
@@ -2865,22 +2966,21 @@ input = "dist/time-management-desktop.app"
     }
 
     #[test]
-    fn delivery_config_rejects_non_codesign_tool() {
+    fn delivery_config_accepts_non_codesign_tool_and_non_default_target() {
         let config: DeliveryConfig = toml::from_str(
             r#"schema_version = "0.1"
 [artifact]
     framework = "tauri"
     stage = "unsigned"
-    target = "darwin/arm64"
+    target = "windows/x86_64"
     input = "MyApp.app"
 [finalize]
-    tool = "bash"
-    args = ["--deep", "--force", "--sign", "-", "MyApp.app"]
+    tool = "signtool"
+    args = ["sign", "/fd", "SHA256", "MyApp.app"]
 "#,
         )
         .expect("config parse");
-        let err = validate_delivery_config(&config).expect_err("config must fail");
-        assert!(err.to_string().contains("PoC requires 'codesign'"));
+        validate_delivery_config(&config).expect("config should be accepted");
     }
 
     #[test]
@@ -2950,7 +3050,7 @@ input = "dist/time-management-desktop.app"
         let result = build_native_artifact_with_strip(&plan, Some(&artifact_path), |_app| Ok(()))?;
 
         assert_eq!(result.build_strategy, "native-delivery");
-        assert_eq!(result.target, DELIVERY_TARGET);
+        assert_eq!(result.target, default_delivery_target_for_input("MyApp.app"));
         assert_eq!(result.derived_from, plan.source_app_path);
         assert_eq!(
             compute_tree_digest(&plan.source_app_path)?,
@@ -2983,15 +3083,20 @@ input = "dist/time-management-desktop.app"
         let source_digest_before = compute_tree_digest(&plan.source_app_path)?;
         let artifact_path = tmp.path().join("out/my-app-0.1.0.capsule");
 
-        let err = build_native_artifact_with_strip(&plan, Some(&artifact_path), |_app| Ok(()))
-            .expect_err("build must fail closed when executable bit is missing");
+        let result = build_native_artifact_with_strip(&plan, Some(&artifact_path), |_app| Ok(()));
 
-        assert!(err.to_string().contains("Executable bit is missing"));
+        if cfg!(target_os = "macos") {
+            let err = result.expect_err("build must fail closed when executable bit is missing");
+            assert!(err.to_string().contains("Executable bit is missing"));
+            assert!(!artifact_path.exists());
+        } else {
+            let built = result.expect("non-macOS hosts currently skip app permission enforcement");
+            assert_eq!(built.artifact_path, artifact_path);
+        }
         assert_eq!(
             compute_tree_digest(&plan.source_app_path)?,
             source_digest_before
         );
-        assert!(!artifact_path.exists());
         Ok(())
     }
 
@@ -3026,7 +3131,7 @@ input = "dist/time-management-desktop.app"
             serde_json::from_str(&fs::read_to_string(&result.provenance_path)?)?;
         assert_eq!(sidecar["parent_digest"], result.parent_digest);
         assert_eq!(sidecar["derived_digest"], result.derived_digest);
-        assert_eq!(sidecar["finalize_tool"], FINALIZE_TOOL);
+        assert_eq!(sidecar["finalize_tool"], DEFAULT_FINALIZE_TOOL);
         Ok(())
     }
 
@@ -3036,9 +3141,14 @@ input = "dist/time-management-desktop.app"
         let fetched_dir = sample_fetch_dir_with_mode(tmp.path(), 0o644)?;
         let output_root = tmp.path().join("dist");
 
-        let err = finalize_with_runner(&fetched_dir, &output_root, |_derived_dir, _config| Ok(()))
-            .expect_err("finalize must fail closed when executable bit is missing");
-        assert!(err.to_string().contains("Executable bit is missing"));
+        let result =
+            finalize_with_runner(&fetched_dir, &output_root, |_derived_dir, _config| Ok(()));
+        if cfg!(target_os = "macos") {
+            let err = result.expect_err("finalize must fail closed when executable bit is missing");
+            assert!(err.to_string().contains("Executable bit is missing"));
+        } else {
+            result.expect("non-macOS hosts currently skip app permission enforcement");
+        }
         Ok(())
     }
 
@@ -3063,6 +3173,28 @@ input = "dist/time-management-desktop.app"
                 .and_then(|value| value.to_str()),
             Some("My App.app")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn rebase_delivery_config_updates_matching_finalize_args() -> Result<()> {
+        let tmp = tempdir()?;
+        let config: DeliveryConfig = toml::from_str(
+            r#"schema_version = "0.1"
+[artifact]
+    framework = "tauri"
+    stage = "unsigned"
+    target = "windows/x86_64"
+    input = "dist/MyApp.exe"
+[finalize]
+    tool = "signtool"
+    args = ["sign", "/fd", "SHA256", "dist/MyApp.exe", "/tr", "http://tsa.test/dist/MyApp.exe"]
+"#,
+        )?;
+        let rebased = rebase_delivery_config_for_finalize(&config, &tmp.path().join("MyApp.exe"))?;
+        assert_eq!(rebased.artifact.input, "MyApp.exe");
+        assert_eq!(rebased.finalize.args[3], "MyApp.exe");
+        assert_eq!(rebased.finalize.args[5], "http://tsa.test/dist/MyApp.exe");
         Ok(())
     }
 
