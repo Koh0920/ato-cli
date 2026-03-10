@@ -137,7 +137,9 @@ fn test_project_help_shows_launcher_projection_contract() {
     cmd.args(["project", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Add a finalized app to launcher surfaces"))
+        .stdout(predicate::str::contains(
+            "Add a finalized app to launcher surfaces",
+        ))
         .stdout(predicate::str::contains("ato finalize"))
         .stdout(predicate::str::contains("--launcher-dir <LAUNCHER_DIR>"))
         .stdout(predicate::str::contains("Commands:"))
