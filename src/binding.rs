@@ -1,8 +1,10 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
+use std::io::{Cursor, Read};
 use std::net::IpAddr;
 use std::path::Path;
 
 use crate::ingress_proxy;
+use crate::process_manager::ProcessManager;
 use crate::registry_store::{NewServiceBindingRecord, RegistryStore, ServiceBindingRecord};
 use capsule_core::types::CapsuleManifest;
 
@@ -250,7 +252,68 @@ pub fn register_service_binding(
 ) -> Result<ServiceBindingRecord> {
     let manifest = load_manifest(manifest_path)?;
     let endpoint = normalize_local_service_locator(url)?;
-    let contract = local_service_binding_contract(&manifest, service_name, &endpoint)?;
+    register_service_binding_from_parts(&manifest, service_name, endpoint)
+}
+
+pub fn register_service_binding_from_process(
+    process_id: &str,
+    service_name: &str,
+    port: Option<u16>,
+    json: bool,
+) -> Result<()> {
+    let record = register_service_binding_for_process(process_id, service_name, port)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&record)?);
+        return Ok(());
+    }
+
+    println!("✅ Registered local service binding {}", record.binding_id);
+    println!("   owner_scope: {}", record.owner_scope);
+    println!("   service_name: {}", record.service_name);
+    println!("   endpoint_locator: {}", record.endpoint_locator);
+    println!("   tls_mode: {}", record.tls_mode);
+    Ok(())
+}
+
+pub fn register_service_binding_for_process(
+    process_id: &str,
+    service_name: &str,
+    port: Option<u16>,
+) -> Result<ServiceBindingRecord> {
+    let process = ProcessManager::new()?
+        .read_pid(process_id)
+        .with_context(|| format!("failed to read process record '{}'", process_id))?;
+    if !process.status.is_active() {
+        anyhow::bail!(
+            "process '{}' is not active (status={})",
+            process_id,
+            process.status
+        );
+    }
+
+    let manifest_path = process.manifest_path.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "process '{}' does not record a manifest path required for service binding registration",
+            process_id
+        )
+    })?;
+    let manifest = load_manifest(manifest_path)?;
+    let endpoint = derive_service_endpoint_locator(
+        &manifest,
+        service_name,
+        process.target_label.as_deref(),
+        port.or(process.requested_port),
+    )?;
+    register_service_binding_from_parts(&manifest, service_name, endpoint)
+}
+
+fn register_service_binding_from_parts(
+    manifest: &CapsuleManifest,
+    service_name: &str,
+    endpoint: String,
+) -> Result<ServiceBindingRecord> {
+    let contract = local_service_binding_contract(manifest, service_name, &endpoint)?;
     open_binding_store()?.register_service_binding(&NewServiceBindingRecord {
         owner_scope: contract.owner_scope,
         service_name: contract.service_name,
@@ -368,7 +431,49 @@ fn load_manifest(path: &Path) -> Result<CapsuleManifest> {
         anyhow::bail!("capsule.toml not found at {}", manifest_path.display());
     }
 
+    if manifest_path
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("capsule"))
+    {
+        let bytes = std::fs::read(&manifest_path).with_context(|| {
+            format!(
+                "failed to read capsule artifact {}",
+                manifest_path.display()
+            )
+        })?;
+        let manifest_raw = extract_manifest_from_capsule(&bytes)?;
+        return CapsuleManifest::from_toml(&manifest_raw).map_err(Into::into);
+    }
+
     CapsuleManifest::load_from_file(&manifest_path).map_err(Into::into)
+}
+
+fn extract_manifest_from_capsule(bytes: &[u8]) -> Result<String> {
+    let mut archive = tar::Archive::new(Cursor::new(bytes));
+    let entries = archive
+        .entries()
+        .context("Failed to read .capsule archive entries")?;
+
+    for entry in entries {
+        let mut entry = entry.context("Invalid .capsule entry")?;
+        let entry_path = entry
+            .path()
+            .context("Failed to read archive entry path")?
+            .to_string_lossy()
+            .to_string();
+        if entry_path != "capsule.toml" {
+            continue;
+        }
+
+        let mut manifest = String::new();
+        entry
+            .read_to_string(&mut manifest)
+            .context("Failed to read capsule.toml from artifact")?;
+        return Ok(manifest);
+    }
+
+    anyhow::bail!("Invalid artifact: capsule.toml not found in .capsule archive")
 }
 
 fn normalize_endpoint_locator(raw: &str) -> Result<String> {
@@ -503,6 +608,15 @@ fn derive_service_upstream_locator(
     manifest: &CapsuleManifest,
     service_name: &str,
 ) -> Result<String> {
+    derive_service_endpoint_locator(manifest, service_name, None, None)
+}
+
+fn derive_service_endpoint_locator(
+    manifest: &CapsuleManifest,
+    service_name: &str,
+    default_target_override: Option<&str>,
+    port_override: Option<u16>,
+) -> Result<String> {
     let service = manifest
         .services
         .as_ref()
@@ -514,6 +628,9 @@ fn derive_service_upstream_locator(
         .target
         .as_deref()
         .filter(|value| !value.trim().is_empty())
+        .or(default_target_override
+            .map(str::trim)
+            .filter(|value| !value.is_empty()))
         .unwrap_or(manifest.default_target.trim());
     if target_label.is_empty() {
         anyhow::bail!(
@@ -521,19 +638,19 @@ fn derive_service_upstream_locator(
             service_name
         );
     }
-    let port = manifest
-        .targets
-        .as_ref()
-        .and_then(|targets| {
-            targets
-                .named
-                .get(target_label)
-                .and_then(|target| target.port)
-                .or(targets.port)
+    let port = port_override
+        .or_else(|| {
+            manifest.targets.as_ref().and_then(|targets| {
+                targets
+                    .named
+                    .get(target_label)
+                    .and_then(|target| target.port)
+                    .or(targets.port)
+            })
         })
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "service '{}' target '{}' does not declare a listening port required for ingress proxying",
+                "service '{}' target '{}' does not declare a listening port required for host-side binding",
                 service_name,
                 target_label
             )
@@ -544,11 +661,12 @@ fn derive_service_upstream_locator(
 #[cfg(test)]
 mod tests {
     use super::{
-        derive_service_upstream_locator, ingress_binding_contract, local_service_binding_contract,
-        normalize_endpoint_locator, normalize_local_service_locator, parse_binding_reference,
-        SERVICE_BINDING_KIND_SERVICE,
+        derive_service_endpoint_locator, derive_service_upstream_locator, ingress_binding_contract,
+        load_manifest, local_service_binding_contract, normalize_endpoint_locator,
+        normalize_local_service_locator, parse_binding_reference, SERVICE_BINDING_KIND_SERVICE,
     };
     use capsule_core::types::CapsuleManifest;
+    use std::fs;
 
     #[test]
     fn parse_binding_reference_accepts_bare_binding_id() {
@@ -654,5 +772,74 @@ network = { publish = true }
 
         let upstream = derive_service_upstream_locator(&manifest, "main").expect("upstream");
         assert_eq!(upstream, "http://127.0.0.1:4310/");
+    }
+
+    #[test]
+    fn derive_service_endpoint_locator_honors_target_and_port_overrides() {
+        let manifest = CapsuleManifest::from_toml(
+            r#"
+schema_version = "0.2"
+name = "demo-app"
+version = "0.1.0"
+type = "app"
+default_target = "app"
+
+[targets.app]
+runtime = "oci"
+image = "ghcr.io/example/app:latest"
+port = 4310
+
+[targets.alt]
+runtime = "oci"
+image = "ghcr.io/example/app:alt"
+port = 5320
+
+[services.api]
+network = { allow_from = ["web"] }
+"#,
+        )
+        .expect("manifest");
+
+        let derived = derive_service_endpoint_locator(&manifest, "api", Some("alt"), None)
+            .expect("derived endpoint");
+        assert_eq!(derived, "http://127.0.0.1:5320/");
+
+        let overridden = derive_service_endpoint_locator(&manifest, "api", Some("alt"), Some(6123))
+            .expect("overridden endpoint");
+        assert_eq!(overridden, "http://127.0.0.1:6123/");
+    }
+
+    #[test]
+    fn load_manifest_reads_capsule_artifact() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let capsule_path = dir.path().join("demo.capsule");
+        let file = fs::File::create(&capsule_path).expect("create capsule");
+        let mut builder = tar::Builder::new(file);
+        let manifest = r#"
+schema_version = "0.2"
+name = "demo-app"
+version = "0.1.0"
+type = "app"
+default_target = "app"
+
+[targets.app]
+runtime = "oci"
+image = "ghcr.io/example/app:latest"
+port = 4310
+
+[services.main]
+network = { publish = true }
+"#;
+        let mut header = tar::Header::new_gnu();
+        header.set_size(manifest.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "capsule.toml", manifest.as_bytes())
+            .expect("append manifest");
+        builder.finish().expect("finish archive");
+
+        let loaded = load_manifest(&capsule_path).expect("load artifact manifest");
+        assert_eq!(loaded.name, "demo-app");
     }
 }

@@ -166,8 +166,10 @@ struct RegisterPersistentStateRequest {
 struct RegisterServiceBindingRequest {
     manifest: String,
     service_name: String,
-    url: String,
+    url: Option<String>,
     binding_kind: Option<String>,
+    process_id: Option<String>,
+    port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -327,6 +329,8 @@ struct ProcessRowResponse {
     scoped_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     target_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested_port: Option<u16>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2702,6 +2706,7 @@ async fn handle_run_local_capsule(
         manifest_path: Some(run_target.clone()),
         scoped_id: Some(scoped_id.clone()),
         target_label: effective_target.clone(),
+        requested_port: effective_port,
         log_path: Some(process_log_path(&process_id)),
         ready_at: Some(std::time::SystemTime::now()),
         last_event: Some("spawned".to_string()),
@@ -2914,6 +2919,7 @@ async fn handle_list_local_processes() -> impl IntoResponse {
             started_at: chrono::DateTime::<Utc>::from(process.start_time).to_rfc3339(),
             scoped_id: process.scoped_id,
             target_label: process.target_label,
+            requested_port: process.requested_port,
         })
         .collect::<Vec<_>>();
 
@@ -3175,18 +3181,27 @@ async fn handle_register_service_binding(
 
     let manifest = request.manifest.trim();
     let service_name = request.service_name.trim();
-    let url = request.url.trim();
+    let url = request
+        .url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let process_id = request
+        .process_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     let binding_kind = request
         .binding_kind
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or(binding::SERVICE_BINDING_KIND_INGRESS);
-    if manifest.is_empty() {
+    if manifest.is_empty() && process_id.is_none() {
         return json_error(
             StatusCode::BAD_REQUEST,
             "invalid_manifest",
-            "manifest is required",
+            "manifest is required unless process_id is provided",
         );
     }
     if service_name.is_empty() {
@@ -3196,18 +3211,43 @@ async fn handle_register_service_binding(
             "service_name is required",
         );
     }
-    if url.is_empty() {
-        return json_error(StatusCode::BAD_REQUEST, "invalid_url", "url is required");
+    if request.port.is_some_and(|port| port == 0) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_port",
+            "port must be between 1 and 65535",
+        );
     }
 
     let _guard = state.lock.lock().await;
     let result = match binding_kind {
         binding::SERVICE_BINDING_KIND_INGRESS => {
+            let Some(url) = url else {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_url",
+                    "url is required for ingress bindings",
+                );
+            };
             binding::register_ingress_binding(Path::new(manifest), service_name, url)
         }
-        binding::SERVICE_BINDING_KIND_SERVICE => {
-            binding::register_service_binding(Path::new(manifest), service_name, url)
-        }
+        binding::SERVICE_BINDING_KIND_SERVICE => match (url, process_id) {
+            (Some(url), _) => {
+                binding::register_service_binding(Path::new(manifest), service_name, url)
+            }
+            (None, Some(process_id)) => binding::register_service_binding_for_process(
+                process_id,
+                service_name,
+                request.port,
+            ),
+            (None, None) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_service_binding_source",
+                    "service bindings require either url or process_id",
+                );
+            }
+        },
         other => {
             return json_error(
                 StatusCode::BAD_REQUEST,
