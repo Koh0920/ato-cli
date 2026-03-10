@@ -1364,6 +1364,29 @@ enum BindingCommands {
         json: bool,
     },
 
+    /// Resolve a host-side service binding by owner scope, service, and kind
+    Resolve {
+        /// Binding owner scope
+        #[arg(long)]
+        owner_scope: String,
+
+        /// Service name from [services.<name>]
+        #[arg(long)]
+        service_name: String,
+
+        /// Binding kind to resolve
+        #[arg(long, default_value = "ingress")]
+        binding_kind: String,
+
+        /// Optional caller service for allow_from-restricted bindings
+        #[arg(long)]
+        caller_service: Option<String>,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Register a host-side ingress binding from a manifest service
     RegisterIngress {
         /// Path to capsule directory or capsule.toml
@@ -2464,6 +2487,19 @@ fn execute_binding_command(command: BindingCommands) -> Result<()> {
         BindingCommands::Inspect { binding_ref, json } => {
             binding::inspect_binding(&binding_ref, json)
         }
+        BindingCommands::Resolve {
+            owner_scope,
+            service_name,
+            binding_kind,
+            caller_service,
+            json,
+        } => binding::resolve_binding(
+            &owner_scope,
+            &service_name,
+            &binding_kind,
+            caller_service.as_deref(),
+            json,
+        ),
         BindingCommands::RegisterIngress {
             manifest,
             service_name,

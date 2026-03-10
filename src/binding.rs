@@ -17,6 +17,7 @@ struct ServiceBindingContract {
     transport_kind: String,
     adapter_kind: String,
     tls_mode: String,
+    allowed_callers: Vec<String>,
     target_hint: Option<String>,
 }
 
@@ -99,12 +100,63 @@ pub fn inspect_binding(binding_ref: &str, json: bool) -> Result<()> {
     println!("Adapter Kind: {}", record.adapter_kind);
     println!("Endpoint Locator: {}", record.endpoint_locator);
     println!("TLS Mode: {}", record.tls_mode);
+    if !record.allowed_callers.is_empty() {
+        println!("Allowed Callers: {}", record.allowed_callers.join(", "));
+    }
     if let Some(target_hint) = record.target_hint.as_deref() {
         println!("Target Hint: {}", target_hint);
     }
     println!("Created At: {}", record.created_at);
     println!("Updated At: {}", record.updated_at);
     Ok(())
+}
+
+pub fn resolve_binding(
+    owner_scope: &str,
+    service_name: &str,
+    binding_kind: &str,
+    caller_service: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let record = resolve_binding_record(owner_scope, service_name, binding_kind, caller_service)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&record)?);
+        return Ok(());
+    }
+
+    println!("Resolved Binding: {}", record.binding_id);
+    println!("Owner Scope: {}", record.owner_scope);
+    println!("Service Name: {}", record.service_name);
+    println!("Binding Kind: {}", record.binding_kind);
+    println!("Transport Kind: {}", record.transport_kind);
+    println!("Endpoint Locator: {}", record.endpoint_locator);
+    if let Some(caller_service) = caller_service.filter(|value| !value.trim().is_empty()) {
+        println!("Caller Service: {}", caller_service.trim());
+    }
+    if !record.allowed_callers.is_empty() {
+        println!("Allowed Callers: {}", record.allowed_callers.join(", "));
+    }
+    Ok(())
+}
+
+pub fn resolve_binding_record(
+    owner_scope: &str,
+    service_name: &str,
+    binding_kind: &str,
+    caller_service: Option<&str>,
+) -> Result<ServiceBindingRecord> {
+    let record = open_binding_store()?
+        .resolve_service_binding(owner_scope, service_name, binding_kind, caller_service)?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "host-side service binding '{}:{}:{}' was not found",
+                owner_scope,
+                service_name,
+                binding_kind
+            )
+        })?;
+    Ok(record)
 }
 
 pub fn register_ingress_binding_from_manifest(
@@ -147,6 +199,7 @@ pub fn register_ingress_binding(
         adapter_kind: contract.adapter_kind,
         endpoint_locator: endpoint,
         tls_mode: contract.tls_mode,
+        allowed_callers: contract.allowed_callers,
         target_hint: contract.target_hint,
     })
 }
@@ -221,13 +274,19 @@ fn service_binding_contract(
         transport_kind: transport_kind.to_string(),
         adapter_kind: SERVICE_BINDING_ADAPTER_REVERSE_PROXY.to_string(),
         tls_mode: tls_mode.to_string(),
+        allowed_callers: service
+            .network
+            .as_ref()
+            .map(|network| network.allow_from.clone())
+            .unwrap_or_default(),
         target_hint: service.target.clone(),
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_endpoint_locator, parse_binding_reference};
+    use super::{normalize_endpoint_locator, parse_binding_reference, service_binding_contract};
+    use capsule_core::types::CapsuleManifest;
 
     #[test]
     fn parse_binding_reference_accepts_bare_binding_id() {
@@ -245,5 +304,31 @@ mod tests {
             "https://example.com/api"
         );
         assert!(normalize_endpoint_locator("tcp://127.0.0.1:8080").is_err());
+    }
+
+    #[test]
+    fn service_binding_contract_carries_allow_from_metadata() {
+        let manifest = CapsuleManifest::from_toml(
+            r#"
+schema_version = "0.2"
+name = "demo-app"
+version = "0.1.0"
+type = "app"
+default_target = "app"
+
+[targets.app]
+runtime = "oci"
+image = "ghcr.io/example/app:latest"
+
+[services.api]
+target = "app"
+network = { publish = true, allow_from = ["web", "worker"] }
+"#,
+        )
+        .expect("manifest");
+
+        let contract =
+            service_binding_contract(&manifest, "api", "https://demo.local/").expect("contract");
+        assert_eq!(contract.allowed_callers, vec!["web", "worker"]);
     }
 }
