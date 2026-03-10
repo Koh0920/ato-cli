@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::path::Path;
 
+use crate::ingress_proxy;
 use crate::registry_store::{NewServiceBindingRecord, RegistryStore, ServiceBindingRecord};
 use capsule_core::types::CapsuleManifest;
 
@@ -100,6 +101,20 @@ pub fn inspect_binding(binding_ref: &str, json: bool) -> Result<()> {
     println!("Adapter Kind: {}", record.adapter_kind);
     println!("Endpoint Locator: {}", record.endpoint_locator);
     println!("TLS Mode: {}", record.tls_mode);
+    if let Some(tls) = ingress_proxy::load_tls_bootstrap(&record.binding_id)? {
+        println!("TLS Bootstrap: ready");
+        println!("TLS Cert Path: {}", tls.cert_path.display());
+        println!(
+            "TLS Trust Installed: {}",
+            if tls.system_trust_installed {
+                "yes"
+            } else {
+                "no"
+            }
+        );
+    } else if record.tls_mode == SERVICE_BINDING_TLS_MODE_EXPLICIT {
+        println!("TLS Bootstrap: pending");
+    }
     if !record.allowed_callers.is_empty() {
         println!("Allowed Callers: {}", record.allowed_callers.join(", "));
     }
@@ -204,6 +219,99 @@ pub fn register_ingress_binding(
     })
 }
 
+pub fn bootstrap_ingress_tls(
+    binding_ref: &str,
+    install_system_trust: bool,
+    yes: bool,
+    json: bool,
+) -> Result<()> {
+    let binding_id = parse_binding_reference(binding_ref).unwrap_or(binding_ref);
+    let record = open_binding_store()?
+        .find_service_binding_by_id(binding_id)?
+        .ok_or_else(|| {
+            anyhow::anyhow!("host-side service binding '{}' was not found", binding_id)
+        })?;
+    if record.binding_kind != SERVICE_BINDING_KIND_INGRESS {
+        anyhow::bail!(
+            "TLS bootstrap currently supports only ingress bindings (got '{}')",
+            record.binding_kind
+        );
+    }
+    if record.tls_mode != SERVICE_BINDING_TLS_MODE_EXPLICIT {
+        anyhow::bail!(
+            "binding '{}' does not require explicit TLS bootstrap because tls_mode={}.",
+            record.binding_id,
+            record.tls_mode
+        );
+    }
+
+    let endpoint = reqwest::Url::parse(&record.endpoint_locator)?;
+    let endpoint_host = endpoint.host_str().ok_or_else(|| {
+        anyhow::anyhow!("binding '{}' endpoint is missing a host", record.binding_id)
+    })?;
+    let tls =
+        ingress_proxy::bootstrap_tls(&record.binding_id, endpoint_host, install_system_trust, yes)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&tls)?);
+        return Ok(());
+    }
+
+    println!("✅ Bootstrapped ingress TLS for {}", record.binding_id);
+    println!("   endpoint_host: {}", tls.endpoint_host);
+    println!("   cert_path: {}", tls.cert_path.display());
+    println!("   key_path: {}", tls.key_path.display());
+    println!(
+        "   system_trust_installed: {}",
+        if tls.system_trust_installed {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    Ok(())
+}
+
+pub fn serve_ingress_binding(
+    binding_ref: &str,
+    manifest_path: &Path,
+    upstream_url: Option<&str>,
+) -> Result<()> {
+    let binding_id = parse_binding_reference(binding_ref).unwrap_or(binding_ref);
+    let record = open_binding_store()?
+        .find_service_binding_by_id(binding_id)?
+        .ok_or_else(|| {
+            anyhow::anyhow!("host-side service binding '{}' was not found", binding_id)
+        })?;
+    if record.binding_kind != SERVICE_BINDING_KIND_INGRESS {
+        anyhow::bail!(
+            "host-side proxy serving currently supports only ingress bindings (got '{}')",
+            record.binding_kind
+        );
+    }
+
+    let manifest = load_manifest(manifest_path)?;
+    let upstream_locator = match upstream_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => normalize_endpoint_locator(value)?,
+        None => derive_service_upstream_locator(&manifest, &record.service_name)?,
+    };
+
+    println!(
+        "▶️  Serving ingress binding {} on {} -> {}",
+        record.binding_id, record.endpoint_locator, upstream_locator
+    );
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(ingress_proxy::serve(ingress_proxy::IngressProxyConfig {
+        binding_id: record.binding_id,
+        endpoint_locator: record.endpoint_locator,
+        upstream_locator,
+        tls_mode: record.tls_mode,
+    }))
+}
+
 fn load_manifest(path: &Path) -> Result<CapsuleManifest> {
     let manifest_path = if path.is_dir() {
         path.join("capsule.toml")
@@ -283,9 +391,54 @@ fn service_binding_contract(
     })
 }
 
+fn derive_service_upstream_locator(
+    manifest: &CapsuleManifest,
+    service_name: &str,
+) -> Result<String> {
+    let service = manifest
+        .services
+        .as_ref()
+        .and_then(|services| services.get(service_name))
+        .ok_or_else(|| {
+            anyhow::anyhow!("service '{}' is not declared in the manifest", service_name)
+        })?;
+    let target_label = service
+        .target
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(manifest.default_target.trim());
+    if target_label.is_empty() {
+        anyhow::bail!(
+            "service '{}' does not resolve to a target with a listening port",
+            service_name
+        );
+    }
+    let port = manifest
+        .targets
+        .as_ref()
+        .and_then(|targets| {
+            targets
+                .named
+                .get(target_label)
+                .and_then(|target| target.port)
+                .or(targets.port)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "service '{}' target '{}' does not declare a listening port required for ingress proxying",
+                service_name,
+                target_label
+            )
+        })?;
+    Ok(format!("http://127.0.0.1:{port}/"))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{normalize_endpoint_locator, parse_binding_reference, service_binding_contract};
+    use super::{
+        derive_service_upstream_locator, normalize_endpoint_locator, parse_binding_reference,
+        service_binding_contract,
+    };
     use capsule_core::types::CapsuleManifest;
 
     #[test]
@@ -330,5 +483,31 @@ network = { publish = true, allow_from = ["web", "worker"] }
         let contract =
             service_binding_contract(&manifest, "api", "https://demo.local/").expect("contract");
         assert_eq!(contract.allowed_callers, vec!["web", "worker"]);
+    }
+
+    #[test]
+    fn derive_service_upstream_locator_uses_target_port() {
+        let manifest = CapsuleManifest::from_toml(
+            r#"
+schema_version = "0.2"
+name = "demo-app"
+version = "0.1.0"
+type = "app"
+default_target = "app"
+
+[targets.app]
+runtime = "oci"
+image = "ghcr.io/example/app:latest"
+port = 4310
+
+[services.main]
+target = "app"
+network = { publish = true }
+"#,
+        )
+        .expect("manifest");
+
+        let upstream = derive_service_upstream_locator(&manifest, "main").expect("upstream");
+        assert_eq!(upstream, "http://127.0.0.1:4310/");
     }
 }

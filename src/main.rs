@@ -90,6 +90,7 @@ mod error_codes;
 mod executors;
 mod gen_ci;
 mod guest_protocol;
+mod ingress_proxy;
 mod init;
 mod install;
 mod ipc;
@@ -1387,6 +1388,40 @@ enum BindingCommands {
         json: bool,
     },
 
+    /// Explicitly bootstrap TLS assets and optional trust installation for an ingress binding
+    BootstrapTls {
+        /// Binding reference (`binding-...`)
+        #[arg(long = "binding")]
+        binding_ref: String,
+
+        /// Attempt to install the generated certificate into the local user trust store
+        #[arg(long, default_value_t = false)]
+        install_system_trust: bool,
+
+        /// Skip the interactive consent prompt after reviewing the trust action
+        #[arg(short = 'y', long = "yes", default_value_t = false)]
+        yes: bool,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Run a host-side ingress reverse proxy for a registered binding
+    ServeIngress {
+        /// Binding reference (`binding-...`)
+        #[arg(long = "binding")]
+        binding_ref: String,
+
+        /// Path to capsule directory or capsule.toml used to derive the upstream port
+        #[arg(long, default_value = ".")]
+        manifest: PathBuf,
+
+        /// Optional upstream URL override
+        #[arg(long)]
+        upstream_url: Option<String>,
+    },
+
     /// Register a host-side ingress binding from a manifest service
     RegisterIngress {
         /// Path to capsule directory or capsule.toml
@@ -2500,6 +2535,17 @@ fn execute_binding_command(command: BindingCommands) -> Result<()> {
             caller_service.as_deref(),
             json,
         ),
+        BindingCommands::BootstrapTls {
+            binding_ref,
+            install_system_trust,
+            yes,
+            json,
+        } => binding::bootstrap_ingress_tls(&binding_ref, install_system_trust, yes, json),
+        BindingCommands::ServeIngress {
+            binding_ref,
+            manifest,
+            upstream_url,
+        } => binding::serve_ingress_binding(&binding_ref, &manifest, upstream_url.as_deref()),
         BindingCommands::RegisterIngress {
             manifest,
             service_name,

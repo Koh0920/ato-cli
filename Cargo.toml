@@ -42,6 +42,7 @@ regex = "1"
 walkdir = "2"
 tracing = "0.1"
 axum = { version = "0.7", features = ["multipart"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
 jsonschema = "0.17"
 shell-words = "1.1"
 async-trait = "0.1"
@@ -60,6 +61,7 @@ chrono = { version = "0.4", default-features = true }
 thiserror = "2.0"
 subtle = "2.6"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }
+rcgen = "0.13"
 urlencoding = "2.1"
 hickory-resolver = "0.24"
 libc = "0.2"
@@ -69,6 +71,7 @@ colored = "2.1"
 ratatui = "0.29"
 crossterm = "0.29"
 tui-input = "0.12"
+tower = "0.5"
 tower-http = { version = "0.6", features = ["cors"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 
