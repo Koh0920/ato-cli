@@ -1765,17 +1765,12 @@ fn validate_delivery_config(config: &DeliveryConfig) -> Result<()> {
     if input.is_empty() {
         bail!("artifact.input must not be empty");
     }
-    if config.finalize.tool.trim().is_empty() {
+    let tool = config.finalize.tool.trim();
+    if tool.is_empty() {
         bail!("finalize.tool must not be empty");
     }
-    if config
-        .finalize
-        .args
-        .iter()
-        .any(|argument| argument.trim().is_empty())
-    {
-        bail!("finalize.args must not contain empty arguments");
-    }
+    validate_finalize_tool(tool)?;
+    validate_finalize_args(tool, &config.finalize.args, input)?;
     Ok(())
 }
 
@@ -1785,6 +1780,160 @@ fn validate_delivery_target(target: &str) -> Result<()> {
     let arch = segments.next().unwrap_or_default().trim();
     if os.is_empty() || arch.is_empty() || segments.next().is_some() {
         bail!("artifact.target must use the '<os>/<arch>' format");
+    }
+    let normalized_os = normalize_delivery_os(os);
+    let normalized_arch = normalize_delivery_arch(arch);
+    if !matches!(normalized_os, "darwin" | "linux" | "windows")
+        || !matches!(normalized_arch, "arm64" | "x86_64")
+    {
+        bail!(
+            "Unsupported artifact.target '{}'; expected darwin|linux|windows with arm64|x86_64",
+            target
+        );
+    }
+    Ok(())
+}
+
+fn validate_finalize_tool(tool: &str) -> Result<()> {
+    if !tool.chars().any(char::is_control) {
+        return Ok(());
+    }
+    bail!(
+        "finalize.tool '{}' must not contain control characters",
+        tool
+    );
+}
+
+fn validate_finalize_args(tool: &str, args: &[String], input: &str) -> Result<()> {
+    if args.iter().any(|argument| argument.trim().is_empty()) {
+        bail!("finalize.args must not contain empty arguments");
+    }
+    if tool.eq_ignore_ascii_case("codesign") {
+        return validate_codesign_finalize_args(args, input);
+    }
+    if tool.eq_ignore_ascii_case("signtool") {
+        return validate_signtool_finalize_args(args, input);
+    }
+    Ok(())
+}
+
+fn validate_codesign_finalize_args(args: &[String], input: &str) -> Result<()> {
+    let mut expects_value_for: Option<&str> = None;
+    let mut saw_input = false;
+
+    for argument in args {
+        let trimmed = argument.trim();
+        if let Some(option) = expects_value_for.take() {
+            if option == "--sign" || option == "--timestamp" || option == "--options" {
+                continue;
+            }
+            if trimmed == input {
+                saw_input = true;
+            }
+            continue;
+        }
+
+        match trimmed {
+            "--deep" | "--force" | "--strict" | "--verbose" => {}
+            "--sign" | "--options" | "--entitlements" | "--requirements" | "--timestamp"
+            | "--prefix" | "--identifier" => {
+                expects_value_for = Some(trimmed);
+            }
+            value if value.starts_with("--timestamp=") => {}
+            value if value == input => saw_input = true,
+            _ => {
+                bail!(
+                    "Unsupported finalize.args entry '{}' for finalize.tool '{}'",
+                    trimmed,
+                    "codesign"
+                );
+            }
+        }
+    }
+
+    if let Some(option) = expects_value_for {
+        bail!("finalize.args is missing a value for '{}'", option);
+    }
+    if !saw_input {
+        bail!(
+            "finalize.args must include artifact.input '{}' for finalize.tool '{}'",
+            input,
+            "codesign"
+        );
+    }
+    Ok(())
+}
+
+fn validate_signtool_finalize_args(args: &[String], input: &str) -> Result<()> {
+    const SIGNTOOL_BOOLEAN_SWITCHES: &[&str] =
+        &["a", "as", "debug", "nph", "ph", "q", "sm", "uw", "v"];
+    const SIGNTOOL_VALUE_SWITCHES: &[&str] = &[
+        "ac", "c", "csp", "d", "dg", "di", "ds", "du", "f", "fd", "i", "kc", "n", "p", "p7ce",
+        "p7co", "pg", "r", "s", "sha1", "t", "td", "tr", "u",
+    ];
+
+    let mut arguments = args.iter();
+    let Some(command) = arguments.next() else {
+        bail!("finalize.args must not be empty");
+    };
+    if !command.trim().eq_ignore_ascii_case("sign") {
+        bail!(
+            "Unsupported finalize.args subcommand '{}' for finalize.tool '{}'",
+            command.trim(),
+            "signtool"
+        );
+    }
+
+    let mut expects_value_for: Option<String> = None;
+    let mut saw_input = false;
+    for argument in arguments {
+        let trimmed = argument.trim();
+        if expects_value_for.take().is_some() {
+            if trimmed == input {
+                saw_input = true;
+            }
+            continue;
+        }
+
+        if trimmed == input {
+            saw_input = true;
+            continue;
+        }
+
+        let Some(option) = trimmed
+            .strip_prefix('/')
+            .or_else(|| trimmed.strip_prefix('-'))
+        else {
+            bail!(
+                "Unsupported finalize.args entry '{}' for finalize.tool '{}'",
+                trimmed,
+                "signtool"
+            );
+        };
+        let normalized = option.trim().to_ascii_lowercase();
+        if SIGNTOOL_BOOLEAN_SWITCHES.contains(&normalized.as_str()) {
+            continue;
+        }
+        if SIGNTOOL_VALUE_SWITCHES.contains(&normalized.as_str()) {
+            expects_value_for = Some(trimmed.to_string());
+            continue;
+        }
+        bail!(
+            "Unsupported finalize.args entry '{}' for finalize.tool '{}'",
+            trimmed,
+            "signtool"
+        );
+    }
+
+    if let Some(option) = expects_value_for {
+        bail!("finalize.args is missing a value for '{}'", option);
+    }
+    if !saw_input {
+        bail!(
+            "finalize.args must include artifact.input '{}' for finalize.tool '{}'",
+            input,
+            "signtool"
+        );
     }
     Ok(())
 }
@@ -3387,6 +3536,66 @@ input = "dist/time-management-desktop.app"
         )
         .expect("config parse");
         validate_delivery_config(&config).expect("config should be accepted");
+    }
+
+    #[test]
+    fn delivery_config_accepts_signtool_with_timestamp_args() {
+        let config: DeliveryConfig = toml::from_str(
+            r#"schema_version = "0.1"
+[artifact]
+    framework = "tauri"
+    stage = "unsigned"
+    target = "windows/x86_64"
+    input = "dist/MyApp.exe"
+[finalize]
+    tool = "signtool"
+    args = ["sign", "/fd", "SHA256", "/tr", "http://tsa.test", "/td", "SHA256", "dist/MyApp.exe"]
+"#,
+        )
+        .expect("config parse");
+        validate_delivery_config(&config).expect("config should be accepted");
+    }
+
+    #[test]
+    fn delivery_config_rejects_unknown_signtool_switch() {
+        let config: DeliveryConfig = toml::from_str(
+            r#"schema_version = "0.1"
+[artifact]
+    framework = "tauri"
+    stage = "unsigned"
+    target = "windows/x86_64"
+    input = "dist/MyApp.exe"
+[finalize]
+    tool = "signtool"
+    args = ["sign", "/bogus", "dist/MyApp.exe"]
+"#,
+        )
+        .expect("config parse");
+        let err = validate_delivery_config(&config).expect_err("config should be rejected");
+        assert!(err
+            .to_string()
+            .contains("Unsupported finalize.args entry '/bogus'"));
+    }
+
+    #[test]
+    fn delivery_config_rejects_unsupported_target() {
+        let config: DeliveryConfig = toml::from_str(
+            r#"schema_version = "0.1"
+[artifact]
+    framework = "tauri"
+    stage = "unsigned"
+    target = "solaris/x86_64"
+    input = "MyApp.app"
+[finalize]
+    tool = "codesign"
+    args = ["--deep", "--force", "--sign", "-", "MyApp.app"]
+"#,
+        )
+        .expect("config parse");
+        let err = validate_delivery_config(&config).expect_err("config should be rejected");
+        assert!(err
+            .to_string()
+            .contains("Unsupported artifact.target 'solaris/x86_64'"));
     }
 
     #[test]
