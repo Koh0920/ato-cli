@@ -282,7 +282,7 @@ fn detect_framework_hints(dir: &Path, detected: &DetectedProject) -> Result<Vec<
         if node.has_hono {
             hints.push("Hono".to_string());
         }
-        if node.is_bun && !hints.iter().any(|hint| hint == "Bun") {
+        if node.is_bun {
             hints.push("Bun".to_string());
         }
     }

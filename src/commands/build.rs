@@ -71,7 +71,7 @@ pub fn execute_pack_command(
             )?;
         } else {
             futures::executor::block_on(reporter.warn(
-                "No capsule.toml found. Using defaults. Run `ato init` to generate an agent prompt, or `ato build --init` to create capsule.toml interactively.".to_string(),
+                "No `capsule.toml` found. Using defaults. Run `ato init` to generate an agent prompt, or `ato build --init` to create `capsule.toml` interactively.".to_string(),
             ))?;
             let inferred = infer_zero_config_manifest(&dir)?;
             std::fs::write(&manifest, inferred).with_context(|| {
