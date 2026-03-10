@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag to upload (for example: v0.4.12)
+        description: "Release tag to upload (for example: v0.4.12)"
         required: true
         type: string
 
@@ -34,7 +34,7 @@ jobs:
         id: download
         shell: bash
         run: |
-          TAG="${{ inputs.tag }}"
+          TAG="${{ github.event.inputs.tag }}"
           if [[ "$TAG" =~ ^v(.+)$ ]]; then
             VERSION="${BASH_REMATCH[1]}"
           else
