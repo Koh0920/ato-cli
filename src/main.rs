@@ -226,6 +226,10 @@ enum Commands {
         #[arg(long)]
         registry: Option<String>,
 
+        /// Explicitly bind a manifest [state.<name>] entry to a host path using STATE=/absolute/path
+        #[arg(long = "state", value_name = "STATE=/ABS/PATH")]
+        state: Vec<String>,
+
         /// Network enforcement mode
         #[arg(long, value_enum, default_value_t = EnforcementMode::Strict)]
         enforcement: EnforcementMode,
@@ -708,6 +712,10 @@ enum Commands {
         /// Registry URL for auto-install when app-id is not installed (default: https://api.ato.run)
         #[arg(long)]
         registry: Option<String>,
+
+        /// Explicitly bind a manifest [state.<name>] entry to a host path using STATE=/absolute/path
+        #[arg(long = "state", value_name = "STATE=/ABS/PATH")]
+        state: Vec<String>,
 
         /// Network enforcement mode
         #[arg(long, value_enum, default_value_t = EnforcementMode::Strict)]
@@ -1369,6 +1377,7 @@ fn run() -> Result<()> {
             background,
             nacelle,
             registry,
+            state,
             enforcement,
             sandbox_mode,
             unsafe_mode_legacy,
@@ -1383,6 +1392,7 @@ fn run() -> Result<()> {
             background,
             nacelle,
             registry,
+            state,
             enforcement,
             sandbox_mode,
             unsafe_mode_legacy,
@@ -1415,6 +1425,7 @@ fn run() -> Result<()> {
             background,
             nacelle,
             registry,
+            state,
             enforcement,
             sandbox_mode,
             unsafe_mode_legacy,
@@ -1428,6 +1439,7 @@ fn run() -> Result<()> {
             background,
             nacelle,
             registry,
+            state,
             enforcement,
             sandbox_mode,
             unsafe_mode_legacy,
@@ -3042,6 +3054,7 @@ fn execute_run_like_command(
     background: bool,
     nacelle: Option<PathBuf>,
     registry: Option<String>,
+    state: Vec<String>,
     enforcement: EnforcementMode,
     sandbox_mode: bool,
     unsafe_mode_legacy: bool,
@@ -3100,6 +3113,7 @@ fn execute_run_like_command(
             sandbox_requested,
             dangerously_skip_permissions,
             yes,
+            state,
             reporter,
         );
     }
@@ -3129,6 +3143,7 @@ fn execute_run_like_command(
         sandbox_requested,
         dangerously_skip_permissions,
         yes,
+        state,
         reporter,
     )
 }
@@ -3688,6 +3703,7 @@ fn execute_open_command(
     sandbox_mode: bool,
     dangerously_skip_permissions: bool,
     assume_yes: bool,
+    state: Vec<String>,
     reporter: std::sync::Arc<reporters::CliReporter>,
 ) -> Result<()> {
     let target_path = if path.is_file() || path.extension().is_some_and(|ext| ext == "capsule") {
@@ -3709,6 +3725,7 @@ fn execute_open_command(
         sandbox_mode,
         dangerously_skip_permissions,
         assume_yes,
+        state_bindings: state,
         reporter,
     }))
 }
@@ -3932,6 +3949,31 @@ mod tests {
         assert!(!should_use_search_tui(true, false, false, false));
         assert!(!should_use_search_tui(true, true, true, false));
         assert!(!should_use_search_tui(true, true, false, true));
+    }
+
+    #[test]
+    fn run_command_parses_explicit_state_bindings() {
+        let cli = Cli::try_parse_from([
+            "ato",
+            "run",
+            ".",
+            "--state",
+            "data=/var/lib/ato/persistent/demo",
+            "--state",
+            "cache=/var/lib/ato/persistent/cache",
+        ])
+        .expect("parse");
+
+        match cli.command {
+            Commands::Run { state, .. } => assert_eq!(
+                state,
+                vec![
+                    "data=/var/lib/ato/persistent/demo".to_string(),
+                    "cache=/var/lib/ato/persistent/cache".to_string()
+                ]
+            ),
+            other => panic!("unexpected command: {:?}", std::mem::discriminant(&other)),
+        }
     }
 
     #[test]

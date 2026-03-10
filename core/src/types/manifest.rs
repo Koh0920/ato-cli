@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path};
 
 use super::error::CapsuleError;
 use super::utils::parse_memory_string;
@@ -321,6 +321,10 @@ pub struct ServiceSpec {
     #[serde(default)]
     pub env: Option<HashMap<String, String>>,
 
+    /// State requirements bound into this service at runtime.
+    #[serde(default)]
+    pub state_bindings: Vec<ServiceStateBinding>,
+
     /// Readiness probe (Step 2/3).
     #[serde(default)]
     pub readiness_probe: Option<ReadinessProbe>,
@@ -328,6 +332,12 @@ pub struct ServiceSpec {
     /// Service-to-service network exposure controls.
     #[serde(default)]
     pub network: Option<ServiceNetworkSpec>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServiceStateBinding {
+    pub state: String,
+    pub target: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -399,6 +409,10 @@ pub struct CapsuleManifest {
     /// Persistent storage volumes
     #[serde(default)]
     pub storage: CapsuleStorage,
+
+    /// Filesystem-backed application state requirements.
+    #[serde(default)]
+    pub state: HashMap<String, StateRequirement>,
 
     /// Routing configuration
     #[serde(default)]
@@ -581,6 +595,40 @@ pub struct StorageVolume {
     pub encrypted: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StateKind {
+    Filesystem,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StateDurability {
+    Ephemeral,
+    Persistent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum StateAttach {
+    #[default]
+    Auto,
+    Explicit,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StateRequirement {
+    pub kind: StateKind,
+    pub durability: StateDurability,
+    pub purpose: String,
+    #[serde(default)]
+    pub producer: Option<String>,
+    #[serde(default)]
+    pub attach: StateAttach,
+    #[serde(default)]
+    pub schema_id: Option<String>,
+}
+
 /// Human-readable metadata
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CapsuleMetadata {
@@ -759,6 +807,10 @@ pub struct CapsuleRouting {
 
 fn default_true() -> bool {
     true
+}
+
+pub fn default_ephemeral_state_base() -> String {
+    std::env::var("ATO_STATE_EPHEMERAL_BASE").unwrap_or_else(|_| "/var/lib/ato/state".to_string())
 }
 
 /// Model configuration (for inference Capsules)
@@ -1287,20 +1339,20 @@ impl CapsuleManifest {
             .unwrap_or(false);
         let mut requires_web_services_validation = false;
 
-        for (label, target) in named_targets {
+        for (label, target) in &named_targets {
             let runtime = target.runtime.trim().to_ascii_lowercase();
             let entrypoint = target.entrypoint.trim();
             if label.trim().is_empty()
                 || runtime.is_empty()
                 || !matches!(runtime.as_str(), "source" | "wasm" | "oci" | "web")
             {
-                errors.push(ValidationError::InvalidTarget(label));
+                errors.push(ValidationError::InvalidTarget(label.clone()));
                 continue;
             }
 
             if runtime == "source" {
                 if entrypoint.is_empty() {
-                    errors.push(ValidationError::InvalidTarget(label));
+                    errors.push(ValidationError::InvalidTarget(label.clone()));
                     continue;
                 }
                 let effective_driver = infer_source_driver(&target, entrypoint);
@@ -1386,7 +1438,7 @@ impl CapsuleManifest {
                     }
                 } else {
                     if entrypoint.is_empty() {
-                        errors.push(ValidationError::InvalidTarget(label));
+                        errors.push(ValidationError::InvalidTarget(label.clone()));
                         continue;
                     }
                     if matches!(
@@ -1407,11 +1459,11 @@ impl CapsuleManifest {
             if runtime == "oci" {
                 let image = target.image.as_deref().map(str::trim).unwrap_or("");
                 if entrypoint.is_empty() && image.is_empty() {
-                    errors.push(ValidationError::InvalidTarget(label));
+                    errors.push(ValidationError::InvalidTarget(label.clone()));
                     continue;
                 }
             } else if entrypoint.is_empty() {
-                errors.push(ValidationError::InvalidTarget(label));
+                errors.push(ValidationError::InvalidTarget(label.clone()));
                 continue;
             }
 
@@ -1739,6 +1791,169 @@ impl CapsuleManifest {
             }
         }
 
+        if !self.state.is_empty() {
+            if self
+                .services
+                .as_ref()
+                .map(|services| {
+                    services.is_empty()
+                        || !services
+                            .values()
+                            .any(|service| !service.state_bindings.is_empty())
+                })
+                .unwrap_or(true)
+            {
+                errors.push(ValidationError::InvalidState(
+                    "state".to_string(),
+                    "services.*.state_bindings are required when [state] is declared".to_string(),
+                ));
+            }
+
+            let mut shared_state_bindings = HashMap::new();
+            for (state_name, requirement) in &self.state {
+                let trimmed_name = state_name.trim();
+                if trimmed_name.is_empty() || !is_kebab_case(trimmed_name) {
+                    errors.push(ValidationError::InvalidState(
+                        state_name.clone(),
+                        "state name must be kebab-case".to_string(),
+                    ));
+                }
+
+                if requirement.purpose.trim().is_empty() {
+                    errors.push(ValidationError::InvalidState(
+                        state_name.clone(),
+                        "purpose is required".to_string(),
+                    ));
+                }
+                if requirement
+                    .producer
+                    .as_deref()
+                    .is_some_and(|producer| producer.trim().is_empty())
+                {
+                    errors.push(ValidationError::InvalidState(
+                        state_name.clone(),
+                        "producer cannot be empty".to_string(),
+                    ));
+                }
+
+                if requirement.kind != StateKind::Filesystem {
+                    errors.push(ValidationError::InvalidState(
+                        state_name.clone(),
+                        "only kind=\"filesystem\" is supported in this PoC".to_string(),
+                    ));
+                }
+
+                if requirement.durability == StateDurability::Persistent {
+                    if requirement.attach != StateAttach::Explicit {
+                        errors.push(ValidationError::InvalidState(
+                            state_name.clone(),
+                            "persistent state requires attach=\"explicit\"".to_string(),
+                        ));
+                    }
+                    if requirement
+                        .schema_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .is_none()
+                    {
+                        errors.push(ValidationError::InvalidState(
+                            state_name.clone(),
+                            "persistent state requires schema_id".to_string(),
+                        ));
+                    }
+                }
+            }
+
+            if let Some(services) = self.services.as_ref() {
+                for (service_name, service) in services {
+                    if service.state_bindings.is_empty() {
+                        continue;
+                    }
+
+                    let Some(target_label) = service
+                        .target
+                        .as_ref()
+                        .map(|value| value.trim())
+                        .filter(|value| !value.is_empty())
+                    else {
+                        errors.push(ValidationError::InvalidStateBinding(
+                            service_name.clone(),
+                            "state_bindings require target-based services".to_string(),
+                        ));
+                        continue;
+                    };
+
+                    if let Some(target) = named_targets.get(target_label) {
+                        if !target.runtime.eq_ignore_ascii_case("oci") {
+                            errors.push(ValidationError::InvalidStateBinding(
+                                service_name.clone(),
+                                format!(
+                                    "state_bindings are only supported for OCI targets in this PoC (target '{}')",
+                                    target_label
+                                ),
+                            ));
+                        }
+                    }
+
+                    let mut bound_states = std::collections::HashSet::new();
+                    let mut bound_targets = std::collections::HashSet::new();
+                    for binding in &service.state_bindings {
+                        let state_name = binding.state.trim();
+                        let target = binding.target.trim();
+
+                        if state_name.is_empty() {
+                            errors.push(ValidationError::InvalidStateBinding(
+                                service_name.clone(),
+                                "binding.state is required".to_string(),
+                            ));
+                        } else {
+                            if !bound_states.insert(state_name.to_string()) {
+                                errors.push(ValidationError::InvalidStateBinding(
+                                    service_name.clone(),
+                                    format!("state '{}' is bound more than once", state_name),
+                                ));
+                            }
+
+                            if let Some(previous_service) = shared_state_bindings
+                                .insert(state_name.to_string(), service_name.clone())
+                            {
+                                if previous_service != *service_name {
+                                    errors.push(ValidationError::InvalidStateBinding(
+                                        service_name.clone(),
+                                        format!(
+                                            "state '{}' is already bound by service '{}'; shared mutable state is not supported in this PoC",
+                                            state_name, previous_service
+                                        ),
+                                    ));
+                                }
+                            }
+
+                            match self.state.get(state_name) {
+                                Some(_) => {}
+                                None => errors.push(ValidationError::InvalidStateBinding(
+                                    service_name.clone(),
+                                    format!("state '{}' is not declared under [state]", state_name),
+                                )),
+                            }
+                        }
+
+                        if !is_valid_mount_path(target) {
+                            errors.push(ValidationError::InvalidStateBinding(
+                                service_name.clone(),
+                                format!("target '{}' must be an absolute path", binding.target),
+                            ));
+                        } else if !bound_targets.insert(target.to_string()) {
+                            errors.push(ValidationError::InvalidStateBinding(
+                                service_name.clone(),
+                                format!("target '{}' is bound more than once", target),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -1793,6 +2008,67 @@ impl CapsuleManifest {
     pub fn can_fallback_to_cloud(&self) -> bool {
         self.routing.fallback_to_cloud && self.routing.cloud_capsule.is_some()
     }
+
+    pub fn ephemeral_state_source_path(&self, state_name: &str) -> Result<String, CapsuleError> {
+        let state_name = state_name.trim();
+        if !is_kebab_case(state_name) {
+            return Err(CapsuleError::ValidationError(format!(
+                "state '{}' must be kebab-case before deriving an ephemeral state path",
+                state_name
+            )));
+        }
+
+        Ok(format!(
+            "{}/{}/{}",
+            default_ephemeral_state_base().trim_end_matches('/'),
+            self.name,
+            state_name
+        ))
+    }
+
+    pub fn state_source_path(
+        &self,
+        state_name: &str,
+        requirement: &StateRequirement,
+        overrides: Option<&HashMap<String, String>>,
+    ) -> Result<String, CapsuleError> {
+        if let Some(path) = overrides
+            .and_then(|entries| entries.get(state_name.trim()))
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        {
+            return Ok(path.to_string());
+        }
+
+        match requirement.durability {
+            StateDurability::Ephemeral => self.ephemeral_state_source_path(state_name),
+            StateDurability::Persistent => Err(CapsuleError::ValidationError(format!(
+                "state '{}' requires an explicit persistent binding before it can be attached",
+                state_name.trim()
+            ))),
+        }
+    }
+
+    /// Resolve the producer identity for a state requirement.
+    ///
+    /// When `producer` is omitted on `[state.<name>]`, the manifest name is used as the
+    /// default producer identity so persistent attach checks remain fail-closed. When
+    /// both are empty, this returns `None`; callers should treat that as a validation
+    /// failure and reject the attach.
+    pub fn state_producer(&self, state_name: &str) -> Option<String> {
+        self.state
+            .get(state_name.trim())
+            // Prefer an explicit producer on the state requirement; otherwise fall back to the
+            // manifest identity so persistent attach compatibility remains fail-closed by default.
+            .and_then(|requirement| requirement.producer.as_deref())
+            .map(str::trim)
+            .filter(|producer| !producer.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                let name = self.name.trim();
+                (!name.is_empty()).then(|| name.to_string())
+            })
+    }
 }
 
 /// Validation error types
@@ -1815,6 +2091,8 @@ pub enum ValidationError {
     MissingRuntimeVersion(String, String),
     InvalidWebTarget(String, String),
     InvalidService(String, String),
+    InvalidState(String, String),
+    InvalidStateBinding(String, String),
 }
 
 impl std::fmt::Display for ValidationError {
@@ -1897,6 +2175,16 @@ impl std::fmt::Display for ValidationError {
             ValidationError::InvalidService(name, message) => {
                 write!(f, "Invalid service '{}': {}", name, message)
             }
+            ValidationError::InvalidState(name, message) => {
+                write!(f, "Invalid state '{}': {}", name, message)
+            }
+            ValidationError::InvalidStateBinding(name, message) => {
+                write!(
+                    f,
+                    "Invalid state binding for service '{}': {}",
+                    name, message
+                )
+            }
         }
     }
 }
@@ -1933,6 +2221,17 @@ fn is_semver(s: &str) -> bool {
     }
 
     version_nums.iter().all(|n| n.parse::<u32>().is_ok())
+}
+
+pub(crate) fn is_valid_mount_path(path: &str) -> bool {
+    let path = Path::new(path);
+    path.is_absolute()
+        && path.components().all(|component| {
+            !matches!(
+                component,
+                Component::ParentDir | Component::CurDir | Component::Prefix(_)
+            )
+        })
 }
 
 fn infer_source_driver(target: &NamedTarget, entrypoint: &str) -> Option<String> {
@@ -2370,6 +2669,102 @@ expose = ["API_PORT"]
             ValidationError::InvalidService(name, msg)
                 if name == "main" && msg.contains("expose is not supported")
         )));
+    }
+
+    #[test]
+    fn test_validate_ephemeral_state_binding_for_oci_service() {
+        let toml = r#"
+schema_version = "0.2"
+name = "stateful-app"
+version = "0.1.0"
+type = "app"
+default_target = "app"
+
+[targets.app]
+runtime = "oci"
+image = "ghcr.io/example/app:latest"
+
+[state.data]
+kind = "filesystem"
+durability = "ephemeral"
+purpose = "primary-data"
+
+[services.main]
+target = "app"
+
+[[services.main.state_bindings]]
+state = "data"
+target = "/var/lib/app"
+"#;
+        let manifest = CapsuleManifest::from_toml(toml).unwrap();
+        assert!(manifest.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_state_binding_for_non_oci_service() {
+        let toml = r#"
+schema_version = "0.2"
+name = "stateful-app"
+version = "0.1.0"
+type = "app"
+default_target = "web"
+
+[targets.web]
+runtime = "web"
+driver = "node"
+entrypoint = "server.js"
+port = 3000
+
+[state.data]
+kind = "filesystem"
+durability = "ephemeral"
+purpose = "primary-data"
+
+[services.main]
+target = "web"
+
+[[services.main.state_bindings]]
+state = "data"
+target = "/var/lib/app"
+"#;
+        let manifest = CapsuleManifest::from_toml(toml).unwrap();
+        let errors = manifest.validate().unwrap_err();
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            ValidationError::InvalidStateBinding(name, msg)
+                if name == "main" && msg.contains("only supported for OCI targets")
+        )));
+    }
+
+    #[test]
+    fn test_validate_accepts_persistent_state_with_explicit_attach() {
+        let toml = r#"
+schema_version = "0.2"
+name = "stateful-app"
+version = "0.1.0"
+type = "app"
+default_target = "app"
+
+[targets.app]
+runtime = "oci"
+image = "ghcr.io/example/app:latest"
+
+[state.data]
+kind = "filesystem"
+durability = "persistent"
+purpose = "primary-data"
+attach = "explicit"
+schema_id = "vaultwarden/data/v1"
+
+[services.main]
+target = "app"
+
+[[services.main.state_bindings]]
+state = "data"
+target = "/var/lib/app"
+"#;
+        let manifest = CapsuleManifest::from_toml(toml).unwrap();
+        assert!(manifest.validate().is_ok());
     }
 
     #[test]

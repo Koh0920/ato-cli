@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use ed25519_dalek::{Signer, SigningKey};
+use rand::rngs::OsRng;
 use rand::RngCore;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use semver::Version;
@@ -22,11 +23,15 @@ const ACTIVE_KEY_FILE: &str = "active";
 const DEFAULT_LEASE_TTL_SECS: u64 = 900;
 const DEFAULT_GC_DEFER_SECS: i64 = 30;
 const RETENTION_PINNED_RELEASES: i64 = 5;
+// 128-bit random ids already make collisions vanishingly unlikely, but a small retry
+// budget keeps the insert path fail-closed if SQLite reports a uniqueness race.
+const MAX_STATE_ID_GENERATION_ATTEMPTS: usize = 10;
 const SCHEMA_MIGRATION_0001: &str = "2026-03-05-0001-manifests-tombstoned";
 const SCHEMA_MIGRATION_0002: &str = "2026-03-05-0002-leases-composite";
 const SCHEMA_MIGRATION_0003: &str = "2026-03-05-0003-gc-indexes";
 const SCHEMA_MIGRATION_0004: &str = "2026-03-05-0004-auto-vacuum-incremental";
 const SCHEMA_MIGRATION_0005: &str = "2026-03-05-0005-manifests-yanked";
+const SCHEMA_MIGRATION_0006: &str = "2026-03-10-0006-persistent-state-registry";
 
 fn manifest_distribution(
     manifest: &CapsuleManifest,
@@ -37,6 +42,12 @@ fn manifest_distribution(
             crate::error_codes::ATO_ERR_INTEGRITY_FAILURE
         )
     })
+}
+
+fn generate_random_state_id() -> String {
+    let mut bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    format!("state-{}", hex::encode(bytes))
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +96,29 @@ pub struct RegistryStoreMetadataRecord {
     pub icon_path: Option<String>,
     pub text: Option<String>,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistentStateRecord {
+    pub state_id: String,
+    pub owner_scope: String,
+    pub state_name: String,
+    pub backend_locator: String,
+    pub producer: String,
+    pub purpose: String,
+    pub schema_id: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewPersistentStateRecord {
+    pub owner_scope: String,
+    pub state_name: String,
+    pub backend_locator: String,
+    pub producer: String,
+    pub purpose: String,
+    pub schema_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -332,6 +366,95 @@ impl RegistryStore {
             packages.push(package);
         }
         Ok(packages)
+    }
+
+    pub fn find_persistent_state_by_owner_and_locator(
+        &self,
+        owner_scope: &str,
+        backend_locator: &str,
+    ) -> Result<Option<PersistentStateRecord>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT state_id, owner_scope, state_name, backend_locator, producer, purpose, schema_id, created_at, updated_at
+             FROM persistent_states
+             WHERE owner_scope=?1 AND backend_locator=?2",
+            params![owner_scope, backend_locator],
+            Self::map_persistent_state_row,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn register_persistent_state(
+        &self,
+        record: &NewPersistentStateRecord,
+    ) -> Result<PersistentStateRecord> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let conn = self.connect()?;
+        for _ in 0..MAX_STATE_ID_GENERATION_ATTEMPTS {
+            let state_id = generate_random_state_id();
+            match conn.execute(
+                "INSERT INTO persistent_states(
+                    state_id, owner_scope, state_name, backend_locator, producer, purpose, schema_id, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+                params![
+                    state_id,
+                    record.owner_scope,
+                    record.state_name,
+                    record.backend_locator,
+                    record.producer,
+                    record.purpose,
+                    record.schema_id,
+                    now,
+                ],
+            ) {
+                Ok(_) => {
+                    return self
+                        .find_persistent_state_by_owner_and_locator(
+                            &record.owner_scope,
+                            &record.backend_locator,
+                        )?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "failed to retrieve persistent state after registration - database inconsistency detected"
+                            )
+                        });
+                }
+                Err(rusqlite::Error::SqliteFailure(err, _))
+                    if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+                {
+                    if let Some(existing) = self.find_persistent_state_by_owner_and_locator(
+                        &record.owner_scope,
+                        &record.backend_locator,
+                    )? {
+                        return Ok(existing);
+                    }
+                    continue;
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        anyhow::bail!(
+            "failed to allocate a unique persistent state id after {} attempts",
+            MAX_STATE_ID_GENERATION_ATTEMPTS
+        );
+    }
+
+    fn map_persistent_state_row(
+        row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<PersistentStateRecord> {
+        Ok(PersistentStateRecord {
+            state_id: row.get(0)?,
+            owner_scope: row.get(1)?,
+            state_name: row.get(2)?,
+            backend_locator: row.get(3)?,
+            producer: row.get(4)?,
+            purpose: row.get(5)?,
+            schema_id: row.get(6)?,
+            created_at: row.get(7)?,
+            updated_at: row.get(8)?,
+        })
     }
 
     pub fn find_registry_release(
@@ -2156,6 +2279,18 @@ impl RegistryStore {
               updated_at TEXT NOT NULL,
               FOREIGN KEY(scoped_id) REFERENCES registry_packages(scoped_id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS persistent_states(
+              state_id TEXT PRIMARY KEY,
+              owner_scope TEXT NOT NULL,
+              state_name TEXT NOT NULL,
+              backend_locator TEXT NOT NULL,
+              producer TEXT NOT NULL,
+              purpose TEXT NOT NULL,
+              schema_id TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              UNIQUE(owner_scope, backend_locator)
+            );
             CREATE TABLE IF NOT EXISTS schema_migrations(
               migration_id TEXT PRIMARY KEY,
               applied_at TEXT NOT NULL
@@ -2168,6 +2303,7 @@ impl RegistryStore {
             CREATE INDEX IF NOT EXISTS idx_registry_packages_publisher_slug ON registry_packages(publisher, slug);
             CREATE INDEX IF NOT EXISTS idx_registry_releases_manifest_hash ON registry_releases(manifest_hash);
             CREATE INDEX IF NOT EXISTS idx_registry_store_metadata_updated_at ON registry_store_metadata(updated_at);
+            CREATE INDEX IF NOT EXISTS idx_persistent_states_owner_scope ON persistent_states(owner_scope, state_name);
             ",
         )?;
         self.apply_schema_migrations(&mut conn)?;
@@ -2252,6 +2388,28 @@ impl RegistryStore {
                 conn.execute("ALTER TABLE manifests ADD COLUMN yanked_at TEXT", [])?;
             }
             self.mark_migration_applied(conn, SCHEMA_MIGRATION_0005)?;
+        }
+
+        if !self.is_migration_applied(conn, SCHEMA_MIGRATION_0006)? {
+            conn.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS persistent_states(
+                  state_id TEXT PRIMARY KEY,
+                  owner_scope TEXT NOT NULL,
+                  state_name TEXT NOT NULL,
+                  backend_locator TEXT NOT NULL,
+                  producer TEXT NOT NULL,
+                  purpose TEXT NOT NULL,
+                  schema_id TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  UNIQUE(owner_scope, backend_locator)
+                );
+                CREATE INDEX IF NOT EXISTS idx_persistent_states_owner_scope
+                  ON persistent_states(owner_scope, state_name);
+                ",
+            )?;
+            self.mark_migration_applied(conn, SCHEMA_MIGRATION_0006)?;
         }
 
         Ok(())
@@ -3322,6 +3480,34 @@ default_target = "cli"
             "unexpected lease plan: {}",
             lease_plan
         );
+    }
+
+    #[test]
+    fn persistent_state_registry_round_trips() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = RegistryStore::open(temp.path()).expect("open store");
+        let record = store
+            .register_persistent_state(&NewPersistentStateRecord {
+                owner_scope: "demo-app".to_string(),
+                state_name: "data".to_string(),
+                backend_locator: "/var/lib/ato/persistent/demo-app/data".to_string(),
+                producer: "demo-app".to_string(),
+                purpose: "primary-data".to_string(),
+                schema_id:
+                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_string(),
+            })
+            .expect("register");
+        assert!(record.state_id.starts_with("state-"));
+
+        let fetched = store
+            .find_persistent_state_by_owner_and_locator(
+                "demo-app",
+                "/var/lib/ato/persistent/demo-app/data",
+            )
+            .expect("lookup")
+            .expect("record");
+        assert_eq!(fetched, record);
     }
 
     #[test]
