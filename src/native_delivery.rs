@@ -220,6 +220,7 @@ impl std::fmt::Display for NativeArtifactKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FinalizeRunnerKind {
     Codesign,
+    Signtool,
     ExternalStub,
 }
 
@@ -230,10 +231,18 @@ struct FinalizeRunner {
 }
 
 impl FinalizeRunner {
-    fn for_tool(tool: &str) -> Self {
-        let trimmed = tool.trim();
-        let kind = if trimmed.eq_ignore_ascii_case("codesign") {
+    fn for_config(config: &DeliveryConfig) -> Self {
+        let trimmed = config.finalize.tool.trim();
+        let kind = if tool_name_matches(trimmed, "codesign") {
             FinalizeRunnerKind::Codesign
+        } else if tool_name_matches(trimmed, "signtool")
+            || path_has_extension(Path::new(config.artifact.input.trim()), "exe")
+            || matches!(
+                delivery_target_os_family(config.artifact.target.trim()),
+                Some("windows")
+            )
+        {
+            FinalizeRunnerKind::Signtool
         } else {
             FinalizeRunnerKind::ExternalStub
         };
@@ -246,13 +255,14 @@ impl FinalizeRunner {
     fn strip_existing_signature(&self, artifact_path: &Path) -> Result<()> {
         match self.kind {
             FinalizeRunnerKind::Codesign => strip_codesign_signature(&self.tool, artifact_path),
-            FinalizeRunnerKind::ExternalStub => Ok(()),
+            FinalizeRunnerKind::Signtool | FinalizeRunnerKind::ExternalStub => Ok(()),
         }
     }
 
     fn run(&self, derived_dir: &Path, config: &DeliveryConfig) -> Result<()> {
         match self.kind {
             FinalizeRunnerKind::Codesign => run_codesign_command(derived_dir, config),
+            FinalizeRunnerKind::Signtool => run_signtool_command(derived_dir, config),
             FinalizeRunnerKind::ExternalStub => bail!(
                 "finalize tool '{}' is not implemented for this host yet",
                 self.tool
@@ -409,7 +419,7 @@ pub(crate) fn build_native_artifact(
     }
 
     let config = staged_delivery_config(plan)?;
-    let runner = FinalizeRunner::for_tool(&config.finalize.tool);
+    let runner = FinalizeRunner::for_config(&config);
     build_native_artifact_with_strip(plan, output_path, |artifact_path| {
         runner.strip_existing_signature(artifact_path)
     })
@@ -958,10 +968,6 @@ pub fn execute_finalize(
         bail!("finalize requires --allow-external-finalize for any external signing step");
     }
 
-    if !host_supports_finalize() {
-        bail!("ato finalize currently supports macOS hosts only");
-    }
-
     finalize_with_dispatch(fetched_dir, output_dir)
 }
 
@@ -1004,7 +1010,13 @@ pub fn execute_unproject(reference: &str) -> Result<UnprojectResult> {
 
 fn finalize_with_dispatch(fetched_dir: &Path, output_dir: &Path) -> Result<FinalizeResult> {
     finalize_with_runner(fetched_dir, output_dir, |derived_dir, config| {
-        FinalizeRunner::for_tool(&config.finalize.tool).run(derived_dir, config)
+        if !host_supports_finalize_target(&config.artifact.target) {
+            bail!(
+                "{}",
+                unsupported_finalize_host_message(&config.artifact.target)
+            );
+        }
+        FinalizeRunner::for_config(config).run(derived_dir, config)
     })
 }
 
@@ -1040,7 +1052,6 @@ where
     validate_relative_input_path(&input_relative)?;
     let input_app_path = artifact_root.join(&input_relative);
     validate_native_bundle_directory(&input_app_path)?;
-    ensure_native_artifact_kind_supported(&input_app_path, "finalize")?;
 
     fs::create_dir_all(output_dir).with_context(|| {
         format!(
@@ -2038,16 +2049,40 @@ fn staged_delivery_config(plan: &NativeBuildPlan) -> Result<DeliveryConfig> {
 
 fn run_codesign_command(derived_dir: &Path, config: &DeliveryConfig) -> Result<()> {
     let tool = config.finalize.tool.trim();
+    run_finalize_command(Path::new(tool), tool, &config.finalize.args, derived_dir)
+}
+
+fn run_signtool_command(derived_dir: &Path, config: &DeliveryConfig) -> Result<()> {
+    let tool = config.finalize.tool.trim();
+    let resolved_tool = resolve_signtool_command(tool)?;
+    run_finalize_command(
+        &resolved_tool,
+        resolved_tool.to_string_lossy().as_ref(),
+        &config.finalize.args,
+        derived_dir,
+    )
+}
+
+fn run_finalize_command(
+    tool: &Path,
+    display_tool: &str,
+    args: &[String],
+    derived_dir: &Path,
+) -> Result<()> {
     let mut command = Command::new(tool);
     command
-        .args(&config.finalize.args)
+        .args(args)
         .current_dir(derived_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let output = command
-        .output()
-        .with_context(|| format!("Failed to execute {} in {}", tool, derived_dir.display()))?;
+    let output = command.output().with_context(|| {
+        format!(
+            "Failed to execute {} in {}",
+            display_tool,
+            derived_dir.display()
+        )
+    })?;
     if output.status.success() {
         return Ok(());
     }
@@ -2060,7 +2095,7 @@ fn run_codesign_command(derived_dir: &Path, config: &DeliveryConfig) -> Result<(
     };
     bail!(
         "{} failed with status {}{}",
-        tool,
+        display_tool,
         output
             .status
             .code()
@@ -2072,6 +2107,123 @@ fn run_codesign_command(derived_dir: &Path, config: &DeliveryConfig) -> Result<(
             format!(": {}", details)
         },
     )
+}
+
+fn resolve_signtool_command(tool: &str) -> Result<PathBuf> {
+    let trimmed = tool.trim();
+    if trimmed.is_empty() {
+        bail!("finalize.tool must not be empty");
+    }
+    if !tool_name_matches(trimmed, "signtool") {
+        return Ok(PathBuf::from(trimmed));
+    }
+    if let Some(path) = env_path_var("ATO_SIGNTOOL_PATH") {
+        return Ok(path);
+    }
+    for candidate in ["signtool.exe", "signtool"] {
+        if let Ok(found) = which::which(candidate) {
+            return Ok(found);
+        }
+    }
+    if let Some(found) = discover_windows_sdk_signtool() {
+        return Ok(found);
+    }
+    bail!(
+        "Failed to resolve signtool.exe. Set finalize.tool to an explicit path, export ATO_SIGNTOOL_PATH, or install the Windows SDK signing tools."
+    )
+}
+
+fn env_path_var(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name).and_then(|value| {
+        let trimmed = value.to_string_lossy().trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(trimmed))
+        }
+    })
+}
+
+#[cfg(windows)]
+fn discover_windows_sdk_signtool() -> Option<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(path) = env_path_var("WindowsSdkVerBinPath") {
+        roots.push(path);
+    }
+    if let Some(path) = env_path_var("WindowsSdkBinPath") {
+        roots.push(path);
+    }
+    if let Some(path) = env_path_var("WindowsSdkDir") {
+        roots.push(path.join("bin"));
+    }
+    if let Some(path) = env_path_var("ProgramFiles(x86)") {
+        roots.push(path.join("Windows Kits"));
+    }
+    if let Some(path) = env_path_var("ProgramFiles") {
+        roots.push(path.join("Windows Kits"));
+    }
+
+    let mut candidates = roots
+        .into_iter()
+        .filter(|root| root.exists())
+        .flat_map(|root| {
+            WalkDir::new(root)
+                .max_depth(5)
+                .into_iter()
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.into_path())
+                .filter(|path| {
+                    path.is_file()
+                        && path
+                            .file_name()
+                            .and_then(|value| value.to_str())
+                            .map(|value| value.eq_ignore_ascii_case("signtool.exe"))
+                            .unwrap_or(false)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    candidates.sort_by(|left, right| {
+        signtool_candidate_rank(right)
+            .cmp(&signtool_candidate_rank(left))
+            .then_with(|| left.cmp(right))
+    });
+    candidates.into_iter().next()
+}
+
+#[cfg(not(windows))]
+fn discover_windows_sdk_signtool() -> Option<PathBuf> {
+    None
+}
+
+#[cfg(windows)]
+fn signtool_candidate_rank(path: &Path) -> (usize, usize) {
+    let lowered = path.to_string_lossy().to_ascii_lowercase();
+    let arch_rank = if lowered.contains("\\arm64\\") {
+        3
+    } else if lowered.contains("\\x64\\") {
+        2
+    } else if lowered.contains("\\x86\\") {
+        1
+    } else {
+        0
+    };
+    (arch_rank, lowered.len())
+}
+
+fn tool_name_matches(tool: &str, expected: &str) -> bool {
+    let trimmed = tool.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let file_name = trimmed
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(trimmed);
+    file_name.eq_ignore_ascii_case(expected)
+        || file_name.eq_ignore_ascii_case(&format!("{expected}.exe"))
 }
 
 fn strip_codesign_signature(tool: &str, app_path: &Path) -> Result<()> {
@@ -2711,6 +2863,30 @@ fn create_projection_symlink(target: &Path, destination: &Path) -> std::io::Resu
 
 pub(crate) fn host_supports_finalize() -> bool {
     cfg!(target_os = "macos")
+}
+
+pub(crate) fn host_supports_finalize_target(target: &str) -> bool {
+    match delivery_target_os_family(target) {
+        Some("darwin") => cfg!(target_os = "macos"),
+        Some("windows") => cfg!(target_os = "windows"),
+        _ => false,
+    }
+}
+
+fn unsupported_finalize_host_message(target: &str) -> String {
+    match delivery_target_os_family(target) {
+        Some("darwin") => {
+            "ato finalize currently supports darwin targets on macOS hosts only".to_string()
+        }
+        Some("windows") => {
+            "ato finalize currently supports windows targets on Windows hosts only".to_string()
+        }
+        Some(other) => format!(
+            "ato finalize does not support local finalize for '{}' targets yet",
+            other
+        ),
+        None => "ato finalize requires a valid artifact.target in <os>/<arch> format".to_string(),
+    }
 }
 
 fn random_hex(len_bytes: usize) -> String {
@@ -3387,6 +3563,10 @@ input = "dist/time-management-desktop.app"
         )
         .expect("config parse");
         validate_delivery_config(&config).expect("config should be accepted");
+        assert!(matches!(
+            FinalizeRunner::for_config(&config).kind,
+            FinalizeRunnerKind::Signtool
+        ));
     }
 
     #[test]
@@ -3562,17 +3742,43 @@ input = "dist/time-management-desktop.app"
     }
 
     #[test]
-    fn finalize_rejects_single_file_native_artifacts_with_explicit_error() -> Result<()> {
+    fn finalize_allows_windows_single_file_artifacts_without_mutating_parent() -> Result<()> {
         let tmp = tempdir()?;
         let fetched_dir = sample_file_fetch_dir(tmp.path())?;
+        let artifact_dir = fetched_dir.join(FETCH_ARTIFACT_DIR);
+        let parent_before = compute_tree_digest(&artifact_dir)?;
         let output_root = tmp.path().join("dist");
 
-        let err = finalize_with_runner(&fetched_dir, &output_root, |_derived_dir, _config| Ok(()))
-            .expect_err("single-file native artifacts should fail closed during finalize");
+        let result = finalize_with_runner(&fetched_dir, &output_root, |derived_dir, config| {
+            assert_eq!(config.artifact.input, "MyApp.exe");
+            assert_eq!(
+                config.finalize.args,
+                vec![
+                    "sign".to_string(),
+                    "/fd".to_string(),
+                    "SHA256".to_string(),
+                    "MyApp.exe".to_string(),
+                ]
+            );
+            let derived_exe = derived_dir.join("MyApp.exe");
+            let mut bytes = fs::read(&derived_exe)?;
+            bytes.extend_from_slice(b"signed");
+            fs::write(&derived_exe, bytes)?;
+            Ok(())
+        })?;
 
-        assert!(err
-            .to_string()
-            .contains("Native delivery finalize does not support single-file artifacts yet"));
+        assert_eq!(parent_before, result.parent_digest);
+        assert_eq!(compute_tree_digest(&artifact_dir)?, parent_before);
+        assert_eq!(
+            result
+                .derived_app_path
+                .file_name()
+                .and_then(|value| value.to_str()),
+            Some("MyApp.exe")
+        );
+        assert!(
+            fs::read(&result.derived_app_path)?.len() > sample_windows_executable_bytes().len()
+        );
         Ok(())
     }
 
@@ -3620,6 +3826,65 @@ input = "dist/time-management-desktop.app"
         assert_eq!(rebased.finalize.args[3], "MyApp.exe");
         assert_eq!(rebased.finalize.args[5], "http://tsa.test/dist/MyApp.exe");
         Ok(())
+    }
+
+    #[test]
+    fn tool_name_matches_accepts_explicit_signtool_paths() {
+        assert!(tool_name_matches("signtool", "signtool"));
+        assert!(tool_name_matches("signtool.exe", "signtool"));
+        assert!(tool_name_matches(
+            r"C:\Program Files (x86)\Windows Kits\10\bin\x64\signtool.exe",
+            "signtool"
+        ));
+        assert!(!tool_name_matches("osslsigncode", "signtool"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_signtool_command_prefers_env_override() -> Result<()> {
+        struct EnvGuard {
+            key: &'static str,
+            original: Option<std::ffi::OsString>,
+        }
+
+        impl EnvGuard {
+            fn set(key: &'static str, value: &Path) -> Self {
+                let original = std::env::var_os(key);
+                std::env::set_var(key, value);
+                Self { key, original }
+            }
+        }
+
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                if let Some(value) = self.original.as_ref() {
+                    std::env::set_var(self.key, value);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+
+        let tmp = tempdir()?;
+        let custom = tmp.path().join("signtool.exe");
+        fs::write(&custom, b"stub")?;
+        let _guard = EnvGuard::set("ATO_SIGNTOOL_PATH", &custom);
+
+        assert_eq!(resolve_signtool_command("signtool")?, custom);
+        Ok(())
+    }
+
+    #[test]
+    fn host_supports_finalize_target_is_target_specific() {
+        assert_eq!(
+            host_supports_finalize_target("darwin/arm64"),
+            cfg!(target_os = "macos")
+        );
+        assert_eq!(
+            host_supports_finalize_target("windows/x86_64"),
+            cfg!(target_os = "windows")
+        );
+        assert!(!host_supports_finalize_target("linux/x86_64"));
     }
 
     #[test]

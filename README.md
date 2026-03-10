@@ -35,7 +35,7 @@ ato registry serve --host 127.0.0.1 --port 18787 [--auth-token <token>]
 - `ato.delivery.toml` is still accepted as a compatibility sidecar. When present, it must match the `capsule.toml` native target contract; the build rewrites/stages compatibility metadata into the artifact.
 - Native install JSON exposes `local_derivation` and `projection` envelopes. For this contract generation, `schema_version = "0.1"` is the stable machine-readable version for fetch/finalize/project/unproject/install metadata.
 - `fetch`, `finalize`, `project`, and `unproject` remain advanced/debug surfaces. Most users should stay on the integrated `build` / `publish` / `install` flow.
-- Local finalize is currently fail-closed and limited to macOS darwin/arm64 with `codesign`.
+- Local finalize is fail-closed: darwin targets finalize on macOS with `codesign`, and windows targets finalize on Windows with `signtool`.
 
 ## Quick Start (Local)
 

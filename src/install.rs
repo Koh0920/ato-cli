@@ -567,10 +567,11 @@ pub async fn install_app(
     }
 
     let native_spec = crate::native_delivery::detect_install_requires_local_derivation(&bytes)?;
-    if let Some(_native_spec) = native_spec {
-        if !crate::native_delivery::host_supports_finalize() {
+    if let Some(native_spec) = native_spec {
+        if !crate::native_delivery::host_supports_finalize_target(&native_spec.target) {
             bail!(
-                "This app requires local finalize, but this host does not support native finalize (macOS hosts only)."
+                "This app requires local finalize, but this host does not support '{}' local finalize.",
+                native_spec.target
             );
         }
 
