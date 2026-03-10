@@ -1273,16 +1273,12 @@ fn project_with_roots_and_command_dir(
             )
         })?;
         if projected_command_path.exists() || fs::symlink_metadata(projected_command_path).is_ok() {
-            if is_managed_symlink_to(projected_command_path, projected_command_target)? {
+            if !is_managed_symlink_to(projected_command_path, projected_command_target)? {
                 bail!(
-                    "Projection command conflict: command path already exists without matching metadata: {}",
+                    "Projection command conflict: command path already exists: {}",
                     projected_command_path.display()
                 );
             }
-            bail!(
-                "Projection command conflict: command path already exists: {}",
-                projected_command_path.display()
-            );
         }
     }
 
@@ -1329,14 +1325,16 @@ fn project_with_roots_and_command_dir(
                     .projected_command_target
                     .as_ref()
                     .context("linux command target missing")?;
-                create_projection_symlink(projected_command_target, projected_command_path)
-                    .with_context(|| {
-                        format!(
-                            "Failed to create command symlink {} -> {}",
-                            projected_command_path.display(),
-                            projected_command_target.display()
-                        )
-                    })?;
+                if !is_managed_symlink_to(projected_command_path, projected_command_target)? {
+                    create_projection_symlink(projected_command_target, projected_command_path)
+                        .with_context(|| {
+                            format!(
+                                "Failed to create command symlink {} -> {}",
+                                projected_command_path.display(),
+                                projected_command_target.display()
+                            )
+                        })?;
+                }
                 fs::write(
                     &projected_path,
                     render_linux_desktop_entry(
@@ -1686,15 +1684,25 @@ fn resolve_linux_projection_command_target(derived_app_path: &Path) -> Result<Pa
         return Ok(preferred);
     }
 
-    let mut candidates = WalkDir::new(derived_app_path)
+    let mut candidates = Vec::new();
+    for entry in WalkDir::new(derived_app_path)
         .min_depth(1)
         .max_depth(LINUX_PROJECTION_EXEC_SEARCH_MAX_DEPTH)
-        .into_iter()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_type().is_file())
-        .map(|entry| entry.into_path())
-        .filter(|path| is_executable_file(path).unwrap_or(false))
-        .collect::<Vec<_>>();
+    {
+        let entry = entry.with_context(|| {
+            format!(
+                "Failed to inspect projection command candidates in {}",
+                derived_app_path.display()
+            )
+        })?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.into_path();
+        if is_executable_file(&path)? {
+            candidates.push(path);
+        }
+    }
     candidates.sort();
     match candidates.len() {
         1 => Ok(candidates.remove(0)),
@@ -3167,6 +3175,8 @@ fn escape_desktop_entry_exec_value(path: &Path) -> String {
     escape_desktop_entry_string_value(&path.to_string_lossy())
         .replace(' ', "\\ ")
         .replace('"', "\\\"")
+        .replace('$', "\\$")
+        .replace('`', "\\`")
 }
 
 fn remove_projected_path(path: &Path, projection_kind: &str) -> Result<bool> {
@@ -3892,11 +3902,12 @@ input = "dist/time-management-desktop.app"
         assert_eq!(sanitize_projection_segment("---"), "ato-app");
         assert_eq!(sanitize_projection_segment("my___app"), "my___app");
         assert_eq!(sanitize_projection_segment("My.App"), "my-app");
+        assert_eq!(sanitize_projection_segment("My...App"), "my-app");
     }
 
     #[test]
     fn projection_name_helpers_prefer_scoped_slug_when_available() -> Result<()> {
-        let derived_app_path = Path::new("/tmp/Time Management Desktop.app");
+        let derived_app_path = Path::new("Time Management Desktop.app");
         assert_eq!(
             projection_display_name(derived_app_path, Some("koh0920/time-management-desktop"))?,
             "Time Management Desktop"
@@ -3912,12 +3923,12 @@ input = "dist/time-management-desktop.app"
     fn render_linux_desktop_entry_escapes_special_characters() {
         let rendered = render_linux_desktop_entry(
             "My App\nTabbed\tName",
-            Path::new("/tmp/My App/bin/my\"app"),
-            Path::new("/tmp/My App/root"),
+            Path::new("My App/bin/my\"app"),
+            Path::new("My App/root"),
         );
         assert!(rendered.contains("Name=My App\\nTabbed\\tName"));
-        assert!(rendered.contains("Exec=/tmp/My\\ App/bin/my\\\"app"));
-        assert!(rendered.contains("Path=/tmp/My App/root"));
+        assert!(rendered.contains("Exec=My\\ App/bin/my\\\"app"));
+        assert!(rendered.contains("Path=My App/root"));
     }
 
     #[test]
