@@ -2396,13 +2396,13 @@ fn validate_minimal_linux_elf_directory(root: &Path) -> Result<()> {
             continue;
         }
 
-        let bytes = fs::read(&path)
-            .with_context(|| format!("Failed to read Linux executable {}", path.display()))?;
-        if !bytes.starts_with(b"\x7FELF") {
+        if !path_has_elf_magic(&path)? {
             continue;
         }
 
         validate_unix_executable_permissions(&path, &metadata)?;
+        let bytes = fs::read(&path)
+            .with_context(|| format!("Failed to read Linux executable {}", path.display()))?;
         validate_linux_elf_bytes(&path, &bytes)?;
         found_regular_elf = true;
     }
@@ -2440,6 +2440,16 @@ fn validate_linux_elf_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
         );
     };
     Ok(())
+}
+
+fn path_has_elf_magic(path: &Path) -> Result<bool> {
+    let mut file =
+        fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
+    let mut magic = [0u8; 4];
+    let bytes_read = file
+        .read(&mut magic)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    Ok(bytes_read == magic.len() && magic == *b"\x7FELF")
 }
 
 fn native_file_candidate_extension(path: &Path) -> Option<&'static str> {
@@ -2979,14 +2989,18 @@ args = ["sign", "/fd", "SHA256", "dist/MyApp.exe"]
         bytes
     }
 
+    #[cfg(unix)]
+    fn write_linux_elf(path: &Path, mode: u32) -> Result<()> {
+        fs::write(path, sample_linux_elf_bytes())?;
+        let mut permissions = fs::metadata(path)?.permissions();
+        permissions.set_mode(mode);
+        fs::set_permissions(path, permissions)?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
     fn write_linux_elf(path: &Path, _mode: u32) -> Result<()> {
         fs::write(path, sample_linux_elf_bytes())?;
-        #[cfg(unix)]
-        {
-            let mut permissions = fs::metadata(path)?.permissions();
-            permissions.set_mode(_mode);
-            fs::set_permissions(path, permissions)?;
-        }
         Ok(())
     }
 
