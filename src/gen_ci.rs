@@ -145,8 +145,9 @@ fn resolve_release_checksum(
                     })?;
             Ok(ChecksumResolution {
                 checksum,
-                archive_path: "/ato/releases/${ATO_VERSION}/ato-cli-x86_64-unknown-linux-gnu.tar.xz"
-                    .to_string(),
+                archive_path:
+                    "/ato/releases/${ATO_VERSION}/ato-cli-x86_64-unknown-linux-gnu.tar.xz"
+                        .to_string(),
                 used_latest_fallback: true,
             })
         }
@@ -272,8 +273,8 @@ mod tests {
     #[test]
     fn parses_matching_checksum_line() {
         let input = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  ato-cli-x86_64-unknown-linux-gnu.tar.xz\n";
-        let hash =
-            parse_checksum_line(input, "ato-cli-x86_64-unknown-linux-gnu.tar.xz").expect("must parse");
+        let hash = parse_checksum_line(input, "ato-cli-x86_64-unknown-linux-gnu.tar.xz")
+            .expect("must parse");
         assert_eq!(
             hash,
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -283,8 +284,8 @@ mod tests {
     #[test]
     fn supports_gnu_style_star_prefix() {
         let input = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *ato-cli-x86_64-unknown-linux-gnu.tar.xz\n";
-        let hash =
-            parse_checksum_line(input, "ato-cli-x86_64-unknown-linux-gnu.tar.xz").expect("must parse");
+        let hash = parse_checksum_line(input, "ato-cli-x86_64-unknown-linux-gnu.tar.xz")
+            .expect("must parse");
         assert_eq!(
             hash,
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"

@@ -2445,8 +2445,8 @@ fn validate_linux_elf_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
 fn native_file_candidate_extension(path: &Path) -> Option<&'static str> {
     if path_has_extension(path, "exe") {
         Some("exe")
-    } else if path_has_extension(path, "appimage") {
-        Some("appimage")
+    } else if path_has_extension(path, "AppImage") {
+        Some("AppImage")
     } else if path_has_extension(path, "deb") {
         Some("deb")
     } else {
@@ -2457,7 +2457,7 @@ fn native_file_candidate_extension(path: &Path) -> Option<&'static str> {
 fn native_file_candidate_label(path: &Path) -> Option<&'static str> {
     match native_file_candidate_extension(path) {
         Some("exe") => Some(".exe"),
-        Some("appimage") => Some(".AppImage"),
+        Some("AppImage") => Some(".AppImage"),
         Some("deb") => Some(".deb"),
         Some(_) | None => None,
     }
@@ -2979,15 +2979,14 @@ args = ["sign", "/fd", "SHA256", "dist/MyApp.exe"]
         bytes
     }
 
-    fn write_linux_elf(path: &Path, mode: u32) -> Result<()> {
+    fn write_linux_elf(path: &Path, _mode: u32) -> Result<()> {
         fs::write(path, sample_linux_elf_bytes())?;
         #[cfg(unix)]
         {
             let mut permissions = fs::metadata(path)?.permissions();
-            permissions.set_mode(mode);
+            permissions.set_mode(_mode);
             fs::set_permissions(path, permissions)?;
         }
-        let _ = mode;
         Ok(())
     }
 
@@ -3324,6 +3323,27 @@ input = "dist/time-management-desktop.app"
         assert!(err
             .to_string()
             .contains("Linux executable failed minimum ELF validation"));
+        Ok(())
+    }
+
+    #[test]
+    fn validate_native_bundle_directory_rejects_linux_directory_without_elf_executable(
+    ) -> Result<()> {
+        let tmp = tempdir()?;
+        let linux_dir = tmp.path().join("dist/linux");
+        let launcher = linux_dir.join("AppRun");
+        fs::create_dir_all(&linux_dir)?;
+        fs::write(&launcher, b"#!/bin/sh\nexit 0\n")?;
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&launcher)?.permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&launcher, permissions)?;
+        }
+
+        let err = validate_native_bundle_directory(&linux_dir)
+            .expect_err("directory without an ELF executable should fail closed");
+        assert!(err.to_string().contains("missing a regular ELF executable"));
         Ok(())
     }
 
