@@ -19,6 +19,7 @@ ato publish [--registry <url>] [--artifact <file.capsule>] [--scoped-id <publish
 ato publish --dry-run
 ato publish --ci
 ato gen-ci
+ato inspect requirements <path|publisher/slug> --json [--registry <url>]
 ato search [query]
 ato source sync-status --source-id <id> --sync-run-id <id> [--registry <url>]
 ato source rebuild --source-id <id> [--ref <branch|tag|sha>] [--wait] [--registry <url>]
@@ -186,6 +187,54 @@ If missing or empty, execution stops fail-closed.
 
 - `targets.<label>.required_env = ["KEY1", "KEY2"]` (recommended)
 - Backward compatibility: `targets.<label>.env.ATO_ORCH_REQUIRED_ENVS = "KEY1,KEY2"`
+
+## Inspect Requirements JSON
+
+`ato inspect requirements <path|publisher/slug> --json` returns a stable machine-readable
+requirements contract derived from `capsule.toml`.
+
+- `capsule.toml` is the only source of truth for requirement discovery
+- local paths and remote `publisher/slug` refs return the same top-level JSON shape
+- state-related requirements are exposed under `requirements.state` (state-first), not `storage`
+- success prints JSON only to `stdout`
+- `--json` failures print structured JSON to `stderr` and exit non-zero
+
+Success shape:
+
+```json
+{
+  "schemaVersion": "1",
+  "target": {
+    "input": "./examples/foo",
+    "kind": "local",
+    "resolved": {
+      "path": "/abs/path/to/examples/foo"
+    }
+  },
+  "requirements": {
+    "secrets": [],
+    "state": [],
+    "env": [],
+    "network": [],
+    "services": [],
+    "consent": []
+  }
+}
+```
+
+Failure shape:
+
+```json
+{
+  "error": {
+    "code": "CAPSULE_TOML_NOT_FOUND",
+    "message": "capsule.toml was not found",
+    "details": {
+      "input": "./examples/foo"
+    }
+  }
+}
+```
 
 ## Build Strictness
 
