@@ -420,6 +420,13 @@ pub struct CapsuleManifest {
     #[serde(default)]
     pub state_owner_scope: Option<String>,
 
+    /// Optional opaque owner scope used for host-managed service binding identity.
+    ///
+    /// When omitted, `name` remains the default owner scope so published ingress and
+    /// future cross-capsule bindings inherit a stable default identity.
+    #[serde(default)]
+    pub service_binding_scope: Option<String>,
+
     /// Routing configuration
     #[serde(default)]
     pub routing: CapsuleRouting,
@@ -1242,6 +1249,17 @@ impl CapsuleManifest {
             errors.push(ValidationError::InvalidState(
                 "state_owner_scope".to_string(),
                 "state_owner_scope cannot be empty".to_string(),
+            ));
+        }
+
+        if self
+            .service_binding_scope
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            errors.push(ValidationError::InvalidService(
+                "service_binding_scope".to_string(),
+                "service_binding_scope cannot be empty".to_string(),
             ));
         }
 
@@ -2103,6 +2121,23 @@ impl CapsuleManifest {
                 (!name.is_empty()).then(|| name.to_string())
             })
     }
+
+    /// Resolve the owner scope used by the host-side service binding registry.
+    ///
+    /// `service_binding_scope` is treated as an opaque, user-controlled identity string.
+    /// When it is omitted, the manifest name remains the fail-closed default so
+    /// existing manifests keep a stable binding identity.
+    pub fn host_service_binding_scope(&self) -> Option<String> {
+        self.service_binding_scope
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                let name = self.name.trim();
+                (!name.is_empty()).then(|| name.to_string())
+            })
+    }
 }
 
 /// Validation error types
@@ -2870,6 +2905,58 @@ target = "/var/lib/app"
         assert_eq!(
             manifest.persistent_state_owner_scope().as_deref(),
             Some("tenant/acme/prod")
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_empty_service_binding_scope() {
+        let toml = r#"
+schema_version = "0.2"
+name = "stateful-app"
+version = "0.1.0"
+type = "app"
+default_target = "app"
+service_binding_scope = "   "
+
+[targets.app]
+runtime = "oci"
+image = "ghcr.io/example/app:latest"
+
+[services.main]
+target = "app"
+network = { publish = true }
+"#;
+        let manifest = CapsuleManifest::from_toml(toml).unwrap();
+        let errors = manifest.validate().unwrap_err();
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            ValidationError::InvalidService(name, message)
+                if name == "service_binding_scope" && message.contains("cannot be empty")
+        )));
+    }
+
+    #[test]
+    fn test_host_service_binding_scope_prefers_explicit_field() {
+        let toml = r#"
+schema_version = "0.2"
+name = "stateful-app"
+version = "0.1.0"
+type = "app"
+default_target = "app"
+service_binding_scope = "tenant/acme/services"
+
+[targets.app]
+runtime = "oci"
+image = "ghcr.io/example/app:latest"
+
+[services.main]
+target = "app"
+network = { publish = true }
+"#;
+        let manifest = CapsuleManifest::from_toml(toml).unwrap();
+        assert_eq!(
+            manifest.host_service_binding_scope().as_deref(),
+            Some("tenant/acme/services")
         );
     }
 

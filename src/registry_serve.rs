@@ -25,6 +25,7 @@ use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 
+use crate::binding;
 use crate::process_manager::{ProcessInfo, ProcessManager, ProcessStatus};
 use crate::publish_artifact::{
     ChunkUploadResponse, SyncCommitRequest, SyncCommitResponse, SyncNegotiateRequest,
@@ -140,11 +141,35 @@ struct PersistentStateListQuery {
     state_name: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+struct ServiceBindingListQuery {
+    owner_scope: Option<String>,
+    service_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct ServiceBindingResolveQuery {
+    owner_scope: Option<String>,
+    service_name: Option<String>,
+    binding_kind: Option<String>,
+    caller_service: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct RegisterPersistentStateRequest {
     manifest: String,
     state_name: String,
     path: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RegisterServiceBindingRequest {
+    manifest: String,
+    service_name: String,
+    url: Option<String>,
+    binding_kind: Option<String>,
+    process_id: Option<String>,
+    port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -239,6 +264,8 @@ struct DeleteCapsuleResponse {
     removed_versions: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     removed_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    removed_service_binding_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -268,6 +295,8 @@ struct RunCapsuleResponse {
     requested_target: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     requested_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    registered_service_binding_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -289,6 +318,8 @@ struct StopProcessRequest {
 #[derive(Debug, Serialize)]
 struct StopProcessResponse {
     stopped: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    removed_service_binding_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -304,6 +335,8 @@ struct ProcessRowResponse {
     scoped_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     target_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requested_port: Option<u16>,
 }
 
 #[derive(Debug, Serialize)]
@@ -540,6 +573,18 @@ pub async fn serve(config: RegistryServerConfig) -> Result<()> {
         .route(
             "/v1/local/states/:state_id",
             get(handle_get_persistent_state),
+        )
+        .route(
+            "/v1/local/bindings",
+            get(handle_list_service_bindings).post(handle_register_service_binding),
+        )
+        .route(
+            "/v1/local/bindings/resolve",
+            get(handle_resolve_service_binding),
+        )
+        .route(
+            "/v1/local/bindings/:binding_id",
+            get(handle_get_service_binding),
         )
         .route("/v1/local/processes", get(handle_list_local_processes))
         .route("/v1/local/url-ready", get(handle_local_url_ready))
@@ -2667,6 +2712,7 @@ async fn handle_run_local_capsule(
         manifest_path: Some(run_target.clone()),
         scoped_id: Some(scoped_id.clone()),
         target_label: effective_target.clone(),
+        requested_port: effective_port,
         log_path: Some(process_log_path(&process_id)),
         ready_at: Some(std::time::SystemTime::now()),
         last_event: Some("spawned".to_string()),
@@ -2692,6 +2738,22 @@ async fn handle_run_local_capsule(
             &format!("failed to persist process record: {}", err),
         );
     }
+    let registered_service_binding_ids =
+        match binding::sync_service_bindings_for_process(&process_id) {
+            Ok(records) => records
+                .into_iter()
+                .map(|record| record.binding_id)
+                .collect(),
+            Err(err) => {
+                let _ = child.kill();
+                let _ = process_manager.delete_pid(&process_id);
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "service_binding_register_failed",
+                    &err.to_string(),
+                );
+            }
+        };
     std::thread::spawn(move || {
         let _ = child.wait();
     });
@@ -2703,6 +2765,7 @@ async fn handle_run_local_capsule(
             scoped_id,
             requested_target: effective_target,
             requested_port: effective_port,
+            registered_service_binding_ids,
         }),
     )
         .into_response()
@@ -2769,6 +2832,10 @@ async fn handle_delete_local_capsule(
             "capsule is running; stop active process before delete",
         );
     }
+    let inactive_processes = processes
+        .into_iter()
+        .filter(|process| process.scoped_id.as_deref() == Some(scoped_id.as_str()))
+        .collect::<Vec<_>>();
 
     let _guard = state.lock.lock().await;
     let store = match RegistryStore::open(&state.data_dir) {
@@ -2804,6 +2871,7 @@ async fn handle_delete_local_capsule(
             }
         };
 
+    let mut removed_service_binding_ids = Vec::new();
     if outcome.removed_capsule {
         if let Err(err) = store.delete_store_metadata(&scoped_id) {
             return json_error(
@@ -2823,6 +2891,26 @@ async fn handle_delete_local_capsule(
                 &err.to_string(),
             );
         }
+        for process in &inactive_processes {
+            match binding::cleanup_service_bindings_for_process_info(process) {
+                Ok(records) => removed_service_binding_ids
+                    .extend(records.into_iter().map(|record| record.binding_id)),
+                Err(err) => {
+                    return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "service_binding_cleanup_failed",
+                        &err.to_string(),
+                    );
+                }
+            }
+            if let Err(err) = process_manager.delete_pid(&process.id) {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "process_cleanup_failed",
+                    &err.to_string(),
+                );
+            }
+        }
     }
 
     cleanup_removed_artifacts(
@@ -2839,6 +2927,7 @@ async fn handle_delete_local_capsule(
             removed_capsule: outcome.removed_capsule,
             removed_versions: outcome.removed_releases.len(),
             removed_version: outcome.removed_version,
+            removed_service_binding_ids,
         }),
     )
         .into_response()
@@ -2855,6 +2944,25 @@ async fn handle_list_local_processes() -> impl IntoResponse {
             )
         }
     };
+    let cleaned = match pm.cleanup_dead_processes_with_details() {
+        Ok(cleaned) => cleaned,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "process_cleanup_failed",
+                &err.to_string(),
+            )
+        }
+    };
+    for process in &cleaned {
+        if let Err(err) = binding::cleanup_service_bindings_for_process_info(process) {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "service_binding_cleanup_failed",
+                &err.to_string(),
+            );
+        }
+    }
     let mut processes = match pm.list_processes() {
         Ok(processes) => processes,
         Err(err) => {
@@ -2879,6 +2987,7 @@ async fn handle_list_local_processes() -> impl IntoResponse {
             started_at: chrono::DateTime::<Utc>::from(process.start_time).to_rfc3339(),
             scoped_id: process.scoped_id,
             target_label: process.target_label,
+            requested_port: process.requested_port,
         })
         .collect::<Vec<_>>();
 
@@ -2951,6 +3060,141 @@ async fn handle_get_persistent_state(
     }
 }
 
+async fn handle_list_service_bindings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ServiceBindingListQuery>,
+) -> impl IntoResponse {
+    if let Err(err) = validate_read_auth(&headers, state.auth_token.as_deref()) {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized", &err);
+    }
+
+    let owner_scope = query
+        .owner_scope
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let service_name = query
+        .service_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let _guard = state.lock.lock().await;
+    match binding::open_binding_store()
+        .and_then(|store| store.list_service_bindings(owner_scope, service_name))
+    {
+        Ok(records) => (StatusCode::OK, Json(records)).into_response(),
+        Err(err) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "service_binding_list_failed",
+            &err.to_string(),
+        ),
+    }
+}
+
+async fn handle_get_service_binding(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(binding_id): AxumPath<String>,
+) -> impl IntoResponse {
+    if let Err(err) = validate_read_auth(&headers, state.auth_token.as_deref()) {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized", &err);
+    }
+
+    let binding_id = binding_id.trim();
+    if binding_id.is_empty() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_binding_id",
+            "binding_id is required",
+        );
+    }
+
+    let _guard = state.lock.lock().await;
+    match binding::open_binding_store()
+        .and_then(|store| store.find_service_binding_by_id(binding_id))
+    {
+        Ok(Some(record)) => (StatusCode::OK, Json(record)).into_response(),
+        Ok(None) => json_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "Host-side service binding not found",
+        ),
+        Err(err) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "service_binding_lookup_failed",
+            &err.to_string(),
+        ),
+    }
+}
+
+async fn handle_resolve_service_binding(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ServiceBindingResolveQuery>,
+) -> impl IntoResponse {
+    if let Err(err) = validate_read_auth(&headers, state.auth_token.as_deref()) {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized", &err);
+    }
+
+    let owner_scope = query
+        .owner_scope
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let service_name = query
+        .service_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let binding_kind = query
+        .binding_kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(binding::SERVICE_BINDING_KIND_INGRESS);
+    let caller_service = query
+        .caller_service
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let Some(owner_scope) = owner_scope else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_owner_scope",
+            "owner_scope is required",
+        );
+    };
+    let Some(service_name) = service_name else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_service_name",
+            "service_name is required",
+        );
+    };
+
+    let _guard = state.lock.lock().await;
+    match binding::resolve_binding_record(owner_scope, service_name, binding_kind, caller_service) {
+        Ok(record) => (StatusCode::OK, Json(record)).into_response(),
+        Err(err) => {
+            let message = err.to_string();
+            if message.contains("was not found") {
+                return json_error(StatusCode::NOT_FOUND, "not_found", &message);
+            }
+            if message.contains("not allowed") {
+                return json_error(StatusCode::FORBIDDEN, "forbidden", &message);
+            }
+            json_error(
+                StatusCode::BAD_REQUEST,
+                "service_binding_resolve_failed",
+                &message,
+            )
+        }
+    }
+}
+
 async fn handle_register_persistent_state(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2989,6 +3233,107 @@ async fn handle_register_persistent_state(
         Err(err) => json_error(
             StatusCode::BAD_REQUEST,
             "persistent_state_register_failed",
+            &err.to_string(),
+        ),
+    }
+}
+
+async fn handle_register_service_binding(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<RegisterServiceBindingRequest>,
+) -> impl IntoResponse {
+    if let Err(err) = validate_write_auth(&headers, state.auth_token.as_deref()) {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized", &err);
+    }
+
+    let manifest = request.manifest.trim();
+    let service_name = request.service_name.trim();
+    let url = request
+        .url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let process_id = request
+        .process_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let binding_kind = request
+        .binding_kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(binding::SERVICE_BINDING_KIND_INGRESS);
+    if manifest.is_empty() && process_id.is_none() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_manifest",
+            "manifest is required unless process_id is provided",
+        );
+    }
+    if service_name.is_empty() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_service_name",
+            "service_name is required",
+        );
+    }
+    if request.port.is_some_and(|port| port == 0) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_port",
+            "port must be between 1 and 65535",
+        );
+    }
+
+    let _guard = state.lock.lock().await;
+    let result = match binding_kind {
+        binding::SERVICE_BINDING_KIND_INGRESS => {
+            let Some(url) = url else {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_url",
+                    "url is required for ingress bindings",
+                );
+            };
+            binding::register_ingress_binding(Path::new(manifest), service_name, url)
+        }
+        binding::SERVICE_BINDING_KIND_SERVICE => match (url, process_id) {
+            (Some(url), _) => {
+                binding::register_service_binding(Path::new(manifest), service_name, url)
+            }
+            (None, Some(process_id)) => binding::register_service_binding_for_process(
+                process_id,
+                service_name,
+                request.port,
+            ),
+            (None, None) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_service_binding_source",
+                    "service bindings require either url or process_id",
+                );
+            }
+        },
+        other => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_binding_kind",
+                &format!(
+                    "binding_kind must be '{}' or '{}' (got '{}')",
+                    binding::SERVICE_BINDING_KIND_INGRESS,
+                    binding::SERVICE_BINDING_KIND_SERVICE,
+                    other
+                ),
+            );
+        }
+    };
+    match result {
+        Ok(record) => (StatusCode::CREATED, Json(record)).into_response(),
+        Err(err) => json_error(
+            StatusCode::BAD_REQUEST,
+            "service_binding_register_failed",
             &err.to_string(),
         ),
     }
@@ -3088,6 +3433,7 @@ async fn handle_stop_local_process(
             )
         }
     };
+    let process = pm.read_pid(id.trim()).ok();
     let stopped = match pm.stop_process(id.trim(), request.force.unwrap_or(false)) {
         Ok(stopped) => stopped,
         Err(err) => {
@@ -3099,7 +3445,31 @@ async fn handle_stop_local_process(
         }
     };
 
-    (StatusCode::OK, Json(StopProcessResponse { stopped })).into_response()
+    let removed_service_binding_ids = match process {
+        Some(process) => match binding::cleanup_service_bindings_for_process_info(&process) {
+            Ok(records) => records
+                .into_iter()
+                .map(|record| record.binding_id)
+                .collect(),
+            Err(err) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "service_binding_cleanup_failed",
+                    &err.to_string(),
+                )
+            }
+        },
+        None => Vec::new(),
+    };
+
+    (
+        StatusCode::OK,
+        Json(StopProcessResponse {
+            stopped,
+            removed_service_binding_ids,
+        }),
+    )
+        .into_response()
 }
 
 async fn handle_get_process_logs(

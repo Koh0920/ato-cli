@@ -545,6 +545,7 @@ async fn execute_normal_mode(args: OpenArgs) -> Result<()> {
                     manifest_path: Some(decision.plan.manifest_path.clone()),
                     scoped_id: run_scoped_id.clone(),
                     target_label: Some(decision.plan.selected_target_label().to_string()),
+                    requested_port: None,
                     log_path: process.log_path.clone(),
                     ready_at: if args.dangerously_skip_permissions {
                         Some(now)
@@ -667,6 +668,7 @@ async fn execute_normal_mode(args: OpenArgs) -> Result<()> {
                     manifest_path: Some(decision.plan.manifest_path.clone()),
                     scoped_id: run_scoped_id.clone(),
                     target_label: Some(decision.plan.selected_target_label().to_string()),
+                    requested_port: None,
                     log_path: None,
                     ready_at: Some(std::time::SystemTime::now()),
                     last_event: Some("spawned".to_string()),

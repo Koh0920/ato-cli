@@ -208,6 +208,28 @@ pub fn from_anyhow(err: &AnyhowError, command_context: CommandContext) -> CliDia
             causes,
         );
     }
+    if message.contains("ingress TLS bootstrap required") {
+        return CliDiagnostic::new(
+            CliDiagnosticCode::E999,
+            message,
+            Some("`ato binding bootstrap-tls --binding <binding-id> [--install-system-trust]` を実行して明示的に TLS をセットアップしてください。"),
+            None,
+            None,
+            causes,
+        );
+    }
+    if message.contains("ingress TLS bootstrap requires explicit consent")
+        || message.contains("ingress TLS trust installation failed")
+    {
+        return CliDiagnostic::new(
+            CliDiagnosticCode::E999,
+            message,
+            Some("TLS trust bootstrap は明示的同意が必要です。内容を確認して `ato binding bootstrap-tls --binding <binding-id> --install-system-trust --yes` を再実行してください。"),
+            None,
+            None,
+            causes,
+        );
+    }
     if is_manifest_parse(&message) {
         return CliDiagnostic::new(
             CliDiagnosticCode::E001,
@@ -554,5 +576,19 @@ mod tests {
         let envelope: JsonErrorEnvelopeV1 = diagnostic.to_json_envelope();
         assert_eq!(envelope.schema_version, "1");
         assert_eq!(envelope.error_type, "error");
+    }
+
+    #[test]
+    fn maps_ingress_tls_bootstrap_required_to_actionable_hint() {
+        let err = anyhow!(
+            "ingress TLS bootstrap required for binding 'binding-demo'. Run `ato binding bootstrap-tls --binding binding-demo` first."
+        );
+        let diagnostic = from_anyhow(&err, CommandContext::Run);
+        assert_eq!(diagnostic.code, CliDiagnosticCode::E999);
+        assert!(diagnostic
+            .hint
+            .as_deref()
+            .unwrap_or_default()
+            .contains("bootstrap-tls"));
     }
 }
