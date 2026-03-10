@@ -167,6 +167,7 @@ struct RegisterServiceBindingRequest {
     manifest: String,
     service_name: String,
     url: String,
+    binding_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -3175,6 +3176,12 @@ async fn handle_register_service_binding(
     let manifest = request.manifest.trim();
     let service_name = request.service_name.trim();
     let url = request.url.trim();
+    let binding_kind = request
+        .binding_kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(binding::SERVICE_BINDING_KIND_INGRESS);
     if manifest.is_empty() {
         return json_error(
             StatusCode::BAD_REQUEST,
@@ -3194,7 +3201,27 @@ async fn handle_register_service_binding(
     }
 
     let _guard = state.lock.lock().await;
-    match binding::register_ingress_binding(Path::new(manifest), service_name, url) {
+    let result = match binding_kind {
+        binding::SERVICE_BINDING_KIND_INGRESS => {
+            binding::register_ingress_binding(Path::new(manifest), service_name, url)
+        }
+        binding::SERVICE_BINDING_KIND_SERVICE => {
+            binding::register_service_binding(Path::new(manifest), service_name, url)
+        }
+        other => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_binding_kind",
+                &format!(
+                    "binding_kind must be '{}' or '{}' (got '{}')",
+                    binding::SERVICE_BINDING_KIND_INGRESS,
+                    binding::SERVICE_BINDING_KIND_SERVICE,
+                    other
+                ),
+            );
+        }
+    };
+    match result {
         Ok(record) => (StatusCode::CREATED, Json(record)).into_response(),
         Err(err) => json_error(
             StatusCode::BAD_REQUEST,
