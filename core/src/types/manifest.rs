@@ -622,6 +622,8 @@ pub struct StateRequirement {
     pub durability: StateDurability,
     pub purpose: String,
     #[serde(default)]
+    pub producer: Option<String>,
+    #[serde(default)]
     pub attach: StateAttach,
     #[serde(default)]
     pub schema_id: Option<String>,
@@ -1823,6 +1825,16 @@ impl CapsuleManifest {
                         "purpose is required".to_string(),
                     ));
                 }
+                if requirement
+                    .producer
+                    .as_deref()
+                    .is_some_and(|producer| producer.trim().is_empty())
+                {
+                    errors.push(ValidationError::InvalidState(
+                        state_name.clone(),
+                        "producer cannot be empty".to_string(),
+                    ));
+                }
 
                 if requirement.kind != StateKind::Filesystem {
                     errors.push(ValidationError::InvalidState(
@@ -1850,10 +1862,6 @@ impl CapsuleManifest {
                             "persistent state requires schema_id".to_string(),
                         ));
                     }
-                    errors.push(ValidationError::InvalidState(
-                        state_name.clone(),
-                        "persistent filesystem state is not supported yet; this PoC is fail-closed until explicit binds and compatibility gates are implemented".to_string(),
-                    ));
                 }
             }
 
@@ -1922,17 +1930,6 @@ impl CapsuleManifest {
                             }
 
                             match self.state.get(state_name) {
-                                Some(requirement)
-                                    if requirement.durability == StateDurability::Persistent =>
-                                {
-                                    errors.push(ValidationError::InvalidStateBinding(
-                                        service_name.clone(),
-                                        format!(
-                                            "state '{}' is persistent and cannot be attached until explicit binding support is implemented",
-                                            state_name
-                                        ),
-                                    ));
-                                }
                                 Some(_) => {}
                                 None => errors.push(ValidationError::InvalidStateBinding(
                                     service_name.clone(),
@@ -2027,6 +2024,50 @@ impl CapsuleManifest {
             self.name,
             state_name
         ))
+    }
+
+    pub fn state_source_path(
+        &self,
+        state_name: &str,
+        requirement: &StateRequirement,
+        overrides: Option<&HashMap<String, String>>,
+    ) -> Result<String, CapsuleError> {
+        if let Some(path) = overrides
+            .and_then(|entries| entries.get(state_name.trim()))
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        {
+            return Ok(path.to_string());
+        }
+
+        match requirement.durability {
+            StateDurability::Ephemeral => self.ephemeral_state_source_path(state_name),
+            StateDurability::Persistent => Err(CapsuleError::ValidationError(format!(
+                "state '{}' requires an explicit persistent binding before it can be attached",
+                state_name.trim()
+            ))),
+        }
+    }
+
+    /// Resolve the producer identity for a state requirement.
+    ///
+    /// When `producer` is omitted on `[state.<name>]`, the manifest name is used as the
+    /// default producer identity so persistent attach checks remain fail-closed. When
+    /// both are empty, this returns `None`; callers should treat that as a validation
+    /// failure and reject the attach.
+    pub fn state_producer(&self, state_name: &str) -> Option<String> {
+        self.state
+            .get(state_name.trim())
+            // Prefer an explicit producer on the state requirement; otherwise fall back to the
+            // manifest identity so persistent attach compatibility remains fail-closed by default.
+            .and_then(|requirement| requirement.producer.as_deref())
+            .map(str::trim)
+            .filter(|producer| !producer.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                let name = self.name.trim();
+                (!name.is_empty()).then(|| name.to_string())
+            })
     }
 }
 
@@ -2696,7 +2737,7 @@ target = "/var/lib/app"
     }
 
     #[test]
-    fn test_validate_rejects_persistent_state_until_explicit_bind_support_exists() {
+    fn test_validate_accepts_persistent_state_with_explicit_attach() {
         let toml = r#"
 schema_version = "0.2"
 name = "stateful-app"
@@ -2723,12 +2764,7 @@ state = "data"
 target = "/var/lib/app"
 "#;
         let manifest = CapsuleManifest::from_toml(toml).unwrap();
-        let errors = manifest.validate().unwrap_err();
-        assert!(errors.iter().any(|e| matches!(
-            e,
-            ValidationError::InvalidState(name, msg)
-                if name == "data" && msg.contains("persistent filesystem state is not supported yet")
-        )));
+        assert!(manifest.validate().is_ok());
     }
 
     #[test]

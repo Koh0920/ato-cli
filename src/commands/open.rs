@@ -20,12 +20,15 @@ use tracing::debug;
 use crate::executors::source::ExecuteMode;
 use crate::executors::source::NacelleExecEvent;
 use crate::executors::target_runner::{self, TargetLaunchOptions};
+use crate::registry_store::{NewPersistentStateRecord, RegistryStore};
 use crate::reporters::CliReporter;
 use crate::runtime_manager;
 use crate::runtime_overrides;
 use crate::runtime_tree;
 use capsule_core::execution_plan::error::AtoExecutionError;
 use capsule_core::execution_plan::guard::ExecutorKind;
+use capsule_core::schema_registry::SchemaRegistry;
+use capsule_core::types::{CapsuleManifest, StateDurability};
 use capsule_core::{router, CapsuleReporter};
 
 mod watch;
@@ -43,6 +46,7 @@ pub struct OpenArgs {
     pub sandbox_mode: bool,
     pub dangerously_skip_permissions: bool,
     pub assume_yes: bool,
+    pub state_bindings: Vec<String>,
     pub reporter: Arc<CliReporter>,
 }
 
@@ -88,6 +92,7 @@ async fn execute_capsule_file(args: &OpenArgs, capsule_path: &PathBuf) -> Result
             sandbox_mode: args.sandbox_mode,
             dangerously_skip_permissions: args.dangerously_skip_permissions,
             assume_yes: args.assume_yes,
+            state_bindings: args.state_bindings.clone(),
             reporter: args.reporter.clone(),
         };
         return execute_normal_mode(open_args).await;
@@ -184,6 +189,7 @@ async fn execute_capsule_file(args: &OpenArgs, capsule_path: &PathBuf) -> Result
         sandbox_mode: args.sandbox_mode,
         dangerously_skip_permissions: args.dangerously_skip_permissions,
         assume_yes: args.assume_yes,
+        state_bindings: args.state_bindings.clone(),
         reporter: args.reporter.clone(),
     };
 
@@ -377,10 +383,13 @@ async fn execute_normal_mode(args: OpenArgs) -> Result<()> {
         args.target.clone()
     };
 
-    let decision = capsule_core::router::route_manifest(
+    let manifest = CapsuleManifest::load_from_file(&manifest_path)?;
+    let state_source_overrides = resolve_state_source_overrides(&manifest, &args.state_bindings)?;
+    let decision = capsule_core::router::route_manifest_with_state_overrides(
         &manifest_path,
         router::ExecutionProfile::Dev,
         args.target_label.as_deref(),
+        state_source_overrides,
     )?;
     let launch_ctx = target_runner::resolve_launch_context(&decision.plan, &args.reporter).await?;
 
@@ -708,6 +717,197 @@ async fn execute_normal_mode(args: OpenArgs) -> Result<()> {
     Ok(())
 }
 
+fn resolve_state_source_overrides(
+    manifest: &CapsuleManifest,
+    raw_bindings: &[String],
+) -> Result<std::collections::HashMap<String, String>> {
+    let mut requested = std::collections::HashMap::new();
+    for raw in raw_bindings {
+        let (state_name, locator) = raw.split_once('=').ok_or_else(|| {
+            anyhow::anyhow!(
+                "invalid --state binding '{}'; expected data=/absolute/path",
+                raw
+            )
+        })?;
+        let state_name = state_name.trim();
+        let locator = locator.trim();
+        if state_name.is_empty() || locator.is_empty() {
+            anyhow::bail!(
+                "invalid --state binding '{}'; expected data=/absolute/path",
+                raw
+            );
+        }
+        if requested
+            .insert(state_name.to_string(), locator.to_string())
+            .is_some()
+        {
+            anyhow::bail!(
+                "state '{}' was bound more than once via --state",
+                state_name
+            );
+        }
+    }
+
+    for state_name in requested.keys() {
+        let requirement = manifest.state.get(state_name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "--state references undeclared manifest state '{}'",
+                state_name
+            )
+        })?;
+        if requirement.durability != StateDurability::Persistent {
+            anyhow::bail!(
+                "--state only supports persistent manifest state; '{}' is {:?}",
+                state_name,
+                requirement.durability
+            );
+        }
+    }
+
+    let persistent_states: Vec<_> = manifest
+        .state
+        .iter()
+        .filter(|(_, requirement)| requirement.durability == StateDurability::Persistent)
+        .collect();
+    if persistent_states.is_empty() {
+        if requested.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        anyhow::bail!(
+            "--state was provided but the manifest declares no persistent [state] entries"
+        );
+    }
+
+    let schema_registry = SchemaRegistry::load()?;
+    let store_dir = capsule_core::config::config_dir()?.join("state");
+    let store = RegistryStore::open(&store_dir)?;
+    let owner_scope = persistent_state_owner_scope(manifest)?;
+    let mut resolved = std::collections::HashMap::new();
+
+    for (state_name, requirement) in persistent_states {
+        let locator = requested.get(state_name.as_str()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "persistent state '{}' requires an explicit --state {}=/absolute/path binding",
+                state_name,
+                state_name
+            )
+        })?;
+        let backend_locator = prepare_backend_locator(locator)?;
+        let producer = manifest.state_producer(state_name).ok_or_else(|| {
+            anyhow::anyhow!("state '{}' is missing a producer identity", state_name)
+        })?;
+        let schema_id = requirement
+            .schema_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("persistent state '{}' is missing schema_id", state_name)
+            })
+            .and_then(|value| {
+                schema_registry
+                    .resolve_schema_hash(value)
+                    .map_err(Into::into)
+            })?;
+
+        if let Some(existing) =
+            store.find_persistent_state_by_owner_and_locator(&owner_scope, &backend_locator)?
+        {
+            if existing.state_name != *state_name
+                || existing.producer != producer
+                || existing.purpose != requirement.purpose
+                || existing.schema_id != schema_id
+            {
+                anyhow::bail!(
+                    "persistent state '{}' is incompatible with existing registry entry '{}': producer/purpose/schema_id must match exactly",
+                    state_name,
+                    existing.state_id
+                );
+            }
+        } else {
+            store.register_persistent_state(&NewPersistentStateRecord {
+                owner_scope: owner_scope.clone(),
+                state_name: state_name.clone(),
+                backend_locator: backend_locator.clone(),
+                producer,
+                purpose: requirement.purpose.clone(),
+                schema_id,
+            })?;
+        }
+
+        resolved.insert(state_name.clone(), backend_locator);
+    }
+
+    Ok(resolved)
+}
+
+/// Resolve the registry owner scope for persistent state entries.
+///
+/// The current thin registry keeps ownership scoped to the capsule manifest name so a
+/// state entry cannot be silently reused by a different capsule identity. Manifest
+/// validation already requires a non-empty capsule name, so the thin registry reuses
+/// that stable manifest identity directly.
+fn persistent_state_owner_scope(manifest: &CapsuleManifest) -> Result<String> {
+    let owner_scope = manifest.name.trim().to_string();
+    if owner_scope.is_empty() {
+        anyhow::bail!("manifest name is required before persistent state can be attached");
+    }
+    Ok(owner_scope)
+}
+
+/// Validate, create if needed, and canonicalize a host path used for persistent state.
+///
+/// On Unix, newly created directories are restricted to mode `0o700`. On non-Unix
+/// platforms the OS-default directory ACLs are used.
+fn prepare_backend_locator(locator: &str) -> Result<String> {
+    let path = PathBuf::from(locator);
+    if !path.is_absolute() {
+        anyhow::bail!(
+            "persistent state binding '{}' must use an absolute host path",
+            locator
+        );
+    }
+
+    if path.exists() {
+        let metadata = fs::metadata(&path)
+            .with_context(|| format!("failed to inspect state path: {}", path.display()))?;
+        if !metadata.is_dir() {
+            anyhow::bail!(
+                "persistent state binding '{}' must point to a directory",
+                path.display()
+            );
+        }
+    } else {
+        create_state_directory(&path)?;
+    }
+
+    Ok(fs::canonicalize(&path)
+        .with_context(|| format!("failed to canonicalize state path: {}", path.display()))?
+        .to_string_lossy()
+        .to_string())
+}
+
+fn create_state_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder
+            .create(path)
+            .with_context(|| format!("failed to create state directory: {}", path.display()))?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path)
+            .with_context(|| format!("failed to create state directory: {}", path.display()))?;
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ForegroundEventMessage {
     Notify(String),
@@ -966,10 +1166,13 @@ fn execute_watch_mode(args: OpenArgs) -> Result<()> {
     } else {
         args.target.clone()
     };
-    let decision = capsule_core::router::route_manifest(
+    let manifest = CapsuleManifest::load_from_file(&manifest_path)?;
+    let state_source_overrides = resolve_state_source_overrides(&manifest, &args.state_bindings)?;
+    let decision = capsule_core::router::route_manifest_with_state_overrides(
         &manifest_path,
         router::ExecutionProfile::Dev,
         args.target_label.as_deref(),
+        state_source_overrides,
     )?;
     if decision.plan.is_orchestration_mode() {
         anyhow::bail!("--watch is not supported for orchestration mode");
@@ -1618,11 +1821,43 @@ mod tests {
     use super::{
         foreground_native_event_messages, initial_foreground_native_messages,
         preflight_required_environment_variables, resolve_python_dependency_lock_path,
-        ForegroundEventMessage,
+        resolve_state_source_overrides, ForegroundEventMessage,
     };
     use crate::executors::source::NacelleExecEvent;
     use capsule_core::router::{ExecutionProfile, ManifestData};
+    use capsule_core::types::CapsuleManifest;
+    use std::ffi::OsString;
     use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Serialize tests that mutate process-global environment variables like `HOME`.
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// RAII helper that restores the previous `HOME` environment variable on drop.
+    struct HomeGuard {
+        previous: Option<OsString>,
+    }
+
+    impl HomeGuard {
+        fn set(path: &std::path::Path) -> Self {
+            let previous = std::env::var_os("HOME");
+            std::env::set_var("HOME", path);
+            Self { previous }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var("HOME", previous);
+            } else {
+                std::env::remove_var("HOME");
+            }
+        }
+    }
 
     #[test]
     fn resolve_python_dependency_lock_path_prefers_source_uv_lock() {
@@ -1724,6 +1959,128 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resolve_state_source_overrides_registers_persistent_state_binding() {
+        let _guard = env_lock().lock().unwrap();
+        let home = tempfile::tempdir().expect("home");
+        let _home_guard = HomeGuard::set(home.path());
+
+        let manifest = CapsuleManifest::from_toml(
+            r#"
+schema_version = "0.2"
+name = "demo-app"
+version = "0.1.0"
+type = "app"
+default_target = "app"
+
+[targets.app]
+runtime = "oci"
+image = "ghcr.io/example/app:latest"
+
+[state.data]
+kind = "filesystem"
+durability = "persistent"
+purpose = "primary-data"
+attach = "explicit"
+schema_id = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+[services.main]
+target = "app"
+
+[[services.main.state_bindings]]
+state = "data"
+target = "/var/lib/app"
+"#,
+        )
+        .unwrap();
+
+        let bind_dir = home.path().join("bind").join("data");
+        let overrides =
+            resolve_state_source_overrides(&manifest, &[format!("data={}", bind_dir.display())])
+                .expect("state override");
+
+        assert_eq!(
+            overrides.get("data").map(|value| value.as_str()),
+            Some(bind_dir.canonicalize().unwrap().to_string_lossy().as_ref())
+        );
+        assert!(home.path().join(".ato/state/registry.sqlite3").exists());
+    }
+
+    #[test]
+    fn resolve_state_source_overrides_rejects_incompatible_registry_entry() {
+        let _guard = env_lock().lock().unwrap();
+        let home = tempfile::tempdir().expect("home");
+        let _home_guard = HomeGuard::set(home.path());
+
+        let manifest_a = CapsuleManifest::from_toml(
+            r#"
+schema_version = "0.2"
+name = "demo-app"
+version = "0.1.0"
+type = "app"
+default_target = "app"
+
+[targets.app]
+runtime = "oci"
+image = "ghcr.io/example/app:latest"
+
+[state.data]
+kind = "filesystem"
+durability = "persistent"
+purpose = "primary-data"
+attach = "explicit"
+schema_id = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+[services.main]
+target = "app"
+
+[[services.main.state_bindings]]
+state = "data"
+target = "/var/lib/app"
+"#,
+        )
+        .unwrap();
+        let manifest_b = CapsuleManifest::from_toml(
+            r#"
+schema_version = "0.2"
+name = "demo-app"
+version = "0.1.0"
+type = "app"
+default_target = "app"
+
+[targets.app]
+runtime = "oci"
+image = "ghcr.io/example/app:latest"
+
+[state.data]
+kind = "filesystem"
+durability = "persistent"
+purpose = "secondary-data"
+attach = "explicit"
+schema_id = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+[services.main]
+target = "app"
+
+[[services.main.state_bindings]]
+state = "data"
+target = "/var/lib/app"
+"#,
+        )
+        .unwrap();
+
+        let bind_dir = home.path().join("bind").join("data");
+        resolve_state_source_overrides(&manifest_a, &[format!("data={}", bind_dir.display())])
+            .expect("first bind");
+
+        let err =
+            resolve_state_source_overrides(&manifest_b, &[format!("data={}", bind_dir.display())])
+                .expect_err("incompatible bind must fail");
+        assert!(err
+            .to_string()
+            .contains("producer/purpose/schema_id must match exactly"));
+    }
+
     fn manifest_with_required_env(keys: Vec<&str>) -> ManifestData {
         let mut manifest = toml::map::Map::new();
         manifest.insert("name".to_string(), toml::Value::String("demo".to_string()));
@@ -1764,6 +2121,7 @@ mod tests {
             manifest_dir: PathBuf::from("/tmp"),
             profile: ExecutionProfile::Dev,
             selected_target: "default".to_string(),
+            state_source_overrides: std::collections::HashMap::new(),
         }
     }
 }

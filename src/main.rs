@@ -226,6 +226,10 @@ enum Commands {
         #[arg(long)]
         registry: Option<String>,
 
+        /// Explicitly bind a manifest [state.<name>] entry to a host path using STATE=/absolute/path
+        #[arg(long = "state", value_name = "STATE=/ABS/PATH")]
+        state: Vec<String>,
+
         /// Network enforcement mode
         #[arg(long, value_enum, default_value_t = EnforcementMode::Strict)]
         enforcement: EnforcementMode,
@@ -683,6 +687,10 @@ enum Commands {
         #[arg(long)]
         registry: Option<String>,
 
+        /// Explicitly bind a manifest [state.<name>] entry to a host path using STATE=/absolute/path
+        #[arg(long = "state", value_name = "STATE=/ABS/PATH")]
+        state: Vec<String>,
+
         /// Network enforcement mode
         #[arg(long, value_enum, default_value_t = EnforcementMode::Strict)]
         enforcement: EnforcementMode,
@@ -870,7 +878,9 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum ProjectCommands {
-    #[command(about = "List experimental projection state and detect broken projections read-only")]
+    #[command(
+        about = "List experimental projection state and detect broken projections read-only"
+    )]
     Ls {
         /// Emit machine-readable JSON output
         #[arg(long)]
@@ -1310,6 +1320,7 @@ fn run() -> Result<()> {
             background,
             nacelle,
             registry,
+            state,
             enforcement,
             sandbox_mode,
             unsafe_mode_legacy,
@@ -1324,6 +1335,7 @@ fn run() -> Result<()> {
             background,
             nacelle,
             registry,
+            state,
             enforcement,
             sandbox_mode,
             unsafe_mode_legacy,
@@ -1356,6 +1368,7 @@ fn run() -> Result<()> {
             background,
             nacelle,
             registry,
+            state,
             enforcement,
             sandbox_mode,
             unsafe_mode_legacy,
@@ -1369,6 +1382,7 @@ fn run() -> Result<()> {
             background,
             nacelle,
             registry,
+            state,
             enforcement,
             sandbox_mode,
             unsafe_mode_legacy,
@@ -1715,7 +1729,9 @@ fn run() -> Result<()> {
             json,
             command,
         } => match command {
-            Some(ProjectCommands::Ls { json: subcommand_json }) => {
+            Some(ProjectCommands::Ls {
+                json: subcommand_json,
+            }) => {
                 let result = native_delivery::execute_project_ls()?;
                 if cli.json || json || subcommand_json {
                     println!("{}", serde_json::to_string_pretty(&result)?);
@@ -1723,7 +1739,11 @@ fn run() -> Result<()> {
                     println!("No experimental projections found.");
                 } else {
                     for projection in result.projections {
-                        let marker = if projection.state == "ok" { "✅" } else { "⚠️" };
+                        let marker = if projection.state == "ok" {
+                            "✅"
+                        } else {
+                            "⚠️"
+                        };
                         println!(
                             "{} [{}] {} -> {}",
                             marker,
@@ -1745,10 +1765,8 @@ fn run() -> Result<()> {
                         "ato project requires <DERIVED_APP_PATH> or use `ato project ls` for read-only status"
                     )
                 })?;
-                let result = native_delivery::execute_project(
-                    &derived_app_path,
-                    launcher_dir.as_deref(),
-                )?;
+                let result =
+                    native_delivery::execute_project(&derived_app_path, launcher_dir.as_deref())?;
                 if cli.json || json {
                     println!("{}", serde_json::to_string_pretty(&result)?);
                 } else {
@@ -1773,7 +1791,10 @@ fn run() -> Result<()> {
                 println!("✅ Unprojected: {}", result.projected_path.display());
                 println!("   ID:      {}", result.projection_id);
                 println!("   State:   {}", result.state_before);
-                println!("   Removed: metadata={}, symlink={}", result.removed_metadata, result.removed_projected_path);
+                println!(
+                    "   Removed: metadata={}, symlink={}",
+                    result.removed_metadata, result.removed_projected_path
+                );
             }
             Ok(())
         }
@@ -2914,6 +2935,7 @@ fn execute_run_like_command(
     background: bool,
     nacelle: Option<PathBuf>,
     registry: Option<String>,
+    state: Vec<String>,
     enforcement: EnforcementMode,
     sandbox_mode: bool,
     unsafe_mode_legacy: bool,
@@ -2972,6 +2994,7 @@ fn execute_run_like_command(
             sandbox_requested,
             dangerously_skip_permissions,
             yes,
+            state,
             reporter,
         );
     }
@@ -3001,6 +3024,7 @@ fn execute_run_like_command(
         sandbox_requested,
         dangerously_skip_permissions,
         yes,
+        state,
         reporter,
     )
 }
@@ -3553,6 +3577,7 @@ fn execute_open_command(
     sandbox_mode: bool,
     dangerously_skip_permissions: bool,
     assume_yes: bool,
+    state: Vec<String>,
     reporter: std::sync::Arc<reporters::CliReporter>,
 ) -> Result<()> {
     let target_path = if path.is_file() || path.extension().is_some_and(|ext| ext == "capsule") {
@@ -3574,6 +3599,7 @@ fn execute_open_command(
         sandbox_mode,
         dangerously_skip_permissions,
         assume_yes,
+        state_bindings: state,
         reporter,
     }))
 }
@@ -3797,6 +3823,31 @@ mod tests {
         assert!(!should_use_search_tui(true, false, false, false));
         assert!(!should_use_search_tui(true, true, true, false));
         assert!(!should_use_search_tui(true, true, false, true));
+    }
+
+    #[test]
+    fn run_command_parses_explicit_state_bindings() {
+        let cli = Cli::try_parse_from([
+            "ato",
+            "run",
+            ".",
+            "--state",
+            "data=/var/lib/ato/persistent/demo",
+            "--state",
+            "cache=/var/lib/ato/persistent/cache",
+        ])
+        .expect("parse");
+
+        match cli.command {
+            Commands::Run { state, .. } => assert_eq!(
+                state,
+                vec![
+                    "data=/var/lib/ato/persistent/demo".to_string(),
+                    "cache=/var/lib/ato/persistent/cache".to_string()
+                ]
+            ),
+            other => panic!("unexpected command: {:?}", std::mem::discriminant(&other)),
+        }
     }
 
     #[test]
