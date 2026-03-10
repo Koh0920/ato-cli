@@ -32,6 +32,7 @@ pub struct ManifestData {
     pub manifest_dir: PathBuf,
     pub profile: ExecutionProfile,
     pub selected_target: String,
+    pub state_source_overrides: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +47,15 @@ pub fn route_manifest(
     profile: ExecutionProfile,
     target_label: Option<&str>,
 ) -> Result<RuntimeDecision> {
+    route_manifest_with_state_overrides(manifest_path, profile, target_label, HashMap::new())
+}
+
+pub fn route_manifest_with_state_overrides(
+    manifest_path: &Path,
+    profile: ExecutionProfile,
+    target_label: Option<&str>,
+    state_source_overrides: HashMap<String, String>,
+) -> Result<RuntimeDecision> {
     let loaded = manifest::load_manifest(manifest_path)?;
     let manifest = loaded.raw;
     let manifest_dir = loaded.dir.clone();
@@ -57,6 +67,7 @@ pub fn route_manifest(
         manifest_dir,
         profile,
         selected_target,
+        state_source_overrides,
     };
 
     let runtime = plan.execution_runtime().ok_or_else(|| {
@@ -270,7 +281,11 @@ impl ManifestData {
                 working_dir: target.working_dir.clone(),
                 port: self.target_port(&target_label),
                 required_env: self.target_required_envs(&target_label),
-                mounts: state_mounts_for_service(&typed_manifest, name)?,
+                mounts: state_mounts_for_service(
+                    &typed_manifest,
+                    name,
+                    &self.state_source_overrides,
+                )?,
             };
 
             let runtime = match runtime_kind {
@@ -695,7 +710,11 @@ fn array_to_vec(values: &[toml::Value]) -> Vec<String> {
         .collect()
 }
 
-fn state_mounts_for_service(manifest: &CapsuleManifest, service_name: &str) -> Result<Vec<Mount>> {
+fn state_mounts_for_service(
+    manifest: &CapsuleManifest,
+    service_name: &str,
+    state_source_overrides: &HashMap<String, String>,
+) -> Result<Vec<Mount>> {
     let Some(service) = manifest
         .services
         .as_ref()
@@ -716,16 +735,13 @@ fn state_mounts_for_service(manifest: &CapsuleManifest, service_name: &str) -> R
                     state_name
                 )
             })?;
-            if requirement.durability != crate::types::StateDurability::Ephemeral {
-                anyhow::bail!(
-                    "services.{}.state_bindings requires unsupported persistent state '{}'",
-                    service_name,
-                    state_name
-                );
-            }
 
             Ok(Mount {
-                source: manifest.ephemeral_state_source_path(state_name)?,
+                source: manifest.state_source_path(
+                    state_name,
+                    requirement,
+                    Some(state_source_overrides),
+                )?,
                 target: binding.target.trim().to_string(),
                 readonly: false,
             })
@@ -735,7 +751,7 @@ fn state_mounts_for_service(manifest: &CapsuleManifest, service_name: &str) -> R
 
 #[cfg(test)]
 mod tests {
-    use super::{route_manifest, ExecutionProfile};
+    use super::{route_manifest, route_manifest_with_state_overrides, ExecutionProfile};
     use crate::types::Mount;
     use std::fs;
 
@@ -936,6 +952,106 @@ target = "/var/lib/app"
             main.runtime.runtime().mounts,
             vec![Mount {
                 source: "/var/lib/ato/state/demo-app/data".to_string(),
+                target: "/var/lib/app".to_string(),
+                readonly: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn resolve_services_requires_explicit_bind_for_persistent_state() {
+        let dir = write_manifest(
+            r#"
+schema_version = "0.2"
+name = "demo-app"
+version = "0.1.0"
+type = "app"
+default_target = "app"
+
+[targets.app]
+runtime = "oci"
+image = "ghcr.io/example/app:latest"
+
+[state.data]
+kind = "filesystem"
+durability = "persistent"
+purpose = "primary-data"
+attach = "explicit"
+schema_id = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+[services.main]
+target = "app"
+
+[[services.main.state_bindings]]
+state = "data"
+target = "/var/lib/app"
+"#,
+        );
+
+        let decision = route_manifest(
+            &dir.path().join("capsule.toml"),
+            ExecutionProfile::Dev,
+            None,
+        )
+        .expect("route manifest");
+        let err = decision
+            .plan
+            .resolve_services()
+            .expect_err("missing bind must fail");
+        assert!(err
+            .to_string()
+            .contains("requires an explicit persistent binding"));
+    }
+
+    #[test]
+    fn resolve_services_uses_explicit_bind_for_persistent_state() {
+        let dir = write_manifest(
+            r#"
+schema_version = "0.2"
+name = "demo-app"
+version = "0.1.0"
+type = "app"
+default_target = "app"
+
+[targets.app]
+runtime = "oci"
+image = "ghcr.io/example/app:latest"
+
+[state.data]
+kind = "filesystem"
+durability = "persistent"
+purpose = "primary-data"
+attach = "explicit"
+schema_id = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+[services.main]
+target = "app"
+
+[[services.main.state_bindings]]
+state = "data"
+target = "/var/lib/app"
+"#,
+        );
+
+        let decision = route_manifest_with_state_overrides(
+            &dir.path().join("capsule.toml"),
+            ExecutionProfile::Dev,
+            None,
+            [(
+                "data".to_string(),
+                "/var/lib/ato/persistent/demo-app/data".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        )
+        .expect("route manifest");
+        let plan = decision.plan.resolve_services().expect("resolve services");
+        let main = plan.service("main").expect("main service");
+
+        assert_eq!(
+            main.runtime.runtime().mounts,
+            vec![Mount {
+                source: "/var/lib/ato/persistent/demo-app/data".to_string(),
                 target: "/var/lib/app".to_string(),
                 readonly: false,
             }]
