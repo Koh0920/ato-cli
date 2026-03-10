@@ -586,7 +586,11 @@ fn project_with_roots(
         .ok_or_else(|| anyhow::anyhow!("Derived app path has no terminal name"))?
         .to_os_string();
     let projected_path = launcher_dir.join(&app_name);
-    let projection_id = build_projection_id(&source.derived_app_path, &projected_path, &source.derived_digest);
+    let projection_id = build_projection_id(
+        &source.derived_app_path,
+        &projected_path,
+        &source.derived_digest,
+    );
     let metadata_path = metadata_root.join(format!("{}.json", projection_id));
 
     let existing = load_projection_records(metadata_root)?;
@@ -664,13 +668,15 @@ fn project_with_roots(
     };
 
     let result = (|| -> Result<ProjectResult> {
-        create_projection_symlink(&source.derived_app_path, &projected_path).with_context(|| {
-            format!(
-                "Failed to create symlink {} -> {}",
-                projected_path.display(),
-                source.derived_app_path.display()
-            )
-        })?;
+        create_projection_symlink(&source.derived_app_path, &projected_path).with_context(
+            || {
+                format!(
+                    "Failed to create symlink {} -> {}",
+                    projected_path.display(),
+                    source.derived_app_path.display()
+                )
+            },
+        )?;
         write_json_pretty(&metadata_path, &metadata)?;
         let status = inspect_projection(&metadata, &metadata_path)?;
         Ok(ProjectResult {
@@ -699,7 +705,10 @@ fn list_projections(metadata_root: &Path) -> Result<ProjectionListResult> {
         .into_iter()
         .map(|record| inspect_projection(&record.metadata, &record.metadata_path))
         .collect::<Result<Vec<_>>>()?;
-    let broken = projections.iter().filter(|item| item.state == "broken").count();
+    let broken = projections
+        .iter()
+        .filter(|item| item.state == "broken")
+        .count();
     Ok(ProjectionListResult {
         total: projections.len(),
         broken,
@@ -896,9 +905,7 @@ fn load_projection_source(derived_app_path: &Path) -> Result<ProjectionSource> {
         )
     })?;
     let derived_dir = derived_app_path.parent().ok_or_else(|| {
-        anyhow::anyhow!(
-            "Projection input must be an ato finalize output with a parent directory"
-        )
+        anyhow::anyhow!("Projection input must be an ato finalize output with a parent directory")
     })?;
     let provenance_path = derived_dir.join(PROVENANCE_FILE);
     let raw = fs::read_to_string(&provenance_path).with_context(|| {
@@ -991,7 +998,10 @@ fn load_projection_records(metadata_root: &Path) -> Result<Vec<StoredProjection>
 fn find_projection_record(reference: &str, metadata_root: &Path) -> Result<StoredProjection> {
     let records = load_projection_records(metadata_root)?;
     if records.is_empty() {
-        bail!("No projection metadata found in {}", metadata_root.display());
+        bail!(
+            "No projection metadata found in {}",
+            metadata_root.display()
+        );
     }
 
     let mut matches = Vec::new();
@@ -1019,7 +1029,10 @@ fn find_projection_record(reference: &str, metadata_root: &Path) -> Result<Store
     }
 }
 
-fn inspect_projection(metadata: &ProjectionMetadata, metadata_path: &Path) -> Result<ProjectionStatus> {
+fn inspect_projection(
+    metadata: &ProjectionMetadata,
+    metadata_path: &Path,
+) -> Result<ProjectionStatus> {
     let mut problems = Vec::new();
     if metadata.schema_version != DELIVERY_SCHEMA_VERSION {
         problems.push(format!(
@@ -1581,7 +1594,11 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
     }
 }
 
-fn build_projection_id(derived_app_path: &Path, projected_path: &Path, derived_digest: &str) -> String {
+fn build_projection_id(
+    derived_app_path: &Path,
+    projected_path: &Path,
+    derived_digest: &str,
+) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(derived_app_path.to_string_lossy().as_bytes());
     hasher.update(b"\0");
@@ -1617,7 +1634,9 @@ fn is_managed_symlink_to(path: &Path, target: &Path) -> Result<bool> {
     let resolved_target = if link_target.is_absolute() {
         link_target
     } else {
-        path.parent().unwrap_or_else(|| Path::new(".")).join(link_target)
+        path.parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(link_target)
     };
     paths_match(&resolved_target, target)
 }
@@ -1854,9 +1873,7 @@ args = ["--deep", "--force", "--sign", "-", "MyApp.app"]
 
         let err = finalize_with_runner(&fetched_dir, &output_root, |_derived_dir, _config| Ok(()))
             .expect_err("finalize must fail closed when executable bit is missing");
-        assert!(err
-            .to_string()
-            .contains("Executable bit is missing"));
+        assert!(err.to_string().contains("Executable bit is missing"));
         Ok(())
     }
 

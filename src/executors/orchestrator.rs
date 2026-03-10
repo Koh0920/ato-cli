@@ -1305,6 +1305,7 @@ mod tests {
             manifest_dir: PathBuf::from("/tmp"),
             profile: capsule_core::router::ExecutionProfile::Dev,
             selected_target: "app".to_string(),
+            state_source_overrides: HashMap::new(),
         }
     }
 
