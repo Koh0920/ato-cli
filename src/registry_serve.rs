@@ -25,6 +25,7 @@ use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 
+use crate::binding;
 use crate::process_manager::{ProcessInfo, ProcessManager, ProcessStatus};
 use crate::publish_artifact::{
     ChunkUploadResponse, SyncCommitRequest, SyncCommitResponse, SyncNegotiateRequest,
@@ -140,11 +141,24 @@ struct PersistentStateListQuery {
     state_name: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+struct ServiceBindingListQuery {
+    owner_scope: Option<String>,
+    service_name: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct RegisterPersistentStateRequest {
     manifest: String,
     state_name: String,
     path: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RegisterServiceBindingRequest {
+    manifest: String,
+    service_name: String,
+    url: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -540,6 +554,14 @@ pub async fn serve(config: RegistryServerConfig) -> Result<()> {
         .route(
             "/v1/local/states/:state_id",
             get(handle_get_persistent_state),
+        )
+        .route(
+            "/v1/local/bindings",
+            get(handle_list_service_bindings).post(handle_register_service_binding),
+        )
+        .route(
+            "/v1/local/bindings/:binding_id",
+            get(handle_get_service_binding),
         )
         .route("/v1/local/processes", get(handle_list_local_processes))
         .route("/v1/local/url-ready", get(handle_local_url_ready))
@@ -2951,6 +2973,75 @@ async fn handle_get_persistent_state(
     }
 }
 
+async fn handle_list_service_bindings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ServiceBindingListQuery>,
+) -> impl IntoResponse {
+    if let Err(err) = validate_read_auth(&headers, state.auth_token.as_deref()) {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized", &err);
+    }
+
+    let owner_scope = query
+        .owner_scope
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let service_name = query
+        .service_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let _guard = state.lock.lock().await;
+    match binding::open_binding_store()
+        .and_then(|store| store.list_service_bindings(owner_scope, service_name))
+    {
+        Ok(records) => (StatusCode::OK, Json(records)).into_response(),
+        Err(err) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "service_binding_list_failed",
+            &err.to_string(),
+        ),
+    }
+}
+
+async fn handle_get_service_binding(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(binding_id): AxumPath<String>,
+) -> impl IntoResponse {
+    if let Err(err) = validate_read_auth(&headers, state.auth_token.as_deref()) {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized", &err);
+    }
+
+    let binding_id = binding_id.trim();
+    if binding_id.is_empty() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_binding_id",
+            "binding_id is required",
+        );
+    }
+
+    let _guard = state.lock.lock().await;
+    match binding::open_binding_store()
+        .and_then(|store| store.find_service_binding_by_id(binding_id))
+    {
+        Ok(Some(record)) => (StatusCode::OK, Json(record)).into_response(),
+        Ok(None) => json_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "Host-side service binding not found",
+        ),
+        Err(err) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "service_binding_lookup_failed",
+            &err.to_string(),
+        ),
+    }
+}
+
 async fn handle_register_persistent_state(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2989,6 +3080,47 @@ async fn handle_register_persistent_state(
         Err(err) => json_error(
             StatusCode::BAD_REQUEST,
             "persistent_state_register_failed",
+            &err.to_string(),
+        ),
+    }
+}
+
+async fn handle_register_service_binding(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<RegisterServiceBindingRequest>,
+) -> impl IntoResponse {
+    if let Err(err) = validate_write_auth(&headers, state.auth_token.as_deref()) {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized", &err);
+    }
+
+    let manifest = request.manifest.trim();
+    let service_name = request.service_name.trim();
+    let url = request.url.trim();
+    if manifest.is_empty() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_manifest",
+            "manifest is required",
+        );
+    }
+    if service_name.is_empty() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_service_name",
+            "service_name is required",
+        );
+    }
+    if url.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "invalid_url", "url is required");
+    }
+
+    let _guard = state.lock.lock().await;
+    match binding::register_ingress_binding(Path::new(manifest), service_name, url) {
+        Ok(record) => (StatusCode::CREATED, Json(record)).into_response(),
+        Err(err) => json_error(
+            StatusCode::BAD_REQUEST,
+            "service_binding_register_failed",
             &err.to_string(),
         ),
     }

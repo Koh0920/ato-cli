@@ -26,6 +26,7 @@ const RETENTION_PINNED_RELEASES: i64 = 5;
 // 128-bit random ids already make collisions vanishingly unlikely, but a small retry
 // budget keeps the insert path fail-closed if SQLite reports a uniqueness race.
 const MAX_STATE_ID_GENERATION_ATTEMPTS: usize = 10;
+const MAX_BINDING_ID_GENERATION_ATTEMPTS: usize = 10;
 const SCHEMA_MIGRATION_0001: &str = "2026-03-05-0001-manifests-tombstoned";
 const SCHEMA_MIGRATION_0002: &str = "2026-03-05-0002-leases-composite";
 const SCHEMA_MIGRATION_0003: &str = "2026-03-05-0003-gc-indexes";
@@ -33,6 +34,7 @@ const SCHEMA_MIGRATION_0004: &str = "2026-03-05-0004-auto-vacuum-incremental";
 const SCHEMA_MIGRATION_0005: &str = "2026-03-05-0005-manifests-yanked";
 const SCHEMA_MIGRATION_0006: &str = "2026-03-10-0006-persistent-state-registry";
 const SCHEMA_MIGRATION_0007: &str = "2026-03-10-0007-persistent-state-kind-columns";
+const SCHEMA_MIGRATION_0008: &str = "2026-03-10-0008-service-binding-registry";
 
 fn manifest_distribution(
     manifest: &CapsuleManifest,
@@ -49,6 +51,12 @@ fn generate_random_state_id() -> String {
     let mut bytes = [0u8; 16];
     OsRng.fill_bytes(&mut bytes);
     format!("state-{}", hex::encode(bytes))
+}
+
+fn generate_random_binding_id() -> String {
+    let mut bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    format!("binding-{}", hex::encode(bytes))
 }
 
 #[derive(Debug, Clone)]
@@ -124,6 +132,34 @@ pub struct NewPersistentStateRecord {
     pub producer: String,
     pub purpose: String,
     pub schema_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceBindingRecord {
+    pub binding_id: String,
+    pub owner_scope: String,
+    pub service_name: String,
+    pub binding_kind: String,
+    pub transport_kind: String,
+    pub adapter_kind: String,
+    pub endpoint_locator: String,
+    pub tls_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_hint: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewServiceBindingRecord {
+    pub owner_scope: String,
+    pub service_name: String,
+    pub binding_kind: String,
+    pub transport_kind: String,
+    pub adapter_kind: String,
+    pub endpoint_locator: String,
+    pub tls_mode: String,
+    pub target_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -518,6 +554,184 @@ impl RegistryStore {
         );
     }
 
+    pub fn find_service_binding_by_identity(
+        &self,
+        owner_scope: &str,
+        service_name: &str,
+        binding_kind: &str,
+    ) -> Result<Option<ServiceBindingRecord>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT binding_id, owner_scope, service_name, binding_kind, transport_kind, adapter_kind, endpoint_locator, tls_mode, target_hint, created_at, updated_at
+             FROM service_bindings
+             WHERE owner_scope=?1 AND service_name=?2 AND binding_kind=?3",
+            params![owner_scope, service_name, binding_kind],
+            Self::map_service_binding_row,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn find_service_binding_by_id(
+        &self,
+        binding_id: &str,
+    ) -> Result<Option<ServiceBindingRecord>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT binding_id, owner_scope, service_name, binding_kind, transport_kind, adapter_kind, endpoint_locator, tls_mode, target_hint, created_at, updated_at
+             FROM service_bindings
+             WHERE binding_id=?1",
+            params![binding_id],
+            Self::map_service_binding_row,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn list_service_bindings(
+        &self,
+        owner_scope: Option<&str>,
+        service_name: Option<&str>,
+    ) -> Result<Vec<ServiceBindingRecord>> {
+        let conn = self.connect()?;
+        let sql = match (owner_scope, service_name) {
+            (Some(_), Some(_)) => {
+                "SELECT binding_id, owner_scope, service_name, binding_kind, transport_kind, adapter_kind, endpoint_locator, tls_mode, target_hint, created_at, updated_at
+                 FROM service_bindings
+                 WHERE owner_scope=?1 AND service_name=?2
+                 ORDER BY updated_at DESC, binding_id ASC"
+            }
+            (Some(_), None) => {
+                "SELECT binding_id, owner_scope, service_name, binding_kind, transport_kind, adapter_kind, endpoint_locator, tls_mode, target_hint, created_at, updated_at
+                 FROM service_bindings
+                 WHERE owner_scope=?1
+                 ORDER BY updated_at DESC, binding_id ASC"
+            }
+            (None, Some(_)) => {
+                "SELECT binding_id, owner_scope, service_name, binding_kind, transport_kind, adapter_kind, endpoint_locator, tls_mode, target_hint, created_at, updated_at
+                 FROM service_bindings
+                 WHERE service_name=?1
+                 ORDER BY updated_at DESC, binding_id ASC"
+            }
+            (None, None) => {
+                "SELECT binding_id, owner_scope, service_name, binding_kind, transport_kind, adapter_kind, endpoint_locator, tls_mode, target_hint, created_at, updated_at
+                 FROM service_bindings
+                 ORDER BY updated_at DESC, binding_id ASC"
+            }
+        };
+
+        let mut stmt = conn.prepare(sql)?;
+        let rows = match (owner_scope, service_name) {
+            (Some(owner_scope), Some(service_name)) => stmt.query_map(
+                params![owner_scope, service_name],
+                Self::map_service_binding_row,
+            )?,
+            (Some(owner_scope), None) => {
+                stmt.query_map(params![owner_scope], Self::map_service_binding_row)?
+            }
+            (None, Some(service_name)) => {
+                stmt.query_map(params![service_name], Self::map_service_binding_row)?
+            }
+            (None, None) => stmt.query_map([], Self::map_service_binding_row)?,
+        };
+
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row?);
+        }
+        Ok(records)
+    }
+
+    pub fn register_service_binding(
+        &self,
+        record: &NewServiceBindingRecord,
+    ) -> Result<ServiceBindingRecord> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let conn = self.connect()?;
+
+        if let Some(existing) = self.find_service_binding_by_identity(
+            &record.owner_scope,
+            &record.service_name,
+            &record.binding_kind,
+        )? {
+            conn.execute(
+                "UPDATE service_bindings
+                 SET transport_kind=?1,
+                     adapter_kind=?2,
+                     endpoint_locator=?3,
+                     tls_mode=?4,
+                     target_hint=?5,
+                     updated_at=?6
+                 WHERE binding_id=?7",
+                params![
+                    record.transport_kind,
+                    record.adapter_kind,
+                    record.endpoint_locator,
+                    record.tls_mode,
+                    record.target_hint,
+                    now,
+                    existing.binding_id,
+                ],
+            )?;
+            return self
+                .find_service_binding_by_id(&existing.binding_id)?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "failed to retrieve service binding after update - database inconsistency detected"
+                    )
+                });
+        }
+
+        for _ in 0..MAX_BINDING_ID_GENERATION_ATTEMPTS {
+            let binding_id = generate_random_binding_id();
+            match conn.execute(
+                "INSERT INTO service_bindings(
+                    binding_id, owner_scope, service_name, binding_kind, transport_kind, adapter_kind, endpoint_locator, tls_mode, target_hint, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+                params![
+                    binding_id,
+                    record.owner_scope,
+                    record.service_name,
+                    record.binding_kind,
+                    record.transport_kind,
+                    record.adapter_kind,
+                    record.endpoint_locator,
+                    record.tls_mode,
+                    record.target_hint,
+                    now,
+                ],
+            ) {
+                Ok(_) => {
+                    return self
+                        .find_service_binding_by_id(&binding_id)?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "failed to retrieve service binding after registration - database inconsistency detected"
+                            )
+                        });
+                }
+                Err(rusqlite::Error::SqliteFailure(err, _))
+                    if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+                {
+                    if let Some(existing) = self.find_service_binding_by_identity(
+                        &record.owner_scope,
+                        &record.service_name,
+                        &record.binding_kind,
+                    )? {
+                        return Ok(existing);
+                    }
+                    continue;
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        anyhow::bail!(
+            "failed to allocate a unique service binding id after {} attempts",
+            MAX_BINDING_ID_GENERATION_ATTEMPTS
+        );
+    }
+
     fn map_persistent_state_row(
         row: &rusqlite::Row<'_>,
     ) -> rusqlite::Result<PersistentStateRecord> {
@@ -531,6 +745,22 @@ impl RegistryStore {
             producer: row.get(6)?,
             purpose: row.get(7)?,
             schema_id: row.get(8)?,
+            created_at: row.get(9)?,
+            updated_at: row.get(10)?,
+        })
+    }
+
+    fn map_service_binding_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServiceBindingRecord> {
+        Ok(ServiceBindingRecord {
+            binding_id: row.get(0)?,
+            owner_scope: row.get(1)?,
+            service_name: row.get(2)?,
+            binding_kind: row.get(3)?,
+            transport_kind: row.get(4)?,
+            adapter_kind: row.get(5)?,
+            endpoint_locator: row.get(6)?,
+            tls_mode: row.get(7)?,
+            target_hint: row.get(8)?,
             created_at: row.get(9)?,
             updated_at: row.get(10)?,
         })
@@ -2372,6 +2602,20 @@ impl RegistryStore {
               updated_at TEXT NOT NULL,
               UNIQUE(owner_scope, backend_locator)
             );
+                        CREATE TABLE IF NOT EXISTS service_bindings(
+                            binding_id TEXT PRIMARY KEY,
+                            owner_scope TEXT NOT NULL,
+                            service_name TEXT NOT NULL,
+                            binding_kind TEXT NOT NULL,
+                            transport_kind TEXT NOT NULL,
+                            adapter_kind TEXT NOT NULL,
+                            endpoint_locator TEXT NOT NULL,
+                            tls_mode TEXT NOT NULL,
+                            target_hint TEXT,
+                            created_at TEXT NOT NULL,
+                            updated_at TEXT NOT NULL,
+                            UNIQUE(owner_scope, service_name, binding_kind)
+                        );
             CREATE TABLE IF NOT EXISTS schema_migrations(
               migration_id TEXT PRIMARY KEY,
               applied_at TEXT NOT NULL
@@ -2385,6 +2629,7 @@ impl RegistryStore {
             CREATE INDEX IF NOT EXISTS idx_registry_releases_manifest_hash ON registry_releases(manifest_hash);
             CREATE INDEX IF NOT EXISTS idx_registry_store_metadata_updated_at ON registry_store_metadata(updated_at);
             CREATE INDEX IF NOT EXISTS idx_persistent_states_owner_scope ON persistent_states(owner_scope, state_name);
+            CREATE INDEX IF NOT EXISTS idx_service_bindings_owner_scope ON service_bindings(owner_scope, service_name, binding_kind);
             ",
         )?;
         self.apply_schema_migrations(&mut conn)?;
@@ -2509,6 +2754,30 @@ impl RegistryStore {
                 )?;
             }
             self.mark_migration_applied(conn, SCHEMA_MIGRATION_0007)?;
+        }
+
+        if !self.is_migration_applied(conn, SCHEMA_MIGRATION_0008)? {
+            conn.execute_batch(
+                "
+                                CREATE TABLE IF NOT EXISTS service_bindings(
+                                    binding_id TEXT PRIMARY KEY,
+                                    owner_scope TEXT NOT NULL,
+                                    service_name TEXT NOT NULL,
+                                    binding_kind TEXT NOT NULL,
+                                    transport_kind TEXT NOT NULL,
+                                    adapter_kind TEXT NOT NULL,
+                                    endpoint_locator TEXT NOT NULL,
+                                    tls_mode TEXT NOT NULL,
+                                    target_hint TEXT,
+                                    created_at TEXT NOT NULL,
+                                    updated_at TEXT NOT NULL,
+                                    UNIQUE(owner_scope, service_name, binding_kind)
+                                );
+                                CREATE INDEX IF NOT EXISTS idx_service_bindings_owner_scope
+                                    ON service_bindings(owner_scope, service_name, binding_kind);
+                                ",
+            )?;
+            self.mark_migration_applied(conn, SCHEMA_MIGRATION_0008)?;
         }
 
         Ok(())
@@ -3653,6 +3922,58 @@ default_target = "cli"
             .list_persistent_states(Some("demo-app"), Some("data"))
             .expect("list states");
         assert_eq!(listed, vec![record]);
+    }
+
+    #[test]
+    fn service_binding_registry_round_trips_and_updates() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = RegistryStore::open(temp.path()).expect("open store");
+        let record = store
+            .register_service_binding(&NewServiceBindingRecord {
+                owner_scope: "demo-app".to_string(),
+                service_name: "main".to_string(),
+                binding_kind: "ingress".to_string(),
+                transport_kind: "https".to_string(),
+                adapter_kind: "reverse_proxy".to_string(),
+                endpoint_locator: "https://demo.local/".to_string(),
+                tls_mode: "explicit".to_string(),
+                target_hint: Some("app".to_string()),
+            })
+            .expect("register binding");
+        assert!(record.binding_id.starts_with("binding-"));
+
+        let fetched = store
+            .find_service_binding_by_identity("demo-app", "main", "ingress")
+            .expect("lookup binding")
+            .expect("binding record");
+        assert_eq!(fetched, record);
+
+        let by_id = store
+            .find_service_binding_by_id(&record.binding_id)
+            .expect("lookup binding by id")
+            .expect("binding record by id");
+        assert_eq!(by_id, record);
+
+        let updated = store
+            .register_service_binding(&NewServiceBindingRecord {
+                owner_scope: "demo-app".to_string(),
+                service_name: "main".to_string(),
+                binding_kind: "ingress".to_string(),
+                transport_kind: "http".to_string(),
+                adapter_kind: "reverse_proxy".to_string(),
+                endpoint_locator: "http://127.0.0.1:4310/".to_string(),
+                tls_mode: "disabled".to_string(),
+                target_hint: Some("app".to_string()),
+            })
+            .expect("update binding");
+        assert_eq!(updated.binding_id, record.binding_id);
+        assert_eq!(updated.endpoint_locator, "http://127.0.0.1:4310/");
+        assert_eq!(updated.tls_mode, "disabled");
+
+        let listed = store
+            .list_service_bindings(Some("demo-app"), Some("main"))
+            .expect("list bindings");
+        assert_eq!(listed, vec![updated]);
     }
 
     #[test]
