@@ -62,7 +62,7 @@ pub fn execute_pack_command(
             if cli_json {
                 anyhow::bail!("--init cannot be used with --json output");
             }
-            init::execute(
+            init::execute_manifest_init(
                 init::InitArgs {
                     path: Some(dir.clone()),
                     yes: false,
@@ -71,7 +71,7 @@ pub fn execute_pack_command(
             )?;
         } else {
             futures::executor::block_on(reporter.warn(
-                "No capsule.toml found. Using defaults. Run 'ato init' to configure.".to_string(),
+                "No `capsule.toml` found. Using defaults. Run `ato init` to generate an agent prompt, or `ato build --init` to create `capsule.toml` interactively.".to_string(),
             ))?;
             let inferred = infer_zero_config_manifest(&dir)?;
             std::fs::write(&manifest, inferred).with_context(|| {
@@ -500,7 +500,7 @@ fn infer_zero_config_manifest(dir: &Path) -> Result<String> {
 
     let entrypoint = infer_entrypoint(dir).ok_or_else(|| {
         anyhow::anyhow!(
-            "capsule.toml not found and entrypoint could not be inferred. Add capsule.toml or run `ato init`."
+            "capsule.toml not found and entrypoint could not be inferred. Add capsule.toml, run `ato init` for an agent prompt, or use `ato build --init`."
         )
     })?;
 
