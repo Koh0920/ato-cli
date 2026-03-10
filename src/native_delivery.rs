@@ -197,11 +197,12 @@ enum NativeArtifactKind {
 
 impl NativeArtifactKind {
     fn from_path(path: &Path) -> Self {
-        match () {
-            _ if path_has_extension(path, "app") => Self::MacOsAppBundle,
-            _ if path_has_extension(path, "exe") => Self::File,
-            _ if path.is_file() => Self::File,
-            _ => Self::Directory,
+        if path_has_extension(path, "app") {
+            Self::MacOsAppBundle
+        } else if path_has_extension(path, "exe") || path.is_file() {
+            Self::File
+        } else {
+            Self::Directory
         }
     }
 }
@@ -1925,7 +1926,11 @@ fn discover_nearby_native_artifacts(expected_path: &Path, max_depth: usize) -> V
         .map(|entry| entry.into_path())
         .filter(|path| match kind {
             NativeArtifactKind::MacOsAppBundle => path.is_dir() && path_has_extension(path, "app"),
-            NativeArtifactKind::File => path.is_file() && path_has_extension(path, "exe"),
+            NativeArtifactKind::File => {
+                path.is_file()
+                    && (!path_has_extension(expected_path, "exe")
+                        || path_has_extension(path, "exe"))
+            }
             NativeArtifactKind::Directory => path.is_dir(),
         })
         .collect::<Vec<_>>();
@@ -2777,39 +2782,58 @@ args = ["sign", "/fd", "SHA256", "dist/MyApp.exe"]
 "#
     }
 
-    fn sample_windows_executable_bytes() -> Vec<u8> {
-        let mut bytes = vec![0u8; 0x400];
+    fn sample_windows_pe_bytes(is_dll: bool) -> Vec<u8> {
+        const SAMPLE_PE_SIZE: usize = 0x400;
+        const PE_OFFSET: usize = 0x80;
+        const PE32_PLUS_OPTIONAL_HEADER_SIZE: usize = 0xF0;
+        const SECTION_ALIGNMENT: u32 = 0x1000;
+        const FILE_ALIGNMENT: u32 = 0x200;
+        const IMAGE_BASE: u64 = 0x1_4000_0000;
+        // IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_LARGE_ADDRESS_AWARE
+        const EXECUTABLE_CHARACTERISTICS: u16 = 0x0022;
+        // EXECUTABLE_CHARACTERISTICS | IMAGE_FILE_DLL
+        const DLL_CHARACTERISTICS: u16 = 0x2022;
+
+        let mut bytes = vec![0u8; SAMPLE_PE_SIZE];
         bytes[0..2].copy_from_slice(b"MZ");
-        bytes[0x3c..0x40].copy_from_slice(&(0x80u32).to_le_bytes());
+        bytes[0x3c..0x40].copy_from_slice(&(PE_OFFSET as u32).to_le_bytes());
 
-        let pe_offset = 0x80;
-        bytes[pe_offset..pe_offset + 4].copy_from_slice(b"PE\0\0");
+        bytes[PE_OFFSET..PE_OFFSET + 4].copy_from_slice(b"PE\0\0");
 
-        let coff_offset = pe_offset + 4;
+        let coff_offset = PE_OFFSET + 4;
         bytes[coff_offset..coff_offset + 2].copy_from_slice(&(0x8664u16).to_le_bytes());
         bytes[coff_offset + 2..coff_offset + 4].copy_from_slice(&(1u16).to_le_bytes());
-        bytes[coff_offset + 16..coff_offset + 18].copy_from_slice(&(0x00f0u16).to_le_bytes());
-        bytes[coff_offset + 18..coff_offset + 20].copy_from_slice(&(0x0022u16).to_le_bytes());
+        bytes[coff_offset + 16..coff_offset + 18]
+            .copy_from_slice(&(PE32_PLUS_OPTIONAL_HEADER_SIZE as u16).to_le_bytes());
+        bytes[coff_offset + 18..coff_offset + 20].copy_from_slice(
+            &(if is_dll {
+                DLL_CHARACTERISTICS
+            } else {
+                EXECUTABLE_CHARACTERISTICS
+            })
+            .to_le_bytes(),
+        );
 
         let optional_offset = coff_offset + 20;
         bytes[optional_offset..optional_offset + 2].copy_from_slice(&(0x20bu16).to_le_bytes());
-        bytes[optional_offset + 4..optional_offset + 8].copy_from_slice(&(0x200u32).to_le_bytes());
+        bytes[optional_offset + 4..optional_offset + 8]
+            .copy_from_slice(&FILE_ALIGNMENT.to_le_bytes());
         bytes[optional_offset + 16..optional_offset + 20]
-            .copy_from_slice(&(0x1000u32).to_le_bytes());
+            .copy_from_slice(&SECTION_ALIGNMENT.to_le_bytes());
         bytes[optional_offset + 20..optional_offset + 24]
-            .copy_from_slice(&(0x1000u32).to_le_bytes());
+            .copy_from_slice(&SECTION_ALIGNMENT.to_le_bytes());
         bytes[optional_offset + 24..optional_offset + 32]
-            .copy_from_slice(&(0x1_4000_0000u64).to_le_bytes());
+            .copy_from_slice(&IMAGE_BASE.to_le_bytes());
         bytes[optional_offset + 32..optional_offset + 36]
-            .copy_from_slice(&(0x1000u32).to_le_bytes());
+            .copy_from_slice(&SECTION_ALIGNMENT.to_le_bytes());
         bytes[optional_offset + 36..optional_offset + 40]
-            .copy_from_slice(&(0x200u32).to_le_bytes());
+            .copy_from_slice(&FILE_ALIGNMENT.to_le_bytes());
         bytes[optional_offset + 40..optional_offset + 42].copy_from_slice(&(6u16).to_le_bytes());
         bytes[optional_offset + 48..optional_offset + 50].copy_from_slice(&(6u16).to_le_bytes());
         bytes[optional_offset + 56..optional_offset + 60]
-            .copy_from_slice(&(0x2000u32).to_le_bytes());
+            .copy_from_slice(&(SECTION_ALIGNMENT * 2).to_le_bytes());
         bytes[optional_offset + 60..optional_offset + 64]
-            .copy_from_slice(&(0x200u32).to_le_bytes());
+            .copy_from_slice(&FILE_ALIGNMENT.to_le_bytes());
         bytes[optional_offset + 68..optional_offset + 70].copy_from_slice(&(3u16).to_le_bytes());
         bytes[optional_offset + 72..optional_offset + 80]
             .copy_from_slice(&(0x10_0000u64).to_le_bytes());
@@ -2821,17 +2845,28 @@ args = ["sign", "/fd", "SHA256", "dist/MyApp.exe"]
             .copy_from_slice(&(0x1000u64).to_le_bytes());
         bytes[optional_offset + 108..optional_offset + 112].copy_from_slice(&(16u32).to_le_bytes());
 
-        let section_offset = optional_offset + 0xF0;
+        let section_offset = optional_offset + PE32_PLUS_OPTIONAL_HEADER_SIZE;
         bytes[section_offset..section_offset + 8].copy_from_slice(b".text\0\0\0");
         bytes[section_offset + 8..section_offset + 12].copy_from_slice(&(1u32).to_le_bytes());
-        bytes[section_offset + 12..section_offset + 16].copy_from_slice(&(0x1000u32).to_le_bytes());
-        bytes[section_offset + 16..section_offset + 20].copy_from_slice(&(0x200u32).to_le_bytes());
-        bytes[section_offset + 20..section_offset + 24].copy_from_slice(&(0x200u32).to_le_bytes());
+        bytes[section_offset + 12..section_offset + 16]
+            .copy_from_slice(&SECTION_ALIGNMENT.to_le_bytes());
+        bytes[section_offset + 16..section_offset + 20]
+            .copy_from_slice(&FILE_ALIGNMENT.to_le_bytes());
+        bytes[section_offset + 20..section_offset + 24]
+            .copy_from_slice(&FILE_ALIGNMENT.to_le_bytes());
         bytes[section_offset + 36..section_offset + 40]
             .copy_from_slice(&(0x6000_0020u32).to_le_bytes());
 
-        bytes[0x200] = 0xC3;
+        bytes[FILE_ALIGNMENT as usize] = 0xC3;
         bytes
+    }
+
+    fn sample_windows_executable_bytes() -> Vec<u8> {
+        sample_windows_pe_bytes(false)
+    }
+
+    fn sample_windows_dll_bytes() -> Vec<u8> {
+        sample_windows_pe_bytes(true)
     }
 
     fn sample_native_build_plan(root: &Path, mode: u32) -> Result<NativeBuildPlan> {
@@ -3139,6 +3174,19 @@ input = "dist/time-management-desktop.app"
         assert!(err
             .to_string()
             .contains("Windows executable failed minimum PE validation"));
+        Ok(())
+    }
+
+    #[test]
+    fn validate_native_bundle_directory_rejects_windows_dll_renamed_to_exe() -> Result<()> {
+        let tmp = tempdir()?;
+        let windows_exe = tmp.path().join("dist/MyApp.exe");
+        fs::create_dir_all(windows_exe.parent().context("missing exe parent")?)?;
+        fs::write(&windows_exe, sample_windows_dll_bytes())?;
+
+        let err = validate_native_bundle_directory(&windows_exe)
+            .expect_err("dll-shaped PE should fail executable validation");
+        assert!(err.to_string().contains("is a DLL, not an .exe"));
         Ok(())
     }
 
