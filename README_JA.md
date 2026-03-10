@@ -36,6 +36,69 @@ ato registry serve --host 127.0.0.1 --port 18787 [--auth-token <token>]
 - `fetch` / `finalize` / `project` / `unproject` は advanced/debug surface の位置付けです。通常は統合済みの `build` / `publish` / `install` を使ってください。
 - local finalize は fail-closed で、現時点では macOS darwin/arm64 + `codesign` のみ対応です。
 
+### Native Delivery contract（現在の canonical 形）
+
+project input の source of truth は `capsule.toml` です。現在の canonical contract は次です。
+
+```toml
+schema_version = "0.2"
+name = "my-app"
+version = "0.1.0"
+type = "app"
+default_target = "desktop"
+
+[targets.desktop]
+runtime = "source"
+driver = "native"
+entrypoint = "MyApp.app"
+```
+
+この `.app` entrypoint 形式では、現行 PoC の既定値は `ato` が内部導出します。
+
+- `artifact.framework = "tauri"`
+- `artifact.stage = "unsigned"`
+- `artifact.target = "darwin/arm64"`
+- `artifact.input = <targets.<default>.entrypoint>`
+- `finalize.tool = "codesign"`
+- `finalize.args = ["--deep", "--force", "--sign", "-", <artifact.input>]`
+
+native target が command mode（`entrypoint = "sh"` と `cmd = [...]`）のときは、現時点では明示的な delivery metadata が必要です。その metadata は `capsule.toml` 内の `[artifact]` + `[finalize]` でも、互換 sidecar の `ato.delivery.toml` でも構いません。片方だけの inline metadata は fail-closed で拒否されます。
+
+### 互換 sidecar と artifact metadata flow
+
+- `ato.delivery.toml` はもはや canonical な project manifest ではありません。command-mode native build の互換入力、および `.app` entrypoint project 向けの互換 mirror metadata です。
+- build は、source project が canonical `capsule.toml` しか持っていない場合でも、常に `ato.delivery.toml` を artifact payload に stage します。これにより source tree がなくても local finalize/install で artifact 自身が自己記述的になります。
+- `ato install` / `ato finalize` / `ato project` は stage 済み artifact metadata と `local-derivation.json` を読みます。後段では source checkout 側の sidecar は不要です。
+- 直近の方針としては、`ato.delivery.toml` は backward-compatible input として残しつつ、product surface 上では optional な compatibility metadata として扱います。
+
+### Stable / experimental の machine-readable contract
+
+`schema_version = "0.1"` で stable とみなすもの:
+
+- `fetch.json`: `schema_version`, `scoped_id`, `version`, `registry`, `parent_digest`
+- build JSON: `build_strategy = "native-delivery"`, `schema_version`, `target`, `derived_from`
+- finalize JSON: `schema_version`, `derived_app_path`, `provenance_path`, `parent_digest`, `derived_digest`
+- `local-derivation.json`: `schema_version`, `parent_digest`, `derived_digest`, `framework`, `target`, `finalize_tool`, `finalized_at`
+- project / unproject JSON: `schema_version`, `projection_id`, `metadata_path`, `projected_path`, `derived_app_path`, `parent_digest`, `derived_digest`, `state`
+- install JSON: `install_kind`, `launchable`, `local_derivation`, `projection`
+  - `install_kind = "NativeRequiresLocalDerivation"` は install 自体は成功だが、起動対象が保存済み `.capsule` ではなく locally derived app bundle であることを意味します
+  - `launchable.path` は caller が open/run に使うべき path です
+  - `local_derivation.provenance_path`, `parent_digest`, `derived_digest` は fetch/finalize/project/install を結ぶ stable link です
+  - `projection.metadata_path` は `ato unproject` や launcher state inspection に使う stable handle です
+
+引き続き experimental なもの:
+
+- `~/.ato/fetches`, `~/.ato/apps`, `~/.ato/native-delivery/projections` 配下の正確な directory layout
+- 上記 stable fields 以外で将来追加される key
+- advanced/debug command (`fetch`, `finalize`, `project`, `unproject`) の UX 詳細。ただし現行の `schema_version = "0.1"` JSON envelope 自体は維持対象です
+- macOS darwin/arm64 + `codesign` 以外の host/tool support
+
+### Migration path
+
+1. **現在**: `capsule.toml` が canonical。`ato.delivery.toml` は互換 input / output metadata として残す。
+2. **次段**: command-mode native build は維持しつつ、docs / tooling は canonical `capsule.toml` を第一に案内し、manifest 情報だけで足りる場面では sidecar を optional にする。
+3. **将来**: internal artifact metadata は sidecar 名から抽象化できるようにしつつ、automation 向けには `schema_version = "0.1"` の JSON / provenance contract を維持する。
+
 ## クイックスタート（ローカル）
 
 ```bash

@@ -767,7 +767,9 @@ fn ensure_delivery_config_matches_context(
     if actual.artifact.framework != expected.artifact.framework
         || actual.artifact.stage != expected.artifact.stage
         || actual.artifact.target != expected.artifact.target
+        || actual.artifact.input != expected.artifact.input
         || actual.finalize.tool != expected.finalize.tool
+        || actual.finalize.args != expected.finalize.args
     {
         bail!(
             "{} native delivery config conflicts with the default target contract",
@@ -2680,6 +2682,113 @@ args = ["--deep", "--force", "--sign", "-", "dist/time-management-desktop.app"]
     }
 
     #[test]
+    fn detect_build_strategy_generates_canonical_delivery_config_from_capsule_manifest(
+    ) -> Result<()> {
+        let tmp = tempdir()?;
+        let manifest_dir = tmp.path().join("native-build-project");
+        let source_app_path = manifest_dir.join("MyApp.app");
+        let binary_path = source_app_path.join("Contents/MacOS/MyApp");
+        fs::create_dir_all(binary_path.parent().context("binary parent missing")?)?;
+        fs::write(
+            manifest_dir.join("capsule.toml"),
+            r#"schema_version = "0.2"
+name = "my-app"
+version = "0.1.0"
+type = "app"
+default_target = "cli"
+
+[targets.cli]
+runtime = "source"
+driver = "native"
+entrypoint = "MyApp.app"
+"#,
+        )?;
+        fs::write(&binary_path, b"unsigned-app")?;
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&binary_path)?.permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&binary_path, permissions)?;
+        }
+
+        let plan =
+            detect_build_strategy(&manifest_dir)?.context("expected native delivery build plan")?;
+        let staged: DeliveryConfig = toml::from_str(&plan.staged_delivery_config_toml)?;
+
+        assert!(plan.delivery_config_path.is_none());
+        assert_eq!(plan.source_app_path, manifest_dir.join("MyApp.app"));
+        assert_eq!(staged.schema_version, DELIVERY_SCHEMA_VERSION_STABLE);
+        assert_eq!(staged.artifact.input, "MyApp.app");
+        assert_eq!(staged.artifact.framework, DELIVERY_FRAMEWORK);
+        assert_eq!(staged.artifact.target, DELIVERY_TARGET);
+        assert_eq!(staged.finalize.tool, FINALIZE_TOOL);
+        assert_eq!(
+            staged.finalize.args,
+            vec![
+                "--deep".to_string(),
+                "--force".to_string(),
+                "--sign".to_string(),
+                "-".to_string(),
+                "MyApp.app".to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn detect_build_strategy_rejects_sidecar_that_conflicts_with_canonical_capsule_manifest() {
+        let tmp = tempdir().expect("tmp dir");
+        let manifest_dir = tmp.path().join("native-build-project");
+        let source_app_path = manifest_dir.join("MyApp.app");
+        let binary_path = source_app_path.join("Contents/MacOS/MyApp");
+        fs::create_dir_all(binary_path.parent().expect("binary parent")).expect("create app");
+        fs::write(
+            manifest_dir.join("capsule.toml"),
+            r#"schema_version = "0.2"
+name = "my-app"
+version = "0.1.0"
+type = "app"
+default_target = "cli"
+
+[targets.cli]
+runtime = "source"
+driver = "native"
+entrypoint = "MyApp.app"
+"#,
+        )
+        .expect("write manifest");
+        fs::write(
+            manifest_dir.join(DELIVERY_CONFIG_FILE),
+            r#"schema_version = "0.1"
+[artifact]
+framework = "tauri"
+stage = "unsigned"
+target = "darwin/arm64"
+input = "Other.app"
+[finalize]
+tool = "codesign"
+args = ["--deep", "--force", "--sign", "-", "Other.app"]
+"#,
+        )
+        .expect("write sidecar");
+        fs::write(&binary_path, b"unsigned-app").expect("write binary");
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&binary_path)
+                .expect("binary metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&binary_path, permissions).expect("set permissions");
+        }
+
+        let err = detect_build_strategy(&manifest_dir)
+            .expect_err("conflicting compatibility sidecar must be rejected");
+        assert!(err
+            .to_string()
+            .contains("native delivery config conflicts with the default target contract"));
+    }
+
+    #[test]
     fn detect_build_strategy_rejects_partial_inline_delivery_config() {
         let tmp = tempdir().expect("tmp dir");
         let manifest_dir = tmp.path().join("inline-command-build-project");
@@ -3092,6 +3201,7 @@ input = "dist/time-management-desktop.app"
     }
 
     #[test]
+    #[serial_test::serial]
     fn materialize_fetch_cache_extracts_payload_tree() -> Result<()> {
         let tmp_home = tempdir()?;
         std::env::set_var("HOME", tmp_home.path());
@@ -3132,6 +3242,7 @@ input = "dist/time-management-desktop.app"
     }
 
     #[test]
+    #[serial_test::serial]
     fn materialize_fetch_cache_preserves_executable_mode_from_payload() -> Result<()> {
         let tmp_home = tempdir()?;
         std::env::set_var("HOME", tmp_home.path());
