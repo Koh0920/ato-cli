@@ -644,6 +644,53 @@ fn test_build_routes_native_delivery_projects_without_delivery_sidecar() {
 }
 
 #[test]
+fn test_build_strict_v3_non_app_native_target_keeps_strict_v3_error() {
+    let tmp = tempdir().unwrap();
+    fs::create_dir_all(tmp.path().join("source")).unwrap();
+    fs::write(
+        tmp.path().join("capsule.toml"),
+        r#"schema_version = "0.2"
+name = "strict-v3-ci-check"
+version = "0.1.0"
+type = "app"
+default_target = "cli"
+
+[targets.cli]
+runtime = "source"
+driver = "native"
+entrypoint = "source/main.py"
+"#,
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("source/main.py"),
+        "print('strict v3 check')\n",
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("ato")
+        .unwrap()
+        .args(["build", tmp.path().to_str().unwrap(), "--strict-v3"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("strict-v3")
+            || stderr.contains("Strict v3 fallback is not allowed")
+            || stderr.contains("strict-manifest")
+            || stderr.contains("source_digest is missing")
+            || stderr.contains("E102"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Native delivery target 'cli' entrypoint must point to a .app bundle"),
+        "stderr:\n{stderr}"
+    );
+}
+
+#[test]
 fn test_install_help_shows_native_projection_controls() {
     let mut cmd = Command::cargo_bin("ato").unwrap();
     cmd.args(["install", "--help"])
