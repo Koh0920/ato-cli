@@ -5,6 +5,7 @@ pub mod guest;
 #[cfg(windows)]
 #[path = "guest_windows.rs"]
 pub mod guest;
+pub mod inspect;
 pub mod ipc;
 pub mod logs;
 pub mod open;

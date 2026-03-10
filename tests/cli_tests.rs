@@ -198,6 +198,20 @@ fn test_fetch_accepts_subcommand_json_flag() {
 }
 
 #[test]
+fn test_inspect_requirements_help_shows_json_and_registry() {
+    let mut cmd = Command::cargo_bin("ato").unwrap();
+    cmd.args(["inspect", "requirements", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Inspect runtime requirements from capsule.toml",
+        ))
+        .stdout(predicate::str::contains("publisher/slug"))
+        .stdout(predicate::str::contains("--registry <REGISTRY>"))
+        .stdout(predicate::str::contains("--json"));
+}
+
+#[test]
 fn test_finalize_accepts_subcommand_json_flag() {
     let tmp = tempdir().unwrap();
     let output_dir = tmp.path().join("dist");

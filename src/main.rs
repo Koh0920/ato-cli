@@ -160,6 +160,7 @@ Auth:
   whoami   Show current authentication status
 
 Advanced Commands:
+  inspect  Inspect capsule metadata and runtime requirements
   fetch    Fetch an artifact into local cache for debugging or manual workflows
   finalize Perform local derivation for a fetched native artifact
   project  Add a finalized app to launcher surfaces
@@ -379,6 +380,15 @@ enum Commands {
         /// Emit machine-readable JSON output
         #[arg(long)]
         json: bool,
+    },
+
+    #[command(
+        next_help_heading = "Advanced Commands",
+        about = "Inspect capsule metadata and runtime requirements"
+    )]
+    Inspect {
+        #[command(subcommand)]
+        command: InspectCommands,
     },
 
     #[command(
@@ -903,6 +913,23 @@ enum Commands {
 }
 
 #[derive(Subcommand)]
+enum InspectCommands {
+    #[command(about = "Inspect runtime requirements from capsule.toml")]
+    Requirements {
+        /// Local path or scoped store ID (publisher/slug)
+        target: String,
+
+        /// Registry URL override for remote inspection
+        #[arg(long)]
+        registry: Option<String>,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum ProjectCommands {
     #[command(
         about = "List experimental projection state and detect broken projections read-only"
@@ -1330,6 +1357,10 @@ fn main() {
     let command_context = diagnostics::detect_command_context(&args);
 
     if let Err(err) = run() {
+        if json_mode && commands::inspect::try_emit_json_error(&err) {
+            std::process::exit(error_codes::EXIT_USER_ERROR);
+        }
+
         if ato_error_jsonl::try_emit_from_anyhow(&err, json_mode) {
             std::process::exit(error_codes::EXIT_USER_ERROR);
         }
@@ -1504,6 +1535,22 @@ fn run() -> Result<()> {
             commands::validate::execute(path, cli.json || json)?;
             Ok(())
         }
+
+        Commands::Inspect { command } => match command {
+            InspectCommands::Requirements {
+                target,
+                registry,
+                json,
+            } => {
+                let rt = tokio::runtime::Runtime::new()?;
+                rt.block_on(async {
+                    commands::inspect::execute_requirements(target, registry, cli.json || json)
+                        .await
+                        .map(|_| ())
+                        .map_err(anyhow::Error::from)
+                })
+            }
+        },
 
         Commands::Keygen { out, force, json } => {
             keygen::execute(keygen::KeygenArgs { out, force, json }, reporter.clone())
