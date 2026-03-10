@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use chrono::{SecondsFormat, Utc};
+use goblin::Object;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{Cursor, Read, Write};
@@ -196,9 +197,9 @@ enum NativeArtifactKind {
 
 impl NativeArtifactKind {
     fn from_path(path: &Path) -> Self {
-        match path.extension().and_then(|ext| ext.to_str()) {
-            Some("app") => Self::MacOsAppBundle,
-            Some("exe") => Self::File,
+        match () {
+            _ if path_has_extension(path, "app") => Self::MacOsAppBundle,
+            _ if path_has_extension(path, "exe") => Self::File,
             _ if path.is_file() => Self::File,
             _ => Self::Directory,
         }
@@ -447,7 +448,7 @@ where
             .with_context(|| format!("Failed to create {}", parent.display()))?;
     }
 
-    validate_minimal_app_permissions(&plan.source_app_path)?;
+    validate_minimal_native_artifact_permissions(&plan.source_app_path)?;
 
     let tmp_root = plan.manifest_dir.join(".tmp");
     fs::create_dir_all(&tmp_root)
@@ -463,7 +464,7 @@ where
         }
         copy_recursively(&plan.source_app_path, &staged_app_path)?;
         strip_signature(&staged_app_path)?;
-        validate_minimal_app_permissions(&staged_app_path)?;
+        validate_minimal_native_artifact_permissions(&staged_app_path)?;
 
         fs::write(
             payload_root.join(DELIVERY_CONFIG_FILE),
@@ -772,17 +773,49 @@ fn default_delivery_target() -> String {
 }
 
 fn default_delivery_target_for_input(input: &str) -> String {
-    if Path::new(input).extension().and_then(|ext| ext.to_str()) == Some("app") {
+    let input_path = Path::new(input);
+    if path_has_extension(input_path, "app") {
         if cfg!(target_os = "macos") && std::env::consts::ARCH == "x86_64" {
             return "darwin/x86_64".to_string();
         }
         return DEFAULT_DELIVERY_TARGET.to_string();
+    }
+    if path_has_extension(input_path, "exe") {
+        return format!(
+            "windows/{}",
+            normalize_delivery_arch(std::env::consts::ARCH)
+        );
     }
     default_delivery_target()
 }
 
 fn default_finalize_tool() -> &'static str {
     DEFAULT_FINALIZE_TOOL
+}
+
+fn default_finalize_tool_for_input(input: &str) -> &'static str {
+    if path_has_extension(Path::new(input), "exe") {
+        return "signtool";
+    }
+    default_finalize_tool()
+}
+
+fn default_finalize_args_for_input(input: &str) -> Vec<String> {
+    if path_has_extension(Path::new(input), "exe") {
+        return vec![
+            "sign".to_string(),
+            "/fd".to_string(),
+            "SHA256".to_string(),
+            input.to_string(),
+        ];
+    }
+    vec![
+        "--deep".to_string(),
+        "--force".to_string(),
+        "--sign".to_string(),
+        "-".to_string(),
+        input.to_string(),
+    ]
 }
 
 fn delivery_config_from_input(input: &str) -> DeliveryConfig {
@@ -795,14 +828,8 @@ fn delivery_config_from_input(input: &str) -> DeliveryConfig {
             input: input.to_string(),
         },
         finalize: DeliveryFinalize {
-            tool: default_finalize_tool().to_string(),
-            args: vec![
-                "--deep".to_string(),
-                "--force".to_string(),
-                "--sign".to_string(),
-                "-".to_string(),
-                input.to_string(),
-            ],
+            tool: default_finalize_tool_for_input(input).to_string(),
+            args: default_finalize_args_for_input(input),
         },
     }
 }
@@ -821,7 +848,10 @@ fn detect_native_manifest_contract(
 
     let input_path = PathBuf::from(input);
     validate_relative_input_path(&input_path)?;
-    if input_path.extension().and_then(|ext| ext.to_str()) != Some("app") {
+    if !matches!(
+        NativeArtifactKind::from_path(&input_path),
+        NativeArtifactKind::MacOsAppBundle | NativeArtifactKind::File
+    ) {
         return Ok(None);
     }
 
@@ -1024,12 +1054,12 @@ where
     let derived_app_path = derived_dir.join(input_name);
 
     let result = (|| -> Result<FinalizeResult> {
-        validate_minimal_app_permissions(&input_app_path)?;
+        validate_minimal_native_artifact_permissions(&input_app_path)?;
         copy_recursively(&input_app_path, &derived_app_path)?;
-        validate_minimal_app_permissions(&derived_app_path)?;
+        validate_minimal_native_artifact_permissions(&derived_app_path)?;
         let derived_config = rebase_delivery_config_for_finalize(&config, &derived_app_path)?;
         runner(&derived_dir, &derived_config)?;
-        validate_minimal_app_permissions(&derived_app_path)?;
+        validate_minimal_native_artifact_permissions(&derived_app_path)?;
         let derived_digest = compute_tree_digest(&derived_app_path)?;
         let provenance = LocalDerivationProvenance {
             schema_version: DELIVERY_SCHEMA_VERSION.to_string(),
@@ -1851,11 +1881,11 @@ fn validate_native_bundle_directory(source_app_path: &Path) -> Result<()> {
     match NativeArtifactKind::from_path(source_app_path) {
         NativeArtifactKind::MacOsAppBundle => {
             if !source_app_path.is_dir() {
-                let candidates = discover_nearby_app_bundles(source_app_path, 6);
+                let candidates = discover_nearby_native_artifacts(source_app_path, 6);
                 bail!(
                     "Native delivery build input is not a .app directory: {}{}",
                     source_app_path.display(),
-                    format_app_bundle_candidates(&candidates)
+                    format_nearby_native_artifact_candidates(source_app_path, &candidates)
                 );
             }
         }
@@ -1869,28 +1899,35 @@ fn validate_native_bundle_directory(source_app_path: &Path) -> Result<()> {
         }
         NativeArtifactKind::File => {
             if !source_app_path.is_file() {
+                let candidates = discover_nearby_native_artifacts(source_app_path, 6);
                 bail!(
-                    "Native delivery build input must be a file: {}",
-                    source_app_path.display()
+                    "Native delivery build input is not a file: {}{}",
+                    source_app_path.display(),
+                    format_nearby_native_artifact_candidates(source_app_path, &candidates)
                 );
             }
         }
     }
+    validate_minimal_native_artifact_permissions(source_app_path)?;
     Ok(())
 }
 
-fn discover_nearby_app_bundles(expected_app_path: &Path, max_depth: usize) -> Vec<PathBuf> {
-    let Some(search_root) = nearest_existing_directory(expected_app_path) else {
+fn discover_nearby_native_artifacts(expected_path: &Path, max_depth: usize) -> Vec<PathBuf> {
+    let Some(search_root) = nearest_existing_directory(expected_path) else {
         return Vec::new();
     };
 
+    let kind = NativeArtifactKind::from_path(expected_path);
     let mut bundles = WalkDir::new(&search_root)
         .max_depth(max_depth)
         .into_iter()
         .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_type().is_dir())
         .map(|entry| entry.into_path())
-        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("app"))
+        .filter(|path| match kind {
+            NativeArtifactKind::MacOsAppBundle => path.is_dir() && path_has_extension(path, "app"),
+            NativeArtifactKind::File => path.is_file() && path_has_extension(path, "exe"),
+            NativeArtifactKind::Directory => path.is_dir(),
+        })
         .collect::<Vec<_>>();
     bundles.sort();
     bundles.dedup();
@@ -1909,10 +1946,22 @@ fn nearest_existing_directory(path: &Path) -> Option<PathBuf> {
     None
 }
 
-fn format_app_bundle_candidates(candidates: &[PathBuf]) -> String {
+fn format_nearby_native_artifact_candidates(
+    expected_path: &Path,
+    candidates: &[PathBuf],
+) -> String {
+    let kind = NativeArtifactKind::from_path(expected_path);
+    let label = match kind {
+        NativeArtifactKind::MacOsAppBundle => ".app bundle",
+        NativeArtifactKind::File if path_has_extension(expected_path, "exe") => ".exe",
+        NativeArtifactKind::File => "file",
+        NativeArtifactKind::Directory => "directory",
+    };
     if candidates.is_empty() {
-        return "\nHint: confirm that [artifact].input matches the actual Tauri .app output path."
-            .to_string();
+        return format!(
+            "\nHint: confirm that [artifact].input matches the actual {} output path.",
+            label
+        );
     }
 
     let formatted = candidates
@@ -1921,8 +1970,8 @@ fn format_app_bundle_candidates(candidates: &[PathBuf]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "\nFound nearby .app bundle candidates: {}\nHint: update [artifact].input to the correct bundle path.",
-        formatted
+        "\nFound nearby {} candidates: {}\nHint: update [artifact].input to the correct path.",
+        label, formatted
     )
 }
 
@@ -2275,7 +2324,17 @@ fn copy_recursively(source: &Path, destination: &Path) -> Result<()> {
     )
 }
 
-fn validate_minimal_app_permissions(app_dir: &Path) -> Result<()> {
+fn validate_minimal_native_artifact_permissions(path: &Path) -> Result<()> {
+    match NativeArtifactKind::from_path(path) {
+        NativeArtifactKind::MacOsAppBundle => validate_minimal_macos_app_permissions(path),
+        NativeArtifactKind::File if path_has_extension(path, "exe") => {
+            validate_minimal_windows_executable(path)
+        }
+        NativeArtifactKind::File | NativeArtifactKind::Directory => Ok(()),
+    }
+}
+
+fn validate_minimal_macos_app_permissions(app_dir: &Path) -> Result<()> {
     if !cfg!(target_os = "macos") {
         return Ok(());
     }
@@ -2319,6 +2378,42 @@ fn validate_minimal_app_permissions(app_dir: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn validate_minimal_windows_executable(path: &Path) -> Result<()> {
+    if !path_has_extension(path, "exe") {
+        return Ok(());
+    }
+
+    let bytes = fs::read(path)
+        .with_context(|| format!("Failed to read Windows executable {}", path.display()))?;
+    let object = Object::parse(&bytes).with_context(|| {
+        format!(
+            "Windows executable failed minimum PE validation: {}",
+            path.display()
+        )
+    })?;
+    let Object::PE(pe) = object else {
+        bail!(
+            "Windows executable failed minimum PE validation: {} is not a PE image",
+            path.display()
+        );
+    };
+    if pe.is_lib {
+        bail!(
+            "Windows executable failed minimum PE validation: {} is a DLL, not an .exe",
+            path.display()
+        );
+    }
+
+    Ok(())
+}
+
+fn path_has_extension(path: &Path, expected: &str) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case(expected))
+        .unwrap_or(false)
 }
 
 fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -2682,6 +2777,63 @@ args = ["sign", "/fd", "SHA256", "dist/MyApp.exe"]
 "#
     }
 
+    fn sample_windows_executable_bytes() -> Vec<u8> {
+        let mut bytes = vec![0u8; 0x400];
+        bytes[0..2].copy_from_slice(b"MZ");
+        bytes[0x3c..0x40].copy_from_slice(&(0x80u32).to_le_bytes());
+
+        let pe_offset = 0x80;
+        bytes[pe_offset..pe_offset + 4].copy_from_slice(b"PE\0\0");
+
+        let coff_offset = pe_offset + 4;
+        bytes[coff_offset..coff_offset + 2].copy_from_slice(&(0x8664u16).to_le_bytes());
+        bytes[coff_offset + 2..coff_offset + 4].copy_from_slice(&(1u16).to_le_bytes());
+        bytes[coff_offset + 16..coff_offset + 18].copy_from_slice(&(0x00f0u16).to_le_bytes());
+        bytes[coff_offset + 18..coff_offset + 20].copy_from_slice(&(0x0022u16).to_le_bytes());
+
+        let optional_offset = coff_offset + 20;
+        bytes[optional_offset..optional_offset + 2].copy_from_slice(&(0x20bu16).to_le_bytes());
+        bytes[optional_offset + 4..optional_offset + 8].copy_from_slice(&(0x200u32).to_le_bytes());
+        bytes[optional_offset + 16..optional_offset + 20]
+            .copy_from_slice(&(0x1000u32).to_le_bytes());
+        bytes[optional_offset + 20..optional_offset + 24]
+            .copy_from_slice(&(0x1000u32).to_le_bytes());
+        bytes[optional_offset + 24..optional_offset + 32]
+            .copy_from_slice(&(0x1_4000_0000u64).to_le_bytes());
+        bytes[optional_offset + 32..optional_offset + 36]
+            .copy_from_slice(&(0x1000u32).to_le_bytes());
+        bytes[optional_offset + 36..optional_offset + 40]
+            .copy_from_slice(&(0x200u32).to_le_bytes());
+        bytes[optional_offset + 40..optional_offset + 42].copy_from_slice(&(6u16).to_le_bytes());
+        bytes[optional_offset + 48..optional_offset + 50].copy_from_slice(&(6u16).to_le_bytes());
+        bytes[optional_offset + 56..optional_offset + 60]
+            .copy_from_slice(&(0x2000u32).to_le_bytes());
+        bytes[optional_offset + 60..optional_offset + 64]
+            .copy_from_slice(&(0x200u32).to_le_bytes());
+        bytes[optional_offset + 68..optional_offset + 70].copy_from_slice(&(3u16).to_le_bytes());
+        bytes[optional_offset + 72..optional_offset + 80]
+            .copy_from_slice(&(0x10_0000u64).to_le_bytes());
+        bytes[optional_offset + 80..optional_offset + 88]
+            .copy_from_slice(&(0x1000u64).to_le_bytes());
+        bytes[optional_offset + 88..optional_offset + 96]
+            .copy_from_slice(&(0x10_0000u64).to_le_bytes());
+        bytes[optional_offset + 96..optional_offset + 104]
+            .copy_from_slice(&(0x1000u64).to_le_bytes());
+        bytes[optional_offset + 108..optional_offset + 112].copy_from_slice(&(16u32).to_le_bytes());
+
+        let section_offset = optional_offset + 0xF0;
+        bytes[section_offset..section_offset + 8].copy_from_slice(b".text\0\0\0");
+        bytes[section_offset + 8..section_offset + 12].copy_from_slice(&(1u32).to_le_bytes());
+        bytes[section_offset + 12..section_offset + 16].copy_from_slice(&(0x1000u32).to_le_bytes());
+        bytes[section_offset + 16..section_offset + 20].copy_from_slice(&(0x200u32).to_le_bytes());
+        bytes[section_offset + 20..section_offset + 24].copy_from_slice(&(0x200u32).to_le_bytes());
+        bytes[section_offset + 36..section_offset + 40]
+            .copy_from_slice(&(0x6000_0020u32).to_le_bytes());
+
+        bytes[0x200] = 0xC3;
+        bytes
+    }
+
     fn sample_native_build_plan(root: &Path, mode: u32) -> Result<NativeBuildPlan> {
         let manifest_dir = root.join("native-build-project");
         let source_app_path = manifest_dir.join("MyApp.app");
@@ -2742,7 +2894,7 @@ entrypoint = "dist/MyApp.exe"
             manifest_dir.join(DELIVERY_CONFIG_FILE),
             sample_file_delivery_toml(),
         )?;
-        fs::write(&source_file_path, b"unsigned-exe")?;
+        fs::write(&source_file_path, sample_windows_executable_bytes())?;
 
         detect_build_strategy(&manifest_dir)?.context("expected native delivery build plan")
     }
@@ -2780,6 +2932,47 @@ working_dir = "."
         assert_eq!(build_command.args, vec!["build-app.sh".to_string()]);
         assert_eq!(build_command.working_dir, manifest_dir);
         assert_eq!(plan.source_app_path, plan.manifest_dir.join("MyApp.app"));
+        Ok(())
+    }
+
+    #[test]
+    fn detect_build_strategy_accepts_windows_exe_manifest_contract() -> Result<()> {
+        let tmp = tempdir()?;
+        let manifest_dir = tmp.path().join("windows-build-project");
+        let source_file_path = manifest_dir.join("dist/MyApp.exe");
+        fs::create_dir_all(
+            source_file_path
+                .parent()
+                .context("source file parent missing")?,
+        )?;
+        fs::write(
+            manifest_dir.join("capsule.toml"),
+            r#"schema_version = "0.2"
+name = "my-app"
+version = "0.1.0"
+type = "app"
+default_target = "cli"
+
+[targets.cli]
+runtime = "source"
+driver = "native"
+entrypoint = "dist/MyApp.exe"
+"#,
+        )?;
+        fs::write(&source_file_path, sample_windows_executable_bytes())?;
+
+        let plan =
+            detect_build_strategy(&manifest_dir)?.context("expected native delivery build plan")?;
+        let config = staged_delivery_config(&plan)?;
+        assert_eq!(plan.source_app_path, source_file_path);
+        assert_eq!(config.artifact.input, "dist/MyApp.exe");
+        assert_eq!(
+            config.artifact.target,
+            format!(
+                "windows/{}",
+                normalize_delivery_arch(std::env::consts::ARCH)
+            )
+        );
         Ok(())
     }
 
@@ -2904,16 +3097,48 @@ input = "dist/time-management-desktop.app"
     }
 
     #[test]
+    fn validate_native_bundle_directory_reports_nearby_exe_candidates() -> Result<()> {
+        let tmp = tempdir()?;
+        let windows_dir = tmp.path().join("src-tauri/target/release/bundle/windows");
+        let candidate = windows_dir.join("Time Management Desktop.exe");
+        fs::create_dir_all(&windows_dir)?;
+        fs::write(&candidate, sample_windows_executable_bytes())?;
+
+        let err =
+            validate_native_bundle_directory(&windows_dir.join("time-management-desktop.exe"))
+                .expect_err("missing exact exe path should fail");
+        let message = err.to_string();
+        assert!(message.contains("Found nearby .exe candidates"));
+        assert!(message.contains("Time Management Desktop.exe"));
+        Ok(())
+    }
+
+    #[test]
     fn validate_native_bundle_directory_accepts_generic_directory_and_file() -> Result<()> {
         let tmp = tempdir()?;
         let linux_dir = tmp.path().join("dist/linux");
         let windows_exe = tmp.path().join("dist/MyApp.exe");
         fs::create_dir_all(&linux_dir)?;
         fs::create_dir_all(windows_exe.parent().context("missing exe parent")?)?;
-        fs::write(&windows_exe, b"windows-binary")?;
+        fs::write(&windows_exe, sample_windows_executable_bytes())?;
 
         validate_native_bundle_directory(&linux_dir)?;
         validate_native_bundle_directory(&windows_exe)?;
+        Ok(())
+    }
+
+    #[test]
+    fn validate_native_bundle_directory_rejects_invalid_windows_executable() -> Result<()> {
+        let tmp = tempdir()?;
+        let windows_exe = tmp.path().join("dist/MyApp.exe");
+        fs::create_dir_all(windows_exe.parent().context("missing exe parent")?)?;
+        fs::write(&windows_exe, b"not-a-pe-file")?;
+
+        let err = validate_native_bundle_directory(&windows_exe)
+            .expect_err("invalid exe should fail PE validation");
+        assert!(err
+            .to_string()
+            .contains("Windows executable failed minimum PE validation"));
         Ok(())
     }
 
@@ -3015,7 +3240,10 @@ input = "dist/time-management-desktop.app"
             artifact_dir.join(DELIVERY_CONFIG_FILE),
             sample_file_delivery_toml(),
         )?;
-        fs::write(artifact_dir.join("dist/MyApp.exe"), b"unsigned-exe")?;
+        fs::write(
+            artifact_dir.join("dist/MyApp.exe"),
+            sample_windows_executable_bytes(),
+        )?;
         let metadata = FetchMetadata {
             schema_version: DELIVERY_SCHEMA_VERSION.to_string(),
             scoped_id: "local/my-app".to_string(),
