@@ -1467,6 +1467,17 @@ enum BindingCommands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Auto-register all eligible local service bindings from a running process
+    SyncProcess {
+        /// Running local process id
+        #[arg(long)]
+        process_id: String,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2598,6 +2609,9 @@ fn execute_binding_command(command: BindingCommands) -> Result<()> {
             ),
             (None, None) => anyhow::bail!("register-service requires either --url or --process-id"),
         },
+        BindingCommands::SyncProcess { process_id, json } => {
+            binding::sync_service_bindings_from_process(&process_id, json)
+        }
     }
 }
 
