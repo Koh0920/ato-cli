@@ -607,10 +607,10 @@ fn collect_app_bundles(root: &Path, dir: &Path, context: &mut PromptContext) -> 
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if entry.file_type()?.is_dir() {
-            if path.extension().and_then(|ext| ext.to_str()) == Some("app") {
-                context.add_artifact_candidate(relative_display(root, &path));
-            }
+        if entry.file_type()?.is_dir()
+            && path.extension().and_then(|ext| ext.to_str()) == Some("app")
+        {
+            context.add_artifact_candidate(relative_display(root, &path));
         }
     }
     Ok(())
