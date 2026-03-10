@@ -5,19 +5,22 @@ use axoupdater::AxoUpdater;
 pub fn update() -> Result<()> {
     println!("🔍 更新を確認中...");
 
-    let updater = AxoUpdater::new_for("Koh0920/ato-cli")
-        .context("Failed to create updater")?;
+    let mut updater = AxoUpdater::new_for("ato");
+    updater
+        .load_receipt()
+        .context("ato のインストール情報を読み込めませんでした")?;
+    updater.disable_installer_output();
 
-    match updater.update() {
-        Ok(Some(version)) => {
-            println!("✅ 最新版 (v{}) に更新しました", version);
-        }
-        Ok(None) => {
-            println!("✨ すでに最新版です");
-        }
-        Err(e) => {
-            return Err(e).context("Failed to update ato CLI");
-        }
+    let update_result = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("更新確認用のランタイムを初期化できませんでした")?
+        .block_on(updater.run())
+        .context("ato CLI の更新に失敗しました")?;
+
+    match update_result {
+        Some(result) => println!("✅ 最新版 (v{}) に更新しました", result.new_version),
+        None => println!("✨ すでに最新版です"),
     }
 
     Ok(())
