@@ -108,6 +108,72 @@ fn test_search_help_uses_store_api_default() {
 }
 
 #[test]
+fn test_init_help_describes_agent_prompt_output() {
+    let mut cmd = Command::cargo_bin("ato").unwrap();
+    cmd.args(["init", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Analyze the current project and print an agent-ready capsule.toml prompt",
+        ))
+        .stdout(predicate::str::contains("Usage: ato init"))
+        .stdout(predicate::str::contains("<NAME>").not());
+}
+
+#[test]
+fn test_init_outputs_agent_prompt_for_next_project_without_writing_manifest() {
+    let tmp = tempdir().unwrap();
+    fs::write(
+        tmp.path().join("package.json"),
+        r#"{
+  "name": "demo-next-app",
+  "private": true,
+  "dependencies": {
+    "next": "^15.0.0",
+    "react": "^19.0.0"
+  },
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  }
+}"#,
+    )
+    .unwrap();
+    fs::create_dir_all(tmp.path().join("app")).unwrap();
+    fs::create_dir_all(tmp.path().join("public")).unwrap();
+
+    let output = Command::cargo_bin("ato")
+        .unwrap()
+        .current_dir(tmp.path())
+        .arg("init")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("Generated an agent-ready prompt for capsule.toml creation."),
+        "stdout={stdout}"
+    );
+    assert!(stdout.contains("Next.js"), "stdout={stdout}");
+    assert!(
+        stdout.contains("static export (`out/`) or a dynamic server"),
+        "stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("schema_version = \"0.2\""),
+        "stdout={stdout}"
+    );
+    assert!(stdout.contains("```toml"), "stdout={stdout}");
+    assert!(!tmp.path().join("capsule.toml").exists());
+}
+
+#[test]
 fn test_fetch_help_shows_registry_and_version() {
     let mut cmd = Command::cargo_bin("ato").unwrap();
     cmd.args(["fetch", "--help"])
