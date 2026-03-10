@@ -2480,8 +2480,6 @@ impl RegistryStore {
                   state_name TEXT NOT NULL,
                                     kind TEXT NOT NULL,
                                     backend_kind TEXT NOT NULL,
-                                    kind TEXT NOT NULL,
-                                    backend_kind TEXT NOT NULL,
                   backend_locator TEXT NOT NULL,
                   producer TEXT NOT NULL,
                   purpose TEXT NOT NULL,
@@ -3580,6 +3578,39 @@ default_target = "cli"
             lease_plan.contains("idx_leases_chunk_expires") || lease_plan.contains("USING INDEX"),
             "unexpected lease plan: {}",
             lease_plan
+        );
+    }
+
+    #[test]
+    fn registry_store_fresh_db_creates_persistent_state_columns_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = RegistryStore::open(temp.path()).expect("open store");
+        let conn = store.connect().expect("connect");
+
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(persistent_states)")
+            .expect("prepare table info");
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query table info")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("collect columns");
+
+        assert_eq!(
+            columns,
+            vec![
+                "state_id",
+                "owner_scope",
+                "state_name",
+                "kind",
+                "backend_kind",
+                "backend_locator",
+                "producer",
+                "purpose",
+                "schema_id",
+                "created_at",
+                "updated_at",
+            ]
         );
     }
 
