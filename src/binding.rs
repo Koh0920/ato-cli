@@ -4,7 +4,7 @@ use std::net::IpAddr;
 use std::path::Path;
 
 use crate::ingress_proxy;
-use crate::process_manager::ProcessManager;
+use crate::process_manager::{ProcessInfo, ProcessManager};
 use crate::registry_store::{NewServiceBindingRecord, RegistryStore, ServiceBindingRecord};
 use capsule_core::types::CapsuleManifest;
 
@@ -339,25 +339,8 @@ pub fn register_service_binding_for_process(
 }
 
 pub fn sync_service_bindings_for_process(process_id: &str) -> Result<Vec<ServiceBindingRecord>> {
-    let process = ProcessManager::new()?
-        .read_pid(process_id)
-        .with_context(|| format!("failed to read process record '{}'", process_id))?;
-    if !process.status.is_active() {
-        anyhow::bail!(
-            "process '{}' is not active (status={})",
-            process_id,
-            process.status
-        );
-    }
-
-    let manifest_path = process.manifest_path.as_deref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "process '{}' does not record a manifest path required for service binding registration",
-            process_id
-        )
-    })?;
-    let manifest = load_manifest(manifest_path)?;
-
+    let process = load_active_process(process_id)?;
+    let manifest = load_manifest_from_process(&process, process_id)?;
     let mut records = Vec::new();
     for service_name in auto_bindable_service_names(&manifest) {
         let endpoint = derive_service_endpoint_locator(
@@ -373,6 +356,31 @@ pub fn sync_service_bindings_for_process(process_id: &str) -> Result<Vec<Service
         )?);
     }
     Ok(records)
+}
+
+pub fn cleanup_service_bindings_for_process_info(
+    process: &ProcessInfo,
+) -> Result<Vec<ServiceBindingRecord>> {
+    let manifest_path = process.manifest_path.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "process '{}' does not record a manifest path required for service binding cleanup",
+            process.id
+        )
+    })?;
+    let manifest = load_manifest(manifest_path)?;
+    let owner_scope = host_service_binding_scope(&manifest)?;
+    let store = open_binding_store()?;
+    let mut removed = Vec::new();
+    for service_name in auto_bindable_service_names(&manifest) {
+        if let Some(record) = store.delete_service_binding_by_identity(
+            &owner_scope,
+            &service_name,
+            SERVICE_BINDING_KIND_SERVICE,
+        )? {
+            removed.push(record);
+        }
+    }
+    Ok(removed)
 }
 
 fn register_service_binding_from_parts(
@@ -392,6 +400,30 @@ fn register_service_binding_from_parts(
         allowed_callers: contract.allowed_callers,
         target_hint: contract.target_hint,
     })
+}
+
+fn load_active_process(process_id: &str) -> Result<ProcessInfo> {
+    let process = ProcessManager::new()?
+        .read_pid(process_id)
+        .with_context(|| format!("failed to read process record '{}'", process_id))?;
+    if !process.status.is_active() {
+        anyhow::bail!(
+            "process '{}' is not active (status={})",
+            process_id,
+            process.status
+        );
+    }
+    Ok(process)
+}
+
+fn load_manifest_from_process(process: &ProcessInfo, process_id: &str) -> Result<CapsuleManifest> {
+    let manifest_path = process.manifest_path.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "process '{}' does not record a manifest path required for service binding registration",
+            process_id
+        )
+    })?;
+    load_manifest(manifest_path)
 }
 
 pub fn bootstrap_ingress_tls(

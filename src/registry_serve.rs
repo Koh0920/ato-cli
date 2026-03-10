@@ -316,6 +316,8 @@ struct StopProcessRequest {
 #[derive(Debug, Serialize)]
 struct StopProcessResponse {
     stopped: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    removed_service_binding_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3384,6 +3386,7 @@ async fn handle_stop_local_process(
             )
         }
     };
+    let process = pm.read_pid(id.trim()).ok();
     let stopped = match pm.stop_process(id.trim(), request.force.unwrap_or(false)) {
         Ok(stopped) => stopped,
         Err(err) => {
@@ -3395,7 +3398,31 @@ async fn handle_stop_local_process(
         }
     };
 
-    (StatusCode::OK, Json(StopProcessResponse { stopped })).into_response()
+    let removed_service_binding_ids = match process {
+        Some(process) => match binding::cleanup_service_bindings_for_process_info(&process) {
+            Ok(records) => records
+                .into_iter()
+                .map(|record| record.binding_id)
+                .collect(),
+            Err(err) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "service_binding_cleanup_failed",
+                    &err.to_string(),
+                )
+            }
+        },
+        None => Vec::new(),
+    };
+
+    (
+        StatusCode::OK,
+        Json(StopProcessResponse {
+            stopped,
+            removed_service_binding_ids,
+        }),
+    )
+        .into_response()
 }
 
 async fn handle_get_process_logs(

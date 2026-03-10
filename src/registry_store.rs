@@ -817,6 +817,26 @@ impl RegistryStore {
         );
     }
 
+    pub fn delete_service_binding_by_identity(
+        &self,
+        owner_scope: &str,
+        service_name: &str,
+        binding_kind: &str,
+    ) -> Result<Option<ServiceBindingRecord>> {
+        let Some(existing) =
+            self.find_service_binding_by_identity(owner_scope, service_name, binding_kind)?
+        else {
+            return Ok(None);
+        };
+
+        let conn = self.connect()?;
+        conn.execute(
+            "DELETE FROM service_bindings WHERE binding_id=?1",
+            params![existing.binding_id],
+        )?;
+        Ok(Some(existing))
+    }
+
     fn map_persistent_state_row(
         row: &rusqlite::Row<'_>,
     ) -> rusqlite::Result<PersistentStateRecord> {
@@ -4113,6 +4133,36 @@ default_target = "cli"
             .resolve_service_binding("demo-app", "api", "service", Some("worker"))
             .expect_err("unauthorized caller must fail");
         assert!(denied.to_string().contains("not allowed"));
+    }
+
+    #[test]
+    fn delete_service_binding_by_identity_removes_record() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = RegistryStore::open(temp.path()).expect("open store");
+        let record = store
+            .register_service_binding(&NewServiceBindingRecord {
+                owner_scope: "demo-app".to_string(),
+                service_name: "api".to_string(),
+                binding_kind: "service".to_string(),
+                transport_kind: "http".to_string(),
+                adapter_kind: "local_service".to_string(),
+                endpoint_locator: "http://127.0.0.1:4310/".to_string(),
+                tls_mode: "disabled".to_string(),
+                allowed_callers: vec!["web".to_string()],
+                target_hint: Some("app".to_string()),
+            })
+            .expect("register binding");
+
+        let deleted = store
+            .delete_service_binding_by_identity("demo-app", "api", "service")
+            .expect("delete binding")
+            .expect("deleted record");
+        assert_eq!(deleted, record);
+
+        let remaining = store
+            .find_service_binding_by_identity("demo-app", "api", "service")
+            .expect("lookup binding after delete");
+        assert!(remaining.is_none());
     }
 
     #[test]
