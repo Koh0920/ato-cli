@@ -79,6 +79,7 @@ impl Drop for SidecarCleanup {
 
 mod ato_error_jsonl;
 mod auth;
+mod binding;
 mod commands;
 mod common;
 mod consent_store;
@@ -89,6 +90,7 @@ mod error_codes;
 mod executors;
 mod gen_ci;
 mod guest_protocol;
+mod ingress_proxy;
 mod init;
 mod install;
 mod ipc;
@@ -155,6 +157,7 @@ Management:
   stop     Stop a running capsule
   logs     Show logs of a running capsule
     state    Inspect or register persistent state bindings
+    binding  Inspect or register host-side service bindings
 
 Auth:
   login    Login to Ato registry
@@ -568,6 +571,15 @@ enum Commands {
     State {
         #[command(subcommand)]
         command: StateCommands,
+    },
+
+    #[command(
+        next_help_heading = "Management",
+        about = "Inspect or register host-side service bindings"
+    )]
+    Binding {
+        #[command(subcommand)]
+        command: BindingCommands,
     },
 
     #[command(next_help_heading = "Auth", about = "Login to Ato registry")]
@@ -1318,6 +1330,149 @@ enum StateCommands {
         /// Absolute host directory to bind to this state contract
         #[arg(long = "path", value_name = "/ABS/PATH")]
         path: PathBuf,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum BindingCommands {
+    /// List registered host-side service bindings
+    #[command(visible_alias = "ls")]
+    List {
+        /// Filter by owner scope
+        #[arg(long)]
+        owner_scope: Option<String>,
+
+        /// Filter by service name
+        #[arg(long)]
+        service_name: Option<String>,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Inspect one host-side service binding by binding-id
+    Inspect {
+        /// Binding reference (`binding-...`)
+        binding_ref: String,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Resolve a host-side service binding by owner scope, service, and kind
+    Resolve {
+        /// Binding owner scope
+        #[arg(long)]
+        owner_scope: String,
+
+        /// Service name from [services.<name>]
+        #[arg(long)]
+        service_name: String,
+
+        /// Binding kind to resolve
+        #[arg(long, default_value = "ingress")]
+        binding_kind: String,
+
+        /// Optional caller service for allow_from-restricted bindings
+        #[arg(long)]
+        caller_service: Option<String>,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Explicitly bootstrap TLS assets and optional trust installation for an ingress binding
+    BootstrapTls {
+        /// Binding reference (`binding-...`)
+        #[arg(long = "binding")]
+        binding_ref: String,
+
+        /// Attempt to install the generated certificate into the local user trust store
+        #[arg(long, default_value_t = false)]
+        install_system_trust: bool,
+
+        /// Skip the interactive consent prompt after reviewing the trust action
+        #[arg(short = 'y', long = "yes", default_value_t = false)]
+        yes: bool,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Run a host-side ingress reverse proxy for a registered binding
+    ServeIngress {
+        /// Binding reference (`binding-...`)
+        #[arg(long = "binding")]
+        binding_ref: String,
+
+        /// Path to capsule directory or capsule.toml used to derive the upstream port
+        #[arg(long, default_value = ".")]
+        manifest: PathBuf,
+
+        /// Optional upstream URL override
+        #[arg(long)]
+        upstream_url: Option<String>,
+    },
+
+    /// Register a host-side ingress binding from a manifest service
+    RegisterIngress {
+        /// Path to capsule directory or capsule.toml
+        #[arg(long, default_value = ".")]
+        manifest: PathBuf,
+
+        /// Service name from [services.<name>]
+        #[arg(long)]
+        service_name: String,
+
+        /// Host-side ingress URL (http:// or https://)
+        #[arg(long)]
+        url: String,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Register a local cross-capsule service binding for a separately launched service
+    RegisterService {
+        /// Path to capsule directory or capsule.toml
+        #[arg(long, default_value = ".")]
+        manifest: PathBuf,
+
+        /// Service name from [services.<name>]
+        #[arg(long)]
+        service_name: String,
+
+        /// Loopback URL for the running local service (http://localhost:PORT or http://127.0.0.1:PORT)
+        #[arg(long)]
+        url: Option<String>,
+
+        /// Running local process id to derive manifest and target metadata from
+        #[arg(long)]
+        process_id: Option<String>,
+
+        /// Override the loopback port when registering from a running process
+        #[arg(long)]
+        port: Option<u16>,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Auto-register all eligible local service bindings from a running process
+    SyncProcess {
+        /// Running local process id
+        #[arg(long)]
+        process_id: String,
 
         /// Emit machine-readable JSON output
         #[arg(long)]
@@ -2182,6 +2337,8 @@ fn run() -> Result<()> {
 
         Commands::State { command } => execute_state_command(command),
 
+        Commands::Binding { command } => execute_binding_command(command),
+
         Commands::Guest { sync_path } => {
             commands::guest::execute(commands::guest::GuestArgs { sync_path })
         }
@@ -2390,6 +2547,71 @@ fn execute_state_command(command: StateCommands) -> Result<()> {
             path.to_string_lossy().as_ref(),
             json,
         ),
+    }
+}
+
+fn execute_binding_command(command: BindingCommands) -> Result<()> {
+    match command {
+        BindingCommands::List {
+            owner_scope,
+            service_name,
+            json,
+        } => binding::list_bindings(owner_scope.as_deref(), service_name.as_deref(), json),
+        BindingCommands::Inspect { binding_ref, json } => {
+            binding::inspect_binding(&binding_ref, json)
+        }
+        BindingCommands::Resolve {
+            owner_scope,
+            service_name,
+            binding_kind,
+            caller_service,
+            json,
+        } => binding::resolve_binding(
+            &owner_scope,
+            &service_name,
+            &binding_kind,
+            caller_service.as_deref(),
+            json,
+        ),
+        BindingCommands::BootstrapTls {
+            binding_ref,
+            install_system_trust,
+            yes,
+            json,
+        } => binding::bootstrap_ingress_tls(&binding_ref, install_system_trust, yes, json),
+        BindingCommands::ServeIngress {
+            binding_ref,
+            manifest,
+            upstream_url,
+        } => binding::serve_ingress_binding(&binding_ref, &manifest, upstream_url.as_deref()),
+        BindingCommands::RegisterIngress {
+            manifest,
+            service_name,
+            url,
+            json,
+        } => binding::register_ingress_binding_from_manifest(&manifest, &service_name, &url, json),
+        BindingCommands::RegisterService {
+            manifest,
+            service_name,
+            url,
+            process_id,
+            port,
+            json,
+        } => match (url.as_deref(), process_id.as_deref()) {
+            (Some(url), _) => {
+                binding::register_service_binding_from_manifest(&manifest, &service_name, url, json)
+            }
+            (None, Some(process_id)) => binding::register_service_binding_from_process(
+                process_id,
+                &service_name,
+                port,
+                json,
+            ),
+            (None, None) => anyhow::bail!("register-service requires either --url or --process-id"),
+        },
+        BindingCommands::SyncProcess { process_id, json } => {
+            binding::sync_service_bindings_from_process(&process_id, json)
+        }
     }
 }
 
