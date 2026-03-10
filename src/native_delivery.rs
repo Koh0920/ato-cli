@@ -28,6 +28,7 @@ const FINALIZE_TOOL: &str = "codesign";
 const DEFAULT_LAUNCHER_DIR: &str = "Applications";
 const PROJECTIONS_DIR: &str = ".ato/native-delivery/projections";
 const PROJECTION_KIND: &str = "symlink";
+const DEFAULT_DERIVED_APPS_DIR: &str = ".ato/apps";
 
 #[derive(Debug, Serialize)]
 pub struct FetchResult {
@@ -37,6 +38,33 @@ pub struct FetchResult {
     pub artifact_dir: PathBuf,
     pub parent_digest: String,
     pub registry: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NativeBuildPlan {
+    pub manifest_path: PathBuf,
+    pub manifest_dir: PathBuf,
+    pub delivery_config_path: PathBuf,
+    pub source_app_path: PathBuf,
+    pub input_relative: PathBuf,
+    pub framework: String,
+    pub target: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NativeBuildResult {
+    pub artifact_path: PathBuf,
+    pub build_strategy: String,
+    pub target: String,
+    pub derived_from: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NativeArtifactSpec {
+    pub framework: String,
+    pub target: String,
+    pub input: String,
+    pub finalize_tool: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -192,6 +220,122 @@ struct StoredProjection {
     metadata: ProjectionMetadata,
 }
 
+pub(crate) fn detect_build_strategy(manifest_dir: &Path) -> Result<Option<NativeBuildPlan>> {
+    let manifest_path = manifest_dir.join("capsule.toml");
+    let delivery_config_path = manifest_dir.join(DELIVERY_CONFIG_FILE);
+    if !manifest_path.exists() || !delivery_config_path.exists() {
+        return Ok(None);
+    }
+
+    let config = load_delivery_config(&delivery_config_path)?;
+    let input_relative = PathBuf::from(config.artifact.input.trim());
+    validate_relative_input_path(&input_relative)?;
+    let source_app_path = manifest_dir.join(&input_relative);
+    if !source_app_path.is_dir() {
+        bail!(
+            "Native delivery build input is not a .app directory: {}",
+            source_app_path.display()
+        );
+    }
+    if source_app_path.extension().and_then(|ext| ext.to_str()) != Some("app") {
+        bail!(
+            "Native delivery build input must be a .app bundle: {}",
+            source_app_path.display()
+        );
+    }
+
+    Ok(Some(NativeBuildPlan {
+        manifest_path,
+        manifest_dir: manifest_dir.to_path_buf(),
+        delivery_config_path,
+        source_app_path,
+        input_relative,
+        framework: config.artifact.framework,
+        target: config.artifact.target,
+    }))
+}
+
+pub(crate) fn build_native_artifact(
+    plan: &NativeBuildPlan,
+    output_path: Option<&Path>,
+) -> Result<NativeBuildResult> {
+    if !host_supports_finalize() {
+        bail!("native delivery build currently supports tauri darwin/arm64 only");
+    }
+
+    build_native_artifact_with_strip(plan, output_path, strip_codesign_signature)
+}
+
+fn build_native_artifact_with_strip<F>(
+    plan: &NativeBuildPlan,
+    output_path: Option<&Path>,
+    strip_signature: F,
+) -> Result<NativeBuildResult>
+where
+    F: Fn(&Path) -> Result<()>,
+{
+    let manifest_raw = fs::read_to_string(&plan.manifest_path).with_context(|| {
+        format!(
+            "Failed to read capsule manifest for native build: {}",
+            plan.manifest_path.display()
+        )
+    })?;
+    let manifest =
+        capsule_core::types::CapsuleManifest::from_toml(&manifest_raw).map_err(|err| {
+            anyhow::anyhow!("Failed to parse {}: {}", plan.manifest_path.display(), err)
+        })?;
+
+    let artifact_path = output_path.map(Path::to_path_buf).unwrap_or_else(|| {
+        default_native_artifact_path(&plan.manifest_dir, &manifest.name, &manifest.version)
+    });
+    if let Some(parent) = artifact_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}", parent.display()))?;
+    }
+
+    validate_minimal_macos_app_permissions(&plan.source_app_path)?;
+
+    let tmp_root = plan.manifest_dir.join(".tmp");
+    fs::create_dir_all(&tmp_root)
+        .with_context(|| format!("Failed to create {}", tmp_root.display()))?;
+    let staging_root = create_temp_subdir(&tmp_root, "native-build")?;
+    let payload_root = staging_root.join("payload");
+    let staged_app_path = payload_root.join(&plan.input_relative);
+
+    let result = (|| -> Result<NativeBuildResult> {
+        if let Some(parent) = staged_app_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create {}", parent.display()))?;
+        }
+        copy_recursively(&plan.source_app_path, &staged_app_path)?;
+        strip_signature(&staged_app_path)?;
+        validate_minimal_macos_app_permissions(&staged_app_path)?;
+
+        fs::copy(
+            &plan.delivery_config_path,
+            payload_root.join(DELIVERY_CONFIG_FILE),
+        )
+        .with_context(|| format!("Failed to stage {}", plan.delivery_config_path.display()))?;
+
+        let payload_tar = create_payload_tar_from_directory(&payload_root)?;
+        let payload_tar_zst = zstd::stream::encode_all(Cursor::new(payload_tar), 3)
+            .context("Failed to encode native payload.tar.zst")?;
+        let capsule_bytes = build_capsule_archive(&manifest_raw, &payload_tar_zst)?;
+        fs::write(&artifact_path, &capsule_bytes)
+            .with_context(|| format!("Failed to write {}", artifact_path.display()))?;
+
+        Ok(NativeBuildResult {
+            artifact_path: artifact_path.clone(),
+            build_strategy: "native-delivery".to_string(),
+            target: plan.target.clone(),
+            derived_from: plan.source_app_path.clone(),
+        })
+    })();
+
+    let _ = fs::remove_dir_all(&staging_root);
+    result
+}
+
 pub async fn execute_fetch(
     capsule_ref: &str,
     registry_url: Option<&str>,
@@ -284,6 +428,13 @@ pub async fn execute_fetch(
         &registry,
         &artifact_bytes,
     )
+}
+
+pub(crate) fn detect_install_requires_local_derivation(
+    artifact_bytes: &[u8],
+) -> Result<Option<NativeArtifactSpec>> {
+    let payload_tar = extract_payload_tar_from_capsule(artifact_bytes)?;
+    extract_native_artifact_spec_from_payload_tar(&payload_tar)
 }
 
 fn resolve_fetch_request(
@@ -441,6 +592,14 @@ pub fn execute_finalize(
     finalize_with_runner(fetched_dir, output_dir, run_codesign_command)
 }
 
+pub(crate) fn finalize_fetched_artifact(fetched_dir: &Path) -> Result<FinalizeResult> {
+    let metadata = load_fetch_metadata(fetched_dir)?;
+    let output_root = derived_apps_root(&metadata.scoped_id, &metadata.parent_digest)?;
+    fs::create_dir_all(&output_root)
+        .with_context(|| format!("Failed to create {}", output_root.display()))?;
+    finalize_with_runner(fetched_dir, &output_root, run_codesign_command)
+}
+
 pub fn execute_project(
     derived_app_path: &Path,
     launcher_dir: Option<&Path>,
@@ -586,7 +745,11 @@ fn project_with_roots(
         .ok_or_else(|| anyhow::anyhow!("Derived app path has no terminal name"))?
         .to_os_string();
     let projected_path = launcher_dir.join(&app_name);
-    let projection_id = build_projection_id(&source.derived_app_path, &projected_path, &source.derived_digest);
+    let projection_id = build_projection_id(
+        &source.derived_app_path,
+        &projected_path,
+        &source.derived_digest,
+    );
     let metadata_path = metadata_root.join(format!("{}.json", projection_id));
 
     let existing = load_projection_records(metadata_root)?;
@@ -664,13 +827,15 @@ fn project_with_roots(
     };
 
     let result = (|| -> Result<ProjectResult> {
-        create_projection_symlink(&source.derived_app_path, &projected_path).with_context(|| {
-            format!(
-                "Failed to create symlink {} -> {}",
-                projected_path.display(),
-                source.derived_app_path.display()
-            )
-        })?;
+        create_projection_symlink(&source.derived_app_path, &projected_path).with_context(
+            || {
+                format!(
+                    "Failed to create symlink {} -> {}",
+                    projected_path.display(),
+                    source.derived_app_path.display()
+                )
+            },
+        )?;
         write_json_pretty(&metadata_path, &metadata)?;
         let status = inspect_projection(&metadata, &metadata_path)?;
         Ok(ProjectResult {
@@ -699,7 +864,10 @@ fn list_projections(metadata_root: &Path) -> Result<ProjectionListResult> {
         .into_iter()
         .map(|record| inspect_projection(&record.metadata, &record.metadata_path))
         .collect::<Result<Vec<_>>>()?;
-    let broken = projections.iter().filter(|item| item.state == "broken").count();
+    let broken = projections
+        .iter()
+        .filter(|item| item.state == "broken")
+        .count();
     Ok(ProjectionListResult {
         total: projections.len(),
         broken,
@@ -863,6 +1031,15 @@ fn materialize_fetch_cache(
     result
 }
 
+pub(crate) fn materialize_fetch_cache_from_artifact(
+    scoped_id: &str,
+    version: &str,
+    registry: &str,
+    artifact_bytes: &[u8],
+) -> Result<FetchResult> {
+    materialize_fetch_cache(scoped_id, version, registry, artifact_bytes)
+}
+
 fn load_fetch_metadata(fetched_dir: &Path) -> Result<FetchMetadata> {
     let metadata_path = fetched_dir.join(FETCH_METADATA_FILE);
     let raw = fs::read_to_string(&metadata_path)
@@ -896,9 +1073,7 @@ fn load_projection_source(derived_app_path: &Path) -> Result<ProjectionSource> {
         )
     })?;
     let derived_dir = derived_app_path.parent().ok_or_else(|| {
-        anyhow::anyhow!(
-            "Projection input must be an ato finalize output with a parent directory"
-        )
+        anyhow::anyhow!("Projection input must be an ato finalize output with a parent directory")
     })?;
     let provenance_path = derived_dir.join(PROVENANCE_FILE);
     let raw = fs::read_to_string(&provenance_path).with_context(|| {
@@ -991,7 +1166,10 @@ fn load_projection_records(metadata_root: &Path) -> Result<Vec<StoredProjection>
 fn find_projection_record(reference: &str, metadata_root: &Path) -> Result<StoredProjection> {
     let records = load_projection_records(metadata_root)?;
     if records.is_empty() {
-        bail!("No projection metadata found in {}", metadata_root.display());
+        bail!(
+            "No projection metadata found in {}",
+            metadata_root.display()
+        );
     }
 
     let mut matches = Vec::new();
@@ -1019,7 +1197,10 @@ fn find_projection_record(reference: &str, metadata_root: &Path) -> Result<Store
     }
 }
 
-fn inspect_projection(metadata: &ProjectionMetadata, metadata_path: &Path) -> Result<ProjectionStatus> {
+fn inspect_projection(
+    metadata: &ProjectionMetadata,
+    metadata_path: &Path,
+) -> Result<ProjectionStatus> {
     let mut problems = Vec::new();
     if metadata.schema_version != DELIVERY_SCHEMA_VERSION {
         problems.push(format!(
@@ -1112,6 +1293,36 @@ fn load_delivery_config(path: &Path) -> Result<DeliveryConfig> {
         toml::from_str(&raw).with_context(|| format!("Failed to parse {}", path.display()))?;
     validate_delivery_config(&config)?;
     Ok(config)
+}
+
+fn extract_native_artifact_spec_from_payload_tar(
+    payload_tar: &[u8],
+) -> Result<Option<NativeArtifactSpec>> {
+    let mut archive = tar::Archive::new(Cursor::new(payload_tar));
+    let entries = archive
+        .entries()
+        .context("Failed to read payload.tar entries for native delivery detection")?;
+    for entry in entries {
+        let mut entry = entry.context("Invalid payload.tar entry")?;
+        let path = entry.path().context("Failed to read payload entry path")?;
+        if path != Path::new(DELIVERY_CONFIG_FILE) {
+            continue;
+        }
+        let mut raw = String::new();
+        entry
+            .read_to_string(&mut raw)
+            .context("Failed to read ato.delivery.toml from payload")?;
+        let config: DeliveryConfig =
+            toml::from_str(&raw).context("Failed to parse ato.delivery.toml from payload")?;
+        validate_delivery_config(&config)?;
+        return Ok(Some(NativeArtifactSpec {
+            framework: config.artifact.framework,
+            target: config.artifact.target,
+            input: config.artifact.input,
+            finalize_tool: config.finalize.tool,
+        }));
+    }
+    Ok(None)
 }
 
 fn validate_delivery_config(config: &DeliveryConfig) -> Result<()> {
@@ -1217,6 +1428,47 @@ fn run_codesign_command(derived_dir: &Path, config: &DeliveryConfig) -> Result<(
             .code()
             .map(|value| value.to_string())
             .unwrap_or_else(|| "signal".to_string()),
+        if details.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", details)
+        }
+    )
+}
+
+fn strip_codesign_signature(app_path: &Path) -> Result<()> {
+    let output = Command::new(FINALIZE_TOOL)
+        .arg("--remove-signature")
+        .arg(app_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| {
+            format!(
+                "Failed to execute {} for {}",
+                FINALIZE_TOOL,
+                app_path.display()
+            )
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let details = if !stderr.trim().is_empty() {
+        stderr.trim().to_string()
+    } else {
+        stdout.trim().to_string()
+    };
+    if details.contains("not signed at all") || details.contains("code object is not signed") {
+        return Ok(());
+    }
+
+    bail!(
+        "codesign --remove-signature failed for {}{}",
+        app_path.display(),
         if details.is_empty() {
             String::new()
         } else {
@@ -1497,6 +1749,117 @@ fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     Ok(())
 }
 
+fn append_tar_entry(
+    builder: &mut tar::Builder<&mut Vec<u8>>,
+    path: &str,
+    bytes: &[u8],
+    mode: u32,
+) -> Result<()> {
+    let mut header = tar::Header::new_gnu();
+    header.set_size(bytes.len() as u64);
+    header.set_mode(mode);
+    header.set_mtime(0);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_cksum();
+    builder.append_data(&mut header, path, Cursor::new(bytes))?;
+    Ok(())
+}
+
+fn build_capsule_archive(manifest_raw: &str, payload_tar_zst: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut out);
+        append_tar_entry(&mut builder, "capsule.toml", manifest_raw.as_bytes(), 0o644)?;
+        append_tar_entry(&mut builder, "payload.tar.zst", payload_tar_zst, 0o644)?;
+        builder.finish()?;
+    }
+    Ok(out)
+}
+
+fn create_payload_tar_from_directory(root: &Path) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut out);
+        append_tree_to_tar(root, root, &mut builder)?;
+        builder.finish()?;
+    }
+    Ok(out)
+}
+
+fn append_tree_to_tar(
+    root: &Path,
+    path: &Path,
+    builder: &mut tar::Builder<&mut Vec<u8>>,
+) -> Result<()> {
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("Failed to stat {}", path.display()))?;
+    let relative = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let file_type = metadata.file_type();
+
+    if file_type.is_dir() {
+        if !relative.is_empty() {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Directory);
+            header.set_mode(mode_bits(&metadata));
+            header.set_size(0);
+            header.set_mtime(0);
+            header.set_uid(0);
+            header.set_gid(0);
+            header.set_cksum();
+            builder.append_data(&mut header, format!("{relative}/"), std::io::empty())?;
+        }
+        let mut entries = fs::read_dir(path)
+            .with_context(|| format!("Failed to read directory {}", path.display()))?
+            .collect::<std::io::Result<Vec<_>>>()
+            .with_context(|| format!("Failed to enumerate directory {}", path.display()))?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            append_tree_to_tar(root, &entry.path(), builder)?;
+        }
+        return Ok(());
+    }
+
+    if file_type.is_symlink() {
+        let target = fs::read_link(path)
+            .with_context(|| format!("Failed to read symlink {}", path.display()))?;
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_mode(0o777);
+        header.set_size(0);
+        header.set_mtime(0);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_link_name(&target)?;
+        header.set_cksum();
+        builder.append_data(&mut header, &relative, std::io::empty())?;
+        return Ok(());
+    }
+
+    if file_type.is_file() {
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(mode_bits(&metadata));
+        header.set_size(metadata.len());
+        header.set_mtime(0);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_cksum();
+        let mut file =
+            fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
+        builder.append_data(&mut header, &relative, &mut file)?;
+        return Ok(());
+    }
+
+    bail!(
+        "Unsupported filesystem entry for tar payload: {}",
+        path.display()
+    )
+}
+
 fn create_unique_output_dir(output_root: &Path) -> Result<PathBuf> {
     for _ in 0..32 {
         let candidate = output_root.join(format!(
@@ -1556,6 +1919,17 @@ fn fetches_root() -> Result<PathBuf> {
         .join(DEFAULT_FETCHES_DIR))
 }
 
+fn derived_apps_root(scoped_id: &str, parent_digest: &str) -> Result<PathBuf> {
+    let mut root = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(DEFAULT_DERIVED_APPS_DIR);
+    for segment in scoped_id.split('/') {
+        root.push(segment.trim());
+    }
+    root.push(digest_dir_name(parent_digest)?);
+    Ok(root)
+}
+
 fn projections_root() -> Result<PathBuf> {
     Ok(dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -1571,6 +1945,12 @@ fn resolve_launcher_dir(launcher_dir: Option<&Path>) -> Result<PathBuf> {
     }
 }
 
+fn default_native_artifact_path(manifest_dir: &Path, name: &str, version: &str) -> PathBuf {
+    manifest_dir
+        .join("dist")
+        .join(format!("{}-{}.capsule", name, version))
+}
+
 fn absolute_path(path: &Path) -> Result<PathBuf> {
     if path.is_absolute() {
         Ok(path.to_path_buf())
@@ -1581,7 +1961,11 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
     }
 }
 
-fn build_projection_id(derived_app_path: &Path, projected_path: &Path, derived_digest: &str) -> String {
+fn build_projection_id(
+    derived_app_path: &Path,
+    projected_path: &Path,
+    derived_digest: &str,
+) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(derived_app_path.to_string_lossy().as_bytes());
     hasher.update(b"\0");
@@ -1617,7 +2001,9 @@ fn is_managed_symlink_to(path: &Path, target: &Path) -> Result<bool> {
     let resolved_target = if link_target.is_absolute() {
         link_target
     } else {
-        path.parent().unwrap_or_else(|| Path::new(".")).join(link_target)
+        path.parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(link_target)
     };
     paths_match(&resolved_target, target)
 }
@@ -1654,6 +2040,8 @@ fn mode_bits(_metadata: &fs::Metadata) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use tempfile::tempdir;
 
@@ -1675,6 +2063,67 @@ args = ["--deep", "--force", "--sign", "-", "MyApp.app"]
 
     fn sample_fetch_dir(root: &Path) -> Result<PathBuf> {
         sample_fetch_dir_with_mode(root, 0o755)
+    }
+
+    fn sample_native_build_plan(root: &Path, mode: u32) -> Result<NativeBuildPlan> {
+        let manifest_dir = root.join("native-build-project");
+        let source_app_path = manifest_dir.join("MyApp.app");
+        let binary_path = source_app_path.join("Contents/MacOS/MyApp");
+        fs::create_dir_all(binary_path.parent().context("binary parent missing")?)?;
+        fs::write(
+            manifest_dir.join("capsule.toml"),
+            r#"schema_version = "0.2"
+name = "my-app"
+version = "0.1.0"
+type = "app"
+default_target = "cli"
+
+[targets.cli]
+runtime = "source"
+driver = "native"
+entrypoint = "MyApp.app"
+"#,
+        )?;
+        fs::write(
+            manifest_dir.join(DELIVERY_CONFIG_FILE),
+            sample_delivery_toml(),
+        )?;
+        fs::write(&binary_path, b"unsigned-app")?;
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&binary_path)?.permissions();
+            permissions.set_mode(mode);
+            fs::set_permissions(&binary_path, permissions)?;
+        }
+
+        detect_build_strategy(&manifest_dir)?.context("expected native delivery build plan")
+    }
+
+    fn read_payload_entry_modes(artifact_path: &Path) -> Result<BTreeMap<String, u32>> {
+        let capsule_bytes = fs::read(artifact_path)?;
+        let mut capsule = tar::Archive::new(Cursor::new(capsule_bytes));
+        let mut payload_tar_zst = None;
+        for entry in capsule.entries()? {
+            let mut entry = entry?;
+            let path = entry.path()?.to_path_buf();
+            if path == Path::new("payload.tar.zst") {
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes)?;
+                payload_tar_zst = Some(bytes);
+                break;
+            }
+        }
+
+        let payload_tar_zst = payload_tar_zst.context("payload.tar.zst missing from capsule")?;
+        let payload_tar = zstd::stream::decode_all(Cursor::new(payload_tar_zst))?;
+        let mut payload = tar::Archive::new(Cursor::new(payload_tar));
+        let mut entry_modes = BTreeMap::new();
+        for entry in payload.entries()? {
+            let entry = entry?;
+            let path = entry.path()?.display().to_string();
+            entry_modes.insert(path, entry.header().mode()?);
+        }
+        Ok(entry_modes)
     }
 
     fn sample_fetch_dir_with_mode(root: &Path, mode: u32) -> Result<PathBuf> {
@@ -1812,6 +2261,56 @@ args = ["--deep", "--force", "--sign", "-", "MyApp.app"]
     }
 
     #[test]
+    fn build_native_artifact_preserves_source_and_payload_executable_mode() -> Result<()> {
+        let tmp = tempdir()?;
+        let plan = sample_native_build_plan(tmp.path(), 0o755)?;
+        let source_digest_before = compute_tree_digest(&plan.source_app_path)?;
+        let artifact_path = tmp.path().join("out/my-app-0.1.0.capsule");
+
+        let result = build_native_artifact_with_strip(&plan, Some(&artifact_path), |_app| Ok(()))?;
+
+        assert_eq!(result.build_strategy, "native-delivery");
+        assert_eq!(result.target, DELIVERY_TARGET);
+        assert_eq!(result.derived_from, plan.source_app_path);
+        assert_eq!(
+            compute_tree_digest(&plan.source_app_path)?,
+            source_digest_before
+        );
+
+        let entry_modes = read_payload_entry_modes(&artifact_path)?;
+        assert!(entry_modes.contains_key(DELIVERY_CONFIG_FILE));
+        #[cfg(unix)]
+        assert_eq!(
+            entry_modes
+                .get("MyApp.app/Contents/MacOS/MyApp")
+                .copied()
+                .unwrap_or_default()
+                & 0o111,
+            0o111
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_rejects_non_executable_without_mutation() -> Result<()> {
+        let tmp = tempdir()?;
+        let plan = sample_native_build_plan(tmp.path(), 0o644)?;
+        let source_digest_before = compute_tree_digest(&plan.source_app_path)?;
+        let artifact_path = tmp.path().join("out/my-app-0.1.0.capsule");
+
+        let err = build_native_artifact_with_strip(&plan, Some(&artifact_path), |_app| Ok(()))
+            .expect_err("build must fail closed when executable bit is missing");
+
+        assert!(err.to_string().contains("Executable bit is missing"));
+        assert_eq!(
+            compute_tree_digest(&plan.source_app_path)?,
+            source_digest_before
+        );
+        assert!(!artifact_path.exists());
+        Ok(())
+    }
+
+    #[test]
     fn finalize_creates_derived_copy_without_mutating_parent() -> Result<()> {
         let tmp = tempdir()?;
         let fetched_dir = sample_fetch_dir(tmp.path())?;
@@ -1854,9 +2353,7 @@ args = ["--deep", "--force", "--sign", "-", "MyApp.app"]
 
         let err = finalize_with_runner(&fetched_dir, &output_root, |_derived_dir, _config| Ok(()))
             .expect_err("finalize must fail closed when executable bit is missing");
-        assert!(err
-            .to_string()
-            .contains("Executable bit is missing"));
+        assert!(err.to_string().contains("Executable bit is missing"));
         Ok(())
     }
 

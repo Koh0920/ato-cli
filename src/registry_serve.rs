@@ -34,6 +34,7 @@ use crate::registry_store::{
     EpochResolveRequest, KeyRevokeRequest, KeyRotateRequest, LeaseRefreshRequest,
     LeaseReleaseRequest, NegotiateRequest, RegistryStore, RollbackRequest, YankRequest,
 };
+use crate::state::{ensure_registered_state_binding, load_manifest, open_state_store};
 
 const README_CANDIDATES: [&str; 4] = ["README.md", "README.mdx", "README.txt", "README"];
 const README_MAX_BYTES: usize = 512 * 1024;
@@ -131,6 +132,19 @@ struct CapsuleRuntimeConfig {
     selected_target: Option<String>,
     #[serde(default)]
     targets: HashMap<String, RuntimeTargetConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct PersistentStateListQuery {
+    owner_scope: Option<String>,
+    state_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RegisterPersistentStateRequest {
+    manifest: String,
+    state_name: String,
+    path: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -518,6 +532,14 @@ pub async fn serve(config: RegistryServerConfig) -> Result<()> {
         .route(
             "/v1/local/capsules/by/:publisher/:slug/run",
             post(handle_run_local_capsule),
+        )
+        .route(
+            "/v1/local/states",
+            get(handle_list_persistent_states).post(handle_register_persistent_state),
+        )
+        .route(
+            "/v1/local/states/:state_id",
+            get(handle_get_persistent_state),
         )
         .route("/v1/local/processes", get(handle_list_local_processes))
         .route("/v1/local/url-ready", get(handle_local_url_ready))
@@ -2863,6 +2885,115 @@ async fn handle_list_local_processes() -> impl IntoResponse {
     (StatusCode::OK, Json(rows)).into_response()
 }
 
+async fn handle_list_persistent_states(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<PersistentStateListQuery>,
+) -> impl IntoResponse {
+    if let Err(err) = validate_read_auth(&headers, state.auth_token.as_deref()) {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized", &err);
+    }
+
+    let owner_scope = query
+        .owner_scope
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let state_name = query
+        .state_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let _guard = state.lock.lock().await;
+    match open_state_store().and_then(|store| store.list_persistent_states(owner_scope, state_name))
+    {
+        Ok(records) => (StatusCode::OK, Json(records)).into_response(),
+        Err(err) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "persistent_state_list_failed",
+            &err.to_string(),
+        ),
+    }
+}
+
+async fn handle_get_persistent_state(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(state_id): AxumPath<String>,
+) -> impl IntoResponse {
+    if let Err(err) = validate_read_auth(&headers, state.auth_token.as_deref()) {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized", &err);
+    }
+
+    let state_id = state_id.trim();
+    if state_id.is_empty() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_state_id",
+            "state_id is required",
+        );
+    }
+
+    let _guard = state.lock.lock().await;
+    match open_state_store().and_then(|store| store.find_persistent_state_by_id(state_id)) {
+        Ok(Some(record)) => (StatusCode::OK, Json(record)).into_response(),
+        Ok(None) => json_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "Persistent state not found",
+        ),
+        Err(err) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "persistent_state_lookup_failed",
+            &err.to_string(),
+        ),
+    }
+}
+
+async fn handle_register_persistent_state(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<RegisterPersistentStateRequest>,
+) -> impl IntoResponse {
+    if let Err(err) = validate_write_auth(&headers, state.auth_token.as_deref()) {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized", &err);
+    }
+
+    let manifest = request.manifest.trim();
+    let state_name = request.state_name.trim();
+    let path = request.path.trim();
+    if manifest.is_empty() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_manifest",
+            "manifest is required",
+        );
+    }
+    if state_name.is_empty() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_state_name",
+            "state_name is required",
+        );
+    }
+    if path.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "invalid_path", "path is required");
+    }
+
+    let _guard = state.lock.lock().await;
+    let result = load_manifest(Path::new(manifest))
+        .and_then(|manifest| ensure_registered_state_binding(&manifest, state_name, path));
+    match result {
+        Ok(record) => (StatusCode::CREATED, Json(record)).into_response(),
+        Err(err) => json_error(
+            StatusCode::BAD_REQUEST,
+            "persistent_state_register_failed",
+            &err.to_string(),
+        ),
+    }
+}
+
 async fn handle_local_url_ready(Query(query): Query<UrlReadyQuery>) -> impl IntoResponse {
     let Some(raw_url) = query
         .url
@@ -4068,6 +4199,34 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use std::io::{Cursor, Write};
+    use std::sync::{Mutex as StdMutex, OnceLock};
+
+    fn env_lock() -> &'static StdMutex<()> {
+        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| StdMutex::new(()))
+    }
+
+    struct HomeGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl HomeGuard {
+        fn set(path: &std::path::Path) -> Self {
+            let previous = std::env::var_os("HOME");
+            std::env::set_var("HOME", path);
+            Self { previous }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var("HOME", previous);
+            } else {
+                std::env::remove_var("HOME");
+            }
+        }
+    }
 
     fn build_capsule_bytes(manifest: &str) -> Vec<u8> {
         build_capsule_bytes_with_files(manifest, &[("README.md", b"dummy".as_slice())])
@@ -4980,5 +5139,112 @@ repository = "koh0920/sample"
         .await
         .into_response();
         assert_eq!(response.status(), StatusCode::GONE);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn persistent_state_local_api_registers_and_lists_records() {
+        let (_home, _home_guard, manifest_path, bind_dir, state) = {
+            let _guard = env_lock().lock().expect("env lock");
+            let home = tempfile::tempdir().expect("home");
+            let home_guard = HomeGuard::set(home.path());
+
+            let manifest_dir = tempfile::tempdir().expect("manifest dir");
+            let manifest_path = manifest_dir.path().join("capsule.toml");
+            std::fs::write(
+                &manifest_path,
+                r#"
+schema_version = "0.2"
+name = "demo-app"
+version = "0.1.0"
+type = "app"
+default_target = "app"
+
+[targets.app]
+runtime = "oci"
+image = "ghcr.io/example/app:latest"
+
+[state.data]
+kind = "filesystem"
+durability = "persistent"
+purpose = "primary-data"
+attach = "explicit"
+schema_id = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+[services.main]
+target = "app"
+
+[[services.main.state_bindings]]
+state = "data"
+target = "/var/lib/app"
+"#,
+            )
+            .expect("write manifest");
+
+            let bind_dir = home.path().join("bind").join("data");
+            let state = AppState {
+                listen_url: "http://127.0.0.1:8787".to_string(),
+                data_dir: home.path().to_path_buf(),
+                auth_token: None,
+                lock: Arc::new(Mutex::new(())),
+            };
+
+            (home, home_guard, manifest_path, bind_dir, state)
+        };
+
+        let register_response = handle_register_persistent_state(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(RegisterPersistentStateRequest {
+                manifest: manifest_path.to_string_lossy().to_string(),
+                state_name: "data".to_string(),
+                path: bind_dir.to_string_lossy().to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(register_response.status(), StatusCode::CREATED);
+        let register_body = to_bytes(register_response.into_body(), usize::MAX)
+            .await
+            .expect("read register body");
+        let registered: crate::registry_store::PersistentStateRecord =
+            serde_json::from_slice(&register_body).expect("parse register json");
+        assert_eq!(registered.owner_scope, "demo-app");
+        assert_eq!(registered.state_name, "data");
+        assert_eq!(registered.kind, "filesystem");
+        assert_eq!(registered.backend_kind, "host_path");
+
+        let list_response = handle_list_persistent_states(
+            State(state.clone()),
+            HeaderMap::new(),
+            Query(PersistentStateListQuery {
+                owner_scope: Some("demo-app".to_string()),
+                state_name: Some("data".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list_body = to_bytes(list_response.into_body(), usize::MAX)
+            .await
+            .expect("read list body");
+        let listed: Vec<crate::registry_store::PersistentStateRecord> =
+            serde_json::from_slice(&list_body).expect("parse list json");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0], registered);
+
+        let get_response = handle_get_persistent_state(
+            State(state),
+            HeaderMap::new(),
+            AxumPath(registered.state_id.clone()),
+        )
+        .await
+        .into_response();
+        assert_eq!(get_response.status(), StatusCode::OK);
+        let get_body = to_bytes(get_response.into_body(), usize::MAX)
+            .await
+            .expect("read get body");
+        let fetched: crate::registry_store::PersistentStateRecord =
+            serde_json::from_slice(&get_body).expect("parse get json");
+        assert_eq!(fetched, registered);
     }
 }

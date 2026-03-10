@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::Write;
+use std::io::{self};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Once};
@@ -42,6 +43,47 @@ pub struct InstallResult {
     pub version: String,
     pub path: PathBuf,
     pub content_hash: String,
+    pub install_kind: InstallKind,
+    pub launchable: Option<LaunchableTarget>,
+    pub local_derivation: Option<LocalDerivationInfo>,
+    pub projection: Option<ProjectionInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub enum InstallKind {
+    Standard,
+    NativeRequiresLocalDerivation,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub enum LaunchableTarget {
+    CapsuleArchive { path: PathBuf },
+    DerivedApp { path: PathBuf },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LocalDerivationInfo {
+    pub performed: bool,
+    pub fetched_dir: PathBuf,
+    pub derived_app_path: Option<PathBuf>,
+    pub provenance_path: Option<PathBuf>,
+    pub parent_digest: Option<String>,
+    pub derived_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectionInfo {
+    pub performed: bool,
+    pub projection_id: Option<String>,
+    pub projected_path: Option<PathBuf>,
+    pub state: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectionPreference {
+    Prompt,
+    Force,
+    Skip,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -404,9 +446,12 @@ pub async fn install_app(
     version: Option<&str>,
     output_dir: Option<PathBuf>,
     _set_default: bool,
+    yes: bool,
+    projection_preference: ProjectionPreference,
     allow_unverified: bool,
     allow_downgrade: bool,
     json_output: bool,
+    can_prompt_interactively: bool,
 ) -> Result<InstallResult> {
     let request = parse_capsule_request(capsule_ref)?;
     let scoped_ref = request.scoped_ref;
@@ -518,30 +563,172 @@ pub async fn install_app(
         }
     }
 
-    let store_root = output_dir.unwrap_or_else(|| {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(DEFAULT_STORE_DIR)
-    });
-    let install_dir = store_root
-        .join(&scoped_ref.publisher)
-        .join(&scoped_ref.slug)
-        .join(target_version);
-    std::fs::create_dir_all(&install_dir).with_context(|| {
-        format!(
-            "Failed to create store directory: {}",
-            install_dir.display()
-        )
-    })?;
+    let native_spec = crate::native_delivery::detect_install_requires_local_derivation(&bytes)?;
+    if let Some(_native_spec) = native_spec {
+        let finalize_allowed = if yes {
+            true
+        } else if can_prompt_interactively && !json_output {
+            prompt_for_confirmation(
+                "This app requires local setup to run on this machine.\nRun local finalize now? [Y/n] ",
+                true,
+            )?
+        } else {
+            false
+        };
 
-    let output_path = install_dir.join(normalized_file_name);
-    sweep_stale_tmp_capsules(&install_dir)?;
-    write_capsule_atomic(&output_path, &bytes, &computed_blake3)?;
-    runtime_tree::prepare_runtime_tree(
+        if !finalize_allowed {
+            bail!(
+                "This app requires local finalize, but no interactive consent is available. Re-run with --yes."
+            );
+        }
+
+        let fetch_result = crate::native_delivery::materialize_fetch_cache_from_artifact(
+            &scoped_ref.scoped_id,
+            target_version,
+            &registry,
+            &bytes,
+        )?;
+
+        if !json_output {
+            eprintln!("Running local finalize...");
+        }
+        let finalize_result =
+            crate::native_delivery::finalize_fetched_artifact(&fetch_result.cache_dir)?;
+
+        let output_path = persist_installed_artifact(
+            output_dir.clone(),
+            &scoped_ref.publisher,
+            &scoped_ref.slug,
+            target_version,
+            &normalized_file_name,
+            &bytes,
+            &computed_blake3,
+        )?;
+
+        let projection = match projection_preference {
+            ProjectionPreference::Skip => {
+                if !json_output {
+                    eprintln!("Launcher projection skipped.");
+                }
+                ProjectionInfo {
+                    performed: false,
+                    projection_id: None,
+                    projected_path: None,
+                    state: None,
+                }
+            }
+            ProjectionPreference::Force => {
+                match crate::native_delivery::execute_project(
+                    &finalize_result.derived_app_path,
+                    None,
+                ) {
+                    Ok(result) => ProjectionInfo {
+                        performed: true,
+                        projection_id: Some(result.projection_id),
+                        projected_path: Some(result.projected_path),
+                        state: Some(result.state),
+                    },
+                    Err(err) => {
+                        if !json_output {
+                            eprintln!("Launcher projection failed: {err}");
+                            eprintln!(
+                                "Run `ato project {}` to try again later.",
+                                finalize_result.derived_app_path.display()
+                            );
+                        }
+                        ProjectionInfo {
+                            performed: false,
+                            projection_id: None,
+                            projected_path: None,
+                            state: Some("failed".to_string()),
+                        }
+                    }
+                }
+            }
+            ProjectionPreference::Prompt => {
+                let should_project = if yes {
+                    true
+                } else if can_prompt_interactively && !json_output {
+                    prompt_for_confirmation(
+                        "This app can also be added to your Applications launcher.\nCreate a launcher projection? [y/N] ",
+                        false,
+                    )?
+                } else {
+                    false
+                };
+                if should_project {
+                    match crate::native_delivery::execute_project(
+                        &finalize_result.derived_app_path,
+                        None,
+                    ) {
+                        Ok(result) => ProjectionInfo {
+                            performed: true,
+                            projection_id: Some(result.projection_id),
+                            projected_path: Some(result.projected_path),
+                            state: Some(result.state),
+                        },
+                        Err(err) => {
+                            if !json_output {
+                                eprintln!("Launcher projection failed: {err}");
+                                eprintln!(
+                                    "Run `ato project {}` to try again later.",
+                                    finalize_result.derived_app_path.display()
+                                );
+                            }
+                            ProjectionInfo {
+                                performed: false,
+                                projection_id: None,
+                                projected_path: None,
+                                state: Some("failed".to_string()),
+                            }
+                        }
+                    }
+                } else {
+                    if !json_output {
+                        eprintln!("Launcher projection skipped.");
+                    }
+                    ProjectionInfo {
+                        performed: false,
+                        projection_id: None,
+                        projected_path: None,
+                        state: None,
+                    }
+                }
+            }
+        };
+
+        return Ok(InstallResult {
+            capsule_id: capsule.id,
+            scoped_id: scoped_ref.scoped_id.clone(),
+            publisher: scoped_ref.publisher,
+            slug: capsule.slug,
+            version: target_version_owned,
+            path: output_path,
+            content_hash: computed_blake3,
+            install_kind: InstallKind::NativeRequiresLocalDerivation,
+            launchable: Some(LaunchableTarget::DerivedApp {
+                path: finalize_result.derived_app_path.clone(),
+            }),
+            local_derivation: Some(LocalDerivationInfo {
+                performed: true,
+                fetched_dir: fetch_result.cache_dir,
+                derived_app_path: Some(finalize_result.derived_app_path),
+                provenance_path: Some(finalize_result.provenance_path),
+                parent_digest: Some(finalize_result.parent_digest),
+                derived_digest: Some(finalize_result.derived_digest),
+            }),
+            projection: Some(projection),
+        });
+    }
+
+    let output_path = persist_installed_artifact(
+        output_dir,
         &scoped_ref.publisher,
         &scoped_ref.slug,
         target_version,
+        &normalized_file_name,
         &bytes,
+        &computed_blake3,
     )?;
 
     if !json_output {
@@ -555,9 +742,58 @@ pub async fn install_app(
         publisher: scoped_ref.publisher,
         slug: capsule.slug,
         version: target_version_owned,
-        path: output_path,
+        path: output_path.clone(),
         content_hash: computed_blake3,
+        install_kind: InstallKind::Standard,
+        launchable: Some(LaunchableTarget::CapsuleArchive {
+            path: output_path.clone(),
+        }),
+        local_derivation: None,
+        projection: None,
     })
+}
+
+fn persist_installed_artifact(
+    output_dir: Option<PathBuf>,
+    publisher: &str,
+    slug: &str,
+    version: &str,
+    normalized_file_name: &str,
+    bytes: &[u8],
+    content_hash: &str,
+) -> Result<PathBuf> {
+    let store_root = output_dir.unwrap_or_else(|| {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(DEFAULT_STORE_DIR)
+    });
+    let install_dir = store_root.join(publisher).join(slug).join(version);
+    std::fs::create_dir_all(&install_dir).with_context(|| {
+        format!(
+            "Failed to create store directory: {}",
+            install_dir.display()
+        )
+    })?;
+
+    let output_path = install_dir.join(normalized_file_name);
+    sweep_stale_tmp_capsules(&install_dir)?;
+    write_capsule_atomic(&output_path, bytes, content_hash)?;
+    runtime_tree::prepare_runtime_tree(publisher, slug, version, bytes)?;
+    Ok(output_path)
+}
+
+fn prompt_for_confirmation(prompt: &str, default_yes: bool) -> Result<bool> {
+    eprint!("{prompt}");
+    io::stderr().flush().context("Failed to flush prompt")?;
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .context("Failed to read interactive input")?;
+    let trimmed = input.trim().to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return Ok(default_yes);
+    }
+    Ok(matches!(trimmed.as_str(), "y" | "yes"))
 }
 
 fn extract_payload_v3_manifest_from_capsule(
@@ -855,6 +1091,45 @@ pub async fn fetch_capsule_detail(
             .map(str::to_string),
         permissions: capsule.permissions,
     })
+}
+
+pub async fn fetch_capsule_manifest_toml(
+    capsule_ref: &str,
+    registry_url: Option<&str>,
+) -> Result<String> {
+    let scoped_ref = parse_capsule_ref(capsule_ref)?;
+    let registry = resolve_registry_url(registry_url, false).await?;
+    let client = reqwest::Client::new();
+    let capsule_url = format!(
+        "{}/v1/manifest/capsules/by/{}/{}",
+        registry,
+        urlencoding::encode(&scoped_ref.publisher),
+        urlencoding::encode(&scoped_ref.slug)
+    );
+    let response = client
+        .get(&capsule_url)
+        .send()
+        .await
+        .with_context(|| format!("Failed to connect to registry: {}", registry))?;
+
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        bail!("Capsule not found: {}", scoped_ref.scoped_id);
+    }
+
+    let capsule: CapsuleDetail = response
+        .error_for_status()
+        .with_context(|| format!("Failed to fetch capsule detail: {}", scoped_ref.scoped_id))?
+        .json()
+        .await
+        .with_context(|| format!("Invalid registry response for {}", scoped_ref.scoped_id))?;
+
+    capsule
+        .manifest_toml
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("capsule.toml was not returned by registry"))
 }
 
 async fn resolve_registry_url(registry_url: Option<&str>, emit_log: bool) -> Result<String> {
@@ -3083,8 +3358,11 @@ entrypoint = "main.py"
             Some(output_root.path().to_path_buf()),
             false,
             false,
+            ProjectionPreference::Skip,
+            false,
             false,
             true,
+            false,
         )
         .await
         .expect("explicit version install should succeed");
@@ -3119,9 +3397,12 @@ entrypoint = "main.py"
             Some(TEST_VERSION),
             Some(output_root.path().to_path_buf()),
             false,
+            false,
+            ProjectionPreference::Skip,
             true,
             false,
             true,
+            false,
         )
         .await
         .expect_err("install should fail closed when negotiate is unavailable");
@@ -3161,8 +3442,11 @@ entrypoint = "main.py"
             Some(output_root.path().to_path_buf()),
             false,
             false,
+            ProjectionPreference::Skip,
+            false,
             false,
             true,
+            false,
         )
         .await
         .expect_err("install should fail closed on unauthorized manifest read");
@@ -3248,9 +3532,12 @@ entrypoint = "main.py"
             Some(TEST_VERSION),
             Some(output_root.path().to_path_buf()),
             false,
+            false,
+            ProjectionPreference::Skip,
             true,
             false,
             true,
+            false,
         )
         .await
         .expect_err("yanked manifest must fail closed");

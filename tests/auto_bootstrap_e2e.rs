@@ -221,7 +221,11 @@ fn auto_bootstrap_succeeds_when_default_engine_registration_is_stale() {
         .join(".ato")
         .join("engines")
         .join(format!("nacelle-{}", version));
-    assert!(installed.exists(), "installed engine missing: {}", installed.display());
+    assert!(
+        installed.exists(),
+        "installed engine missing: {}",
+        installed.display()
+    );
     assert_eq!(
         server.request_count(&format!("/{}/{}", version, binary_name)),
         1,
@@ -269,7 +273,11 @@ fn config_engine_install_uses_engine_manager_release_policy() {
         .join(".ato")
         .join("engines")
         .join(format!("nacelle-{}", version));
-    assert!(installed.exists(), "installed engine missing: {}", installed.display());
+    assert!(
+        installed.exists(),
+        "installed engine missing: {}",
+        installed.display()
+    );
     assert_eq!(
         server.request_count(&format!("/{}/{}", version, binary_name)),
         1,

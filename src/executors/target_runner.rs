@@ -193,6 +193,7 @@ mod tests {
     use super::preflight_required_environment_variables;
     use crate::executors::launch_context::RuntimeLaunchContext;
     use capsule_core::router::{ExecutionProfile, ManifestData};
+    use std::collections::HashMap;
     use std::path::PathBuf;
 
     #[test]
@@ -232,6 +233,7 @@ mod tests {
             manifest_dir: PathBuf::from("/tmp"),
             profile: ExecutionProfile::Dev,
             selected_target: "default".to_string(),
+            state_source_overrides: HashMap::new(),
         };
 
         let launch_ctx = RuntimeLaunchContext::empty().with_injected_env(

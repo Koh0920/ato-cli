@@ -121,6 +121,7 @@ mod sign;
 mod skill;
 mod skill_resolver;
 mod source;
+mod state;
 mod tui;
 mod verify;
 
@@ -143,19 +144,17 @@ Usage: {usage}
 
 Primary Commands:
   run      Execute a capsule or SKILL.md in a strict Zero-Trust sandbox
-  install  Install a verified package from the registry
-  init     Initialize a new project
   build    Pack a project into an immutable .capsule archive
+  publish  Publish capsule artifacts to a registry
+  install  Install a verified package from the registry
   search   Search the registry for agent skills and packages
-    fetch    Fetch an experimental native delivery artifact into immutable local cache
-    finalize Create a locally derived native artifact from fetched input
-    project  Experimental explicit opt-in symlink projection for finalized native .app bundles
-    unproject Remove an experimental launcher projection without mutating the artifact
+  init     Initialize a new project
 
 Management:
   ps       List running capsules
   stop     Stop a running capsule
   logs     Show logs of a running capsule
+    state    Inspect or register persistent state bindings
 
 Auth:
   login    Login to Ato registry
@@ -163,9 +162,13 @@ Auth:
   whoami   Show current authentication status
 
 Advanced Commands:
+  inspect  Inspect capsule metadata and runtime requirements
+  fetch    Fetch an artifact into local cache for debugging or manual workflows
+  finalize Perform local derivation for a fetched native artifact
+  project  Add a finalized app to launcher surfaces
+  unproject Remove a launcher projection
   key      Manage signing keys
   config   Manage configuration (registry, engine, source)
-  publish  Publish capsule (Dock/private: direct upload, official: CI-first)
   gen-ci   Generate GitHub Actions workflow for OIDC CI publish
   registry Manage registry commands (resolve/list/cache/serve)
 
@@ -226,6 +229,10 @@ enum Commands {
         #[arg(long)]
         registry: Option<String>,
 
+        /// Explicitly bind a manifest [state.<name>] entry using STATE=/absolute/path or STATE=state-...
+        #[arg(long = "state", value_name = "STATE=/ABS/PATH|STATE=state-...")]
+        state: Vec<String>,
+
         /// Network enforcement mode
         #[arg(long, value_enum, default_value_t = EnforcementMode::Strict)]
         enforcement: EnforcementMode,
@@ -279,6 +286,10 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         default: bool,
 
+        /// Skip prompts and approve local finalize / projection
+        #[arg(short = 'y', long = "yes", default_value_t = false)]
+        yes: bool,
+
         /// Deprecated legacy flag (always rejected)
         #[arg(long = "skip-verify", hide = true, default_value_t = false)]
         skip_verify_legacy: bool,
@@ -290,6 +301,14 @@ enum Commands {
         /// Output directory (default: ~/.ato/store/)
         #[arg(long)]
         output: Option<PathBuf>,
+
+        /// Create a launcher projection after install
+        #[arg(long, default_value_t = false, conflicts_with = "no_project")]
+        project: bool,
+
+        /// Do not prompt for or create a launcher projection
+        #[arg(long, default_value_t = false, conflicts_with = "project")]
+        no_project: bool,
 
         /// Emit machine-readable JSON output
         #[arg(long)]
@@ -352,6 +371,29 @@ enum Commands {
     },
 
     #[command(
+        next_help_heading = "Advanced Commands",
+        about = "Validate capsule build/run inputs without executing"
+    )]
+    Validate {
+        /// Directory containing capsule.toml or the manifest file itself (default: ".")
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    #[command(
+        next_help_heading = "Advanced Commands",
+        about = "Inspect capsule metadata and runtime requirements"
+    )]
+    Inspect {
+        #[command(subcommand)]
+        command: InspectCommands,
+    },
+
+    #[command(
         next_help_heading = "Primary Commands",
         about = "Search the store for packages"
     )]
@@ -393,8 +435,8 @@ enum Commands {
     },
 
     #[command(
-        next_help_heading = "Primary Commands",
-        about = "Fetch an experimental native delivery artifact into immutable local cache"
+        next_help_heading = "Advanced Commands",
+        about = "Fetch an artifact into local cache for debugging or manual workflows"
     )]
     Fetch {
         /// Capsule ref (`publisher/slug[@version]` or `localhost:8080/slug:version`)
@@ -414,8 +456,8 @@ enum Commands {
     },
 
     #[command(
-        next_help_heading = "Primary Commands",
-        about = "Create a locally derived native artifact from a fetched artifact directory"
+        next_help_heading = "Advanced Commands",
+        about = "Perform local derivation for a fetched native artifact. Most users should use `ato install`."
     )]
     Finalize {
         /// Path to fetched artifact directory created by `ato fetch`
@@ -435,8 +477,8 @@ enum Commands {
     },
 
     #[command(
-        next_help_heading = "Primary Commands",
-        about = "Experimental explicit opt-in: symlink-project a finalized local native .app into launcher surface"
+        next_help_heading = "Advanced Commands",
+        about = "Add a finalized app to launcher surfaces"
     )]
     Project {
         /// Path to a finalized local derived .app bundle created by `ato finalize`
@@ -455,8 +497,8 @@ enum Commands {
     },
 
     #[command(
-        next_help_heading = "Primary Commands",
-        about = "Experimental explicit opt-in: remove a managed launcher projection without mutating the finalized artifact"
+        next_help_heading = "Advanced Commands",
+        about = "Remove a launcher projection without mutating the finalized artifact"
     )]
     Unproject {
         /// Projection ID, projected symlink path, or finalized derived .app path
@@ -517,6 +559,15 @@ enum Commands {
         /// Show last N lines
         #[arg(long)]
         tail: Option<usize>,
+    },
+
+    #[command(
+        next_help_heading = "Management",
+        about = "Inspect or register persistent state bindings"
+    )]
+    State {
+        #[command(subcommand)]
+        command: StateCommands,
     },
 
     #[command(next_help_heading = "Auth", about = "Login to Ato registry")]
@@ -682,6 +733,10 @@ enum Commands {
         /// Registry URL for auto-install when app-id is not installed (default: https://api.ato.run)
         #[arg(long)]
         registry: Option<String>,
+
+        /// Explicitly bind a manifest [state.<name>] entry using STATE=/absolute/path or STATE=state-...
+        #[arg(long = "state", value_name = "STATE=/ABS/PATH|STATE=state-...")]
+        state: Vec<String>,
 
         /// Network enforcement mode
         #[arg(long, value_enum, default_value_t = EnforcementMode::Strict)]
@@ -869,8 +924,27 @@ enum Commands {
 }
 
 #[derive(Subcommand)]
+enum InspectCommands {
+    #[command(about = "Inspect runtime requirements from capsule.toml")]
+    Requirements {
+        /// Local path or scoped store ID (publisher/slug)
+        target: String,
+
+        /// Registry URL override for remote inspection
+        #[arg(long)]
+        registry: Option<String>,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum ProjectCommands {
-    #[command(about = "List experimental projection state and detect broken projections read-only")]
+    #[command(
+        about = "List experimental projection state and detect broken projections read-only"
+    )]
     Ls {
         /// Emit machine-readable JSON output
         #[arg(long)]
@@ -1036,6 +1110,37 @@ enum IpcCommands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Validate and send a JSON-RPC invoke request
+    Invoke {
+        /// Path to capsule directory or capsule.toml
+        #[arg(default_value = ".")]
+        path: PathBuf,
+
+        /// Override exported service name
+        #[arg(long)]
+        service: Option<String>,
+
+        /// Method name to invoke
+        #[arg(long)]
+        method: String,
+
+        /// JSON arguments payload
+        #[arg(long)]
+        args: String,
+
+        /// JSON-RPC request id
+        #[arg(long, default_value = "invoke-1")]
+        id: String,
+
+        /// Maximum serialized message size in bytes
+        #[arg(long)]
+        max_message_size: Option<usize>,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1173,6 +1278,54 @@ enum RegistryCommands {
 }
 
 #[derive(Subcommand)]
+enum StateCommands {
+    /// List registered persistent states
+    #[command(visible_alias = "ls")]
+    List {
+        /// Filter by owner scope
+        #[arg(long)]
+        owner_scope: Option<String>,
+
+        /// Filter by manifest state name
+        #[arg(long)]
+        state_name: Option<String>,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Inspect one persistent state by state-id or ato-state:// URI
+    Inspect {
+        /// State reference (`state-...` or `ato-state://state-...`)
+        state_ref: String,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Register a persistent state from a manifest contract
+    Register {
+        /// Path to capsule directory or capsule.toml
+        #[arg(long, default_value = ".")]
+        manifest: PathBuf,
+
+        /// State name from [state.<name>]
+        #[arg(long = "name")]
+        state_name: String,
+
+        /// Absolute host directory to bind to this state contract
+        #[arg(long = "path", value_name = "/ABS/PATH")]
+        path: PathBuf,
+
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum SourceCommands {
     /// Show sync run status for a source
     SyncStatus {
@@ -1263,6 +1416,10 @@ fn main() {
     let command_context = diagnostics::detect_command_context(&args);
 
     if let Err(err) = run() {
+        if json_mode && commands::inspect::try_emit_json_error(&err) {
+            std::process::exit(error_codes::EXIT_USER_ERROR);
+        }
+
         if ato_error_jsonl::try_emit_from_anyhow(&err, json_mode) {
             std::process::exit(error_codes::EXIT_USER_ERROR);
         }
@@ -1310,6 +1467,7 @@ fn run() -> Result<()> {
             background,
             nacelle,
             registry,
+            state,
             enforcement,
             sandbox_mode,
             unsafe_mode_legacy,
@@ -1324,6 +1482,7 @@ fn run() -> Result<()> {
             background,
             nacelle,
             registry,
+            state,
             enforcement,
             sandbox_mode,
             unsafe_mode_legacy,
@@ -1356,6 +1515,7 @@ fn run() -> Result<()> {
             background,
             nacelle,
             registry,
+            state,
             enforcement,
             sandbox_mode,
             unsafe_mode_legacy,
@@ -1369,6 +1529,7 @@ fn run() -> Result<()> {
             background,
             nacelle,
             registry,
+            state,
             enforcement,
             sandbox_mode,
             unsafe_mode_legacy,
@@ -1408,20 +1569,47 @@ fn run() -> Result<()> {
             keep_failed_artifacts,
             timings,
             strict_v3,
-        } => commands::build::execute_pack_command(
-            dir,
-            init,
-            key,
-            standalone,
-            force_large_payload,
-            keep_failed_artifacts,
-            strict_v3,
-            enforcement.as_str().to_string(),
-            reporter.clone(),
-            timings,
-            cli.json,
-            cli.nacelle,
-        ),
+        } => {
+            let result = commands::build::execute_pack_command(
+                dir,
+                init,
+                key,
+                standalone,
+                force_large_payload,
+                keep_failed_artifacts,
+                strict_v3,
+                enforcement.as_str().to_string(),
+                reporter.clone(),
+                timings,
+                cli.json,
+                cli.nacelle,
+            )?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            }
+            Ok(())
+        }
+
+        Commands::Validate { path, json } => {
+            commands::validate::execute(path, cli.json || json)?;
+            Ok(())
+        }
+
+        Commands::Inspect { command } => match command {
+            InspectCommands::Requirements {
+                target,
+                registry,
+                json,
+            } => {
+                let rt = tokio::runtime::Runtime::new()?;
+                rt.block_on(async {
+                    commands::inspect::execute_requirements(target, registry, cli.json || json)
+                        .await
+                        .map(|_| ())
+                        .map_err(anyhow::Error::from)
+                })
+            }
+        },
 
         Commands::Keygen { out, force, json } => {
             keygen::execute(keygen::KeygenArgs { out, force, json }, reporter.clone())
@@ -1462,7 +1650,7 @@ fn run() -> Result<()> {
             strict_v3,
         } => {
             eprintln!("⚠️  'ato pack' is deprecated. Use 'ato build' instead.");
-            commands::build::execute_pack_command(
+            let result = commands::build::execute_pack_command(
                 dir,
                 init,
                 key,
@@ -1475,7 +1663,11 @@ fn run() -> Result<()> {
                 timings,
                 cli.json,
                 cli.nacelle,
-            )
+            )?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            }
+            Ok(())
         }
 
         Commands::Scaffold {
@@ -1548,9 +1740,12 @@ fn run() -> Result<()> {
             registry,
             version,
             default,
+            yes,
             skip_verify_legacy,
             allow_unverified,
             output,
+            project,
+            no_project,
             json,
         } => {
             if skip_verify_legacy {
@@ -1596,9 +1791,21 @@ fn run() -> Result<()> {
                     version.as_deref(),
                     output,
                     default,
+                    yes,
+                    if project {
+                        install::ProjectionPreference::Force
+                    } else if no_project {
+                        install::ProjectionPreference::Skip
+                    } else {
+                        install::ProjectionPreference::Prompt
+                    },
                     allow_unverified,
-                    json,
                     false,
+                    json,
+                    !json && can_prompt_interactively(
+                        std::io::stdin().is_terminal(),
+                        std::io::stderr().is_terminal(),
+                    ),
                 )
                 .await?;
 
@@ -1610,6 +1817,25 @@ fn run() -> Result<()> {
                     println!("   Version: {}", result.version);
                     println!("   Path:    {}", result.path.display());
                     println!("   Hash:    {}", result.content_hash);
+                    if let Some(launchable) = &result.launchable {
+                        match launchable {
+                            install::LaunchableTarget::CapsuleArchive { path } => {
+                                println!("   Launch:  ato run {}", path.display());
+                            }
+                            install::LaunchableTarget::DerivedApp { path } => {
+                                println!("   App:     {}", path.display());
+                            }
+                        }
+                    }
+                    if let Some(projection) = &result.projection {
+                        if projection.performed {
+                            if let Some(projected_path) = &projection.projected_path {
+                                println!("   Launcher: {}", projected_path.display());
+                            }
+                        } else if no_project {
+                            println!("   Launcher: skipped");
+                        }
+                    }
                 }
                 Ok(())
             })
@@ -1715,7 +1941,9 @@ fn run() -> Result<()> {
             json,
             command,
         } => match command {
-            Some(ProjectCommands::Ls { json: subcommand_json }) => {
+            Some(ProjectCommands::Ls {
+                json: subcommand_json,
+            }) => {
                 let result = native_delivery::execute_project_ls()?;
                 if cli.json || json || subcommand_json {
                     println!("{}", serde_json::to_string_pretty(&result)?);
@@ -1723,7 +1951,11 @@ fn run() -> Result<()> {
                     println!("No experimental projections found.");
                 } else {
                     for projection in result.projections {
-                        let marker = if projection.state == "ok" { "✅" } else { "⚠️" };
+                        let marker = if projection.state == "ok" {
+                            "✅"
+                        } else {
+                            "⚠️"
+                        };
                         println!(
                             "{} [{}] {} -> {}",
                             marker,
@@ -1745,10 +1977,8 @@ fn run() -> Result<()> {
                         "ato project requires <DERIVED_APP_PATH> or use `ato project ls` for read-only status"
                     )
                 })?;
-                let result = native_delivery::execute_project(
-                    &derived_app_path,
-                    launcher_dir.as_deref(),
-                )?;
+                let result =
+                    native_delivery::execute_project(&derived_app_path, launcher_dir.as_deref())?;
                 if cli.json || json {
                     println!("{}", serde_json::to_string_pretty(&result)?);
                 } else {
@@ -1773,7 +2003,10 @@ fn run() -> Result<()> {
                 println!("✅ Unprojected: {}", result.projected_path.display());
                 println!("   ID:      {}", result.projection_id);
                 println!("   State:   {}", result.state_before);
-                println!("   Removed: metadata={}, symlink={}", result.removed_metadata, result.removed_projected_path);
+                println!(
+                    "   Removed: metadata={}, symlink={}",
+                    result.removed_metadata, result.removed_projected_path
+                );
             }
             Ok(())
         }
@@ -1947,6 +2180,8 @@ fn run() -> Result<()> {
             reporter.clone(),
         ),
 
+        Commands::State { command } => execute_state_command(command),
+
         Commands::Guest { sync_path } => {
             commands::guest::execute(commands::guest::GuestArgs { sync_path })
         }
@@ -1962,6 +2197,19 @@ fn run() -> Result<()> {
         Commands::Ipc {
             command: IpcCommands::Stop { name, force, json },
         } => commands::ipc::run_ipc_stop(name, force, json),
+
+        Commands::Ipc {
+            command:
+                IpcCommands::Invoke {
+                    path,
+                    service,
+                    method,
+                    args,
+                    id,
+                    max_message_size,
+                    json,
+                },
+        } => commands::ipc::run_ipc_invoke(path, service, method, args, id, max_message_size, json),
 
         Commands::Login { token, headless } => {
             let rt = tokio::runtime::Runtime::new()?;
@@ -2121,6 +2369,28 @@ fn execute_registry_command(command: RegistryCommands) -> Result<()> {
             }
         }
     })
+}
+
+fn execute_state_command(command: StateCommands) -> Result<()> {
+    match command {
+        StateCommands::List {
+            owner_scope,
+            state_name,
+            json,
+        } => state::list_states(owner_scope.as_deref(), state_name.as_deref(), json),
+        StateCommands::Inspect { state_ref, json } => state::inspect_state(&state_ref, json),
+        StateCommands::Register {
+            manifest,
+            state_name,
+            path,
+            json,
+        } => state::register_state_from_manifest(
+            &manifest,
+            &state_name,
+            path.to_string_lossy().as_ref(),
+            json,
+        ),
+    }
 }
 
 fn execute_publish_ci_command(
@@ -2889,11 +3159,12 @@ fn execute_setup_command(
     skip_verify: bool,
     reporter: std::sync::Arc<reporters::CliReporter>,
 ) -> Result<()> {
+    let capsule_reporter: &dyn capsule_core::CapsuleReporter = reporter.as_ref();
     let install = engine_manager::install_engine_release(
         &engine,
         version.as_deref(),
         skip_verify,
-        &*reporter,
+        capsule_reporter,
     )?;
 
     futures::executor::block_on(reporter.notify(format!(
@@ -2914,6 +3185,7 @@ fn execute_run_like_command(
     background: bool,
     nacelle: Option<PathBuf>,
     registry: Option<String>,
+    state: Vec<String>,
     enforcement: EnforcementMode,
     sandbox_mode: bool,
     unsafe_mode_legacy: bool,
@@ -2972,6 +3244,7 @@ fn execute_run_like_command(
             sandbox_requested,
             dangerously_skip_permissions,
             yes,
+            state,
             reporter,
         );
     }
@@ -3001,6 +3274,7 @@ fn execute_run_like_command(
         sandbox_requested,
         dangerously_skip_permissions,
         yes,
+        state,
         reporter,
     )
 }
@@ -3162,9 +3436,16 @@ async fn resolve_run_target_or_install(
         Some(installable_version.as_str()),
         None,
         false,
+        yes,
+        install::ProjectionPreference::Skip,
         allow_unverified,
-        json_mode,
         false,
+        json_mode,
+        !json_mode
+            && can_prompt_interactively(
+                std::io::stdin().is_terminal(),
+                std::io::stderr().is_terminal(),
+            ),
     )
     .await?;
     Ok(install_result.path)
@@ -3553,6 +3834,7 @@ fn execute_open_command(
     sandbox_mode: bool,
     dangerously_skip_permissions: bool,
     assume_yes: bool,
+    state: Vec<String>,
     reporter: std::sync::Arc<reporters::CliReporter>,
 ) -> Result<()> {
     let target_path = if path.is_file() || path.extension().is_some_and(|ext| ext == "capsule") {
@@ -3574,6 +3856,7 @@ fn execute_open_command(
         sandbox_mode,
         dangerously_skip_permissions,
         assume_yes,
+        state_bindings: state,
         reporter,
     }))
 }
@@ -3797,6 +4080,77 @@ mod tests {
         assert!(!should_use_search_tui(true, false, false, false));
         assert!(!should_use_search_tui(true, true, true, false));
         assert!(!should_use_search_tui(true, true, false, true));
+    }
+
+    #[test]
+    fn run_command_parses_explicit_state_bindings() {
+        let cli = Cli::try_parse_from([
+            "ato",
+            "run",
+            ".",
+            "--state",
+            "data=/var/lib/ato/persistent/demo",
+            "--state",
+            "cache=/var/lib/ato/persistent/cache",
+        ])
+        .expect("parse");
+
+        match cli.command {
+            Commands::Run { state, .. } => assert_eq!(
+                state,
+                vec![
+                    "data=/var/lib/ato/persistent/demo".to_string(),
+                    "cache=/var/lib/ato/persistent/cache".to_string()
+                ]
+            ),
+            other => panic!("unexpected command: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn state_command_parses_register_and_inspect_forms() {
+        let register = Cli::try_parse_from([
+            "ato",
+            "state",
+            "register",
+            "--manifest",
+            ".",
+            "--name",
+            "data",
+            "--path",
+            "/var/lib/ato/persistent/demo",
+        ])
+        .expect("parse register");
+
+        match register.command {
+            Commands::State {
+                command:
+                    StateCommands::Register {
+                        manifest,
+                        state_name,
+                        path,
+                        json,
+                    },
+            } => {
+                assert_eq!(manifest, PathBuf::from("."));
+                assert_eq!(state_name, "data");
+                assert_eq!(path, PathBuf::from("/var/lib/ato/persistent/demo"));
+                assert!(!json);
+            }
+            other => panic!("unexpected command: {:?}", std::mem::discriminant(&other)),
+        }
+
+        let inspect =
+            Cli::try_parse_from(["ato", "state", "inspect", "state-demo"]).expect("parse inspect");
+        match inspect.command {
+            Commands::State {
+                command: StateCommands::Inspect { state_ref, json },
+            } => {
+                assert_eq!(state_ref, "state-demo");
+                assert!(!json);
+            }
+            other => panic!("unexpected command: {:?}", std::mem::discriminant(&other)),
+        }
     }
 
     #[test]

@@ -216,6 +216,7 @@ fn publish_artifact_with_scoped_id(
 }
 
 #[test]
+#[serial_test::serial]
 fn e2e_publish_artifact_without_cwd_manifest() -> Result<()> {
     let ato = assert_cmd::cargo::cargo_bin("ato");
     let tmp = TempDir::new().context("create temp dir")?;
@@ -355,6 +356,7 @@ prepare = "echo prepare"
 }
 
 #[test]
+#[serial_test::serial]
 fn e2e_local_registry_build_publish_install_search_download() -> Result<()> {
     let ato = assert_cmd::cargo::cargo_bin("ato");
     let tmp = TempDir::new().context("create temp dir")?;
@@ -472,6 +474,7 @@ prepare = "echo prepare"
 }
 
 #[test]
+#[serial_test::serial]
 fn e2e_local_registry_publish_phases_preserve_readme() -> Result<()> {
     let ato = assert_cmd::cargo::cargo_bin("ato");
     let tmp = TempDir::new().context("create temp dir")?;
@@ -568,6 +571,7 @@ entrypoint = "main.ts"
 }
 
 #[test]
+#[serial_test::serial]
 fn e2e_local_registry_monorepo_publish_uses_parent_readme() -> Result<()> {
     let ato = assert_cmd::cargo::cargo_bin("ato");
     let tmp = TempDir::new().context("create temp dir")?;
@@ -666,6 +670,7 @@ entrypoint = "main.ts"
 }
 
 #[test]
+#[serial_test::serial]
 fn e2e_local_registry_package_json_prepare_publish_exposes_readme() -> Result<()> {
     let ato = assert_cmd::cargo::cargo_bin("ato");
     let tmp = TempDir::new().context("create temp dir")?;
@@ -785,6 +790,7 @@ repository = "Koh0920/file2api"
 }
 
 #[test]
+#[serial_test::serial]
 fn e2e_local_registry_run_seeds_execution_consent() -> Result<()> {
     let ato = assert_cmd::cargo::cargo_bin("ato");
     let tmp = TempDir::new().context("create temp dir")?;
@@ -925,6 +931,7 @@ entrypoint = "main.js"
 }
 
 #[test]
+#[serial_test::serial]
 fn e2e_local_registry_web_static_build_publish_install() -> Result<()> {
     let ato = assert_cmd::cargo::cargo_bin("ato");
     let tmp = TempDir::new().context("create temp dir")?;
@@ -980,23 +987,23 @@ port = {static_port}
         &home_dir,
     )?;
 
-    let run = run_ato_with_home(
-        &ato,
-        &[
-            "run",
-            "local/test-web-static",
-            "--registry",
-            &base_url,
-            "--yes",
-            "--background",
-        ],
-        tmp.path(),
-        &home_dir,
-    )?;
-    assert!(
-        run.status.success(),
-        "run should start in background; stderr={}",
-        String::from_utf8_lossy(&run.stderr)
+    let client = reqwest::blocking::Client::builder()
+        .build()
+        .context("build client")?;
+    let run_response = client
+        .post(format!(
+            "{}/v1/local/capsules/by/local/test-web-static/run",
+            base_url
+        ))
+        .json(&serde_json::json!({
+            "confirmed": true,
+        }))
+        .send()
+        .context("run endpoint call")?;
+    assert_eq!(
+        run_response.status(),
+        reqwest::StatusCode::ACCEPTED,
+        "run endpoint should accept confirmed local launch"
     );
 
     // Best-effort cleanup in case background process was started.
@@ -1006,6 +1013,7 @@ port = {static_port}
 }
 
 #[test]
+#[serial_test::serial]
 fn e2e_local_registry_node_python_run_fail_closed() -> Result<()> {
     let ato = assert_cmd::cargo::cargo_bin("ato");
     let tmp = TempDir::new().context("create temp dir")?;
@@ -1380,6 +1388,7 @@ entrypoint = "main.py"
 }
 
 #[test]
+#[serial_test::serial]
 fn e2e_local_registry_release_ops_reflect_current_and_yanked_state() -> Result<()> {
     let ato = assert_cmd::cargo::cargo_bin("ato");
     let tmp = TempDir::new().context("create temp dir")?;
