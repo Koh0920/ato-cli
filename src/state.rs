@@ -246,8 +246,8 @@ pub fn list_states(owner_scope: Option<&str>, state_name: Option<&str>, json: bo
     }
 
     println!(
-        "{:<40} {:<20} {:<16} {:<12} {:<12} {}",
-        "STATE ID", "OWNER SCOPE", "STATE", "KIND", "BACKEND", "BACKEND LOCATOR"
+        "{:<40} {:<20} {:<16} {:<12} {:<12} BACKEND LOCATOR",
+        "STATE ID", "OWNER SCOPE", "STATE", "KIND", "BACKEND"
     );
     for record in records {
         println!(

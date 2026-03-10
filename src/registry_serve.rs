@@ -5143,15 +5143,16 @@ repository = "koh0920/sample"
 
     #[tokio::test(flavor = "current_thread")]
     async fn persistent_state_local_api_registers_and_lists_records() {
-        let _guard = env_lock().lock().expect("env lock");
-        let home = tempfile::tempdir().expect("home");
-        let _home_guard = HomeGuard::set(home.path());
+        let (_home, _home_guard, manifest_path, bind_dir, state) = {
+            let _guard = env_lock().lock().expect("env lock");
+            let home = tempfile::tempdir().expect("home");
+            let home_guard = HomeGuard::set(home.path());
 
-        let manifest_dir = tempfile::tempdir().expect("manifest dir");
-        let manifest_path = manifest_dir.path().join("capsule.toml");
-        std::fs::write(
-            &manifest_path,
-            r#"
+            let manifest_dir = tempfile::tempdir().expect("manifest dir");
+            let manifest_path = manifest_dir.path().join("capsule.toml");
+            std::fs::write(
+                &manifest_path,
+                r#"
 schema_version = "0.2"
 name = "demo-app"
 version = "0.1.0"
@@ -5176,15 +5177,18 @@ target = "app"
 state = "data"
 target = "/var/lib/app"
 "#,
-        )
-        .expect("write manifest");
+            )
+            .expect("write manifest");
 
-        let bind_dir = home.path().join("bind").join("data");
-        let state = AppState {
-            listen_url: "http://127.0.0.1:8787".to_string(),
-            data_dir: home.path().to_path_buf(),
-            auth_token: None,
-            lock: Arc::new(Mutex::new(())),
+            let bind_dir = home.path().join("bind").join("data");
+            let state = AppState {
+                listen_url: "http://127.0.0.1:8787".to_string(),
+                data_dir: home.path().to_path_buf(),
+                auth_token: None,
+                lock: Arc::new(Mutex::new(())),
+            };
+
+            (home, home_guard, manifest_path, bind_dir, state)
         };
 
         let register_response = handle_register_persistent_state(
