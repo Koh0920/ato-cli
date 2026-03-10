@@ -147,6 +147,14 @@ struct ServiceBindingListQuery {
     service_name: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+struct ServiceBindingResolveQuery {
+    owner_scope: Option<String>,
+    service_name: Option<String>,
+    binding_kind: Option<String>,
+    caller_service: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct RegisterPersistentStateRequest {
     manifest: String,
@@ -558,6 +566,10 @@ pub async fn serve(config: RegistryServerConfig) -> Result<()> {
         .route(
             "/v1/local/bindings",
             get(handle_list_service_bindings).post(handle_register_service_binding),
+        )
+        .route(
+            "/v1/local/bindings/resolve",
+            get(handle_resolve_service_binding),
         )
         .route(
             "/v1/local/bindings/:binding_id",
@@ -3039,6 +3051,72 @@ async fn handle_get_service_binding(
             "service_binding_lookup_failed",
             &err.to_string(),
         ),
+    }
+}
+
+async fn handle_resolve_service_binding(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ServiceBindingResolveQuery>,
+) -> impl IntoResponse {
+    if let Err(err) = validate_read_auth(&headers, state.auth_token.as_deref()) {
+        return json_error(StatusCode::UNAUTHORIZED, "unauthorized", &err);
+    }
+
+    let owner_scope = query
+        .owner_scope
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let service_name = query
+        .service_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let binding_kind = query
+        .binding_kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(binding::SERVICE_BINDING_KIND_INGRESS);
+    let caller_service = query
+        .caller_service
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let Some(owner_scope) = owner_scope else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_owner_scope",
+            "owner_scope is required",
+        );
+    };
+    let Some(service_name) = service_name else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_service_name",
+            "service_name is required",
+        );
+    };
+
+    let _guard = state.lock.lock().await;
+    match binding::resolve_binding_record(owner_scope, service_name, binding_kind, caller_service) {
+        Ok(record) => (StatusCode::OK, Json(record)).into_response(),
+        Err(err) => {
+            let message = err.to_string();
+            if message.contains("was not found") {
+                return json_error(StatusCode::NOT_FOUND, "not_found", &message);
+            }
+            if message.contains("not allowed") {
+                return json_error(StatusCode::FORBIDDEN, "forbidden", &message);
+            }
+            json_error(
+                StatusCode::BAD_REQUEST,
+                "service_binding_resolve_failed",
+                &message,
+            )
+        }
     }
 }
 

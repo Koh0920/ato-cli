@@ -3,6 +3,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use ed25519_dalek::{Signer, SigningKey};
 use rand::rngs::OsRng;
 use rand::RngCore;
+use rusqlite::types::Type;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,7 @@ const SCHEMA_MIGRATION_0005: &str = "2026-03-05-0005-manifests-yanked";
 const SCHEMA_MIGRATION_0006: &str = "2026-03-10-0006-persistent-state-registry";
 const SCHEMA_MIGRATION_0007: &str = "2026-03-10-0007-persistent-state-kind-columns";
 const SCHEMA_MIGRATION_0008: &str = "2026-03-10-0008-service-binding-registry";
+const SCHEMA_MIGRATION_0009: &str = "2026-03-10-0009-service-binding-allowed-callers";
 
 fn manifest_distribution(
     manifest: &CapsuleManifest,
@@ -57,6 +59,38 @@ fn generate_random_binding_id() -> String {
     let mut bytes = [0u8; 16];
     OsRng.fill_bytes(&mut bytes);
     format!("binding-{}", hex::encode(bytes))
+}
+
+fn normalize_allowed_callers(allowed_callers: &[String]) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for value in allowed_callers {
+        let trimmed = value.trim();
+        if trimmed.is_empty() || normalized.iter().any(|existing| existing == trimmed) {
+            continue;
+        }
+        normalized.push(trimmed.to_string());
+    }
+    normalized
+}
+
+fn encode_allowed_callers(allowed_callers: &[String]) -> Result<String> {
+    Ok(serde_json::to_string(&normalize_allowed_callers(
+        allowed_callers,
+    ))?)
+}
+
+fn decode_allowed_callers(raw: Option<String>) -> rusqlite::Result<Vec<String>> {
+    let Some(raw) = raw
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(Vec::new());
+    };
+
+    serde_json::from_str::<Vec<String>>(raw)
+        .map(|values| normalize_allowed_callers(&values))
+        .map_err(|err| rusqlite::Error::FromSqlConversionFailure(8, Type::Text, Box::new(err)))
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +178,8 @@ pub struct ServiceBindingRecord {
     pub adapter_kind: String,
     pub endpoint_locator: String,
     pub tls_mode: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_callers: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_hint: Option<String>,
     pub created_at: String,
@@ -159,6 +195,7 @@ pub struct NewServiceBindingRecord {
     pub adapter_kind: String,
     pub endpoint_locator: String,
     pub tls_mode: String,
+    pub allowed_callers: Vec<String>,
     pub target_hint: Option<String>,
 }
 
@@ -562,7 +599,7 @@ impl RegistryStore {
     ) -> Result<Option<ServiceBindingRecord>> {
         let conn = self.connect()?;
         conn.query_row(
-            "SELECT binding_id, owner_scope, service_name, binding_kind, transport_kind, adapter_kind, endpoint_locator, tls_mode, target_hint, created_at, updated_at
+            "SELECT binding_id, owner_scope, service_name, binding_kind, transport_kind, adapter_kind, endpoint_locator, tls_mode, allowed_callers_json, target_hint, created_at, updated_at
              FROM service_bindings
              WHERE owner_scope=?1 AND service_name=?2 AND binding_kind=?3",
             params![owner_scope, service_name, binding_kind],
@@ -578,7 +615,7 @@ impl RegistryStore {
     ) -> Result<Option<ServiceBindingRecord>> {
         let conn = self.connect()?;
         conn.query_row(
-            "SELECT binding_id, owner_scope, service_name, binding_kind, transport_kind, adapter_kind, endpoint_locator, tls_mode, target_hint, created_at, updated_at
+            "SELECT binding_id, owner_scope, service_name, binding_kind, transport_kind, adapter_kind, endpoint_locator, tls_mode, allowed_callers_json, target_hint, created_at, updated_at
              FROM service_bindings
              WHERE binding_id=?1",
             params![binding_id],
@@ -586,6 +623,50 @@ impl RegistryStore {
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    pub fn resolve_service_binding(
+        &self,
+        owner_scope: &str,
+        service_name: &str,
+        binding_kind: &str,
+        caller_service: Option<&str>,
+    ) -> Result<Option<ServiceBindingRecord>> {
+        let Some(record) =
+            self.find_service_binding_by_identity(owner_scope, service_name, binding_kind)?
+        else {
+            return Ok(None);
+        };
+
+        if record.allowed_callers.is_empty() {
+            return Ok(Some(record));
+        }
+
+        let caller_service = caller_service
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "service binding '{}' requires caller_service because access is restricted to {:?}",
+                    record.binding_id,
+                    record.allowed_callers
+                )
+            })?;
+
+        if record
+            .allowed_callers
+            .iter()
+            .any(|value| value == caller_service)
+        {
+            return Ok(Some(record));
+        }
+
+        anyhow::bail!(
+            "service '{}' is not allowed to use binding '{}' (allowed callers: {:?})",
+            caller_service,
+            record.binding_id,
+            record.allowed_callers
+        );
     }
 
     pub fn list_service_bindings(
@@ -596,25 +677,25 @@ impl RegistryStore {
         let conn = self.connect()?;
         let sql = match (owner_scope, service_name) {
             (Some(_), Some(_)) => {
-                "SELECT binding_id, owner_scope, service_name, binding_kind, transport_kind, adapter_kind, endpoint_locator, tls_mode, target_hint, created_at, updated_at
+                "SELECT binding_id, owner_scope, service_name, binding_kind, transport_kind, adapter_kind, endpoint_locator, tls_mode, allowed_callers_json, target_hint, created_at, updated_at
                  FROM service_bindings
                  WHERE owner_scope=?1 AND service_name=?2
                  ORDER BY updated_at DESC, binding_id ASC"
             }
             (Some(_), None) => {
-                "SELECT binding_id, owner_scope, service_name, binding_kind, transport_kind, adapter_kind, endpoint_locator, tls_mode, target_hint, created_at, updated_at
+                "SELECT binding_id, owner_scope, service_name, binding_kind, transport_kind, adapter_kind, endpoint_locator, tls_mode, allowed_callers_json, target_hint, created_at, updated_at
                  FROM service_bindings
                  WHERE owner_scope=?1
                  ORDER BY updated_at DESC, binding_id ASC"
             }
             (None, Some(_)) => {
-                "SELECT binding_id, owner_scope, service_name, binding_kind, transport_kind, adapter_kind, endpoint_locator, tls_mode, target_hint, created_at, updated_at
+                "SELECT binding_id, owner_scope, service_name, binding_kind, transport_kind, adapter_kind, endpoint_locator, tls_mode, allowed_callers_json, target_hint, created_at, updated_at
                  FROM service_bindings
                  WHERE service_name=?1
                  ORDER BY updated_at DESC, binding_id ASC"
             }
             (None, None) => {
-                "SELECT binding_id, owner_scope, service_name, binding_kind, transport_kind, adapter_kind, endpoint_locator, tls_mode, target_hint, created_at, updated_at
+                "SELECT binding_id, owner_scope, service_name, binding_kind, transport_kind, adapter_kind, endpoint_locator, tls_mode, allowed_callers_json, target_hint, created_at, updated_at
                  FROM service_bindings
                  ORDER BY updated_at DESC, binding_id ASC"
             }
@@ -648,6 +729,7 @@ impl RegistryStore {
     ) -> Result<ServiceBindingRecord> {
         let now = chrono::Utc::now().to_rfc3339();
         let conn = self.connect()?;
+        let allowed_callers_json = encode_allowed_callers(&record.allowed_callers)?;
 
         if let Some(existing) = self.find_service_binding_by_identity(
             &record.owner_scope,
@@ -660,14 +742,16 @@ impl RegistryStore {
                      adapter_kind=?2,
                      endpoint_locator=?3,
                      tls_mode=?4,
-                     target_hint=?5,
-                     updated_at=?6
-                 WHERE binding_id=?7",
+                     allowed_callers_json=?5,
+                     target_hint=?6,
+                     updated_at=?7
+                 WHERE binding_id=?8",
                 params![
                     record.transport_kind,
                     record.adapter_kind,
                     record.endpoint_locator,
                     record.tls_mode,
+                    &allowed_callers_json,
                     record.target_hint,
                     now,
                     existing.binding_id,
@@ -686,8 +770,8 @@ impl RegistryStore {
             let binding_id = generate_random_binding_id();
             match conn.execute(
                 "INSERT INTO service_bindings(
-                    binding_id, owner_scope, service_name, binding_kind, transport_kind, adapter_kind, endpoint_locator, tls_mode, target_hint, created_at, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+                    binding_id, owner_scope, service_name, binding_kind, transport_kind, adapter_kind, endpoint_locator, tls_mode, allowed_callers_json, target_hint, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
                 params![
                     binding_id,
                     record.owner_scope,
@@ -697,6 +781,7 @@ impl RegistryStore {
                     record.adapter_kind,
                     record.endpoint_locator,
                     record.tls_mode,
+                    &allowed_callers_json,
                     record.target_hint,
                     now,
                 ],
@@ -760,9 +845,10 @@ impl RegistryStore {
             adapter_kind: row.get(5)?,
             endpoint_locator: row.get(6)?,
             tls_mode: row.get(7)?,
-            target_hint: row.get(8)?,
-            created_at: row.get(9)?,
-            updated_at: row.get(10)?,
+            allowed_callers: decode_allowed_callers(row.get(8)?)?,
+            target_hint: row.get(9)?,
+            created_at: row.get(10)?,
+            updated_at: row.get(11)?,
         })
     }
 
@@ -2611,6 +2697,7 @@ impl RegistryStore {
                             adapter_kind TEXT NOT NULL,
                             endpoint_locator TEXT NOT NULL,
                             tls_mode TEXT NOT NULL,
+                            allowed_callers_json TEXT NOT NULL DEFAULT '[]',
                             target_hint TEXT,
                             created_at TEXT NOT NULL,
                             updated_at TEXT NOT NULL,
@@ -2768,6 +2855,7 @@ impl RegistryStore {
                                     adapter_kind TEXT NOT NULL,
                                     endpoint_locator TEXT NOT NULL,
                                     tls_mode TEXT NOT NULL,
+                                    allowed_callers_json TEXT NOT NULL DEFAULT '[]',
                                     target_hint TEXT,
                                     created_at TEXT NOT NULL,
                                     updated_at TEXT NOT NULL,
@@ -2778,6 +2866,16 @@ impl RegistryStore {
                                 ",
             )?;
             self.mark_migration_applied(conn, SCHEMA_MIGRATION_0008)?;
+        }
+
+        if !self.is_migration_applied(conn, SCHEMA_MIGRATION_0009)? {
+            if !self.column_exists(conn, "service_bindings", "allowed_callers_json")? {
+                conn.execute(
+                    "ALTER TABLE service_bindings ADD COLUMN allowed_callers_json TEXT NOT NULL DEFAULT '[]'",
+                    [],
+                )?;
+            }
+            self.mark_migration_applied(conn, SCHEMA_MIGRATION_0009)?;
         }
 
         Ok(())
@@ -3937,10 +4035,12 @@ default_target = "cli"
                 adapter_kind: "reverse_proxy".to_string(),
                 endpoint_locator: "https://demo.local/".to_string(),
                 tls_mode: "explicit".to_string(),
+                allowed_callers: vec!["web".to_string(), "worker".to_string()],
                 target_hint: Some("app".to_string()),
             })
             .expect("register binding");
         assert!(record.binding_id.starts_with("binding-"));
+        assert_eq!(record.allowed_callers, vec!["web", "worker"]);
 
         let fetched = store
             .find_service_binding_by_identity("demo-app", "main", "ingress")
@@ -3963,17 +4063,56 @@ default_target = "cli"
                 adapter_kind: "reverse_proxy".to_string(),
                 endpoint_locator: "http://127.0.0.1:4310/".to_string(),
                 tls_mode: "disabled".to_string(),
+                allowed_callers: vec!["worker".to_string()],
                 target_hint: Some("app".to_string()),
             })
             .expect("update binding");
         assert_eq!(updated.binding_id, record.binding_id);
         assert_eq!(updated.endpoint_locator, "http://127.0.0.1:4310/");
         assert_eq!(updated.tls_mode, "disabled");
+        assert_eq!(updated.allowed_callers, vec!["worker"]);
 
         let listed = store
             .list_service_bindings(Some("demo-app"), Some("main"))
             .expect("list bindings");
         assert_eq!(listed, vec![updated]);
+    }
+
+    #[test]
+    fn service_binding_resolution_enforces_allowed_callers() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = RegistryStore::open(temp.path()).expect("open store");
+        let record = store
+            .register_service_binding(&NewServiceBindingRecord {
+                owner_scope: "demo-app".to_string(),
+                service_name: "api".to_string(),
+                binding_kind: "service".to_string(),
+                transport_kind: "http".to_string(),
+                adapter_kind: "reverse_proxy".to_string(),
+                endpoint_locator: "http://127.0.0.1:4310/".to_string(),
+                tls_mode: "disabled".to_string(),
+                allowed_callers: vec!["web".to_string()],
+                target_hint: Some("app".to_string()),
+            })
+            .expect("register binding");
+
+        let resolved = store
+            .resolve_service_binding("demo-app", "api", "service", Some("web"))
+            .expect("resolve binding")
+            .expect("resolved record");
+        assert_eq!(resolved, record);
+
+        let missing_caller = store
+            .resolve_service_binding("demo-app", "api", "service", None)
+            .expect_err("caller is required for restricted bindings");
+        assert!(missing_caller
+            .to_string()
+            .contains("requires caller_service"));
+
+        let denied = store
+            .resolve_service_binding("demo-app", "api", "service", Some("worker"))
+            .expect_err("unauthorized caller must fail");
+        assert!(denied.to_string().contains("not allowed"));
     }
 
     #[test]
