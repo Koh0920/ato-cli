@@ -913,7 +913,8 @@ where
         validate_minimal_macos_app_permissions(&input_app_path)?;
         copy_recursively(&input_app_path, &derived_app_path)?;
         validate_minimal_macos_app_permissions(&derived_app_path)?;
-        runner(&derived_dir, &config)?;
+        let derived_config = rebase_delivery_config_for_finalize(&config, &derived_app_path)?;
+        runner(&derived_dir, &derived_config)?;
         validate_minimal_macos_app_permissions(&derived_app_path)?;
         let derived_digest = compute_tree_digest(&derived_app_path)?;
         let provenance = LocalDerivationProvenance {
@@ -1696,6 +1697,22 @@ fn validate_relative_project_path(path: &Path, field_name: &str) -> Result<()> {
         bail!("{field_name} must not escape the project root");
     }
     Ok(())
+}
+
+fn rebase_delivery_config_for_finalize(
+    config: &DeliveryConfig,
+    derived_app_path: &Path,
+) -> Result<DeliveryConfig> {
+    let input_name = derived_app_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow::anyhow!("Derived app path has no terminal app name"))?;
+    let mut derived_config = config.clone();
+    derived_config.artifact.input = input_name.to_string();
+    if let Some(last) = derived_config.finalize.args.last_mut() {
+        *last = input_name.to_string();
+    }
+    Ok(derived_config)
 }
 
 fn resolve_native_build_working_dir(
@@ -2509,6 +2526,19 @@ args = ["--deep", "--force", "--sign", "-", "MyApp.app"]
         sample_fetch_dir_with_mode(root, 0o755)
     }
 
+    fn sample_nested_delivery_toml() -> &'static str {
+        r#"schema_version = "0.1"
+[artifact]
+framework = "tauri"
+stage = "unsigned"
+target = "darwin/arm64"
+input = "src-tauri/target/release/bundle/macos/My App.app"
+[finalize]
+tool = "codesign"
+args = ["--deep", "--force", "--sign", "-", "src-tauri/target/release/bundle/macos/My App.app"]
+"#
+    }
+
     fn sample_native_build_plan(root: &Path, mode: u32) -> Result<NativeBuildPlan> {
         let manifest_dir = root.join("native-build-project");
         let source_app_path = manifest_dir.join("MyApp.app");
@@ -2773,6 +2803,37 @@ input = "dist/time-management-desktop.app"
         Ok(fetched_dir)
     }
 
+    fn sample_nested_fetch_dir(root: &Path) -> Result<PathBuf> {
+        let fetched_dir = root.join("fetched-nested");
+        let artifact_dir = fetched_dir.join(FETCH_ARTIFACT_DIR);
+        let app_dir = artifact_dir.join("src-tauri/target/release/bundle/macos/My App.app");
+        fs::create_dir_all(app_dir.join("Contents/MacOS"))?;
+        fs::write(
+            artifact_dir.join(DELIVERY_CONFIG_FILE),
+            sample_nested_delivery_toml(),
+        )?;
+        fs::write(app_dir.join("Contents/MacOS/My App"), b"unsigned-app")?;
+        #[cfg(unix)]
+        {
+            let binary = app_dir.join("Contents/MacOS/My App");
+            let mut permissions = fs::metadata(&binary)?.permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&binary, permissions)?;
+        }
+        let metadata = FetchMetadata {
+            schema_version: DELIVERY_SCHEMA_VERSION.to_string(),
+            scoped_id: "local/my-app".to_string(),
+            version: "0.1.0".to_string(),
+            registry: "http://127.0.0.1:8787".to_string(),
+            fetched_at: "2026-03-09T00:00:00Z".to_string(),
+            parent_digest: compute_tree_digest(&artifact_dir)?,
+            artifact_blake3: compute_blake3(b"artifact"),
+        };
+        fs::create_dir_all(&fetched_dir)?;
+        write_json_pretty(&fetched_dir.join(FETCH_METADATA_FILE), &metadata)?;
+        Ok(fetched_dir)
+    }
+
     fn sample_finalized_app(root: &Path) -> Result<(PathBuf, PathBuf)> {
         let derived_dir = root.join("derived-output");
         let derived_app = derived_dir.join("MyApp.app");
@@ -2978,6 +3039,30 @@ input = "dist/time-management-desktop.app"
         let err = finalize_with_runner(&fetched_dir, &output_root, |_derived_dir, _config| Ok(()))
             .expect_err("finalize must fail closed when executable bit is missing");
         assert!(err.to_string().contains("Executable bit is missing"));
+        Ok(())
+    }
+
+    #[test]
+    fn finalize_rebases_nested_input_to_local_app_name() -> Result<()> {
+        let tmp = tempdir()?;
+        let fetched_dir = sample_nested_fetch_dir(tmp.path())?;
+        let output_root = tmp.path().join("dist");
+
+        let result = finalize_with_runner(&fetched_dir, &output_root, |derived_dir, config| {
+            assert_eq!(config.artifact.input, "My App.app");
+            assert_eq!(config.finalize.args[4], "My App.app");
+            let app_binary = derived_dir.join("My App.app/Contents/MacOS/My App");
+            fs::write(&app_binary, b"signed-app")?;
+            Ok(())
+        })?;
+
+        assert_eq!(
+            result
+                .derived_app_path
+                .file_name()
+                .and_then(|value| value.to_str()),
+            Some("My App.app")
+        );
         Ok(())
     }
 
