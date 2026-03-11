@@ -1,6 +1,15 @@
 # ato-cli
 
+[![CI](https://github.com/Koh0920/ato-cli/actions/workflows/build-multi-os.yml/badge.svg?branch=dev)](https://github.com/Koh0920/ato-cli/actions/workflows/build-multi-os.yml)
+[![GitHub Release](https://img.shields.io/github/v/release/Koh0920/ato-cli)](https://github.com/Koh0920/ato-cli/releases)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-stable-orange?logo=rust)](https://www.rust-lang.org/)
+![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-6f42c1)
+[![Issues](https://img.shields.io/github/issues/Koh0920/ato-cli)](https://github.com/Koh0920/ato-cli/issues)
+[![Last Commit](https://img.shields.io/github/last-commit/Koh0920/ato-cli/dev)](https://github.com/Koh0920/ato-cli/commits/dev)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Koh0920/ato-cli)
+
+> OpenSSF Best Practices バッジは、プロジェクト登録後に追加できます。
 
 English | [日本語](README_JA.md)
 
