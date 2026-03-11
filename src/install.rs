@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::io::{self};
 use std::io::{Cursor, Read};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
@@ -80,6 +80,13 @@ pub struct ProjectionInfo {
     pub state: Option<String>,
     pub schema_version: Option<String>,
     pub metadata_path: Option<PathBuf>,
+}
+
+pub struct GitHubCheckout {
+    pub repository: String,
+    pub publisher: String,
+    pub checkout_dir: PathBuf,
+    _temp_dir: tempfile::TempDir,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -417,6 +424,92 @@ pub fn is_slug_only_ref(input: &str) -> bool {
     !scoped_input.contains('/')
 }
 
+pub fn normalize_github_repository(repository: &str) -> Result<String> {
+    crate::publish_preflight::normalize_repository_value(repository)
+}
+
+pub async fn download_github_repository(repository: &str) -> Result<GitHubCheckout> {
+    let normalized = normalize_github_repository(repository)?;
+    let (owner, repo) = normalized
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("repository must include owner/repo"))?;
+    let publisher = normalize_install_segment(owner)?;
+    let client = reqwest::Client::new();
+    let archive_url = format!("https://api.github.com/repos/{owner}/{repo}/tarball");
+    let response = client
+        .get(&archive_url)
+        .header(reqwest::header::USER_AGENT, "ato-cli")
+        .send()
+        .await
+        .with_context(|| format!("Failed to fetch GitHub repository archive: {normalized}"))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        bail!(
+            "Failed to fetch GitHub repository archive (status={}): {}",
+            status,
+            body
+        );
+    }
+    let archive_bytes = response
+        .bytes()
+        .await
+        .with_context(|| format!("Failed to read GitHub repository archive: {normalized}"))?;
+    let temp_root = github_checkout_root()?;
+    let temp_dir = tempfile::Builder::new()
+        .prefix("gh-install-")
+        .tempdir_in(temp_root)
+        .with_context(|| "Failed to create GitHub checkout directory")?;
+    let checkout_dir = unpack_github_tarball(&archive_bytes, temp_dir.path())?;
+    Ok(GitHubCheckout {
+        repository: normalized,
+        publisher,
+        checkout_dir,
+        _temp_dir: temp_dir,
+    })
+}
+
+pub async fn install_built_github_artifact(
+    artifact_path: &Path,
+    publisher: &str,
+    repository: &str,
+    output_dir: Option<PathBuf>,
+    yes: bool,
+    projection_preference: ProjectionPreference,
+    json_output: bool,
+    can_prompt_interactively: bool,
+) -> Result<InstallResult> {
+    let artifact_bytes = std::fs::read(artifact_path)
+        .with_context(|| format!("Failed to read built artifact: {}", artifact_path.display()))?;
+    let manifest_toml = extract_manifest_toml_from_capsule(&artifact_bytes)
+        .with_context(|| "Built artifact is missing capsule.toml")?;
+    let manifest: CapsuleManifest = toml::from_str(&manifest_toml)
+        .with_context(|| "Built artifact has invalid capsule.toml")?;
+    let slug = normalize_install_segment(&manifest.name)?;
+    let version = manifest.version.trim();
+    if version.is_empty() {
+        bail!("Built artifact capsule.toml is missing version");
+    }
+    let scoped_ref = parse_capsule_ref(&format!("{publisher}/{slug}"))?;
+    let display_slug = scoped_ref.slug.clone();
+    let normalized_file_name = format!("{}-{}.capsule", scoped_ref.slug, version);
+    complete_install_from_bytes(
+        format!("github:{repository}"),
+        scoped_ref,
+        display_slug,
+        version.to_string(),
+        artifact_bytes,
+        normalized_file_name,
+        output_dir,
+        yes,
+        projection_preference,
+        json_output,
+        can_prompt_interactively,
+        Some(&format!("github:{repository}")),
+    )
+    .await
+}
+
 pub fn merge_requested_version(
     embedded_version: Option<&str>,
     explicit_version: Option<&str>,
@@ -547,25 +640,60 @@ pub async fn install_app(
         }
     };
 
-    let computed_blake3 = compute_blake3(&bytes);
+    complete_install_from_bytes(
+        capsule.id,
+        scoped_ref,
+        capsule.slug,
+        target_version_owned,
+        bytes,
+        normalized_file_name,
+        output_dir,
+        yes,
+        projection_preference,
+        json_output,
+        can_prompt_interactively,
+        Some(&registry),
+    )
+    .await
+}
 
+#[allow(clippy::too_many_arguments)]
+async fn complete_install_from_bytes(
+    capsule_id: String,
+    scoped_ref: ScopedCapsuleRef,
+    display_slug: String,
+    version: String,
+    bytes: Vec<u8>,
+    normalized_file_name: String,
+    output_dir: Option<PathBuf>,
+    yes: bool,
+    projection_preference: ProjectionPreference,
+    json_output: bool,
+    can_prompt_interactively: bool,
+    source_label: Option<&str>,
+) -> Result<InstallResult> {
+    let computed_blake3 = compute_blake3(&bytes);
     if let Some(v3_manifest) = extract_payload_v3_manifest_from_capsule(&bytes)? {
-        let sync_result = sync_v3_chunks_from_manifest(&client, &registry, &v3_manifest).await?;
-        match sync_result {
-            V3SyncOutcome::Synced => {}
-            V3SyncOutcome::SkippedUnsupportedRegistry => {
-                if !json_output {
-                    eprintln!(
-                        "ℹ️  Registry does not expose v3 chunk sync endpoint; falling back to embedded payload"
-                    );
+        if let Some(source) = source_label.filter(|value| value.starts_with("http")) {
+            match sync_v3_chunks_from_manifest(&reqwest::Client::new(), source, &v3_manifest)
+                .await?
+            {
+                V3SyncOutcome::Synced => {}
+                V3SyncOutcome::SkippedUnsupportedRegistry => {
+                    if !json_output {
+                        eprintln!(
+                            "ℹ️  Registry does not expose v3 chunk sync endpoint; falling back to embedded payload"
+                        );
+                    }
                 }
-            }
-            V3SyncOutcome::SkippedDisabledCas(reason) => {
-                emit_cas_disabled_performance_warning_once(&reason, json_output);
+                V3SyncOutcome::SkippedDisabledCas(reason) => {
+                    emit_cas_disabled_performance_warning_once(&reason, json_output);
+                }
             }
         }
     }
 
+    let target_version = version.as_str();
     let native_spec = crate::native_delivery::detect_install_requires_local_derivation(&bytes)?;
     if let Some(_native_spec) = native_spec {
         if !crate::native_delivery::host_supports_finalize() {
@@ -594,7 +722,7 @@ pub async fn install_app(
         let fetch_result = crate::native_delivery::materialize_fetch_cache_from_artifact(
             &scoped_ref.scoped_id,
             target_version,
-            &registry,
+            source_label.unwrap_or("local"),
             &bytes,
         )?;
 
@@ -731,11 +859,11 @@ pub async fn install_app(
         };
 
         return Ok(InstallResult {
-            capsule_id: capsule.id,
+            capsule_id,
             scoped_id: scoped_ref.scoped_id.clone(),
             publisher: scoped_ref.publisher,
-            slug: capsule.slug,
-            version: target_version_owned,
+            slug: display_slug,
+            version,
             path: output_path,
             content_hash: computed_blake3,
             install_kind: InstallKind::NativeRequiresLocalDerivation,
@@ -771,11 +899,11 @@ pub async fn install_app(
     }
 
     Ok(InstallResult {
-        capsule_id: capsule.id,
+        capsule_id,
         scoped_id: scoped_ref.scoped_id.clone(),
         publisher: scoped_ref.publisher,
-        slug: capsule.slug,
-        version: target_version_owned,
+        slug: display_slug,
+        version,
         path: output_path.clone(),
         content_hash: computed_blake3,
         install_kind: InstallKind::Standard,
@@ -828,6 +956,85 @@ fn prompt_for_confirmation(prompt: &str, default_yes: bool) -> Result<bool> {
         return Ok(default_yes);
     }
     Ok(matches!(trimmed.as_str(), "y" | "yes"))
+}
+
+fn normalize_install_segment(value: &str) -> Result<String> {
+    let mut normalized = String::new();
+    let mut prev_hyphen = false;
+    for ch in value.trim().chars() {
+        let ch = ch.to_ascii_lowercase();
+        if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
+            normalized.push(ch);
+            prev_hyphen = false;
+        } else if !prev_hyphen && !normalized.is_empty() {
+            normalized.push('-');
+            prev_hyphen = true;
+        }
+    }
+    while normalized.ends_with('-') {
+        normalized.pop();
+    }
+    if !is_valid_segment(&normalized) {
+        bail!("invalid install identifier segment: {}", value);
+    }
+    Ok(normalized)
+}
+
+fn github_checkout_root() -> Result<PathBuf> {
+    let root = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".ato")
+        .join("tmp");
+    std::fs::create_dir_all(&root).with_context(|| {
+        format!(
+            "Failed to create temporary checkout root: {}",
+            root.display()
+        )
+    })?;
+    Ok(root)
+}
+
+fn unpack_github_tarball(bytes: &[u8], destination: &Path) -> Result<PathBuf> {
+    let decoder = flate2::read::GzDecoder::new(Cursor::new(bytes));
+    let mut archive = tar::Archive::new(decoder);
+    let mut root_dir: Option<PathBuf> = None;
+    for entry in archive
+        .entries()
+        .context("Failed to read GitHub repository archive")?
+    {
+        let mut entry = entry.context("Invalid GitHub repository archive entry")?;
+        let path = entry
+            .path()
+            .context("Failed to read GitHub archive entry path")?;
+        let mut components = path.components();
+        let first = components
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("GitHub archive entry path is empty"))?;
+        let Component::Normal(root_component) = first else {
+            bail!("GitHub archive entry contains an invalid path");
+        };
+        if components.any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        }) {
+            bail!("GitHub archive entry contains an unsafe path");
+        }
+        let root_path = PathBuf::from(root_component);
+        match &root_dir {
+            Some(existing) if existing != &root_path => {
+                bail!("GitHub archive contains multiple top-level directories")
+            }
+            None => root_dir = Some(root_path),
+            _ => {}
+        }
+        entry
+            .unpack_in(destination)
+            .context("Failed to unpack GitHub repository archive")?;
+    }
+    let root_dir = root_dir.ok_or_else(|| anyhow::anyhow!("GitHub archive is empty"))?;
+    Ok(destination.join(root_dir))
 }
 
 fn extract_payload_v3_manifest_from_capsule(
@@ -3147,6 +3354,24 @@ entrypoint = "main.py"
         let parsed = parse_capsule_request("koh0920/sample-capsule@1.2.3").unwrap();
         assert_eq!(parsed.scoped_ref.scoped_id, "koh0920/sample-capsule");
         assert_eq!(parsed.version.as_deref(), Some("1.2.3"));
+    }
+
+    #[test]
+    fn test_normalize_github_repository_accepts_url_and_owner_repo() {
+        assert_eq!(
+            normalize_github_repository("https://github.com/Koh0920/ato-cli.git").unwrap(),
+            "Koh0920/ato-cli"
+        );
+        assert_eq!(
+            normalize_github_repository("Koh0920/ato-cli").unwrap(),
+            "Koh0920/ato-cli"
+        );
+    }
+
+    #[test]
+    fn test_normalize_install_segment_slugifies_github_owner() {
+        assert_eq!(normalize_install_segment("Koh_0920").unwrap(), "koh-0920");
+        assert!(normalize_install_segment("___").is_err());
     }
 
     #[test]

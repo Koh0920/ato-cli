@@ -124,6 +124,29 @@ fn test_search_help_uses_store_api_default() {
 }
 
 #[test]
+fn test_install_help_shows_from_gh_repo() {
+    let mut cmd = Command::cargo_bin("ato").unwrap();
+    cmd.args(["install", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--from-gh-repo <REPOSITORY>"));
+}
+
+#[test]
+fn test_install_rejects_slug_with_from_gh_repo() {
+    let mut cmd = Command::cargo_bin("ato").unwrap();
+    cmd.args([
+        "install",
+        "koh0920/sample-capsule",
+        "--from-gh-repo",
+        "github.com/Koh0920/ato-cli",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("--from-gh-repo"));
+}
+
+#[test]
 fn test_init_help_describes_agent_prompt_output() {
     let mut cmd = Command::cargo_bin("ato").unwrap();
     cmd.args(["init", "--help"])
