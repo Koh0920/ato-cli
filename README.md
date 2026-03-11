@@ -1,5 +1,7 @@
 # ato-cli
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Koh0920/ato-cli)
+
 English | [日本語](README_JA.md)
 
 `ato` is a meta-CLI that interprets `capsule.toml` to execute, distribute, and install capsules.
