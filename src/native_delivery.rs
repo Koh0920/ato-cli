@@ -918,7 +918,9 @@ fn ensure_delivery_config_matches_context(
     if actual.artifact.framework != expected.artifact.framework
         || actual.artifact.stage != expected.artifact.stage
         || actual.artifact.target != expected.artifact.target
+        || actual.artifact.input != expected.artifact.input
         || actual.finalize.tool != expected.finalize.tool
+        || actual.finalize.args != expected.finalize.args
     {
         bail!(
             "{} native delivery config conflicts with the default target contract",
@@ -3229,6 +3231,17 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    fn assert_json_object_has_keys(value: &serde_json::Value, keys: &[&str]) {
+        let object = value.as_object().expect("expected JSON object");
+        for key in keys {
+            assert!(
+                object.contains_key(*key),
+                "expected key '{}' in JSON object: {object:?}",
+                key
+            );
+        }
+    }
+
     fn sample_delivery_toml() -> &'static str {
         r#"schema_version = "0.1"
 [artifact]
@@ -3598,6 +3611,113 @@ args = ["--deep", "--force", "--sign", "-", "dist/time-management-desktop.app"]
             manifest_dir.join("dist/time-management-desktop.app")
         );
         Ok(())
+    }
+
+    #[test]
+    fn detect_build_strategy_generates_canonical_delivery_config_from_capsule_manifest(
+    ) -> Result<()> {
+        let tmp = tempdir()?;
+        let manifest_dir = tmp.path().join("native-build-project");
+        let source_app_path = manifest_dir.join("MyApp.app");
+        let binary_path = source_app_path.join("Contents/MacOS/MyApp");
+        fs::create_dir_all(binary_path.parent().context("binary parent missing")?)?;
+        fs::write(
+            manifest_dir.join("capsule.toml"),
+            r#"schema_version = "0.2"
+name = "my-app"
+version = "0.1.0"
+type = "app"
+default_target = "cli"
+
+[targets.cli]
+runtime = "source"
+driver = "native"
+entrypoint = "MyApp.app"
+"#,
+        )?;
+        fs::write(&binary_path, b"unsigned-app")?;
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&binary_path)?.permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&binary_path, permissions)?;
+        }
+
+        let plan =
+            detect_build_strategy(&manifest_dir)?.context("expected native delivery build plan")?;
+        let staged: DeliveryConfig = toml::from_str(&plan.staged_delivery_config_toml)?;
+
+        assert!(plan.delivery_config_path.is_none());
+        assert_eq!(plan.source_app_path, manifest_dir.join("MyApp.app"));
+        assert_eq!(staged.schema_version, DELIVERY_SCHEMA_VERSION_STABLE);
+        assert_eq!(staged.artifact.input, "MyApp.app");
+        assert_eq!(staged.artifact.framework, DEFAULT_DELIVERY_FRAMEWORK);
+        assert_eq!(staged.artifact.target, DEFAULT_DELIVERY_TARGET);
+        assert_eq!(staged.finalize.tool, DEFAULT_FINALIZE_TOOL);
+        assert_eq!(
+            staged.finalize.args,
+            vec![
+                "--deep".to_string(),
+                "--force".to_string(),
+                "--sign".to_string(),
+                "-".to_string(),
+                "MyApp.app".to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn detect_build_strategy_rejects_sidecar_that_conflicts_with_canonical_capsule_manifest() {
+        let tmp = tempdir().expect("tmp dir");
+        let manifest_dir = tmp.path().join("native-build-project");
+        let source_app_path = manifest_dir.join("MyApp.app");
+        let binary_path = source_app_path.join("Contents/MacOS/MyApp");
+        fs::create_dir_all(binary_path.parent().expect("binary parent")).expect("create app");
+        fs::write(
+            manifest_dir.join("capsule.toml"),
+            r#"schema_version = "0.2"
+name = "my-app"
+version = "0.1.0"
+type = "app"
+default_target = "cli"
+
+[targets.cli]
+runtime = "source"
+driver = "native"
+entrypoint = "MyApp.app"
+"#,
+        )
+        .expect("write manifest");
+        fs::write(
+            manifest_dir.join(DELIVERY_CONFIG_FILE),
+            r#"schema_version = "0.1"
+[artifact]
+framework = "tauri"
+stage = "unsigned"
+target = "darwin/arm64"
+input = "Other.app"
+[finalize]
+tool = "codesign"
+args = ["--deep", "--force", "--sign", "-", "Other.app"]
+"#,
+        )
+        .expect("write sidecar");
+        fs::write(&binary_path, b"unsigned-app").expect("write binary");
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&binary_path)
+                .expect("binary metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&binary_path, permissions).expect("set permissions");
+        }
+
+        let err = detect_build_strategy(&manifest_dir)
+            .expect_err("conflicting compatibility sidecar must be rejected");
+        assert!(err
+            .to_string()
+            .contains("native delivery config conflicts with the default target contract"));
     }
 
     #[test]
@@ -4104,6 +4224,109 @@ input = "dist/time-management-desktop.app"
     }
 
     #[test]
+    fn native_delivery_documented_json_contract_fields_are_present() -> Result<()> {
+        let tmp = tempdir()?;
+
+        let fetched_dir = sample_fetch_dir(tmp.path())?;
+        let fetch_metadata = load_fetch_metadata(&fetched_dir)?;
+        let fetch_json = serde_json::to_value(&fetch_metadata)?;
+        assert_json_object_has_keys(
+            &fetch_json,
+            &[
+                "schema_version",
+                "scoped_id",
+                "version",
+                "registry",
+                "parent_digest",
+            ],
+        );
+
+        let build_json = serde_json::to_value(NativeBuildResult {
+            artifact_path: tmp.path().join("out/my-app-0.1.0.capsule"),
+            build_strategy: "native-delivery".to_string(),
+            target: DEFAULT_DELIVERY_TARGET.to_string(),
+            derived_from: tmp.path().join("MyApp.app"),
+            schema_version: DELIVERY_SCHEMA_VERSION.to_string(),
+        })?;
+        assert_json_object_has_keys(
+            &build_json,
+            &["build_strategy", "schema_version", "target", "derived_from"],
+        );
+
+        let (derived_dir, derived_app) = sample_finalized_app(tmp.path())?;
+        let provenance_json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(derived_dir.join(PROVENANCE_FILE))?)?;
+        assert_json_object_has_keys(
+            &provenance_json,
+            &[
+                "schema_version",
+                "parent_digest",
+                "derived_digest",
+                "framework",
+                "target",
+                "finalize_tool",
+                "finalized_at",
+            ],
+        );
+
+        let finalize_json = serde_json::to_value(FinalizeResult {
+            fetched_dir: fetched_dir.clone(),
+            output_dir: derived_dir.clone(),
+            derived_app_path: derived_app.clone(),
+            provenance_path: derived_dir.join(PROVENANCE_FILE),
+            parent_digest: "blake3:parent-digest".to_string(),
+            derived_digest: "blake3:derived-digest".to_string(),
+            schema_version: DELIVERY_SCHEMA_VERSION.to_string(),
+        })?;
+        assert_json_object_has_keys(
+            &finalize_json,
+            &[
+                "schema_version",
+                "derived_app_path",
+                "provenance_path",
+                "parent_digest",
+                "derived_digest",
+            ],
+        );
+
+        let launcher_dir = tmp.path().join("Applications");
+        let metadata_root = tmp.path().join("projection-metadata");
+        let project_result = project_with_roots(&derived_app, &launcher_dir, &metadata_root)?;
+        let project_json = serde_json::to_value(&project_result)?;
+        assert_json_object_has_keys(
+            &project_json,
+            &[
+                "schema_version",
+                "projection_id",
+                "metadata_path",
+                "projected_path",
+                "derived_app_path",
+                "parent_digest",
+                "derived_digest",
+                "state",
+            ],
+        );
+
+        let unproject_result =
+            unproject_with_metadata_root(&project_result.projection_id, &metadata_root)?;
+        let unproject_json = serde_json::to_value(&unproject_result)?;
+        assert_json_object_has_keys(
+            &unproject_json,
+            &[
+                "schema_version",
+                "projection_id",
+                "metadata_path",
+                "projected_path",
+                "removed_projected_path",
+                "removed_metadata",
+                "state_before",
+            ],
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn build_native_artifact_preserves_source_and_payload_executable_mode() -> Result<()> {
         let tmp = tempdir()?;
         let plan = sample_native_build_plan(tmp.path(), 0o755)?;
@@ -4357,6 +4580,7 @@ input = "dist/time-management-desktop.app"
     }
 
     #[test]
+    #[serial_test::serial]
     fn materialize_fetch_cache_extracts_payload_tree() -> Result<()> {
         let tmp_home = tempdir()?;
         std::env::set_var("HOME", tmp_home.path());
@@ -4397,6 +4621,7 @@ input = "dist/time-management-desktop.app"
     }
 
     #[test]
+    #[serial_test::serial]
     fn materialize_fetch_cache_preserves_executable_mode_from_payload() -> Result<()> {
         let tmp_home = tempdir()?;
         std::env::set_var("HOME", tmp_home.path());
