@@ -587,15 +587,17 @@ path = "sample-native-capsule.app"
 
 #[cfg(windows)]
 fn verify_authenticode_signature(path: &Path) -> Result<()> {
-    let path_arg = path.to_string_lossy().into_owned();
+    let path_arg = path.to_string_lossy().replace('\'', "''");
+    let command = format!(
+        "$signature = Get-AuthenticodeSignature -FilePath '{path_arg}'; if ($signature.SignerCertificate) {{ Write-Output signed }} else {{ throw 'missing signer certificate' }}"
+    );
     let output = run_command(
         "powershell.exe",
         &[
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "$signature = Get-AuthenticodeSignature -FilePath $args[0]; if ($signature.SignerCertificate) { Write-Output signed } else { throw 'missing signer certificate' }",
-            &path_arg,
+            &command,
         ],
         path.parent().unwrap_or_else(|| Path::new(".")),
     )?;
