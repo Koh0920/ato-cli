@@ -6,6 +6,10 @@
   "build": {
     "frontendDist": "../web"
   },
+  "bundle": {
+    "active": false,
+    "icon": []
+  },
   "app": {
     "windows": [
       {
