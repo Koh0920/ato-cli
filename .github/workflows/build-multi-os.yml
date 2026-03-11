@@ -2,6 +2,16 @@ name: Build (Multi OS)
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: Optional release version to validate against Cargo.toml.
+        required: false
+        type: string
+      native_only:
+        description: Run only the Windows native delivery E2E job.
+        required: false
+        type: boolean
+        default: false
   pull_request:
   push:
     branches:
@@ -21,6 +31,7 @@ concurrency:
 jobs:
   clippy:
     name: Clippy
+    if: ${{ !((github.event_name == 'workflow_dispatch' && inputs.native_only) || (github.event_name == 'push' && contains(github.event.head_commit.message, '[native-only]'))) }}
     runs-on: ubuntu-latest
 
     steps:
@@ -51,6 +62,7 @@ jobs:
 
   build:
     name: Build ${{ matrix.artifact_name }}
+    if: ${{ !((github.event_name == 'workflow_dispatch' && inputs.native_only) || (github.event_name == 'push' && contains(github.event.head_commit.message, '[native-only]'))) }}
     needs: clippy
     runs-on: ${{ matrix.os }}
     strategy:
@@ -220,6 +232,7 @@ jobs:
 
   smoke:
     name: Smoke ${{ matrix.artifact_name }}
+    if: ${{ !((github.event_name == 'workflow_dispatch' && inputs.native_only) || (github.event_name == 'push' && contains(github.event.head_commit.message, '[native-only]'))) }}
     needs: build
     runs-on: ${{ matrix.os }}
     strategy:
@@ -409,7 +422,29 @@ jobs:
 
   native_delivery_e2e_windows:
     name: Native delivery E2E (Windows)
+    if: ${{ !((github.event_name == 'workflow_dispatch' && inputs.native_only) || (github.event_name == 'push' && contains(github.event.head_commit.message, '[native-only]'))) }}
     needs: clippy
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Windows native delivery E2E
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p ato-cli --test native_delivery_e2e e2e_native_delivery_windows_build_publish_install_run -- --test-threads=1 --nocapture
+
+  native_delivery_e2e_windows_fast:
+    name: Native delivery E2E (Windows Fast)
+    if: ${{ (github.event_name == 'workflow_dispatch' && inputs.native_only) || (github.event_name == 'push' && contains(github.event.head_commit.message, '[native-only]')) }}
     runs-on: windows-latest
 
     steps:
@@ -430,6 +465,7 @@ jobs:
 
   tar_pack_benchmark:
     name: Tar pack benchmark
+    if: ${{ !((github.event_name == 'workflow_dispatch' && inputs.native_only) || (github.event_name == 'push' && contains(github.event.head_commit.message, '[native-only]'))) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
