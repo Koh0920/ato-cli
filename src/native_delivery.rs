@@ -1093,6 +1093,7 @@ where
     let result = (|| -> Result<FinalizeResult> {
         validate_minimal_native_artifact_permissions(&input_app_path)?;
         copy_recursively(&input_app_path, &derived_app_path)?;
+        ensure_tree_writable(&derived_app_path)?;
         validate_minimal_native_artifact_permissions(&derived_app_path)?;
         let derived_config = rebase_delivery_config_for_finalize(&config, &derived_app_path)?;
         runner(&derived_dir, &derived_config)?;
@@ -2826,6 +2827,34 @@ fn copy_recursively(source: &Path, destination: &Path) -> Result<()> {
         "Unsupported filesystem entry for copy: {}",
         source.display()
     )
+}
+
+fn ensure_tree_writable(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("Failed to stat {}", path.display()))?;
+    let file_type = metadata.file_type();
+
+    if !file_type.is_symlink() {
+        let mut permissions = metadata.permissions();
+        if permissions.readonly() {
+            permissions.set_readonly(false);
+            fs::set_permissions(path, permissions)
+                .with_context(|| format!("Failed to set permissions on {}", path.display()))?;
+        }
+    }
+
+    if file_type.is_dir() {
+        let mut entries = fs::read_dir(path)
+            .with_context(|| format!("Failed to read directory {}", path.display()))?
+            .collect::<std::io::Result<Vec<_>>>()
+            .with_context(|| format!("Failed to enumerate directory {}", path.display()))?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            ensure_tree_writable(&entry.path())?;
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_minimal_native_artifact_permissions(path: &Path) -> Result<()> {
@@ -5257,6 +5286,24 @@ input = "dist/time-management-desktop.app"
                 0o755
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn ensure_tree_writable_clears_readonly_on_files() -> Result<()> {
+        let tmp = tempdir()?;
+        let app_dir = tmp.path().join("MyApp.app");
+        let binary = app_dir.join("Contents/MacOS/MyApp");
+        fs::create_dir_all(binary.parent().expect("binary parent"))?;
+        fs::write(&binary, b"unsigned-app")?;
+
+        let mut permissions = fs::metadata(&binary)?.permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&binary, permissions)?;
+
+        ensure_tree_writable(&app_dir)?;
+
+        assert!(!fs::metadata(&binary)?.permissions().readonly());
         Ok(())
     }
 
