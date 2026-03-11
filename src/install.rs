@@ -89,6 +89,26 @@ pub struct GitHubCheckout {
     _temp_dir: tempfile::TempDir,
 }
 
+enum InstallSource {
+    Registry(String),
+    Local(String),
+}
+
+impl InstallSource {
+    fn registry_url(&self) -> Option<&str> {
+        match self {
+            Self::Registry(url) => Some(url),
+            Self::Local(_) => None,
+        }
+    }
+
+    fn cache_label(&self) -> &str {
+        match self {
+            Self::Registry(url) | Self::Local(url) => url,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectionPreference {
     Prompt,
@@ -505,7 +525,7 @@ pub async fn install_built_github_artifact(
         projection_preference,
         json_output,
         can_prompt_interactively,
-        Some(&format!("github:{repository}")),
+        InstallSource::Local(format!("github:{repository}")),
     )
     .await
 }
@@ -652,7 +672,7 @@ pub async fn install_app(
         projection_preference,
         json_output,
         can_prompt_interactively,
-        Some(&registry),
+        InstallSource::Registry(registry),
     )
     .await
 }
@@ -670,12 +690,12 @@ async fn complete_install_from_bytes(
     projection_preference: ProjectionPreference,
     json_output: bool,
     can_prompt_interactively: bool,
-    source_label: Option<&str>,
+    source: InstallSource,
 ) -> Result<InstallResult> {
     let computed_blake3 = compute_blake3(&bytes);
     if let Some(v3_manifest) = extract_payload_v3_manifest_from_capsule(&bytes)? {
-        if let Some(source) = source_label.filter(|value| value.starts_with("http")) {
-            match sync_v3_chunks_from_manifest(&reqwest::Client::new(), source, &v3_manifest)
+        if let Some(registry_url) = source.registry_url() {
+            match sync_v3_chunks_from_manifest(&reqwest::Client::new(), registry_url, &v3_manifest)
                 .await?
             {
                 V3SyncOutcome::Synced => {}
@@ -722,7 +742,7 @@ async fn complete_install_from_bytes(
         let fetch_result = crate::native_delivery::materialize_fetch_cache_from_artifact(
             &scoped_ref.scoped_id,
             target_version,
-            source_label.unwrap_or("local"),
+            source.cache_label(),
             &bytes,
         )?;
 
@@ -981,10 +1001,11 @@ fn normalize_install_segment(value: &str) -> Result<String> {
 }
 
 fn github_checkout_root() -> Result<PathBuf> {
-    let root = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".ato")
-        .join("tmp");
+    let root = std::env::current_dir()
+        .with_context(|| "Failed to resolve current directory for temporary checkout")?
+        .join(".tmp")
+        .join("ato")
+        .join("gh-install");
     std::fs::create_dir_all(&root).with_context(|| {
         format!(
             "Failed to create temporary checkout root: {}",
@@ -1011,7 +1032,9 @@ fn unpack_github_tarball(bytes: &[u8], destination: &Path) -> Result<PathBuf> {
             .next()
             .ok_or_else(|| anyhow::anyhow!("GitHub archive entry path is empty"))?;
         let Component::Normal(root_component) = first else {
-            bail!("GitHub archive entry contains an invalid path");
+            bail!(
+                "GitHub archive entry must start with a top-level directory before repository files"
+            );
         };
         if components.any(|component| {
             matches!(
@@ -1019,7 +1042,9 @@ fn unpack_github_tarball(bytes: &[u8], destination: &Path) -> Result<PathBuf> {
                 Component::ParentDir | Component::RootDir | Component::Prefix(_)
             )
         }) {
-            bail!("GitHub archive entry contains an unsafe path");
+            bail!(
+                "GitHub archive entry contains unsafe path traversal components (`..`, absolute paths, or prefixes)"
+            );
         }
         let root_path = PathBuf::from(root_component);
         match &root_dir {

@@ -1989,7 +1989,9 @@ fn run() -> Result<()> {
                     return Ok(());
                 }
 
-                let slug = slug.ok_or_else(|| anyhow::anyhow!("capsule ref is required"))?;
+                let slug = slug.ok_or_else(|| {
+                    anyhow::anyhow!("capsule slug is required when not using --from-gh-repo")
+                })?;
                 if install::is_slug_only_ref(&slug) {
                     let suggestions = install::suggest_scoped_capsules(
                         &slug,
