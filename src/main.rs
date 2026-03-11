@@ -1969,11 +1969,13 @@ fn run() -> Result<()> {
                     &artifact,
                     &checkout.publisher,
                     &checkout.repository,
-                    output,
-                    yes,
-                    projection_preference,
-                    json,
-                    can_prompt,
+                    install::InstallExecutionOptions {
+                        output_dir: output,
+                        yes,
+                        projection_preference,
+                        json_output: json,
+                        can_prompt_interactively: can_prompt,
+                    },
                 ))?;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&result)?);

@@ -89,6 +89,14 @@ pub struct GitHubCheckout {
     _temp_dir: tempfile::TempDir,
 }
 
+pub struct InstallExecutionOptions {
+    pub output_dir: Option<PathBuf>,
+    pub yes: bool,
+    pub projection_preference: ProjectionPreference,
+    pub json_output: bool,
+    pub can_prompt_interactively: bool,
+}
+
 enum InstallSource {
     Registry(String),
     Local(String),
@@ -496,11 +504,7 @@ pub async fn install_built_github_artifact(
     artifact_path: &Path,
     publisher: &str,
     repository: &str,
-    output_dir: Option<PathBuf>,
-    yes: bool,
-    projection_preference: ProjectionPreference,
-    json_output: bool,
-    can_prompt_interactively: bool,
+    options: InstallExecutionOptions,
 ) -> Result<InstallResult> {
     let artifact_bytes = std::fs::read(artifact_path)
         .with_context(|| format!("Failed to read built artifact: {}", artifact_path.display()))?;
@@ -523,11 +527,7 @@ pub async fn install_built_github_artifact(
         version.to_string(),
         artifact_bytes,
         normalized_file_name,
-        output_dir,
-        yes,
-        projection_preference,
-        json_output,
-        can_prompt_interactively,
+        options,
         InstallSource::Local(format!("github:{repository}")),
     )
     .await
@@ -670,11 +670,13 @@ pub async fn install_app(
         target_version_owned,
         bytes,
         normalized_file_name,
-        output_dir,
-        yes,
-        projection_preference,
-        json_output,
-        can_prompt_interactively,
+        InstallExecutionOptions {
+            output_dir,
+            yes,
+            projection_preference,
+            json_output,
+            can_prompt_interactively,
+        },
         InstallSource::Registry(registry),
     )
     .await
@@ -688,13 +690,16 @@ async fn complete_install_from_bytes(
     version: String,
     bytes: Vec<u8>,
     normalized_file_name: String,
-    output_dir: Option<PathBuf>,
-    yes: bool,
-    projection_preference: ProjectionPreference,
-    json_output: bool,
-    can_prompt_interactively: bool,
+    options: InstallExecutionOptions,
     source: InstallSource,
 ) -> Result<InstallResult> {
+    let InstallExecutionOptions {
+        output_dir,
+        yes,
+        projection_preference,
+        json_output,
+        can_prompt_interactively,
+    } = options;
     let computed_blake3 = compute_blake3(&bytes);
     if let Some(v3_manifest) = extract_payload_v3_manifest_from_capsule(&bytes)? {
         if let Some(registry_url) = source.registry_url() {
@@ -3552,9 +3557,7 @@ entrypoint = "main.py"
 
         let err =
             unpack_github_tarball(&archive_bytes, temp.path()).expect_err("must reject traversal");
-        assert!(err
-            .to_string()
-            .contains("unsafe path traversal components"));
+        assert!(err.to_string().contains("unsafe path traversal components"));
     }
 
     #[test]
