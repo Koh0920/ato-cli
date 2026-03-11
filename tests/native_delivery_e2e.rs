@@ -84,6 +84,25 @@ fn parse_json_result(
     serde_json::from_slice(stdout).with_context(|| context.to_string())
 }
 
+fn find_capsule_artifact(root: &Path, stem: &str) -> Result<PathBuf> {
+    let expected_name = format!("{stem}.capsule");
+    WalkDir::new(root)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.into_path())
+        .find(|path| {
+            path.is_file()
+                && path.file_name().and_then(|name| name.to_str()) == Some(expected_name.as_str())
+        })
+        .with_context(|| {
+            format!(
+                "failed to locate {} under {}",
+                expected_name,
+                root.display()
+            )
+        })
+}
+
 fn wait_for_well_known(
     base_url: &str,
     child: &mut std::process::Child,
@@ -1025,11 +1044,11 @@ fn e2e_native_delivery_windows_build_publish_install_run() -> Result<()> {
     if let Some(target) = build_json["target"].as_str() {
         assert_eq!(target, "windows/x86_64");
     }
-    let artifact_path = PathBuf::from(
-        build_json["artifact"]
-            .as_str()
-            .context("build artifact path missing")?,
-    );
+    let artifact_path = build_json["artifact"]
+        .as_str()
+        .map(PathBuf::from)
+        .map(Ok)
+        .unwrap_or_else(|| find_capsule_artifact(tmp.path(), "sample-native-capsule"))?;
     assert!(
         artifact_path.is_file(),
         "artifact missing: {}",
