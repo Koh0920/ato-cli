@@ -374,6 +374,32 @@ fn prepare_sample_workspace(tmp: &TempDir) -> Result<PathBuf> {
     Ok(destination)
 }
 
+fn ensure_windows_tauri_icon(workspace: &Path) -> Result<()> {
+    let icon_path = workspace.join("src-tauri/icons/icon.ico");
+    if icon_path.exists() {
+        return Ok(());
+    }
+
+    if let Some(parent) = icon_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    // Minimal 1x1 PNG-backed ICO accepted by tauri-build on Windows.
+    const ICON_BYTES: &[u8] = &[
+        0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x20, 0x00, 0x44,
+        0x00, 0x00, 0x00, 0x16, 0x00, 0x00, 0x00, 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+        0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x08, 0x04, 0x00, 0x00, 0x00, 0xb5, 0x1c, 0x0c, 0x02, 0x00, 0x00, 0x00, 0x0b, 0x49,
+        0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0xfc, 0xff, 0x1f, 0x00, 0x03, 0x03, 0x02, 0x00, 0xef,
+        0xa3, 0x2b, 0x7b, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    fs::write(&icon_path, ICON_BYTES)
+        .with_context(|| format!("failed to write {}", icon_path.display()))?;
+    Ok(())
+}
+
 fn build_sample_app(sample_dir: &Path) -> Result<PathBuf> {
     let app_path =
         sample_dir.join("src-tauri/target/release/bundle/macos/sample-native-capsule.app");
@@ -945,6 +971,7 @@ fn e2e_native_delivery_windows_build_publish_install_run() -> Result<()> {
 
     let fixture_workspace = tmp.path().join("sample-native-capsule");
     copy_tree(&windows_fixture_project_dir(), &fixture_workspace)?;
+    ensure_windows_tauri_icon(&fixture_workspace)?;
 
     let Some((_guard, base_url)) = start_local_registry_or_skip(
         &ato,
