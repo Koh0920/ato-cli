@@ -1278,13 +1278,13 @@ fn project_with_roots_and_command_dir(
                 projected_command_dir.display()
             )
         })?;
-        if projected_command_path.exists() || fs::symlink_metadata(projected_command_path).is_ok() {
-            if !is_managed_projection_to(projected_command_path, projected_command_target)? {
-                bail!(
-                    "Projection command conflict: command path already exists: {}",
-                    projected_command_path.display()
-                );
-            }
+        if (projected_command_path.exists() || fs::symlink_metadata(projected_command_path).is_ok())
+            && !is_managed_projection_to(projected_command_path, projected_command_target)?
+        {
+            bail!(
+                "Projection command conflict: command path already exists: {}",
+                projected_command_path.display()
+            );
         }
     }
 
@@ -1772,7 +1772,7 @@ fn is_executable_file(path: &Path) -> Result<bool> {
     }
     #[cfg(unix)]
     {
-        return Ok(metadata.permissions().mode() & 0o111 != 0);
+        Ok(metadata.permissions().mode() & 0o111 != 0)
     }
     #[cfg(not(unix))]
     {
