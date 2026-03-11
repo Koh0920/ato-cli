@@ -38,6 +38,72 @@ ato registry serve --host 127.0.0.1 --port 18787 [--auth-token <token>]
 - Local finalize is currently fail-closed and limited to macOS darwin/arm64 with `codesign`.
 - Projection currently creates a macOS `~/Applications` symlink on macOS hosts, and a Linux `.desktop` launcher plus `~/.local/bin` symlink on Linux hosts.
 
+### Native Delivery contract (current canonical form)
+
+`capsule.toml` is the source of truth for project input. The current canonical contract is:
+
+```toml
+schema_version = "0.2"
+name = "my-app"
+version = "0.1.0"
+type = "app"
+default_target = "desktop"
+
+[targets.desktop]
+runtime = "source"
+driver = "native"
+entrypoint = "MyApp.app"
+```
+
+For this `.app`-entrypoint form, `ato` derives the current PoC defaults internally:
+
+- `artifact.framework = "tauri"`
+- `artifact.stage = "unsigned"`
+- `artifact.target = "darwin/arm64"`
+- `artifact.input = <targets.<default>.entrypoint>`
+- `finalize.tool = "codesign"`
+- `finalize.args = ["--deep", "--force", "--sign", "-", <artifact.input>]`
+
+If the native target is command-driven (`entrypoint = "sh"` plus `cmd = [...]`), then the build still needs explicit delivery metadata today. That metadata may live inline in `capsule.toml` as `[artifact]` + `[finalize]`, or in `ato.delivery.toml` as a compatibility sidecar. Partial inline metadata is rejected fail-closed.
+
+### Compatibility sidecar and artifact metadata flow
+
+- `ato.delivery.toml` is **not** the canonical project manifest anymore. It is an accepted compatibility input for command-mode native builds and a compatibility mirror for `.app`-entrypoint projects.
+- Build always stages `ato.delivery.toml` into the artifact payload, even when the source project used only canonical `capsule.toml`. This keeps the artifact self-describing for local finalize/install without requiring the original source tree.
+- `ato install`, `ato finalize`, and `ato project` read the staged artifact metadata plus `local-derivation.json`; they do not require the source checkout's sidecar to be present later.
+- Near-term policy: keep accepting `ato.delivery.toml` as backward-compatible input, but treat it as optional compatibility metadata rather than product-surface source of truth.
+
+### Stable vs experimental machine-readable contract
+
+For the current `schema_version = "0.1"` generation, the repo documents and test-guards the presence of these machine-readable fields:
+
+- `fetch.json`: `schema_version`, `scoped_id`, `version`, `registry`, `parent_digest`
+- build JSON: `build_strategy = "native-delivery"`, `schema_version`, `target`, `derived_from`
+- finalize JSON: `schema_version`, `derived_app_path`, `provenance_path`, `parent_digest`, `derived_digest`
+- `local-derivation.json`: `schema_version`, `parent_digest`, `derived_digest`, `framework`, `target`, `finalize_tool`, `finalized_at`
+- project JSON: `schema_version`, `projection_id`, `metadata_path`, `projected_path`, `derived_app_path`, `parent_digest`, `derived_digest`, `state`
+- unproject JSON: `schema_version`, `projection_id`, `metadata_path`, `projected_path`, `removed_projected_path`, `removed_metadata`, `state_before`
+- install JSON: `install_kind`, `launchable`, `local_derivation`, `projection`
+  - `install_kind = "NativeRequiresLocalDerivation"` means install succeeded, but the launchable path is the locally derived app bundle, not the stored `.capsule`
+  - `launchable.path` is the path a caller should use to open/run
+  - `local_derivation.provenance_path`, `parent_digest`, and `derived_digest` are the stable linkage between fetch/finalize/project/install
+  - `projection.metadata_path` is the stable recovery handle for `ato unproject` and for launcher state inspection
+
+These guarantees are intentionally narrow: additive fields may still appear, but removing or renaming the documented fields should be treated as a schema-version change.
+
+Still experimental:
+
+- exact on-disk directory layout under `~/.ato/fetches`, `~/.ato/apps`, and `~/.ato/native-delivery/projections`
+- any future additional keys beyond the stable fields above
+- advanced/debug command UX (`fetch`, `finalize`, `project`, `unproject`) beyond their current `schema_version = "0.1"` JSON envelopes
+- host/tool support beyond the current macOS darwin/arm64 + `codesign` PoC
+
+### Migration path
+
+1. **Current**: `capsule.toml` is canonical; `ato.delivery.toml` remains accepted as compatibility input/output metadata.
+2. **Next**: command-mode native builds keep working, but product docs and tooling point users at canonical `capsule.toml` first; sidecar use becomes optional wherever canonical manifest data is sufficient.
+3. **Later**: internal artifact metadata can be abstracted away from the user-facing sidecar name, while preserving the `schema_version = "0.1"` JSON/provenance contract for automation.
+
 ## Quick Start (Local)
 
 ```bash
