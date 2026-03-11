@@ -2835,11 +2835,25 @@ fn ensure_tree_writable(path: &Path) -> Result<()> {
     let file_type = metadata.file_type();
 
     if !file_type.is_symlink() {
-        let mut permissions = metadata.permissions();
-        if permissions.readonly() {
-            permissions.set_readonly(false);
-            fs::set_permissions(path, permissions)
-                .with_context(|| format!("Failed to set permissions on {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            let mode = metadata.permissions().mode();
+            if mode & 0o200 == 0 {
+                let mut permissions = metadata.permissions();
+                permissions.set_mode(mode | 0o200);
+                fs::set_permissions(path, permissions)
+                    .with_context(|| format!("Failed to set permissions on {}", path.display()))?;
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            let mut permissions = metadata.permissions();
+            if permissions.readonly() {
+                permissions.set_readonly(false);
+                fs::set_permissions(path, permissions)
+                    .with_context(|| format!("Failed to set permissions on {}", path.display()))?;
+            }
         }
     }
 
