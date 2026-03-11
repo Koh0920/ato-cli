@@ -223,6 +223,7 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     runs-on: "ubuntu-22.04"
     outputs:
+      hashes: ${{ steps.hashes.outputs.base64_subjects }}
       val: ${{ steps.host.outputs.manifest }}
     steps:
       - uses: actions/checkout@v6
@@ -265,7 +266,25 @@ jobs:
       - name: Cleanup
         run: |
           # Remove the granular manifests
-          rm -f artifacts/*-dist-manifest.json
+          rm -f artifacts/*-dist-manifest.json artifacts/dist-manifest.json
+      - id: hashes
+        name: Generate SLSA subjects
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t release_assets < <(find artifacts -maxdepth 1 -type f | sort)
+          if [[ "${#release_assets[@]}" -eq 0 ]]; then
+            echo "::error::No release assets found to attest"
+            exit 1
+          fi
+
+          sha256sum "${release_assets[@]}" > "$RUNNER_TEMP/release-subjects.txt"
+          {
+            echo "base64_subjects<<EOF"
+            base64 -w0 "$RUNNER_TEMP/release-subjects.txt"
+            echo
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
       - name: Create GitHub Release
         env:
           PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
@@ -313,10 +332,96 @@ jobs:
 
           VERSION="$VERSION" SOURCE_DIR="$SOURCE_DIR" ASSET_PREFIX="$ASSET_PREFIX" DEPLOY_ENV=production ./scripts/upload_release_to_r2.sh
 
+  sign-and-sbom:
+    needs:
+      - plan
+      - host
+    if: ${{ always() && needs.host.result == 'success' && needs.plan.outputs.publishing == 'true' }}
+    permissions:
+      contents: write
+      id-token: write
+    runs-on: "ubuntu-22.04"
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+    steps:
+      - name: Fetch artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: artifacts-*
+          path: artifacts
+          merge-multiple: true
+      - name: Cleanup manifests
+        shell: bash
+        run: rm -f artifacts/*-dist-manifest.json artifacts/dist-manifest.json
+      - id: syft
+        name: Install Syft
+        uses: anchore/sbom-action/download-syft@v0.23.1
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4.1.0
+      - name: Generate SBOMs and keyless signatures
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p generated
+
+          mapfile -t release_assets < <(find artifacts -maxdepth 1 -type f | sort)
+          if [[ "${#release_assets[@]}" -eq 0 ]]; then
+            echo "::error::No release assets found to sign"
+            exit 1
+          fi
+
+          syft_cmd='${{ steps.syft.outputs.cmd }}'
+
+          for asset in "${release_assets[@]}"; do
+            asset_name="$(basename "$asset")"
+
+            case "$asset_name" in
+              *.tar.xz|*.tar.gz|*.zip)
+                "$syft_cmd" "file:$asset" -o "spdx-json=generated/${asset_name}.sbom.spdx.json"
+                ;;
+            esac
+
+            cosign sign-blob --yes \
+              --output-signature "generated/${asset_name}.sig" \
+              --output-certificate "generated/${asset_name}.pem" \
+              "$asset"
+          done
+
+          shopt -s nullglob
+          for sbom in generated/*.sbom.spdx.json; do
+            sbom_name="$(basename "$sbom")"
+            cosign sign-blob --yes \
+              --output-signature "generated/${sbom_name}.sig" \
+              --output-certificate "generated/${sbom_name}.pem" \
+              "$sbom"
+          done
+          shopt -u nullglob
+      - name: Upload SBOMs and signatures
+        shell: bash
+        run: gh release upload "$RELEASE_TAG" generated/* --clobber
+
+  provenance:
+    needs:
+      - plan
+      - host
+    if: ${{ always() && needs.host.result == 'success' && needs.plan.outputs.publishing == 'true' }}
+    permissions:
+      actions: read
+      contents: write
+      id-token: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: ${{ needs.host.outputs.hashes }}
+      upload-assets: true
+      upload-tag-name: ${{ needs.plan.outputs.tag }}
+
   announce:
     needs:
       - plan
       - host
+      - sign-and-sbom
+      - provenance
     # use "always() && ..." to allow us to wait for all publish jobs while
     # still allowing individual publish jobs to skip themselves (for prereleases).
     # "host" however must run to completion, no skipping allowed!
