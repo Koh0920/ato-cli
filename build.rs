@@ -134,7 +134,7 @@ fn ensure_windows_bootstrapped_npm(
         powershell_quote_path(&sums_path),
     ))?;
     run_powershell(&format!(
-        "$expected=(Get-Content '{}' | Where-Object {{ $_ -match ' {base_name}\\.zip$' }} | ForEach-Object {{ ($_ -split '\\s+')[0] }} | Select-Object -First 1); if (-not $expected) {{ throw 'missing checksum for {base_name}.zip' }}; $actual=(Get-FileHash -Algorithm SHA256 '{}').Hash.ToLower(); if ($actual -ne $expected.ToLower()) {{ throw \"checksum mismatch: expected=$expected actual=$actual\" }}",
+        "$expected=(Get-Content '{}' | Where-Object {{ $_ -match ' {base_name}\\.zip$' }} | ForEach-Object {{ ($_ -split '\\s+')[0] }} | Select-Object -First 1); if (-not $expected) {{ throw 'missing checksum for {base_name}.zip' }}; $sha256=[System.Security.Cryptography.SHA256]::Create(); try {{ $bytes=[System.IO.File]::ReadAllBytes('{}'); $actual=[System.BitConverter]::ToString($sha256.ComputeHash($bytes)).Replace('-', '').ToLower() }} finally {{ $sha256.Dispose() }}; if ($actual -ne $expected.ToLower()) {{ throw \"checksum mismatch: expected=$expected actual=$actual\" }}",
         powershell_quote_path(&sums_path),
         powershell_quote_path(&archive_path),
     ))?;

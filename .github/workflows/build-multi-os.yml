@@ -2,12 +2,11 @@ name: Build (Multi OS)
 
 on:
   workflow_dispatch:
+  pull_request:
   push:
     branches:
       - dev
       - main
-    tags:
-      - "v*.*.*"
 
 permissions:
   contents: read
@@ -182,11 +181,11 @@ jobs:
           cp "$binary_path" "dist/payload/${{ matrix.binary_name }}"
 
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
-            archive_name="ato-${resolved_target}.zip"
+            archive_name="ato-cli-${resolved_target}.zip"
             powershell.exe -NoProfile -Command "Push-Location 'dist/payload'; Compress-Archive -Path '${{ matrix.binary_name }}' -DestinationPath '../${archive_name}' -Force; Pop-Location"
           else
-            archive_name="ato-${resolved_target}.tar.gz"
-            tar -C dist/payload -czf "dist/${archive_name}" "${{ matrix.binary_name }}"
+            archive_name="ato-cli-${resolved_target}.tar.xz"
+            tar -C dist/payload -cJf "dist/${archive_name}" "${{ matrix.binary_name }}"
           fi
 
           archive_path="dist/${archive_name}"
@@ -213,8 +212,8 @@ jobs:
         with:
           name: release-${{ matrix.artifact_name }}
           path: |
-            dist/ato-*.tar.gz
-            dist/ato-*.zip
+            dist/ato-cli-*.tar.xz
+            dist/ato-cli-*.zip
             dist/SHA256SUMS
             dist/target-triple.txt
           if-no-files-found: error
@@ -257,7 +256,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p ato-bin
-          archive="$(find ato-smoke -maxdepth 1 -type f \( -name 'ato-*.tar.gz' -o -name 'ato-*.zip' \) | head -n1)"
+          archive="$(find ato-smoke -maxdepth 1 -type f \( -name 'ato-cli-*.tar.xz' -o -name 'ato-cli-*.zip' \) | head -n1)"
           if [[ -z "$archive" ]]; then
             echo "No archive found in ato-smoke" >&2
             exit 1
@@ -268,7 +267,7 @@ jobs:
             dest_win="$(cygpath -w "$PWD/ato-bin")"
             powershell.exe -NoProfile -Command "Expand-Archive -Path '$archive_win' -DestinationPath '$dest_win' -Force"
           else
-            tar -C ato-bin -xzf "$archive"
+            tar -C ato-bin -xJf "$archive"
           fi
 
           binary_path="$PWD/ato-bin/${{ matrix.binary_name }}"
@@ -439,189 +438,3 @@ jobs:
           name: tar-pack-benchmark
           path: /tmp/tar-pack-benchmark
           if-no-files-found: error
-
-  upload_r2:
-    name: Upload to R2
-    needs:
-      - build
-      - smoke
-    runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
-    env:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      DEFAULT_BUCKET_STAGING: ${{ secrets.R2_BUCKET_STAGING }}
-      DEFAULT_BUCKET_PRODUCTION: ${{ secrets.R2_BUCKET_PRODUCTION }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Check tag commit is on main
-        id: tag_main_check
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          git fetch --no-tags origin main:refs/remotes/origin/main
-
-          if git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
-            echo "on_main=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "on_main=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Skipping R2 upload because tag commit is not contained in origin/main."
-          fi
-
-      - name: Check Cloudflare secrets
-        id: secrets_check
-        if: ${{ steps.tag_main_check.outputs.on_main == 'true' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [[ -z "${CLOUDFLARE_API_TOKEN:-}" || -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]]; then
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Skipping R2 upload because CLOUDFLARE_API_TOKEN or CLOUDFLARE_ACCOUNT_ID is not set."
-          else
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Download packaged artifacts
-        if: ${{ steps.tag_main_check.outputs.on_main == 'true' && steps.secrets_check.outputs.available == 'true' }}
-        uses: actions/download-artifact@v4
-        with:
-          pattern: release-*
-          path: /tmp/ato-ci-artifacts
-
-      - name: Set up Node.js
-        if: ${{ steps.tag_main_check.outputs.on_main == 'true' && steps.secrets_check.outputs.available == 'true' }}
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-
-      - name: Install Wrangler CLI
-        if: ${{ steps.tag_main_check.outputs.on_main == 'true' && steps.secrets_check.outputs.available == 'true' }}
-        run: npm install -g wrangler@4
-
-      - name: Prepare upload bundle
-        id: prepare
-        if: ${{ steps.tag_main_check.outputs.on_main == 'true' && steps.secrets_check.outputs.available == 'true' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [[ -z "${CLOUDFLARE_API_TOKEN:-}" || -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]]; then
-            echo "Missing required secrets: CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID" >&2
-            exit 1
-          fi
-
-          cargo_version="$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -n1)"
-          if [[ -z "$cargo_version" ]]; then
-            echo "Failed to read version from Cargo.toml" >&2
-            exit 1
-          fi
-
-          if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
-            release_version="${GITHUB_REF#refs/tags/}"
-          elif [[ "${{ github.event_name }}" == "push" ]]; then
-            release_version="${cargo_version}-${GITHUB_SHA::7}"
-          else
-            release_version="$cargo_version"
-          fi
-
-          semver_alias_enabled="0"
-          if [[ "${GITHUB_REF:-}" == "refs/tags/v${cargo_version}" ]]; then
-            semver_alias_enabled="1"
-          fi
-
-          deploy_env="staging"
-          update_latest="1"
-          bucket_input=""
-          source_dir="/tmp/ato-release/${release_version}"
-          mkdir -p "$source_dir"
-
-          mapfile -t archives < <(find /tmp/ato-ci-artifacts -type f \( -name 'ato-*.tar.gz' -o -name 'ato-*.zip' \) | sort)
-          mapfile -t checksum_parts < <(find /tmp/ato-ci-artifacts -type f -name 'SHA256SUMS' | sort)
-
-          if [[ "${#archives[@]}" -eq 0 ]]; then
-            echo "No packaged archives found under /tmp/ato-ci-artifacts" >&2
-            exit 1
-          fi
-          if [[ "${#checksum_parts[@]}" -eq 0 ]]; then
-            echo "No SHA256SUMS files found under /tmp/ato-ci-artifacts" >&2
-            exit 1
-          fi
-
-          cp "${archives[@]}" "$source_dir/"
-          : > "$source_dir/SHA256SUMS"
-          for checksum_part in "${checksum_parts[@]}"; do
-            cat "$checksum_part" >> "$source_dir/SHA256SUMS"
-          done
-          sed -i.bak '/^[[:space:]]*$/d' "$source_dir/SHA256SUMS"
-          rm -f "$source_dir/SHA256SUMS.bak"
-
-          for archive in "$source_dir"/ato-*.tar.gz "$source_dir"/ato-*.zip; do
-            if [[ ! -f "$archive" ]]; then
-              continue
-            fi
-            archive_name="$(basename "$archive")"
-            if ! grep -qE "[[:xdigit:]]{64}[[:space:]]+\*?${archive_name}$" "$source_dir/SHA256SUMS"; then
-              echo "Missing checksum entry for ${archive_name}" >&2
-              exit 1
-            fi
-          done
-
-          echo "release_version=$release_version" >> "$GITHUB_OUTPUT"
-          echo "cargo_version=$cargo_version" >> "$GITHUB_OUTPUT"
-          echo "deploy_env=$deploy_env" >> "$GITHUB_OUTPUT"
-          echo "update_latest=$update_latest" >> "$GITHUB_OUTPUT"
-          echo "semver_alias_enabled=$semver_alias_enabled" >> "$GITHUB_OUTPUT"
-          echo "bucket=$bucket_input" >> "$GITHUB_OUTPUT"
-          echo "source_dir=$source_dir" >> "$GITHUB_OUTPUT"
-
-      - name: Upload archives to R2
-        if: ${{ steps.tag_main_check.outputs.on_main == 'true' && steps.secrets_check.outputs.available == 'true' }}
-        shell: bash
-        env:
-          VERSION: ${{ steps.prepare.outputs.release_version }}
-          DEPLOY_ENV: ${{ steps.prepare.outputs.deploy_env }}
-          UPDATE_LATEST: ${{ steps.prepare.outputs.update_latest }}
-          BUCKET: ${{ steps.prepare.outputs.bucket }}
-          SOURCE_DIR: ${{ steps.prepare.outputs.source_dir }}
-          WRANGLER_CONFIG: ""
-        run: ./scripts/upload_release_to_r2.sh
-
-      - name: Upload archives to R2 (production mirror for main tag push)
-        if: ${{ steps.tag_main_check.outputs.on_main == 'true' && steps.secrets_check.outputs.available == 'true' }}
-        shell: bash
-        env:
-          VERSION: ${{ steps.prepare.outputs.release_version }}
-          DEPLOY_ENV: production
-          UPDATE_LATEST: ${{ steps.prepare.outputs.update_latest }}
-          SOURCE_DIR: ${{ steps.prepare.outputs.source_dir }}
-          WRANGLER_CONFIG: ""
-        run: ./scripts/upload_release_to_r2.sh
-
-      - name: Upload archives to R2 (semver alias for main tag push)
-        if: ${{ steps.tag_main_check.outputs.on_main == 'true' && steps.secrets_check.outputs.available == 'true' && steps.prepare.outputs.semver_alias_enabled == '1' }}
-        shell: bash
-        env:
-          VERSION: ${{ steps.prepare.outputs.cargo_version }}
-          DEPLOY_ENV: ${{ steps.prepare.outputs.deploy_env }}
-          UPDATE_LATEST: 0
-          BUCKET: ${{ steps.prepare.outputs.bucket }}
-          SOURCE_DIR: ${{ steps.prepare.outputs.source_dir }}
-          WRANGLER_CONFIG: ""
-        run: ./scripts/upload_release_to_r2.sh
-
-      - name: Upload archives to R2 (production semver alias for main tag push)
-        if: ${{ steps.tag_main_check.outputs.on_main == 'true' && steps.secrets_check.outputs.available == 'true' && steps.prepare.outputs.semver_alias_enabled == '1' }}
-        shell: bash
-        env:
-          VERSION: ${{ steps.prepare.outputs.cargo_version }}
-          DEPLOY_ENV: production
-          UPDATE_LATEST: 0
-          SOURCE_DIR: ${{ steps.prepare.outputs.source_dir }}
-          WRANGLER_CONFIG: ""
-        run: ./scripts/upload_release_to_r2.sh

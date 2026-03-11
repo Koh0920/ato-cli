@@ -87,6 +87,24 @@
   gap: 4px;
 }
 
+.platform-badge {
+  min-height: 22px;
+}
+
+.platform-badge-icon {
+  flex: 0 0 auto;
+}
+
+.platform-badge-copy {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+}
+
+.platform-badge-arch {
+  opacity: 0.72;
+}
+
 .badge-accent {
   background: var(--accent-lt);
   color: var(--accent);
@@ -256,6 +274,98 @@
 
 .confirm-note.error {
   color: var(--red);
+}
+
+.permission-mode-list {
+  display: grid;
+  gap: 8px;
+}
+
+.permission-mode-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 10px;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 10px;
+  align-items: start;
+  cursor: pointer;
+  transition: border-color 120ms ease, background-color 120ms ease, opacity 120ms ease;
+}
+
+.permission-mode-card.selected {
+  border-color: var(--accent-md);
+  background: var(--accent-lt);
+}
+
+.permission-mode-card.permission-mode-standard.selected {
+  border-color: var(--red-border);
+  background: var(--red-lt);
+}
+
+.permission-mode-card.permission-mode-dangerous.selected {
+  border-color: var(--yellow);
+  background: var(--yellow-lt);
+}
+
+.permission-mode-card.disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.permission-mode-input {
+  margin: 2px 0 0;
+  accent-color: var(--accent);
+}
+
+.permission-mode-copy {
+  display: grid;
+  gap: 4px;
+}
+
+.permission-mode-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.permission-mode-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-1);
+}
+
+.permission-mode-tag {
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  padding: 2px 6px;
+  font-size: 10px;
+  line-height: 1;
+  color: var(--text-3);
+  background: var(--surface);
+}
+
+.permission-mode-card.permission-mode-standard .permission-mode-tag {
+  color: var(--red);
+  border-color: var(--red-border);
+}
+
+.permission-mode-card.permission-mode-sandbox .permission-mode-tag {
+  color: var(--green);
+  border-color: var(--green-border);
+}
+
+.permission-mode-card.permission-mode-dangerous .permission-mode-tag {
+  color: var(--yellow);
+  border-color: var(--border);
+}
+
+.permission-mode-description {
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-3);
 }
 
 .toast-root {
