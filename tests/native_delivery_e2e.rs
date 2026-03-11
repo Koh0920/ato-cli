@@ -1048,7 +1048,17 @@ fn e2e_native_delivery_windows_build_publish_install_run() -> Result<()> {
         .as_str()
         .map(PathBuf::from)
         .map(Ok)
-        .unwrap_or_else(|| find_capsule_artifact(tmp.path(), "sample-native-capsule"))?;
+        .unwrap_or_else(|| {
+            let default_artifact =
+                fixture_workspace.join("dist/sample-native-capsule-0.1.1.capsule");
+            if default_artifact.is_file() {
+                return Ok(default_artifact);
+            }
+            find_capsule_artifact(
+                &fixture_workspace.join("dist"),
+                "sample-native-capsule-0.1.1",
+            )
+        })?;
     assert!(
         artifact_path.is_file(),
         "artifact missing: {}",
