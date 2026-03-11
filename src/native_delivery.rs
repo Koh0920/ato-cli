@@ -3,7 +3,7 @@ use chrono::{SecondsFormat, Utc};
 use goblin::Object;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::{Cursor, Read, Write};
+use std::io::{self, Cursor, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use walkdir::WalkDir;
@@ -11,6 +11,8 @@ use walkdir::WalkDir;
 use crate::install;
 use crate::registry::RegistryResolver;
 
+#[cfg(windows)]
+use mslnk::ShellLink;
 #[cfg(unix)]
 use std::os::unix::fs::{symlink, PermissionsExt};
 #[cfg(windows)]
@@ -199,7 +201,7 @@ impl NativeArtifactKind {
     fn from_path(path: &Path) -> Self {
         if path_has_extension(path, "app") {
             Self::MacOsAppBundle
-        } else if path_has_extension(path, "exe") || path.is_file() {
+        } else if native_file_candidate_extension(path).is_some() || path.is_file() {
             Self::File
         } else {
             Self::Directory
@@ -916,7 +918,9 @@ fn ensure_delivery_config_matches_context(
     if actual.artifact.framework != expected.artifact.framework
         || actual.artifact.stage != expected.artifact.stage
         || actual.artifact.target != expected.artifact.target
+        || actual.artifact.input != expected.artifact.input
         || actual.finalize.tool != expected.finalize.tool
+        || actual.finalize.args != expected.finalize.args
     {
         bail!(
             "{} native delivery config conflicts with the default target contract",
@@ -977,8 +981,8 @@ pub fn execute_project(
     derived_app_path: &Path,
     launcher_dir: Option<&Path>,
 ) -> Result<ProjectResult> {
-    if !host_supports_finalize() {
-        bail!("ato project currently supports macOS hosts only");
+    if !host_supports_projection() {
+        bail!("ato project currently supports macOS and Windows hosts only");
     }
 
     let launcher_dir = resolve_launcher_dir(launcher_dir)?;
@@ -987,16 +991,16 @@ pub fn execute_project(
 }
 
 pub fn execute_project_ls() -> Result<ProjectionListResult> {
-    if !host_supports_finalize() {
-        bail!("ato project ls currently supports macOS hosts only");
+    if !host_supports_projection() {
+        bail!("ato project ls currently supports macOS and Windows hosts only");
     }
 
     list_projections(&projections_root()?)
 }
 
 pub fn execute_unproject(reference: &str) -> Result<UnprojectResult> {
-    if !host_supports_finalize() {
-        bail!("ato unproject currently supports macOS hosts only");
+    if !host_supports_projection() {
+        bail!("ato unproject currently supports macOS and Windows hosts only");
     }
 
     unproject_with_metadata_root(reference, &projections_root()?)
@@ -1120,24 +1124,19 @@ fn project_with_roots(
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("Derived app path has no terminal name"))?
         .to_os_string();
-    let projected_path = launcher_dir.join(&app_name);
-    let projection_id = build_projection_id(
-        &source.derived_app_path,
-        &projected_path,
-        &source.derived_digest,
-    );
-    let metadata_path = metadata_root.join(format!("{}.json", projection_id));
+    let projected_base_path = launcher_dir.join(&app_name);
+    let projected_candidates = projection_candidate_paths(&projected_base_path);
 
     let existing = load_projection_records(metadata_root)?;
     for record in &existing {
-        if record.metadata.projection_id == projection_id {
+        if paths_match(&record.metadata.derived_app_path, &source.derived_app_path)? {
             let status = inspect_projection(&record.metadata, &record.metadata_path)?;
             if status.state == "ok" {
                 return Ok(ProjectResult {
-                    projection_id,
-                    metadata_path,
-                    launcher_dir,
-                    projected_path,
+                    projection_id: record.metadata.projection_id.clone(),
+                    metadata_path: record.metadata_path.clone(),
+                    launcher_dir: record.metadata.launcher_dir.clone(),
+                    projected_path: record.metadata.projected_path.clone(),
                     derived_app_path: source.derived_app_path.clone(),
                     parent_digest: source.parent_digest.clone(),
                     derived_digest: source.derived_digest.clone(),
@@ -1147,32 +1146,65 @@ fn project_with_roots(
                     schema_version: record.metadata.schema_version.clone(),
                 });
             }
-            break;
-        }
-
-        if paths_match(&record.metadata.derived_app_path, &source.derived_app_path)? {
             bail!(
                 "Derived app is already projected via '{}' (id {}). Use 'ato unproject' first.",
                 record.metadata.projected_path.display(),
                 record.metadata.projection_id
             );
         }
-        if paths_match(&record.metadata.projected_path, &projected_path)? {
+        let mut candidate_conflict = false;
+        for candidate in &projected_candidates {
+            if paths_match(&record.metadata.projected_path, candidate)? {
+                candidate_conflict = true;
+                break;
+            }
+        }
+        if candidate_conflict {
             bail!(
                 "Projection name conflict: '{}' is already managed by projection {}",
-                projected_path.display(),
+                record.metadata.projected_path.display(),
                 record.metadata.projection_id
             );
         }
     }
 
-    if projected_path.exists() || fs::symlink_metadata(&projected_path).is_ok() {
-        if is_managed_symlink_to(&projected_path, &source.derived_app_path)? {
+    if let Some(projected_path) =
+        find_existing_projection_path(&projected_base_path, &source.derived_app_path)?
+    {
+        let projection_id = build_projection_id(
+            &source.derived_app_path,
+            &projected_path,
+            &source.derived_digest,
+        );
+        let metadata_path = metadata_root.join(format!("{}.json", projection_id));
+        return Ok(ProjectResult {
+            projection_id,
+            metadata_path,
+            launcher_dir,
+            projected_path,
+            derived_app_path: source.derived_app_path.clone(),
+            parent_digest: source.parent_digest.clone(),
+            derived_digest: source.derived_digest.clone(),
+            state: "ok".to_string(),
+            problems: Vec::new(),
+            created: false,
+            schema_version: DELIVERY_SCHEMA_VERSION.to_string(),
+        });
+    }
+
+    if let Some(conflict_path) = first_existing_projection_candidate(&projected_base_path)? {
+        if is_managed_projection_to(&conflict_path, &source.derived_app_path)? {
+            let projection_id = build_projection_id(
+                &source.derived_app_path,
+                &conflict_path,
+                &source.derived_digest,
+            );
+            let metadata_path = metadata_root.join(format!("{}.json", projection_id));
             return Ok(ProjectResult {
                 projection_id,
                 metadata_path,
                 launcher_dir,
-                projected_path,
+                projected_path: conflict_path,
                 derived_app_path: source.derived_app_path.clone(),
                 parent_digest: source.parent_digest.clone(),
                 derived_digest: source.derived_digest.clone(),
@@ -1184,40 +1216,45 @@ fn project_with_roots(
         }
         bail!(
             "Projection name conflict: launcher path already exists: {}",
-            projected_path.display()
+            conflict_path.display()
         );
     }
 
-    let metadata = ProjectionMetadata {
-        schema_version: DELIVERY_SCHEMA_VERSION.to_string(),
-        projection_id: projection_id.clone(),
-        projection_kind: PROJECTION_KIND.to_string(),
-        projected_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-        launcher_dir: launcher_dir.clone(),
-        projected_path: projected_path.clone(),
-        derived_app_path: source.derived_app_path.clone(),
-        provenance_path: source.provenance_path.clone(),
-        parent_digest: source.parent_digest.clone(),
-        derived_digest: source.derived_digest.clone(),
-        scoped_id: source.scoped_id.clone(),
-        version: source.version.clone(),
-        registry: source.registry.clone(),
-        artifact_blake3: source.artifact_blake3.clone(),
-        framework: source.framework.clone(),
-        target: source.target.clone(),
-        finalized_at: source.finalized_at.clone(),
-    };
-
     let result = (|| -> Result<ProjectResult> {
-        create_projection_symlink(&source.derived_app_path, &projected_path).with_context(
-            || {
-                format!(
-                    "Failed to create symlink {} -> {}",
-                    projected_path.display(),
-                    source.derived_app_path.display()
-                )
-            },
-        )?;
+        let projected_path =
+            create_projection_symlink(&source.derived_app_path, &projected_base_path)
+                .with_context(|| {
+                    format!(
+                        "Failed to create projection {} -> {}",
+                        projected_base_path.display(),
+                        source.derived_app_path.display()
+                    )
+                })?;
+        let projection_id = build_projection_id(
+            &source.derived_app_path,
+            &projected_path,
+            &source.derived_digest,
+        );
+        let metadata_path = metadata_root.join(format!("{}.json", projection_id));
+        let metadata = ProjectionMetadata {
+            schema_version: DELIVERY_SCHEMA_VERSION.to_string(),
+            projection_id: projection_id.clone(),
+            projection_kind: PROJECTION_KIND.to_string(),
+            projected_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            launcher_dir: launcher_dir.clone(),
+            projected_path: projected_path.clone(),
+            derived_app_path: source.derived_app_path.clone(),
+            provenance_path: source.provenance_path.clone(),
+            parent_digest: source.parent_digest.clone(),
+            derived_digest: source.derived_digest.clone(),
+            scoped_id: source.scoped_id.clone(),
+            version: source.version.clone(),
+            registry: source.registry.clone(),
+            artifact_blake3: source.artifact_blake3.clone(),
+            framework: source.framework.clone(),
+            target: source.target.clone(),
+            finalized_at: source.finalized_at.clone(),
+        };
         write_json_pretty(&metadata_path, &metadata)?;
         let status = inspect_projection(&metadata, &metadata_path)?;
         Ok(ProjectResult {
@@ -1236,8 +1273,9 @@ fn project_with_roots(
     })();
 
     if result.is_err() {
-        let _ = fs::remove_file(&projected_path);
-        let _ = fs::remove_file(&metadata_path);
+        if let Some(path) = first_existing_projection_candidate(&projected_base_path)? {
+            let _ = remove_projection_path(&path);
+        }
     }
     result
 }
@@ -1263,33 +1301,7 @@ fn unproject_with_metadata_root(reference: &str, metadata_root: &Path) -> Result
     let status = inspect_projection(&record.metadata, &record.metadata_path)?;
     let schema_version = record.metadata.schema_version.clone();
 
-    let mut removed_projected_path = false;
-    match fs::symlink_metadata(&record.metadata.projected_path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            fs::remove_file(&record.metadata.projected_path).with_context(|| {
-                format!(
-                    "Failed to remove projection symlink: {}",
-                    record.metadata.projected_path.display()
-                )
-            })?;
-            removed_projected_path = true;
-        }
-        Ok(_) => {
-            bail!(
-                "Refusing to remove non-symlink projected path: {}",
-                record.metadata.projected_path.display()
-            );
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            return Err(err).with_context(|| {
-                format!(
-                    "Failed to inspect projected path: {}",
-                    record.metadata.projected_path.display()
-                )
-            })
-        }
-    }
+    let removed_projected_path = remove_projection_path(&record.metadata.projected_path)?;
 
     fs::remove_file(&record.metadata_path).with_context(|| {
         format!(
@@ -1472,7 +1484,7 @@ fn load_projection_source(derived_app_path: &Path) -> Result<ProjectionSource> {
     let provenance_path = derived_dir.join(PROVENANCE_FILE);
     let raw = fs::read_to_string(&provenance_path).with_context(|| {
         format!(
-            "ato project requires an ato finalize output containing {} next to the .app: {}",
+            "ato project requires an ato finalize output containing {} next to the derived app: {}",
             PROVENANCE_FILE,
             provenance_path.display()
         )
@@ -1489,7 +1501,7 @@ fn load_projection_source(derived_app_path: &Path) -> Result<ProjectionSource> {
     }
     if !supports_projection_target(&provenance.target) {
         bail!(
-            "Projection input target '{}' is unsupported; expected a darwin/<arch> target",
+            "Projection input target '{}' is unsupported; expected a darwin/<arch> or windows/<arch> target",
             provenance.target
         );
     }
@@ -1602,39 +1614,13 @@ fn inspect_projection(
         problems.push(format!("unsupported_target:{}", metadata.target));
     }
 
-    match fs::symlink_metadata(&metadata.projected_path) {
-        Ok(projected_meta) if projected_meta.file_type().is_symlink() => {
-            let link_target = fs::read_link(&metadata.projected_path).with_context(|| {
-                format!(
-                    "Failed to read projection symlink: {}",
-                    metadata.projected_path.display()
-                )
-            })?;
-            let resolved_target = if link_target.is_absolute() {
-                link_target
-            } else {
-                metadata
-                    .projected_path
-                    .parent()
-                    .unwrap_or_else(|| Path::new("."))
-                    .join(link_target)
-            };
-            if !paths_match(&resolved_target, &metadata.derived_app_path)? {
-                problems.push("projected_symlink_target_mismatch".to_string());
-            }
+    match inspect_projection_path(&metadata.projected_path, &metadata.derived_app_path)? {
+        ProjectionPathStatus::MatchesTarget => {}
+        ProjectionPathStatus::TargetMismatch => {
+            problems.push("projected_symlink_target_mismatch".to_string())
         }
-        Ok(_) => problems.push("projected_path_replaced".to_string()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            problems.push("projected_path_missing".to_string())
-        }
-        Err(err) => {
-            return Err(err).with_context(|| {
-                format!(
-                    "Failed to inspect projected path: {}",
-                    metadata.projected_path.display()
-                )
-            })
-        }
+        ProjectionPathStatus::Replaced => problems.push("projected_path_replaced".to_string()),
+        ProjectionPathStatus::Missing => problems.push("projected_path_missing".to_string()),
     }
 
     if !metadata.derived_app_path.exists() {
@@ -1765,15 +1751,12 @@ fn validate_delivery_config(config: &DeliveryConfig) -> Result<()> {
     if input.is_empty() {
         bail!("artifact.input must not be empty");
     }
-    validate_finalize_tool(config.finalize.tool.trim())?;
-    if config
-        .finalize
-        .args
-        .iter()
-        .any(|argument| argument.trim().is_empty())
-    {
-        bail!("finalize.args must not contain empty arguments");
+    let tool = config.finalize.tool.trim();
+    if tool.is_empty() {
+        bail!("finalize.tool must not be empty");
     }
+    validate_finalize_tool(tool)?;
+    validate_finalize_args(tool, &config.finalize.args, input)?;
     Ok(())
 }
 
@@ -1784,12 +1767,164 @@ fn validate_delivery_target(target: &str) -> Result<()> {
     if os.is_empty() || arch.is_empty() || segments.next().is_some() {
         bail!("artifact.target must use the '<os>/<arch>' format");
     }
+    let normalized_os = normalize_delivery_os(os);
+    let normalized_arch = normalize_delivery_arch(arch);
+    if !matches!(normalized_os, "darwin" | "linux" | "windows")
+        || !matches!(normalized_arch, "arm64" | "x86_64")
+    {
+        bail!(
+            "Unsupported artifact.target '{}'; expected darwin|linux|windows with arm64|x86_64",
+            target
+        );
+    }
     Ok(())
 }
 
 fn validate_finalize_tool(tool: &str) -> Result<()> {
     if tool.is_empty() {
         bail!("finalize.tool must not be empty");
+    }
+    if tool.chars().any(char::is_control) {
+        bail!(
+            "finalize.tool '{}' must not contain control characters",
+            tool
+        );
+    }
+    Ok(())
+}
+
+fn validate_finalize_args(tool: &str, args: &[String], input: &str) -> Result<()> {
+    if args.iter().any(|argument| argument.trim().is_empty()) {
+        bail!("finalize.args must not contain empty arguments");
+    }
+    if tool.eq_ignore_ascii_case("codesign") {
+        return validate_codesign_finalize_args(args, input);
+    }
+    if tool.eq_ignore_ascii_case("signtool") {
+        return validate_signtool_finalize_args(args, input);
+    }
+    Ok(())
+}
+
+fn validate_codesign_finalize_args(args: &[String], input: &str) -> Result<()> {
+    let mut expects_value_for: Option<&str> = None;
+    let mut saw_input = false;
+
+    for argument in args {
+        let trimmed = argument.trim();
+        if let Some(option) = expects_value_for.take() {
+            if option == "--sign" || option == "--timestamp" || option == "--options" {
+                continue;
+            }
+            if trimmed == input {
+                saw_input = true;
+            }
+            continue;
+        }
+
+        match trimmed {
+            "--deep" | "--force" | "--strict" | "--verbose" => {}
+            "--sign" | "--options" | "--entitlements" | "--requirements" | "--timestamp"
+            | "--prefix" | "--identifier" => {
+                expects_value_for = Some(trimmed);
+            }
+            value if value.starts_with("--timestamp=") => {}
+            value if value == input => saw_input = true,
+            _ => {
+                bail!(
+                    "Unsupported finalize.args entry '{}' for finalize.tool '{}'",
+                    trimmed,
+                    "codesign"
+                );
+            }
+        }
+    }
+
+    if let Some(option) = expects_value_for {
+        bail!("finalize.args is missing a value for '{}'", option);
+    }
+    if !saw_input {
+        bail!(
+            "finalize.args must include artifact.input '{}' for finalize.tool '{}'",
+            input,
+            "codesign"
+        );
+    }
+    Ok(())
+}
+
+fn validate_signtool_finalize_args(args: &[String], input: &str) -> Result<()> {
+    // Common `signtool sign` switches that do not take a following value.
+    const SIGNTOOL_BOOLEAN_SWITCHES: &[&str] =
+        &["a", "as", "debug", "nph", "ph", "q", "sm", "uw", "v"];
+    // Common `signtool sign` switches that require one following value.
+    const SIGNTOOL_VALUE_SWITCHES: &[&str] = &[
+        "ac", "c", "csp", "d", "dg", "di", "ds", "du", "f", "fd", "i", "kc", "n", "p", "p7ce",
+        "p7co", "pg", "r", "s", "sha1", "t", "td", "tr", "u",
+    ];
+
+    let mut arguments = args.iter();
+    let Some(command) = arguments.next() else {
+        bail!("finalize.args must not be empty");
+    };
+    if !command.trim().eq_ignore_ascii_case("sign") {
+        bail!(
+            "Unsupported finalize.args subcommand '{}' for finalize.tool '{}'",
+            command.trim(),
+            "signtool"
+        );
+    }
+
+    let mut expects_value_for: Option<String> = None;
+    let mut saw_input = false;
+    for argument in arguments {
+        let trimmed = argument.trim();
+        if expects_value_for.take().is_some() {
+            if trimmed == input {
+                saw_input = true;
+            }
+            continue;
+        }
+
+        if trimmed == input {
+            saw_input = true;
+            continue;
+        }
+
+        let Some(option) = trimmed
+            .strip_prefix('/')
+            .or_else(|| trimmed.strip_prefix('-'))
+        else {
+            bail!(
+                "Unsupported finalize.args entry '{}' for finalize.tool '{}'",
+                trimmed,
+                "signtool"
+            );
+        };
+        let normalized = option.to_ascii_lowercase();
+        if SIGNTOOL_BOOLEAN_SWITCHES.contains(&normalized.as_str()) {
+            continue;
+        }
+        if SIGNTOOL_VALUE_SWITCHES.contains(&normalized.as_str()) {
+            expects_value_for = Some(trimmed.to_string());
+            continue;
+        }
+        bail!(
+            "Unsupported finalize.args entry '{}' for finalize.tool '{}'",
+            trimmed,
+            "signtool"
+        );
+    }
+
+    if let Some(option) = expects_value_for {
+        bail!("finalize.args is missing a value for '{}'", option);
+    }
+    if !saw_input {
+        bail!(
+            "finalize.args must include artifact.input '{}' for finalize.tool '{}'",
+            input,
+            "signtool"
+        );
     }
     Ok(())
 }
@@ -1860,7 +1995,10 @@ fn delivery_target_os_family(target: &str) -> Option<&str> {
 }
 
 fn supports_projection_target(target: &str) -> bool {
-    matches!(delivery_target_os_family(target), Some("darwin"))
+    matches!(
+        delivery_target_os_family(target),
+        Some("darwin" | "windows")
+    )
 }
 
 fn resolve_native_build_working_dir(
@@ -1924,6 +2062,7 @@ fn discover_nearby_native_artifacts(expected_path: &Path, max_depth: usize) -> V
     };
 
     let kind = NativeArtifactKind::from_path(expected_path);
+    let expected_file_extension = native_file_candidate_extension(expected_path);
     let mut bundles = WalkDir::new(&search_root)
         .max_depth(max_depth)
         .into_iter()
@@ -1933,8 +2072,9 @@ fn discover_nearby_native_artifacts(expected_path: &Path, max_depth: usize) -> V
             NativeArtifactKind::MacOsAppBundle => path.is_dir() && path_has_extension(path, "app"),
             NativeArtifactKind::File => {
                 path.is_file()
-                    && (!path_has_extension(expected_path, "exe")
-                        || path_has_extension(path, "exe"))
+                    && expected_file_extension
+                        .map(|extension| path_has_extension(path, extension))
+                        .unwrap_or(true)
             }
             NativeArtifactKind::Directory => path.is_dir(),
         })
@@ -1963,8 +2103,7 @@ fn format_nearby_native_artifact_candidates(
     let kind = NativeArtifactKind::from_path(expected_path);
     let label = match kind {
         NativeArtifactKind::MacOsAppBundle => ".app bundle",
-        NativeArtifactKind::File if path_has_extension(expected_path, "exe") => ".exe",
-        NativeArtifactKind::File => "file",
+        NativeArtifactKind::File => native_file_candidate_label(expected_path).unwrap_or("file"),
         NativeArtifactKind::Directory => "directory",
     };
     if candidates.is_empty() {
@@ -2340,7 +2479,9 @@ fn validate_minimal_native_artifact_permissions(path: &Path) -> Result<()> {
         NativeArtifactKind::File if path_has_extension(path, "exe") => {
             validate_minimal_windows_executable(path)
         }
-        NativeArtifactKind::File | NativeArtifactKind::Directory => Ok(()),
+        NativeArtifactKind::File if path_has_extension(path, "deb") => Ok(()),
+        NativeArtifactKind::File => validate_minimal_linux_elf_file(path),
+        NativeArtifactKind::Directory => validate_minimal_linux_elf_directory(path),
     }
 }
 
@@ -2367,17 +2508,7 @@ fn validate_minimal_macos_app_permissions(app_dir: &Path) -> Result<()> {
             continue;
         }
         found_regular_file = true;
-        #[cfg(unix)]
-        {
-            let mode = metadata.permissions().mode();
-            if mode & 0o111 == 0 {
-                bail!(
-                    "Executable bit is missing for {} (mode {:o})",
-                    path.display(),
-                    mode & 0o777
-                );
-            }
-        }
+        validate_unix_executable_permissions(&path, &metadata)?;
     }
 
     if !found_regular_file {
@@ -2387,6 +2518,119 @@ fn validate_minimal_macos_app_permissions(app_dir: &Path) -> Result<()> {
         );
     }
 
+    Ok(())
+}
+
+fn validate_minimal_linux_elf_directory(root: &Path) -> Result<()> {
+    let mut found_regular_elf = false;
+    for entry in WalkDir::new(root)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        let path = entry.into_path();
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("Failed to stat {}", path.display()))?;
+        #[cfg(unix)]
+        if metadata.permissions().mode() & 0o111 == 0 {
+            continue;
+        }
+
+        if !path_has_elf_magic(&path)? {
+            continue;
+        }
+
+        validate_unix_executable_permissions(&path, &metadata)?;
+        let bytes = fs::read(&path)
+            .with_context(|| format!("Failed to read Linux executable {}", path.display()))?;
+        validate_linux_elf_bytes(&path, &bytes)?;
+        found_regular_elf = true;
+    }
+
+    if !found_regular_elf {
+        bail!(
+            "Native delivery input is missing a regular ELF executable in {}",
+            root.display()
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_minimal_linux_elf_file(path: &Path) -> Result<()> {
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("Failed to stat {}", path.display()))?;
+    validate_unix_executable_permissions(path, &metadata)?;
+    let bytes = fs::read(path)
+        .with_context(|| format!("Failed to read Linux executable {}", path.display()))?;
+    validate_linux_elf_bytes(path, &bytes)
+}
+
+fn validate_linux_elf_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    let object = Object::parse(bytes).with_context(|| {
+        format!(
+            "Linux executable failed minimum ELF validation: {}",
+            path.display()
+        )
+    })?;
+    let Object::Elf(_) = object else {
+        bail!(
+            "Linux executable failed minimum ELF validation: {} is not an ELF image",
+            path.display()
+        );
+    };
+    Ok(())
+}
+
+fn path_has_elf_magic(path: &Path) -> Result<bool> {
+    let mut file =
+        fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
+    let mut magic = [0u8; 4];
+    let bytes_read = file
+        .read(&mut magic)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    Ok(bytes_read == magic.len() && magic == *b"\x7FELF")
+}
+
+fn native_file_candidate_extension(path: &Path) -> Option<&'static str> {
+    if path_has_extension(path, "exe") {
+        Some("exe")
+    } else if path_has_extension(path, "AppImage") {
+        Some("AppImage")
+    } else if path_has_extension(path, "deb") {
+        Some("deb")
+    } else {
+        None
+    }
+}
+
+fn native_file_candidate_label(path: &Path) -> Option<&'static str> {
+    match native_file_candidate_extension(path) {
+        Some("exe") => Some(".exe"),
+        Some("AppImage") => Some(".AppImage"),
+        Some("deb") => Some(".deb"),
+        Some(_) | None => None,
+    }
+}
+
+#[cfg(unix)]
+fn validate_unix_executable_permissions(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    let mode = metadata.permissions().mode();
+    if mode & 0o111 == 0 {
+        bail!(
+            "Executable bit is missing for {} (mode {:o})",
+            path.display(),
+            mode & 0o777
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_unix_executable_permissions(_path: &Path, _metadata: &fs::Metadata) -> Result<()> {
     Ok(())
 }
 
@@ -2683,39 +2927,285 @@ fn paths_match(left: &Path, right: &Path) -> Result<bool> {
     Ok(absolute_path(left)? == absolute_path(right)?)
 }
 
-fn is_managed_symlink_to(path: &Path, target: &Path) -> Result<bool> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectionPathStatus {
+    MatchesTarget,
+    TargetMismatch,
+    Replaced,
+    Missing,
+}
+
+fn projection_candidate_paths(path: &Path) -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        vec![path.to_path_buf(), projection_shortcut_path(path)]
+    }
+    #[cfg(not(windows))]
+    {
+        vec![path.to_path_buf()]
+    }
+}
+
+fn first_existing_projection_candidate(path: &Path) -> Result<Option<PathBuf>> {
+    for candidate in projection_candidate_paths(path) {
+        match fs::symlink_metadata(&candidate) {
+            Ok(_) => return Ok(Some(candidate)),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| format!("Failed to stat {}", candidate.display()))
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn find_existing_projection_path(path: &Path, target: &Path) -> Result<Option<PathBuf>> {
+    for candidate in projection_candidate_paths(path) {
+        if is_managed_projection_to(&candidate, target)? {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+fn is_managed_projection_to(path: &Path, target: &Path) -> Result<bool> {
+    Ok(matches!(
+        inspect_projection_path(path, target)?,
+        ProjectionPathStatus::MatchesTarget
+    ))
+}
+
+fn inspect_projection_path(path: &Path, target: &Path) -> Result<ProjectionPathStatus> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Ok(ProjectionPathStatus::Missing)
+        }
         Err(err) => return Err(err).with_context(|| format!("Failed to stat {}", path.display())),
     };
-    if !metadata.file_type().is_symlink() {
-        return Ok(false);
+    if metadata.file_type().is_symlink() {
+        let link_target = fs::read_link(path)
+            .with_context(|| format!("Failed to read symlink {}", path.display()))?;
+        let resolved_target = if link_target.is_absolute() {
+            link_target
+        } else {
+            path.parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(link_target)
+        };
+        return Ok(if paths_match(&resolved_target, target)? {
+            ProjectionPathStatus::MatchesTarget
+        } else {
+            ProjectionPathStatus::TargetMismatch
+        });
     }
-    let link_target = fs::read_link(path)
-        .with_context(|| format!("Failed to read symlink {}", path.display()))?;
-    let resolved_target = if link_target.is_absolute() {
-        link_target
-    } else {
-        path.parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(link_target)
+
+    #[cfg(windows)]
+    {
+        if junction::exists(path)
+            .with_context(|| format!("Failed to inspect junction {}", path.display()))?
+        {
+            let junction_target = junction::get_target(path)
+                .with_context(|| format!("Failed to read junction {}", path.display()))?;
+            return Ok(if paths_match(&junction_target, target)? {
+                ProjectionPathStatus::MatchesTarget
+            } else {
+                ProjectionPathStatus::TargetMismatch
+            });
+        }
+        if is_projection_shortcut(path, &metadata) {
+            let shortcut_target = resolve_projection_shortcut_target(path).with_context(|| {
+                format!(
+                    "Failed to validate projection shortcut target for {}",
+                    path.display()
+                )
+            })?;
+            return Ok(if paths_match(&shortcut_target, target)? {
+                ProjectionPathStatus::MatchesTarget
+            } else {
+                ProjectionPathStatus::TargetMismatch
+            });
+        }
+    }
+
+    Ok(ProjectionPathStatus::Replaced)
+}
+
+fn remove_projection_path(path: &Path) -> Result<bool> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("Failed to inspect projected path: {}", path.display()))
+        }
     };
-    paths_match(&resolved_target, target)
+
+    if metadata.file_type().is_symlink() {
+        remove_projection_symlink(path)
+            .with_context(|| format!("Failed to remove projection symlink: {}", path.display()))?;
+        return Ok(true);
+    }
+
+    #[cfg(windows)]
+    {
+        if junction::exists(path)
+            .with_context(|| format!("Failed to inspect junction {}", path.display()))?
+        {
+            junction::delete(path).with_context(|| {
+                format!("Failed to remove projection junction: {}", path.display())
+            })?;
+            return Ok(true);
+        }
+        if is_projection_shortcut(path, &metadata) {
+            fs::remove_file(path).with_context(|| {
+                format!("Failed to remove projection shortcut: {}", path.display())
+            })?;
+            return Ok(true);
+        }
+    }
+
+    bail!(
+        "Refusing to remove unmanaged projected path: {}",
+        path.display()
+    )
 }
 
 #[cfg(unix)]
-fn create_projection_symlink(target: &Path, destination: &Path) -> std::io::Result<()> {
-    symlink(target, destination)
+fn create_projection_symlink(target: &Path, destination: &Path) -> std::io::Result<PathBuf> {
+    symlink(target, destination)?;
+    Ok(destination.to_path_buf())
 }
 
 #[cfg(windows)]
-fn create_projection_symlink(target: &Path, destination: &Path) -> std::io::Result<()> {
-    symlink_dir(target, destination)
+fn create_projection_symlink(target: &Path, destination: &Path) -> std::io::Result<PathBuf> {
+    match symlink_dir(target, destination) {
+        Ok(()) => Ok(destination.to_path_buf()),
+        Err(symlink_err) => match junction::create(target, destination) {
+            Ok(()) => Ok(destination.to_path_buf()),
+            Err(junction_err) => {
+                let shortcut_path = projection_shortcut_path(destination);
+                match create_projection_shortcut(target, &shortcut_path) {
+                    Ok(()) => Ok(shortcut_path),
+                    Err(shortcut_err) => Err(io::Error::new(
+                        shortcut_err.kind(),
+                        format!(
+                            "Failed to create projection after attempting symlink, junction, and shortcut fallbacks: symlink failed: {}; junction failed: {}; shortcut failed: {}",
+                            symlink_err, junction_err, shortcut_err
+                        ),
+                    )),
+                }
+            }
+        },
+    }
+}
+
+#[cfg(unix)]
+fn remove_projection_symlink(path: &Path) -> io::Result<()> {
+    fs::remove_file(path)
+}
+
+#[cfg(windows)]
+fn remove_projection_symlink(path: &Path) -> io::Result<()> {
+    fs::remove_dir(path).or_else(|_| fs::remove_file(path))
+}
+
+#[cfg(windows)]
+fn projection_shortcut_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "projection".to_string());
+    path.with_file_name(format!("{file_name}.lnk"))
+}
+
+#[cfg(windows)]
+fn create_projection_shortcut(target: &Path, destination: &Path) -> io::Result<()> {
+    let shortcut = ShellLink::new(target).map_err(|err| {
+        io::Error::other(format!(
+            "Failed to prepare shortcut target {}: {}",
+            target.display(),
+            err
+        ))
+    })?;
+    shortcut.create_lnk(destination).map_err(|err| {
+        io::Error::other(format!(
+            "Failed to write shortcut {}: {}",
+            destination.display(),
+            err
+        ))
+    })
+}
+
+#[cfg(windows)]
+fn resolve_projection_shortcut_target(path: &Path) -> Result<PathBuf> {
+    if !path.is_file() {
+        bail!(
+            "Projection shortcut does not exist as a file: {}",
+            path.display()
+        );
+    }
+    let output = powershell_command()
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$ws = New-Object -ComObject WScript.Shell; $shortcut = $ws.CreateShortcut($args[0]); if (-not $shortcut.TargetPath) { exit 1 }; [Console]::Out.Write($shortcut.TargetPath)",
+        ])
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("Failed to resolve projection shortcut {}", path.display()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "Failed to resolve projection shortcut {}: {}",
+            path.display(),
+            stderr.trim()
+        );
+    }
+    let target = String::from_utf8_lossy(&output.stdout)
+        .trim_end_matches(&['\r', '\n'][..])
+        .to_string();
+    if target.is_empty() {
+        bail!("Projection shortcut target is empty: {}", path.display());
+    }
+    Ok(PathBuf::from(target))
+}
+
+#[cfg(windows)]
+fn powershell_command() -> Command {
+    if let Ok(system_root) = std::env::var("SYSTEMROOT") {
+        let candidate = PathBuf::from(system_root)
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+        if candidate.is_file() {
+            return Command::new(candidate);
+        }
+    }
+    Command::new("powershell")
+}
+
+#[cfg(windows)]
+fn is_projection_shortcut(path: &Path, metadata: &fs::Metadata) -> bool {
+    metadata.is_file()
+        && path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.eq_ignore_ascii_case("lnk"))
+            .unwrap_or(false)
 }
 
 pub(crate) fn host_supports_finalize() -> bool {
     cfg!(target_os = "macos")
+}
+
+pub(crate) fn host_supports_projection() -> bool {
+    cfg!(target_os = "macos") || cfg!(windows)
 }
 
 fn random_hex(len_bytes: usize) -> String {
@@ -2743,6 +3233,17 @@ mod tests {
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    fn assert_json_object_has_keys(value: &serde_json::Value, keys: &[&str]) {
+        let object = value.as_object().expect("expected JSON object");
+        for key in keys {
+            assert!(
+                object.contains_key(*key),
+                "expected key '{}' in JSON object: {object:?}",
+                key
+            );
+        }
+    }
 
     fn sample_delivery_toml() -> &'static str {
         r#"schema_version = "0.1"
@@ -2872,6 +3373,35 @@ args = ["sign", "/fd", "SHA256", "dist/MyApp.exe"]
 
     fn sample_windows_dll_bytes() -> Vec<u8> {
         sample_windows_pe_bytes(true)
+    }
+
+    fn sample_linux_elf_bytes() -> Vec<u8> {
+        let mut bytes = vec![0u8; 64];
+        bytes[0..4].copy_from_slice(b"\x7FELF");
+        bytes[4] = 2;
+        bytes[5] = 1;
+        bytes[6] = 1;
+        bytes[16..18].copy_from_slice(&(2u16).to_le_bytes());
+        bytes[18..20].copy_from_slice(&(62u16).to_le_bytes());
+        bytes[20..24].copy_from_slice(&(1u32).to_le_bytes());
+        bytes[24..32].copy_from_slice(&(0x400000u64).to_le_bytes());
+        bytes[52..54].copy_from_slice(&(64u16).to_le_bytes());
+        bytes
+    }
+
+    #[cfg(unix)]
+    fn write_linux_elf(path: &Path, mode: u32) -> Result<()> {
+        fs::write(path, sample_linux_elf_bytes())?;
+        let mut permissions = fs::metadata(path)?.permissions();
+        permissions.set_mode(mode);
+        fs::set_permissions(path, permissions)?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn write_linux_elf(path: &Path, _mode: u32) -> Result<()> {
+        fs::write(path, sample_linux_elf_bytes())?;
+        Ok(())
     }
 
     fn sample_native_build_plan(root: &Path, mode: u32) -> Result<NativeBuildPlan> {
@@ -3087,6 +3617,113 @@ args = ["--deep", "--force", "--sign", "-", "dist/time-management-desktop.app"]
     }
 
     #[test]
+    fn detect_build_strategy_generates_canonical_delivery_config_from_capsule_manifest(
+    ) -> Result<()> {
+        let tmp = tempdir()?;
+        let manifest_dir = tmp.path().join("native-build-project");
+        let source_app_path = manifest_dir.join("MyApp.app");
+        let binary_path = source_app_path.join("Contents/MacOS/MyApp");
+        fs::create_dir_all(binary_path.parent().context("binary parent missing")?)?;
+        fs::write(
+            manifest_dir.join("capsule.toml"),
+            r#"schema_version = "0.2"
+name = "my-app"
+version = "0.1.0"
+type = "app"
+default_target = "cli"
+
+[targets.cli]
+runtime = "source"
+driver = "native"
+entrypoint = "MyApp.app"
+"#,
+        )?;
+        fs::write(&binary_path, b"unsigned-app")?;
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&binary_path)?.permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&binary_path, permissions)?;
+        }
+
+        let plan =
+            detect_build_strategy(&manifest_dir)?.context("expected native delivery build plan")?;
+        let staged: DeliveryConfig = toml::from_str(&plan.staged_delivery_config_toml)?;
+
+        assert!(plan.delivery_config_path.is_none());
+        assert_eq!(plan.source_app_path, manifest_dir.join("MyApp.app"));
+        assert_eq!(staged.schema_version, DELIVERY_SCHEMA_VERSION_STABLE);
+        assert_eq!(staged.artifact.input, "MyApp.app");
+        assert_eq!(staged.artifact.framework, DEFAULT_DELIVERY_FRAMEWORK);
+        assert_eq!(staged.artifact.target, DEFAULT_DELIVERY_TARGET);
+        assert_eq!(staged.finalize.tool, DEFAULT_FINALIZE_TOOL);
+        assert_eq!(
+            staged.finalize.args,
+            vec![
+                "--deep".to_string(),
+                "--force".to_string(),
+                "--sign".to_string(),
+                "-".to_string(),
+                "MyApp.app".to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn detect_build_strategy_rejects_sidecar_that_conflicts_with_canonical_capsule_manifest() {
+        let tmp = tempdir().expect("tmp dir");
+        let manifest_dir = tmp.path().join("native-build-project");
+        let source_app_path = manifest_dir.join("MyApp.app");
+        let binary_path = source_app_path.join("Contents/MacOS/MyApp");
+        fs::create_dir_all(binary_path.parent().expect("binary parent")).expect("create app");
+        fs::write(
+            manifest_dir.join("capsule.toml"),
+            r#"schema_version = "0.2"
+name = "my-app"
+version = "0.1.0"
+type = "app"
+default_target = "cli"
+
+[targets.cli]
+runtime = "source"
+driver = "native"
+entrypoint = "MyApp.app"
+"#,
+        )
+        .expect("write manifest");
+        fs::write(
+            manifest_dir.join(DELIVERY_CONFIG_FILE),
+            r#"schema_version = "0.1"
+[artifact]
+framework = "tauri"
+stage = "unsigned"
+target = "darwin/arm64"
+input = "Other.app"
+[finalize]
+tool = "codesign"
+args = ["--deep", "--force", "--sign", "-", "Other.app"]
+"#,
+        )
+        .expect("write sidecar");
+        fs::write(&binary_path, b"unsigned-app").expect("write binary");
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&binary_path)
+                .expect("binary metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&binary_path, permissions).expect("set permissions");
+        }
+
+        let err = detect_build_strategy(&manifest_dir)
+            .expect_err("conflicting compatibility sidecar must be rejected");
+        assert!(err
+            .to_string()
+            .contains("native delivery config conflicts with the default target contract"));
+    }
+
+    #[test]
     fn detect_build_strategy_rejects_partial_inline_delivery_config() {
         let tmp = tempdir().expect("tmp dir");
         let manifest_dir = tmp.path().join("inline-command-build-project");
@@ -3154,16 +3791,94 @@ input = "dist/time-management-desktop.app"
     }
 
     #[test]
-    fn validate_native_bundle_directory_accepts_generic_directory_and_file() -> Result<()> {
+    fn validate_native_bundle_directory_reports_nearby_appimage_candidates() -> Result<()> {
+        let tmp = tempdir()?;
+        let linux_dir = tmp.path().join("src-tauri/target/release/bundle/appimage");
+        let candidate = linux_dir.join("Time Management Desktop.AppImage");
+        fs::create_dir_all(&linux_dir)?;
+        write_linux_elf(&candidate, 0o755)?;
+
+        let err =
+            validate_native_bundle_directory(&linux_dir.join("time-management-desktop.AppImage"))
+                .expect_err("missing exact AppImage path should fail");
+        let message = err.to_string();
+        assert!(message.contains("Found nearby .AppImage candidates"));
+        assert!(message.contains("Time Management Desktop.AppImage"));
+        Ok(())
+    }
+
+    #[test]
+    fn validate_native_bundle_directory_accepts_linux_directory_and_files() -> Result<()> {
         let tmp = tempdir()?;
         let linux_dir = tmp.path().join("dist/linux");
+        let linux_binary = linux_dir.join("MyApp");
+        let linux_deb = tmp.path().join("dist/MyApp.deb");
         let windows_exe = tmp.path().join("dist/MyApp.exe");
         fs::create_dir_all(&linux_dir)?;
         fs::create_dir_all(windows_exe.parent().context("missing exe parent")?)?;
+        write_linux_elf(&linux_binary, 0o755)?;
+        fs::write(&linux_deb, b"!<arch>\n")?;
         fs::write(&windows_exe, sample_windows_executable_bytes())?;
 
         validate_native_bundle_directory(&linux_dir)?;
+        validate_native_bundle_directory(&linux_deb)?;
         validate_native_bundle_directory(&windows_exe)?;
+        Ok(())
+    }
+
+    #[test]
+    fn validate_native_bundle_directory_rejects_invalid_linux_elf() -> Result<()> {
+        let tmp = tempdir()?;
+        let linux_file = tmp.path().join("dist/MyApp.AppImage");
+        fs::create_dir_all(linux_file.parent().context("missing linux parent")?)?;
+        fs::write(&linux_file, b"\x7FELFnot-a-valid-elf")?;
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&linux_file)?.permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&linux_file, permissions)?;
+        }
+
+        let err = validate_native_bundle_directory(&linux_file)
+            .expect_err("invalid AppImage should fail ELF validation");
+        assert!(err
+            .to_string()
+            .contains("Linux executable failed minimum ELF validation"));
+        Ok(())
+    }
+
+    #[test]
+    fn validate_native_bundle_directory_rejects_linux_directory_without_elf_executable(
+    ) -> Result<()> {
+        let tmp = tempdir()?;
+        let linux_dir = tmp.path().join("dist/linux");
+        let launcher = linux_dir.join("AppRun");
+        fs::create_dir_all(&linux_dir)?;
+        fs::write(&launcher, b"#!/bin/sh\nexit 0\n")?;
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&launcher)?.permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&launcher, permissions)?;
+        }
+
+        let err = validate_native_bundle_directory(&linux_dir)
+            .expect_err("directory without an ELF executable should fail closed");
+        assert!(err.to_string().contains("missing a regular ELF executable"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_native_bundle_directory_rejects_linux_elf_without_executable_bit() -> Result<()> {
+        let tmp = tempdir()?;
+        let linux_file = tmp.path().join("dist/MyApp");
+        fs::create_dir_all(linux_file.parent().context("missing linux parent")?)?;
+        write_linux_elf(&linux_file, 0o644)?;
+
+        let err = validate_native_bundle_directory(&linux_file)
+            .expect_err("missing executable bit should fail closed");
+        assert!(err.to_string().contains("Executable bit is missing"));
         Ok(())
     }
 
@@ -3395,6 +4110,66 @@ input = "dist/time-management-desktop.app"
     }
 
     #[test]
+    fn delivery_config_accepts_signtool_with_timestamp_args() {
+        let config: DeliveryConfig = toml::from_str(
+            r#"schema_version = "0.1"
+[artifact]
+    framework = "tauri"
+    stage = "unsigned"
+    target = "windows/x86_64"
+    input = "dist/MyApp.exe"
+[finalize]
+    tool = "signtool"
+    args = ["sign", "/fd", "SHA256", "/tr", "http://tsa.test", "/td", "SHA256", "dist/MyApp.exe"]
+"#,
+        )
+        .expect("config parse");
+        validate_delivery_config(&config).expect("config should be accepted");
+    }
+
+    #[test]
+    fn delivery_config_rejects_unknown_signtool_switch() {
+        let config: DeliveryConfig = toml::from_str(
+            r#"schema_version = "0.1"
+[artifact]
+    framework = "tauri"
+    stage = "unsigned"
+    target = "windows/x86_64"
+    input = "dist/MyApp.exe"
+[finalize]
+    tool = "signtool"
+    args = ["sign", "/bogus", "dist/MyApp.exe"]
+"#,
+        )
+        .expect("config parse");
+        let err = validate_delivery_config(&config).expect_err("config should be rejected");
+        assert!(err
+            .to_string()
+            .contains("Unsupported finalize.args entry '/bogus'"));
+    }
+
+    #[test]
+    fn delivery_config_rejects_unsupported_target() {
+        let config: DeliveryConfig = toml::from_str(
+            r#"schema_version = "0.1"
+[artifact]
+    framework = "tauri"
+    stage = "unsigned"
+    target = "solaris/x86_64"
+    input = "MyApp.app"
+[finalize]
+    tool = "codesign"
+    args = ["--deep", "--force", "--sign", "-", "MyApp.app"]
+"#,
+        )
+        .expect("config parse");
+        let err = validate_delivery_config(&config).expect_err("config should be rejected");
+        assert!(err
+            .to_string()
+            .contains("Unsupported artifact.target 'solaris/x86_64'"));
+    }
+
+    #[test]
     fn delivery_config_accepts_linux_target_with_noop_finalize_tool() {
         let config: DeliveryConfig = toml::from_str(
             r#"schema_version = "0.1"
@@ -3484,6 +4259,109 @@ input = "dist/time-management-desktop.app"
         fs::write(left.join("a/b/file.txt"), b"hello")?;
         fs::write(right.join("a/b/file.txt"), b"hello")?;
         assert_eq!(compute_tree_digest(&left)?, compute_tree_digest(&right)?);
+        Ok(())
+    }
+
+    #[test]
+    fn native_delivery_documented_json_contract_fields_are_present() -> Result<()> {
+        let tmp = tempdir()?;
+
+        let fetched_dir = sample_fetch_dir(tmp.path())?;
+        let fetch_metadata = load_fetch_metadata(&fetched_dir)?;
+        let fetch_json = serde_json::to_value(&fetch_metadata)?;
+        assert_json_object_has_keys(
+            &fetch_json,
+            &[
+                "schema_version",
+                "scoped_id",
+                "version",
+                "registry",
+                "parent_digest",
+            ],
+        );
+
+        let build_json = serde_json::to_value(NativeBuildResult {
+            artifact_path: tmp.path().join("out/my-app-0.1.0.capsule"),
+            build_strategy: "native-delivery".to_string(),
+            target: DEFAULT_DELIVERY_TARGET.to_string(),
+            derived_from: tmp.path().join("MyApp.app"),
+            schema_version: DELIVERY_SCHEMA_VERSION.to_string(),
+        })?;
+        assert_json_object_has_keys(
+            &build_json,
+            &["build_strategy", "schema_version", "target", "derived_from"],
+        );
+
+        let (derived_dir, derived_app) = sample_finalized_app(tmp.path())?;
+        let provenance_json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(derived_dir.join(PROVENANCE_FILE))?)?;
+        assert_json_object_has_keys(
+            &provenance_json,
+            &[
+                "schema_version",
+                "parent_digest",
+                "derived_digest",
+                "framework",
+                "target",
+                "finalize_tool",
+                "finalized_at",
+            ],
+        );
+
+        let finalize_json = serde_json::to_value(FinalizeResult {
+            fetched_dir: fetched_dir.clone(),
+            output_dir: derived_dir.clone(),
+            derived_app_path: derived_app.clone(),
+            provenance_path: derived_dir.join(PROVENANCE_FILE),
+            parent_digest: "blake3:parent-digest".to_string(),
+            derived_digest: "blake3:derived-digest".to_string(),
+            schema_version: DELIVERY_SCHEMA_VERSION.to_string(),
+        })?;
+        assert_json_object_has_keys(
+            &finalize_json,
+            &[
+                "schema_version",
+                "derived_app_path",
+                "provenance_path",
+                "parent_digest",
+                "derived_digest",
+            ],
+        );
+
+        let launcher_dir = tmp.path().join("Applications");
+        let metadata_root = tmp.path().join("projection-metadata");
+        let project_result = project_with_roots(&derived_app, &launcher_dir, &metadata_root)?;
+        let project_json = serde_json::to_value(&project_result)?;
+        assert_json_object_has_keys(
+            &project_json,
+            &[
+                "schema_version",
+                "projection_id",
+                "metadata_path",
+                "projected_path",
+                "derived_app_path",
+                "parent_digest",
+                "derived_digest",
+                "state",
+            ],
+        );
+
+        let unproject_result =
+            unproject_with_metadata_root(&project_result.projection_id, &metadata_root)?;
+        let unproject_json = serde_json::to_value(&unproject_result)?;
+        assert_json_object_has_keys(
+            &unproject_json,
+            &[
+                "schema_version",
+                "projection_id",
+                "metadata_path",
+                "projected_path",
+                "removed_projected_path",
+                "removed_metadata",
+                "state_before",
+            ],
+        );
+
         Ok(())
     }
 
@@ -3672,12 +4550,47 @@ input = "dist/time-management-desktop.app"
     }
 
     #[test]
-    fn supports_projection_target_accepts_darwin_only() {
+    fn supports_projection_target_accepts_darwin_and_windows() {
         assert!(supports_projection_target("darwin/arm64"));
         assert!(supports_projection_target("darwin/x86_64"));
-        assert!(!supports_projection_target("windows/x86_64"));
+        assert!(supports_projection_target("windows/x86_64"));
         assert!(!supports_projection_target("linux/x86_64"));
         assert!(!supports_projection_target(""));
+    }
+
+    #[test]
+    fn first_existing_projection_candidate_returns_none_for_missing_paths() -> Result<()> {
+        let tmp = tempdir()?;
+        let missing = tmp.path().join("Applications").join("MissingApp");
+        assert_eq!(first_existing_projection_candidate(&missing)?, None);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shortcut_roundtrip_resolves_expected_target() -> Result<()> {
+        let tmp = tempdir()?;
+        let target = tmp.path().join("MyApp");
+        fs::create_dir_all(&target)?;
+        let shortcut = projection_shortcut_path(&tmp.path().join("Launcher").join("MyApp"));
+        let shortcut_parent = shortcut
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("shortcut path missing parent"))?;
+        fs::create_dir_all(shortcut_parent)?;
+
+        create_projection_shortcut(&target, &shortcut)?;
+
+        assert!(shortcut.is_file());
+        assert!(is_projection_shortcut(&shortcut, &fs::metadata(&shortcut)?));
+        assert!(paths_match(
+            &resolve_projection_shortcut_target(&shortcut)?,
+            &target
+        )?);
+        assert_eq!(
+            first_existing_projection_candidate(&tmp.path().join("Launcher").join("MyApp"))?,
+            Some(shortcut)
+        );
+        Ok(())
     }
 
     #[test]
@@ -3706,6 +4619,7 @@ input = "dist/time-management-desktop.app"
     }
 
     #[test]
+    #[serial_test::serial]
     fn materialize_fetch_cache_extracts_payload_tree() -> Result<()> {
         let tmp_home = tempdir()?;
         std::env::set_var("HOME", tmp_home.path());
@@ -3746,6 +4660,7 @@ input = "dist/time-management-desktop.app"
     }
 
     #[test]
+    #[serial_test::serial]
     fn materialize_fetch_cache_preserves_executable_mode_from_payload() -> Result<()> {
         let tmp_home = tempdir()?;
         std::env::set_var("HOME", tmp_home.path());
@@ -3783,7 +4698,7 @@ input = "dist/time-management-desktop.app"
     }
 
     #[test]
-    fn project_creates_symlink_metadata_without_mutating_derived_artifact() -> Result<()> {
+    fn project_creates_projection_metadata_without_mutating_derived_artifact() -> Result<()> {
         let tmp = tempdir()?;
         let metadata_root = tmp.path().join("projection-metadata");
         let launcher_dir = tmp.path().join("Applications");
@@ -3795,8 +4710,12 @@ input = "dist/time-management-desktop.app"
         assert!(result.created);
         assert_eq!(result.state, "ok");
         assert_eq!(compute_tree_digest(&derived_app)?, digest_before);
-        let symlink_meta = fs::symlink_metadata(&result.projected_path)?;
-        assert!(symlink_meta.file_type().is_symlink());
+        assert!(result.projected_path.exists());
+        #[cfg(not(windows))]
+        {
+            let symlink_meta = fs::symlink_metadata(&result.projected_path)?;
+            assert!(symlink_meta.file_type().is_symlink());
+        }
         assert!(result.metadata_path.exists());
         Ok(())
     }
@@ -3869,17 +4788,19 @@ input = "dist/time-management-desktop.app"
     }
 
     #[test]
-    fn project_rejects_non_darwin_targets_even_with_app_bundle_shape() -> Result<()> {
+    fn project_rejects_unsupported_projection_targets_even_with_app_bundle_shape() -> Result<()> {
         let tmp = tempdir()?;
         let metadata_root = tmp.path().join("projection-metadata");
         let launcher_dir = tmp.path().join("Applications");
         let (_derived_dir, derived_app) =
-            sample_finalized_app_with_target(tmp.path(), "windows/x86_64")?;
+            sample_finalized_app_with_target(tmp.path(), "linux/x86_64")?;
 
         let err = project_with_roots(&derived_app, &launcher_dir, &metadata_root)
-            .expect_err("projection must fail closed for non-darwin targets");
+            .expect_err("projection must fail closed for unsupported targets");
 
-        assert!(err.to_string().contains("expected a darwin/<arch> target"));
+        assert!(err
+            .to_string()
+            .contains("expected a darwin/<arch> or windows/<arch> target"));
         Ok(())
     }
 

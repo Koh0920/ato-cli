@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Menu } from "lucide-react";
 import { ConfirmActionModal } from "./components/ConfirmActionModal";
+import {
+  getPermissionModeMessage,
+  PermissionModeSelector,
+} from "./components/PermissionModeSelector";
 import { Sidebar } from "./components/Sidebar";
 import { ProcessDrawer } from "./components/ProcessDrawer";
 import { Toast, type ToastState } from "./components/Toast";
@@ -2299,44 +2303,29 @@ export default function App(): JSX.Element {
   const confirmExtraContent =
     confirmState?.kind === "run" && confirmState.requiresPermissionGrant ? (
       <div className="confirm-extra">
-        <label
-          className="confirm-auth-label"
-          htmlFor="confirm-run-permission-mode"
-        >
-          Execution permissions
-        </label>
-        <select
-          id="confirm-run-permission-mode"
-          className="input confirm-auth-input mono"
+        <span className="confirm-auth-label">Execution permissions</span>
+        <PermissionModeSelector
+          name="confirm-run-permission-mode"
           value={confirmState.permissionMode}
-          onChange={(event) => {
-            const next = event.target.value as RunPermissionMode;
+          disabled={isSubmittingConfirm}
+          onChange={(next) => {
             setConfirmState((prev) =>
               prev && prev.kind === "run"
                 ? { ...prev, permissionMode: next }
                 : prev,
             );
           }}
-          disabled={isSubmittingConfirm}
-        >
-          <option value="standard">Standard (will be blocked)</option>
-          <option value="sandbox">Sandbox</option>
-          <option value="dangerous">Dangerous</option>
-        </select>
+        />
         <p
           className={`confirm-note ${
-            confirmState.permissionMode === "dangerous"
+            getPermissionModeMessage(confirmState.permissionMode).tone === "warn"
               ? "warn"
-              : confirmState.permissionMode === "standard"
+              : getPermissionModeMessage(confirmState.permissionMode).tone === "error"
                 ? "error"
                 : ""
           }`}
         >
-          {confirmState.permissionMode === "dangerous"
-            ? "Dangerous mode bypasses Ato runtime permission barriers for this launch."
-            : confirmState.permissionMode === "sandbox"
-              ? "Sandbox runs Tier2 targets under the native OS sandbox."
-              : "Tier2 targets require Sandbox or Dangerous before Run can proceed."}
+          {getPermissionModeMessage(confirmState.permissionMode).text}
         </p>
       </div>
     ) : null;
