@@ -696,7 +696,8 @@ fn test_build_routes_native_delivery_projects() {
         );
         let combined = format!("{stdout}\n{stderr}");
         assert!(
-            combined.contains("native delivery build currently supports macOS hosts only"),
+            combined
+                .contains("native delivery build currently supports macOS and Windows hosts only"),
             "combined output:\n{combined}"
         );
     }
@@ -734,7 +735,8 @@ fn test_build_routes_native_delivery_projects_without_delivery_sidecar() {
         );
         let combined = format!("{stdout}\n{stderr}");
         assert!(
-            combined.contains("native delivery build currently supports macOS hosts only"),
+            combined
+                .contains("native delivery build currently supports macOS and Windows hosts only"),
             "combined output:\n{combined}"
         );
     }
@@ -833,7 +835,8 @@ fn test_build_routes_native_delivery_command_mode_projects() {
         );
         let combined = format!("{stdout}\n{stderr}");
         assert!(
-            combined.contains("native delivery build currently supports macOS hosts only"),
+            combined
+                .contains("native delivery build currently supports macOS and Windows hosts only"),
             "combined output:\n{combined}"
         );
     }
@@ -879,7 +882,8 @@ fn test_build_routes_inline_native_delivery_command_mode_projects() {
         );
         let combined = format!("{stdout}\n{stderr}");
         assert!(
-            combined.contains("native delivery build currently supports macOS hosts only"),
+            combined
+                .contains("native delivery build currently supports macOS and Windows hosts only"),
             "combined output:\n{combined}"
         );
     }
