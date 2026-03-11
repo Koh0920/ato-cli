@@ -1781,6 +1781,9 @@ fn validate_delivery_target(target: &str) -> Result<()> {
 }
 
 fn validate_finalize_tool(tool: &str) -> Result<()> {
+    if tool.is_empty() {
+        bail!("finalize.tool must not be empty");
+    }
     if tool.chars().any(char::is_control) {
         bail!(
             "finalize.tool '{}' must not contain control characters",
@@ -4164,6 +4167,42 @@ input = "dist/time-management-desktop.app"
         assert!(err
             .to_string()
             .contains("Unsupported artifact.target 'solaris/x86_64'"));
+    }
+
+    #[test]
+    fn delivery_config_accepts_linux_target_with_noop_finalize_tool() {
+        let config: DeliveryConfig = toml::from_str(
+            r#"schema_version = "0.1"
+[artifact]
+    framework = "tauri"
+    stage = "unsigned"
+    target = "linux/x86_64"
+    input = "dist/my-app"
+[finalize]
+    tool = "none"
+    args = []
+"#,
+        )
+        .expect("config parse");
+        validate_delivery_config(&config).expect("config should be accepted");
+    }
+
+    #[test]
+    fn delivery_config_accepts_linux_aarch64_with_chmod_finalize_tool() {
+        let config: DeliveryConfig = toml::from_str(
+            r#"schema_version = "0.1"
+[artifact]
+    framework = "tauri"
+    stage = "unsigned"
+    target = "linux/aarch64"
+    input = "dist/my-app"
+[finalize]
+    tool = "chmod"
+    args = ["0755", "dist/my-app"]
+"#,
+        )
+        .expect("config parse");
+        validate_delivery_config(&config).expect("config should be accepted");
     }
 
     #[test]
