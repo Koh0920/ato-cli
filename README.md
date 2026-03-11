@@ -9,8 +9,6 @@
 [![Last Commit](https://img.shields.io/github/last-commit/Koh0920/ato-cli/dev)](https://github.com/Koh0920/ato-cli/commits/dev)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Koh0920/ato-cli)
 
-> OpenSSF Best Practices バッジは、プロジェクト登録後に追加できます。
-
 English | [日本語](README_JA.md)
 
 `ato` is a meta-CLI that interprets `capsule.toml` to execute, distribute, and install capsules.
