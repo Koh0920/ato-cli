@@ -49,17 +49,53 @@ fn is_permission_denied(err: &anyhow::Error) -> bool {
     }
 }
 
-fn wait_for_well_known(base_url: &str) -> Result<()> {
+fn read_registry_log(path: &Path) -> String {
+    fs::read_to_string(path)
+        .map(|contents| contents.trim().to_string())
+        .unwrap_or_default()
+}
+
+fn wait_for_well_known(
+    base_url: &str,
+    child: &mut std::process::Child,
+    stdout_log: &Path,
+    stderr_log: &Path,
+) -> Result<()> {
     let url = format!("{}/.well-known/capsule.json", base_url);
-    for _ in 0..60 {
-        if let Ok(resp) = reqwest::blocking::get(&url) {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(500))
+        .build()
+        .context("build local registry probe client")?;
+    for _ in 0..150 {
+        if let Some(status) = child
+            .try_wait()
+            .context("check local registry process status")?
+        {
+            let stdout = read_registry_log(stdout_log);
+            let stderr = read_registry_log(stderr_log);
+            anyhow::bail!(
+                "local registry exited before becoming ready: {} (status {})\nstdout:\n{}\nstderr:\n{}",
+                url,
+                status,
+                stdout,
+                stderr
+            );
+        }
+        if let Ok(resp) = client.get(&url).send() {
             if resp.status().is_success() {
                 return Ok(());
             }
         }
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(200));
     }
-    anyhow::bail!("local registry did not become ready: {}", url);
+    let stdout = read_registry_log(stdout_log);
+    let stderr = read_registry_log(stderr_log);
+    anyhow::bail!(
+        "local registry did not become ready: {}\nstdout:\n{}\nstderr:\n{}",
+        url,
+        stdout,
+        stderr
+    );
 }
 
 fn start_local_registry_or_skip(
@@ -85,7 +121,15 @@ fn start_local_registry_or_skip(
 fn start_local_registry(ato: &Path, data_dir: &Path) -> Result<(ServerGuard, String)> {
     let port = reserve_port();
     let base_url = format!("http://127.0.0.1:{}", port);
-    let child = Command::new(ato)
+    fs::create_dir_all(data_dir)
+        .with_context(|| format!("failed to create {}", data_dir.display()))?;
+    let stdout_log = data_dir.join("registry-stdout.log");
+    let stderr_log = data_dir.join("registry-stderr.log");
+    let stdout = fs::File::create(&stdout_log)
+        .with_context(|| format!("failed to create {}", stdout_log.display()))?;
+    let stderr = fs::File::create(&stderr_log)
+        .with_context(|| format!("failed to create {}", stderr_log.display()))?;
+    let mut child = Command::new(ato)
         .args([
             "registry",
             "serve",
@@ -97,12 +141,12 @@ fn start_local_registry(ato: &Path, data_dir: &Path) -> Result<(ServerGuard, Str
             data_dir.to_string_lossy().as_ref(),
         ])
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
         .spawn()
         .context("spawn local registry server")?;
+    wait_for_well_known(&base_url, &mut child, &stdout_log, &stderr_log)?;
     let guard = ServerGuard { child };
-    wait_for_well_known(&base_url)?;
     Ok((guard, base_url))
 }
 
@@ -234,6 +278,7 @@ fn assert_executable(path: &Path, context: &str) -> Result<()> {
             );
         }
     }
+    let _ = path;
     let _ = context;
     Ok(())
 }
