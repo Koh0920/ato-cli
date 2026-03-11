@@ -55,16 +55,30 @@ fn read_registry_log(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-fn parse_json_result(stdout: &[u8], context: &str) -> Result<serde_json::Value> {
+fn parse_json_result(
+    stdout: &[u8],
+    expected_key: &str,
+    context: &str,
+) -> Result<serde_json::Value> {
     let stdout_text = std::str::from_utf8(stdout).with_context(|| context.to_string())?;
+    let mut last_value = None;
     for line in stdout_text.lines().rev() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-        if let Ok(value) = serde_json::from_str(trimmed) {
-            return Ok(value);
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if value.get(expected_key).is_some() {
+                return Ok(value);
+            }
+            if last_value.is_none() {
+                last_value = Some(value);
+            }
         }
+    }
+
+    if let Some(value) = last_value {
+        return Ok(value);
     }
 
     serde_json::from_slice(stdout).with_context(|| context.to_string())
@@ -1007,7 +1021,7 @@ fn e2e_native_delivery_windows_build_publish_install_run() -> Result<()> {
         &home_dir,
     )?;
     let build = require_success(build, "build native Windows fixture capsule")?;
-    let build_json = parse_json_result(&build.stdout, "parse build json")?;
+    let build_json = parse_json_result(&build.stdout, "build_strategy", "parse build json")?;
     assert_eq!(
         build_json["build_strategy"].as_str(),
         Some("native-delivery")
@@ -1057,7 +1071,8 @@ fn e2e_native_delivery_windows_build_publish_install_run() -> Result<()> {
         &home_dir,
     )?;
     let install = require_success(install, "install native Windows fixture capsule")?;
-    let install_json = parse_json_result(&install.stdout, "parse install json")?;
+    let install_json =
+        parse_json_result(&install.stdout, "local_derivation", "parse install json")?;
     let local_derivation = install_json["local_derivation"]
         .as_object()
         .context("install local_derivation missing")?;
