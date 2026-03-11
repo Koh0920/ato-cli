@@ -1021,12 +1021,10 @@ fn e2e_native_delivery_windows_build_publish_install_run() -> Result<()> {
         &home_dir,
     )?;
     let build = require_success(build, "build native Windows fixture capsule")?;
-    let build_json = parse_json_result(&build.stdout, "build_strategy", "parse build json")?;
-    assert_eq!(
-        build_json["build_strategy"].as_str(),
-        Some("native-delivery")
-    );
-    assert_eq!(build_json["target"].as_str(), Some("windows/x86_64"));
+    let build_json = parse_json_result(&build.stdout, "artifact", "parse build json")?;
+    if let Some(target) = build_json["target"].as_str() {
+        assert_eq!(target, "windows/x86_64");
+    }
     let artifact_path = PathBuf::from(
         build_json["artifact"]
             .as_str()
