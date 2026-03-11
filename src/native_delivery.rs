@@ -3132,9 +3132,9 @@ entrypoint = "MyApp.app"
         assert_eq!(plan.source_app_path, manifest_dir.join("MyApp.app"));
         assert_eq!(staged.schema_version, DELIVERY_SCHEMA_VERSION_STABLE);
         assert_eq!(staged.artifact.input, "MyApp.app");
-        assert_eq!(staged.artifact.framework, DELIVERY_FRAMEWORK);
-        assert_eq!(staged.artifact.target, DELIVERY_TARGET);
-        assert_eq!(staged.finalize.tool, FINALIZE_TOOL);
+        assert_eq!(staged.artifact.framework, DEFAULT_DELIVERY_FRAMEWORK);
+        assert_eq!(staged.artifact.target, DEFAULT_DELIVERY_TARGET);
+        assert_eq!(staged.finalize.tool, DEFAULT_FINALIZE_TOOL);
         assert_eq!(
             staged.finalize.args,
             vec![
@@ -3587,7 +3587,7 @@ input = "dist/time-management-desktop.app"
         let build_json = serde_json::to_value(NativeBuildResult {
             artifact_path: tmp.path().join("out/my-app-0.1.0.capsule"),
             build_strategy: "native-delivery".to_string(),
-            target: DELIVERY_TARGET.to_string(),
+            target: DEFAULT_DELIVERY_TARGET.to_string(),
             derived_from: tmp.path().join("MyApp.app"),
             schema_version: DELIVERY_SCHEMA_VERSION.to_string(),
         })?;
