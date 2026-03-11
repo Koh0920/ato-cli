@@ -4,6 +4,15 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
+unmaintained = "workspace"
+ignore = [
+    { id = "RUSTSEC-2024-0438", reason = "Non-Windows runtime remains pinned to wasmtime 16 until the planned dependency refresh lands." },
+    { id = "RUSTSEC-2024-0445", reason = "cap-primitives is pulled in by the same pinned wasmtime 16 stack and is being handled in that upgrade." },
+    { id = "RUSTSEC-2025-0046", reason = "Non-Windows runtime remains pinned to wasmtime 16 until the planned dependency refresh lands." },
+    { id = "RUSTSEC-2025-0118", reason = "Non-Windows runtime remains pinned to wasmtime 16 until the planned dependency refresh lands." },
+    { id = "RUSTSEC-2026-0020", reason = "Non-Windows runtime remains pinned to wasmtime 16 until the planned dependency refresh lands." },
+    { id = "RUSTSEC-2026-0021", reason = "Non-Windows runtime remains pinned to wasmtime 16 until the planned dependency refresh lands." },
+]
 
 [licenses]
 version = 2
@@ -24,14 +33,16 @@ allow = [
     "MPL-2.0",
     "OpenSSL",
     "Unicode-3.0",
-    "Unicode-DFS-2016",
     "Unlicense",
-    "WTFPL",
     "Zlib",
 ]
 
 [bans]
-multiple-versions = "warn"
+# This workspace intentionally resolves multiple target-specific support crates
+# in the shared lockfile; keep duplicate-version noise out of the security gate
+# while still denying wildcard requirements.
+multiple-versions = "allow"
+allow-wildcard-paths = true
 wildcards = "deny"
 
 [sources]

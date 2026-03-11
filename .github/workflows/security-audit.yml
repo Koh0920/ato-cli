@@ -6,6 +6,7 @@ on:
     paths:
       - "**/Cargo.toml"
       - "**/Cargo.lock"
+      - ".cargo/audit.toml"
       - ".github/workflows/security-audit.yml"
       - "deny.toml"
   push:
@@ -15,6 +16,7 @@ on:
     paths:
       - "**/Cargo.toml"
       - "**/Cargo.lock"
+      - ".cargo/audit.toml"
       - ".github/workflows/security-audit.yml"
       - "deny.toml"
   schedule:
@@ -71,7 +73,26 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Determine semver baseline
+        id: baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            base_ref="origin/${{ github.event.pull_request.base.ref }}"
+            git fetch origin "${{ github.event.pull_request.base.ref }}" --depth=1
+          elif [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            base_ref="${{ github.event.before }}"
+          else
+            default_branch="${{ github.event.repository.default_branch }}"
+            base_ref="origin/${default_branch}"
+            git fetch origin "${default_branch}" --depth=1
+          fi
+
+          echo "rev=${base_ref}" >> "$GITHUB_OUTPUT"
       - name: Check capsule-core public API compatibility
         uses: obi1kenobi/cargo-semver-checks-action@v2.8
         with:
           package: capsule-core
+          baseline-rev: ${{ steps.baseline.outputs.rev }}
