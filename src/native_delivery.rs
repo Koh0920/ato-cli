@@ -201,7 +201,7 @@ impl NativeArtifactKind {
     fn from_path(path: &Path) -> Self {
         if path_has_extension(path, "app") {
             Self::MacOsAppBundle
-        } else if path_has_extension(path, "exe") || path.is_file() {
+        } else if native_file_candidate_extension(path).is_some() || path.is_file() {
             Self::File
         } else {
             Self::Directory
@@ -2057,6 +2057,7 @@ fn discover_nearby_native_artifacts(expected_path: &Path, max_depth: usize) -> V
     };
 
     let kind = NativeArtifactKind::from_path(expected_path);
+    let expected_file_extension = native_file_candidate_extension(expected_path);
     let mut bundles = WalkDir::new(&search_root)
         .max_depth(max_depth)
         .into_iter()
@@ -2066,8 +2067,9 @@ fn discover_nearby_native_artifacts(expected_path: &Path, max_depth: usize) -> V
             NativeArtifactKind::MacOsAppBundle => path.is_dir() && path_has_extension(path, "app"),
             NativeArtifactKind::File => {
                 path.is_file()
-                    && (!path_has_extension(expected_path, "exe")
-                        || path_has_extension(path, "exe"))
+                    && expected_file_extension
+                        .map(|extension| path_has_extension(path, extension))
+                        .unwrap_or(true)
             }
             NativeArtifactKind::Directory => path.is_dir(),
         })
@@ -2096,8 +2098,7 @@ fn format_nearby_native_artifact_candidates(
     let kind = NativeArtifactKind::from_path(expected_path);
     let label = match kind {
         NativeArtifactKind::MacOsAppBundle => ".app bundle",
-        NativeArtifactKind::File if path_has_extension(expected_path, "exe") => ".exe",
-        NativeArtifactKind::File => "file",
+        NativeArtifactKind::File => native_file_candidate_label(expected_path).unwrap_or("file"),
         NativeArtifactKind::Directory => "directory",
     };
     if candidates.is_empty() {
@@ -2473,7 +2474,9 @@ fn validate_minimal_native_artifact_permissions(path: &Path) -> Result<()> {
         NativeArtifactKind::File if path_has_extension(path, "exe") => {
             validate_minimal_windows_executable(path)
         }
-        NativeArtifactKind::File | NativeArtifactKind::Directory => Ok(()),
+        NativeArtifactKind::File if path_has_extension(path, "deb") => Ok(()),
+        NativeArtifactKind::File => validate_minimal_linux_elf_file(path),
+        NativeArtifactKind::Directory => validate_minimal_linux_elf_directory(path),
     }
 }
 
@@ -2500,17 +2503,7 @@ fn validate_minimal_macos_app_permissions(app_dir: &Path) -> Result<()> {
             continue;
         }
         found_regular_file = true;
-        #[cfg(unix)]
-        {
-            let mode = metadata.permissions().mode();
-            if mode & 0o111 == 0 {
-                bail!(
-                    "Executable bit is missing for {} (mode {:o})",
-                    path.display(),
-                    mode & 0o777
-                );
-            }
-        }
+        validate_unix_executable_permissions(&path, &metadata)?;
     }
 
     if !found_regular_file {
@@ -2520,6 +2513,119 @@ fn validate_minimal_macos_app_permissions(app_dir: &Path) -> Result<()> {
         );
     }
 
+    Ok(())
+}
+
+fn validate_minimal_linux_elf_directory(root: &Path) -> Result<()> {
+    let mut found_regular_elf = false;
+    for entry in WalkDir::new(root)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        let path = entry.into_path();
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("Failed to stat {}", path.display()))?;
+        #[cfg(unix)]
+        if metadata.permissions().mode() & 0o111 == 0 {
+            continue;
+        }
+
+        if !path_has_elf_magic(&path)? {
+            continue;
+        }
+
+        validate_unix_executable_permissions(&path, &metadata)?;
+        let bytes = fs::read(&path)
+            .with_context(|| format!("Failed to read Linux executable {}", path.display()))?;
+        validate_linux_elf_bytes(&path, &bytes)?;
+        found_regular_elf = true;
+    }
+
+    if !found_regular_elf {
+        bail!(
+            "Native delivery input is missing a regular ELF executable in {}",
+            root.display()
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_minimal_linux_elf_file(path: &Path) -> Result<()> {
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("Failed to stat {}", path.display()))?;
+    validate_unix_executable_permissions(path, &metadata)?;
+    let bytes = fs::read(path)
+        .with_context(|| format!("Failed to read Linux executable {}", path.display()))?;
+    validate_linux_elf_bytes(path, &bytes)
+}
+
+fn validate_linux_elf_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    let object = Object::parse(bytes).with_context(|| {
+        format!(
+            "Linux executable failed minimum ELF validation: {}",
+            path.display()
+        )
+    })?;
+    let Object::Elf(_) = object else {
+        bail!(
+            "Linux executable failed minimum ELF validation: {} is not an ELF image",
+            path.display()
+        );
+    };
+    Ok(())
+}
+
+fn path_has_elf_magic(path: &Path) -> Result<bool> {
+    let mut file =
+        fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
+    let mut magic = [0u8; 4];
+    let bytes_read = file
+        .read(&mut magic)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+    Ok(bytes_read == magic.len() && magic == *b"\x7FELF")
+}
+
+fn native_file_candidate_extension(path: &Path) -> Option<&'static str> {
+    if path_has_extension(path, "exe") {
+        Some("exe")
+    } else if path_has_extension(path, "AppImage") {
+        Some("AppImage")
+    } else if path_has_extension(path, "deb") {
+        Some("deb")
+    } else {
+        None
+    }
+}
+
+fn native_file_candidate_label(path: &Path) -> Option<&'static str> {
+    match native_file_candidate_extension(path) {
+        Some("exe") => Some(".exe"),
+        Some("AppImage") => Some(".AppImage"),
+        Some("deb") => Some(".deb"),
+        Some(_) | None => None,
+    }
+}
+
+#[cfg(unix)]
+fn validate_unix_executable_permissions(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    let mode = metadata.permissions().mode();
+    if mode & 0o111 == 0 {
+        bail!(
+            "Executable bit is missing for {} (mode {:o})",
+            path.display(),
+            mode & 0o777
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_unix_executable_permissions(_path: &Path, _metadata: &fs::Metadata) -> Result<()> {
     Ok(())
 }
 
@@ -3253,6 +3359,35 @@ args = ["sign", "/fd", "SHA256", "dist/MyApp.exe"]
         sample_windows_pe_bytes(true)
     }
 
+    fn sample_linux_elf_bytes() -> Vec<u8> {
+        let mut bytes = vec![0u8; 64];
+        bytes[0..4].copy_from_slice(b"\x7FELF");
+        bytes[4] = 2;
+        bytes[5] = 1;
+        bytes[6] = 1;
+        bytes[16..18].copy_from_slice(&(2u16).to_le_bytes());
+        bytes[18..20].copy_from_slice(&(62u16).to_le_bytes());
+        bytes[20..24].copy_from_slice(&(1u32).to_le_bytes());
+        bytes[24..32].copy_from_slice(&(0x400000u64).to_le_bytes());
+        bytes[52..54].copy_from_slice(&(64u16).to_le_bytes());
+        bytes
+    }
+
+    #[cfg(unix)]
+    fn write_linux_elf(path: &Path, mode: u32) -> Result<()> {
+        fs::write(path, sample_linux_elf_bytes())?;
+        let mut permissions = fs::metadata(path)?.permissions();
+        permissions.set_mode(mode);
+        fs::set_permissions(path, permissions)?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn write_linux_elf(path: &Path, _mode: u32) -> Result<()> {
+        fs::write(path, sample_linux_elf_bytes())?;
+        Ok(())
+    }
+
     fn sample_native_build_plan(root: &Path, mode: u32) -> Result<NativeBuildPlan> {
         let manifest_dir = root.join("native-build-project");
         let source_app_path = manifest_dir.join("MyApp.app");
@@ -3533,16 +3668,94 @@ input = "dist/time-management-desktop.app"
     }
 
     #[test]
-    fn validate_native_bundle_directory_accepts_generic_directory_and_file() -> Result<()> {
+    fn validate_native_bundle_directory_reports_nearby_appimage_candidates() -> Result<()> {
+        let tmp = tempdir()?;
+        let linux_dir = tmp.path().join("src-tauri/target/release/bundle/appimage");
+        let candidate = linux_dir.join("Time Management Desktop.AppImage");
+        fs::create_dir_all(&linux_dir)?;
+        write_linux_elf(&candidate, 0o755)?;
+
+        let err =
+            validate_native_bundle_directory(&linux_dir.join("time-management-desktop.AppImage"))
+                .expect_err("missing exact AppImage path should fail");
+        let message = err.to_string();
+        assert!(message.contains("Found nearby .AppImage candidates"));
+        assert!(message.contains("Time Management Desktop.AppImage"));
+        Ok(())
+    }
+
+    #[test]
+    fn validate_native_bundle_directory_accepts_linux_directory_and_files() -> Result<()> {
         let tmp = tempdir()?;
         let linux_dir = tmp.path().join("dist/linux");
+        let linux_binary = linux_dir.join("MyApp");
+        let linux_deb = tmp.path().join("dist/MyApp.deb");
         let windows_exe = tmp.path().join("dist/MyApp.exe");
         fs::create_dir_all(&linux_dir)?;
         fs::create_dir_all(windows_exe.parent().context("missing exe parent")?)?;
+        write_linux_elf(&linux_binary, 0o755)?;
+        fs::write(&linux_deb, b"!<arch>\n")?;
         fs::write(&windows_exe, sample_windows_executable_bytes())?;
 
         validate_native_bundle_directory(&linux_dir)?;
+        validate_native_bundle_directory(&linux_deb)?;
         validate_native_bundle_directory(&windows_exe)?;
+        Ok(())
+    }
+
+    #[test]
+    fn validate_native_bundle_directory_rejects_invalid_linux_elf() -> Result<()> {
+        let tmp = tempdir()?;
+        let linux_file = tmp.path().join("dist/MyApp.AppImage");
+        fs::create_dir_all(linux_file.parent().context("missing linux parent")?)?;
+        fs::write(&linux_file, b"\x7FELFnot-a-valid-elf")?;
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&linux_file)?.permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&linux_file, permissions)?;
+        }
+
+        let err = validate_native_bundle_directory(&linux_file)
+            .expect_err("invalid AppImage should fail ELF validation");
+        assert!(err
+            .to_string()
+            .contains("Linux executable failed minimum ELF validation"));
+        Ok(())
+    }
+
+    #[test]
+    fn validate_native_bundle_directory_rejects_linux_directory_without_elf_executable(
+    ) -> Result<()> {
+        let tmp = tempdir()?;
+        let linux_dir = tmp.path().join("dist/linux");
+        let launcher = linux_dir.join("AppRun");
+        fs::create_dir_all(&linux_dir)?;
+        fs::write(&launcher, b"#!/bin/sh\nexit 0\n")?;
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&launcher)?.permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&launcher, permissions)?;
+        }
+
+        let err = validate_native_bundle_directory(&linux_dir)
+            .expect_err("directory without an ELF executable should fail closed");
+        assert!(err.to_string().contains("missing a regular ELF executable"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_native_bundle_directory_rejects_linux_elf_without_executable_bit() -> Result<()> {
+        let tmp = tempdir()?;
+        let linux_file = tmp.path().join("dist/MyApp");
+        fs::create_dir_all(linux_file.parent().context("missing linux parent")?)?;
+        write_linux_elf(&linux_file, 0o644)?;
+
+        let err = validate_native_bundle_directory(&linux_file)
+            .expect_err("missing executable bit should fail closed");
+        assert!(err.to_string().contains("Executable bit is missing"));
         Ok(())
     }
 
