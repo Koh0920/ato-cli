@@ -136,7 +136,8 @@ fn require_success(output: Output, context: &str) -> Result<Output> {
 }
 
 fn command_on_path(program: &str) -> bool {
-    Command::new("which")
+    let lookup = if cfg!(windows) { "where" } else { "which" };
+    Command::new(lookup)
         .arg(program)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -157,6 +158,10 @@ fn command_available(program: &str, args: &[&str]) -> bool {
 
 fn sample_project_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".tmp/sample-native-capsule")
+}
+
+fn windows_fixture_project_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/native-delivery-tauri")
 }
 
 fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
@@ -459,6 +464,33 @@ path = "sample-native-capsule.app"
     fs::write(&artifact_path, out)
         .with_context(|| format!("failed to write {}", artifact_path.display()))?;
     Ok(artifact_path)
+}
+
+#[cfg(windows)]
+fn verify_authenticode_signature(path: &Path) -> Result<()> {
+    let path_arg = path.to_string_lossy().into_owned();
+    let output = run_command(
+        "powershell.exe",
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$signature = Get-AuthenticodeSignature -FilePath $args[0]; if ($signature.SignerCertificate) { Write-Output signed } else { throw 'missing signer certificate' }",
+            &path_arg,
+        ],
+        path.parent().unwrap_or_else(|| Path::new(".")),
+    )?;
+    let output = require_success(output, "Get-AuthenticodeSignature")?;
+    let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if status != "signed" {
+        anyhow::bail!("expected a signed Authenticode artifact, got '{status}'");
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn verify_authenticode_signature(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 #[test]
@@ -820,6 +852,158 @@ fn e2e_native_delivery_sample_tauri_unsigned_finalize() -> Result<()> {
         finalize_json["output_dir"].as_str(),
         "finalize must create a fresh derived directory each run"
     );
+
+    Ok(())
+}
+
+#[test]
+fn e2e_native_delivery_windows_build_publish_install_run() -> Result<()> {
+    if !cfg!(windows) {
+        eprintln!("skipping e2e_native_delivery_windows_build_publish_install_run: Windows only");
+        return Ok(());
+    }
+    if !windows_fixture_project_dir().exists() {
+        eprintln!(
+            "skipping e2e_native_delivery_windows_build_publish_install_run: fixture project missing"
+        );
+        return Ok(());
+    }
+    if !command_on_path("cargo") || !command_available("cargo", &["--version"]) {
+        eprintln!(
+            "skipping e2e_native_delivery_windows_build_publish_install_run: cargo unavailable"
+        );
+        return Ok(());
+    }
+    if !command_on_path("powershell.exe")
+        || !command_available(
+            "powershell.exe",
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$PSVersionTable.PSVersion.ToString()",
+            ],
+        )
+    {
+        eprintln!(
+            "skipping e2e_native_delivery_windows_build_publish_install_run: powershell unavailable"
+        );
+        return Ok(());
+    }
+
+    let ato = assert_cmd::cargo::cargo_bin("ato");
+    let tmp = TempDir::new().context("create temp dir")?;
+    let home_dir = tmp.path().join("home");
+    fs::create_dir_all(&home_dir)?;
+    let data_dir = tmp.path().join("registry-data");
+
+    let fixture_workspace = tmp.path().join("sample-native-capsule");
+    copy_tree(&windows_fixture_project_dir(), &fixture_workspace)?;
+
+    let Some((_guard, base_url)) = start_local_registry_or_skip(
+        &ato,
+        &data_dir,
+        "e2e_native_delivery_windows_build_publish_install_run",
+    )?
+    else {
+        return Ok(());
+    };
+
+    let build = run_ato_with_home(
+        &ato,
+        &[
+            "--json",
+            "build",
+            fixture_workspace.to_string_lossy().as_ref(),
+        ],
+        tmp.path(),
+        &home_dir,
+    )?;
+    let build = require_success(build, "build native Windows fixture capsule")?;
+    let build_json: serde_json::Value =
+        serde_json::from_slice(&build.stdout).context("parse build json")?;
+    assert_eq!(
+        build_json["build_strategy"].as_str(),
+        Some("native-delivery")
+    );
+    assert_eq!(build_json["target"].as_str(), Some("windows/x86_64"));
+    let artifact_path = PathBuf::from(
+        build_json["artifact"]
+            .as_str()
+            .context("build artifact path missing")?,
+    );
+    assert!(
+        artifact_path.is_file(),
+        "artifact missing: {}",
+        artifact_path.display()
+    );
+
+    let publish = run_ato_with_home(
+        &ato,
+        &[
+            "publish",
+            "--deploy",
+            "--registry",
+            &base_url,
+            "--artifact",
+            artifact_path.to_string_lossy().as_ref(),
+            "--scoped-id",
+            "local/sample-native-capsule",
+            "--json",
+        ],
+        tmp.path(),
+        &home_dir,
+    )?;
+    require_success(publish, "publish native Windows fixture capsule")?;
+
+    let install = run_ato_with_home(
+        &ato,
+        &[
+            "install",
+            "local/sample-native-capsule",
+            "--registry",
+            &base_url,
+            "--yes",
+            "--no-project",
+            "--json",
+        ],
+        tmp.path(),
+        &home_dir,
+    )?;
+    let install = require_success(install, "install native Windows fixture capsule")?;
+    let install_json: serde_json::Value =
+        serde_json::from_slice(&install.stdout).context("parse install json")?;
+    let local_derivation = install_json["local_derivation"]
+        .as_object()
+        .context("install local_derivation missing")?;
+    assert_eq!(
+        local_derivation.get("performed").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    let derived_exe = PathBuf::from(
+        local_derivation
+            .get("derived_app_path")
+            .and_then(|v| v.as_str())
+            .context("install derived_app_path missing")?,
+    );
+    assert!(
+        derived_exe.is_file(),
+        "derived exe missing: {}",
+        derived_exe.display()
+    );
+    verify_authenticode_signature(&derived_exe)?;
+
+    let run_marker = tmp.path().join("run-marker.txt");
+    let output = Command::new(&derived_exe)
+        .current_dir(tmp.path())
+        .env("SAMPLE_NATIVE_CAPSULE_MARKER", &run_marker)
+        .env("SAMPLE_NATIVE_CAPSULE_EXIT_AFTER_MARK", "1")
+        .output()
+        .with_context(|| format!("failed to launch {}", derived_exe.display()))?;
+    require_success(output, "run installed native Windows fixture")?;
+    let marker_contents = fs::read_to_string(&run_marker)
+        .with_context(|| format!("failed to read {}", run_marker.display()))?;
+    assert_eq!(marker_contents, "sample-native-capsule\n");
 
     Ok(())
 }

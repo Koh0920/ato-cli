@@ -222,7 +222,7 @@ impl std::fmt::Display for NativeArtifactKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FinalizeRunnerKind {
     Codesign,
-    ExternalStub,
+    ExternalCommand,
 }
 
 #[derive(Debug, Clone)]
@@ -237,7 +237,7 @@ impl FinalizeRunner {
         let kind = if trimmed.eq_ignore_ascii_case("codesign") {
             FinalizeRunnerKind::Codesign
         } else {
-            FinalizeRunnerKind::ExternalStub
+            FinalizeRunnerKind::ExternalCommand
         };
         Self {
             tool: trimmed.to_string(),
@@ -248,17 +248,15 @@ impl FinalizeRunner {
     fn strip_existing_signature(&self, artifact_path: &Path) -> Result<()> {
         match self.kind {
             FinalizeRunnerKind::Codesign => strip_codesign_signature(&self.tool, artifact_path),
-            FinalizeRunnerKind::ExternalStub => Ok(()),
+            FinalizeRunnerKind::ExternalCommand => Ok(()),
         }
     }
 
     fn run(&self, derived_dir: &Path, config: &DeliveryConfig) -> Result<()> {
         match self.kind {
-            FinalizeRunnerKind::Codesign => run_codesign_command(derived_dir, config),
-            FinalizeRunnerKind::ExternalStub => bail!(
-                "finalize tool '{}' is not implemented for this host yet",
-                self.tool
-            ),
+            FinalizeRunnerKind::Codesign | FinalizeRunnerKind::ExternalCommand => {
+                run_finalize_command(derived_dir, config)
+            }
         }
     }
 }
@@ -407,7 +405,7 @@ pub(crate) fn build_native_artifact(
     output_path: Option<&Path>,
 ) -> Result<NativeBuildResult> {
     if !host_supports_finalize() {
-        bail!("native delivery build currently supports macOS hosts only");
+        bail!("native delivery build currently supports macOS and Windows hosts only");
     }
 
     let config = staged_delivery_config(plan)?;
@@ -963,7 +961,7 @@ pub fn execute_finalize(
     }
 
     if !host_supports_finalize() {
-        bail!("ato finalize currently supports macOS hosts only");
+        bail!("ato finalize currently supports macOS and Windows hosts only");
     }
 
     finalize_with_dispatch(fetched_dir, output_dir)
@@ -1974,7 +1972,7 @@ fn rebase_delivery_config_for_finalize(
 
 fn ensure_native_artifact_kind_supported(path: &Path, action: &str) -> Result<NativeArtifactKind> {
     let kind = NativeArtifactKind::from_path(path);
-    if kind == NativeArtifactKind::File {
+    if kind == NativeArtifactKind::File && !path_has_extension(path, "exe") {
         bail!(
             "Native delivery {} does not support single-file artifacts yet: {}",
             action,
@@ -2177,7 +2175,7 @@ fn staged_delivery_config(plan: &NativeBuildPlan) -> Result<DeliveryConfig> {
     Ok(config)
 }
 
-fn run_codesign_command(derived_dir: &Path, config: &DeliveryConfig) -> Result<()> {
+fn run_finalize_command(derived_dir: &Path, config: &DeliveryConfig) -> Result<()> {
     let tool = config.finalize.tool.trim();
     let mut command = Command::new(tool);
     command
@@ -3198,7 +3196,7 @@ fn is_projection_shortcut(path: &Path, metadata: &fs::Metadata) -> bool {
 }
 
 pub(crate) fn host_supports_finalize() -> bool {
-    cfg!(target_os = "macos")
+    cfg!(target_os = "macos") || cfg!(windows)
 }
 
 pub(crate) fn host_supports_projection() -> bool {
@@ -3908,18 +3906,17 @@ input = "dist/time-management-desktop.app"
     }
 
     #[test]
-    fn build_rejects_single_file_native_artifacts_with_explicit_error() -> Result<()> {
+    fn build_accepts_windows_single_file_native_artifacts() -> Result<()> {
         let tmp = tempdir()?;
         let plan = sample_file_native_build_plan(tmp.path())?;
         let artifact_path = tmp.path().join("out/my-app-0.1.0.capsule");
 
-        let err = build_native_artifact_with_strip(&plan, Some(&artifact_path), |_path| Ok(()))
-            .expect_err("single-file native artifacts should fail closed during build");
+        let result = build_native_artifact_with_strip(&plan, Some(&artifact_path), |_path| Ok(()))?;
 
-        assert!(err
-            .to_string()
-            .contains("Native delivery build does not support single-file artifacts yet"));
-        assert!(!artifact_path.exists());
+        assert_eq!(result.artifact_path, artifact_path);
+        assert_eq!(result.derived_from, plan.source_app_path);
+        let entry_modes = read_payload_entry_modes(&result.artifact_path)?;
+        assert!(entry_modes.contains_key("dist/MyApp.exe"));
         Ok(())
     }
 
@@ -4442,17 +4439,22 @@ input = "dist/time-management-desktop.app"
     }
 
     #[test]
-    fn finalize_rejects_single_file_native_artifacts_with_explicit_error() -> Result<()> {
+    fn finalize_accepts_windows_single_file_native_artifacts() -> Result<()> {
         let tmp = tempdir()?;
         let fetched_dir = sample_file_fetch_dir(tmp.path())?;
         let output_root = tmp.path().join("dist");
 
-        let err = finalize_with_runner(&fetched_dir, &output_root, |_derived_dir, _config| Ok(()))
-            .expect_err("single-file native artifacts should fail closed during finalize");
+        let result =
+            finalize_with_runner(&fetched_dir, &output_root, |_derived_dir, _config| Ok(()))?;
 
-        assert!(err
-            .to_string()
-            .contains("Native delivery finalize does not support single-file artifacts yet"));
+        assert_eq!(
+            result
+                .derived_app_path
+                .file_name()
+                .and_then(|value| value.to_str()),
+            Some("MyApp.exe")
+        );
+        assert!(result.derived_app_path.is_file());
         Ok(())
     }
 
