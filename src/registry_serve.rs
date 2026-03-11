@@ -39,6 +39,7 @@ use crate::state::{ensure_registered_state_binding, load_manifest, open_state_st
 
 const README_CANDIDATES: [&str; 4] = ["README.md", "README.mdx", "README.txt", "README"];
 const README_MAX_BYTES: usize = 512 * 1024;
+const LOCAL_REGISTRY_DISABLE_UI_ENV: &str = "ATO_LOCAL_REGISTRY_DISABLE_UI";
 
 #[derive(RustEmbed)]
 #[folder = "apps/ato-store-local/dist"]
@@ -485,6 +486,8 @@ pub async fn serve(config: RegistryServerConfig) -> Result<()> {
     };
     spawn_registry_gc_worker(state.data_dir.clone());
 
+    let ui_enabled = std::env::var_os(LOCAL_REGISTRY_DISABLE_UI_ENV).is_none();
+
     let mut app = Router::new()
         .route("/.well-known/capsule.json", get(handle_well_known))
         .route("/v1/capsules", get(handle_search_capsules))
@@ -595,9 +598,13 @@ pub async fn serve(config: RegistryServerConfig) -> Result<()> {
         .route(
             "/v1/local/processes/:id/logs",
             get(handle_get_process_logs).delete(handle_clear_process_logs),
-        )
-        .fallback(handle_ui_request)
-        .with_state(state);
+        );
+
+    if ui_enabled {
+        app = app.fallback(handle_ui_request);
+    }
+
+    let mut app = app.with_state(state);
 
     if std::env::var_os("ATO_LOCAL_REGISTRY_DEV_CORS").is_some() {
         app = app.layer(
@@ -618,9 +625,11 @@ pub async fn serve(config: RegistryServerConfig) -> Result<()> {
 
     let access_base_url = format!("http://{}:{}", access_host, config.port);
     println!("🚀 Local registry serving at {}", listen_url);
-    println!("🌐 Web UI: {}/", access_base_url);
     println!("🔌 API: {}/v1/...", access_base_url);
-    if LocalRegistryUiAssets::get("index.html").is_none() {
+    if ui_enabled {
+        println!("🌐 Web UI: {}/", access_base_url);
+    }
+    if ui_enabled && LocalRegistryUiAssets::get("index.html").is_none() {
         println!("⚠️  Web UI assets are missing. Rebuild with `cargo build` after installing npm deps in apps/ato-store-local.");
     }
     let addr: SocketAddr = format!("{}:{}", host, config.port)

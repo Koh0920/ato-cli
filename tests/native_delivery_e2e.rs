@@ -141,6 +141,7 @@ fn start_local_registry(ato: &Path, data_dir: &Path) -> Result<(ServerGuard, Str
             data_dir.to_string_lossy().as_ref(),
         ])
         .stdin(Stdio::null())
+        .env("ATO_LOCAL_REGISTRY_DISABLE_UI", "1")
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
         .spawn()
