@@ -483,10 +483,10 @@ enum Commands {
         about = "Add a finalized app to launcher surfaces (experimental)"
     )]
     Project {
-        /// Path to a finalized local derived .app bundle created by `ato finalize`
+        /// Path to a finalized local derived artifact directory created by `ato finalize`
         derived_app_path: Option<PathBuf>,
 
-        /// Override launcher surface directory (default: ~/Applications)
+        /// Override launcher surface directory (default: host-specific launcher dir)
         #[arg(long)]
         launcher_dir: Option<PathBuf>,
 
