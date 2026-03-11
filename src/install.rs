@@ -455,7 +455,7 @@ pub async fn download_github_repository(repository: &str) -> Result<GitHubChecko
         .ok_or_else(|| anyhow::anyhow!("repository must include owner/repo"))?;
     let publisher = normalize_install_segment(owner)?;
     let client = reqwest::Client::new();
-    let archive_url = format!("https://api.github.com/repos/{owner}/{repo}/tarball");
+    let archive_url = format!("{}/repos/{owner}/{repo}/tarball", github_api_base_url());
     let response = client
         .get(&archive_url)
         .header(reqwest::header::USER_AGENT, "ato-cli")
@@ -480,7 +480,10 @@ pub async fn download_github_repository(repository: &str) -> Result<GitHubChecko
         .prefix("gh-install-")
         .tempdir_in(temp_root)
         .with_context(|| "Failed to create GitHub checkout directory")?;
-    let checkout_dir = unpack_github_tarball(&archive_bytes, temp_dir.path())?;
+    let checkout_dir = normalize_github_checkout_dir(
+        unpack_github_tarball(&archive_bytes, temp_dir.path())?,
+        repo,
+    )?;
     Ok(GitHubCheckout {
         repository: normalized,
         publisher,
@@ -995,7 +998,10 @@ fn normalize_install_segment(value: &str) -> Result<String> {
         normalized.pop();
     }
     if !is_valid_segment(&normalized) {
-        bail!("invalid install identifier segment: {}", value);
+        bail!(
+            "invalid install identifier segment '{}': must contain lowercase letters or digits and may include single hyphens between them",
+            value
+        );
     }
     Ok(normalized)
 }
@@ -1015,6 +1021,18 @@ fn github_checkout_root() -> Result<PathBuf> {
     Ok(root)
 }
 
+/// Returns the GitHub API base URL for repository archive downloads.
+///
+/// `ATO_GITHUB_API_BASE_URL` is intended for local/mock CLI tests so the
+/// `--from-gh-repo` flow can be exercised without real GitHub network access.
+fn github_api_base_url() -> String {
+    std::env::var("ATO_GITHUB_API_BASE_URL")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "https://api.github.com".to_string())
+}
+
 fn unpack_github_tarball(bytes: &[u8], destination: &Path) -> Result<PathBuf> {
     let decoder = flate2::read::GzDecoder::new(Cursor::new(bytes));
     let mut archive = tar::Archive::new(decoder);
@@ -1030,12 +1048,14 @@ fn unpack_github_tarball(bytes: &[u8], destination: &Path) -> Result<PathBuf> {
         let mut components = path.components();
         let first = components
             .next()
-            .ok_or_else(|| anyhow::anyhow!("GitHub archive entry path is empty"))?;
+            .ok_or_else(|| anyhow::anyhow!("GitHub archive entry path is empty or invalid"))?;
         let Component::Normal(root_component) = first else {
             bail!(
-                "GitHub archive entry must start with a top-level directory before repository files"
+                "GitHub archive entry must start with a top-level directory before repository files; found non-standard leading path component"
             );
         };
+        // The first component is the expected top-level repository directory. Remaining
+        // components must stay within that directory and must not traverse outward.
         if components.any(|component| {
             matches!(
                 component,
@@ -1060,6 +1080,30 @@ fn unpack_github_tarball(bytes: &[u8], destination: &Path) -> Result<PathBuf> {
     }
     let root_dir = root_dir.ok_or_else(|| anyhow::anyhow!("GitHub archive is empty"))?;
     Ok(destination.join(root_dir))
+}
+
+fn normalize_github_checkout_dir(extracted_root: PathBuf, repo: &str) -> Result<PathBuf> {
+    let parent = extracted_root
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("GitHub checkout root is missing a parent directory"))?;
+    let normalized = parent.join(repo.trim());
+    if normalized == extracted_root {
+        return Ok(extracted_root);
+    }
+    if normalized.exists() {
+        bail!(
+            "GitHub checkout directory already exists: {}",
+            normalized.display()
+        );
+    }
+    std::fs::rename(&extracted_root, &normalized).with_context(|| {
+        format!(
+            "Failed to normalize GitHub checkout directory {} -> {}",
+            extracted_root.display(),
+            normalized.display()
+        )
+    })?;
+    Ok(normalized)
 }
 
 fn extract_payload_v3_manifest_from_capsule(
@@ -3397,6 +3441,120 @@ entrypoint = "main.py"
     fn test_normalize_install_segment_slugifies_github_owner() {
         assert_eq!(normalize_install_segment("Koh_0920").unwrap(), "koh-0920");
         assert!(normalize_install_segment("___").is_err());
+    }
+
+    #[test]
+    fn test_github_api_base_url_uses_env_override() {
+        let key = "ATO_GITHUB_API_BASE_URL";
+        let previous = std::env::var(key).ok();
+        std::env::set_var(key, "http://127.0.0.1:3000/");
+        assert_eq!(github_api_base_url(), "http://127.0.0.1:3000");
+        match previous {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    #[test]
+    fn test_normalize_github_checkout_dir_renames_to_repo_name() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let extracted = temp.path().join("Koh0920-demo-abc123");
+        std::fs::create_dir_all(&extracted).expect("create extracted");
+        std::fs::write(extracted.join("index.js"), "console.log('hi')").expect("write fixture");
+        let normalized =
+            normalize_github_checkout_dir(extracted.clone(), "demo").expect("normalize checkout");
+        assert_eq!(normalized, temp.path().join("demo"));
+        assert!(normalized.join("index.js").exists());
+        assert!(!extracted.exists());
+    }
+
+    #[test]
+    fn test_unpack_github_tarball_rejects_empty_archive() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let bytes = encoder.finish().expect("finish gzip");
+        let err = unpack_github_tarball(&bytes, temp.path()).expect_err("empty archive must fail");
+        assert!(err.to_string().contains("GitHub archive is empty"));
+    }
+
+    #[test]
+    fn test_unpack_github_tarball_rejects_multiple_top_level_directories() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut archive_bytes = Vec::new();
+        {
+            let encoder =
+                flate2::write::GzEncoder::new(&mut archive_bytes, flate2::Compression::default());
+            let mut builder = tar::Builder::new(encoder);
+
+            let mut header = tar::Header::new_gnu();
+            header.set_size(1);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "repo-a/index.js", std::io::Cursor::new(b"a"))
+                .expect("append repo-a");
+
+            let mut header = tar::Header::new_gnu();
+            header.set_size(1);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "repo-b/index.js", std::io::Cursor::new(b"b"))
+                .expect("append repo-b");
+
+            builder
+                .into_inner()
+                .expect("finish tar")
+                .finish()
+                .expect("finish gzip");
+        }
+
+        let err =
+            unpack_github_tarball(&archive_bytes, temp.path()).expect_err("must reject archive");
+        assert!(err.to_string().contains("multiple top-level directories"));
+    }
+
+    #[test]
+    fn test_unpack_github_tarball_rejects_path_traversal_entries() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut tar_bytes = Vec::new();
+        {
+            let path = b"repo/../evil.txt";
+            let content = b"x";
+            let mut header = [0u8; 512];
+            header[..path.len()].copy_from_slice(path);
+            header[100..108].copy_from_slice(b"0000644\0");
+            header[108..116].copy_from_slice(b"0000000\0");
+            header[116..124].copy_from_slice(b"0000000\0");
+            header[124..136].copy_from_slice(b"00000000001\0");
+            header[136..148].copy_from_slice(b"00000000000\0");
+            header[148..156].fill(b' ');
+            header[156] = b'0';
+            header[257..263].copy_from_slice(b"ustar\0");
+            header[263..265].copy_from_slice(b"00");
+            let checksum: u32 = header.iter().map(|byte| *byte as u32).sum();
+            let checksum_octal = format!("{checksum:06o}\0 ");
+            header[148..156].copy_from_slice(checksum_octal.as_bytes());
+
+            tar_bytes.extend_from_slice(&header);
+            tar_bytes.extend_from_slice(content);
+            tar_bytes.extend_from_slice(&[0u8; 511][..511 - content.len() + 1]);
+            tar_bytes.extend_from_slice(&[0u8; 1024]);
+        }
+        let mut archive_bytes = Vec::new();
+        {
+            let mut encoder =
+                flate2::write::GzEncoder::new(&mut archive_bytes, flate2::Compression::default());
+            use std::io::Write as _;
+            encoder.write_all(&tar_bytes).expect("write tar");
+            encoder.finish().expect("finish gzip");
+        }
+
+        let err =
+            unpack_github_tarball(&archive_bytes, temp.path()).expect_err("must reject traversal");
+        assert!(err
+            .to_string()
+            .contains("unsafe path traversal components"));
     }
 
     #[test]
