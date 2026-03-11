@@ -85,6 +85,10 @@ predicates = "3"
 wat = "1.0"
 serial_test = "3"
 
+[target.'cfg(windows)'.dependencies]
+junction = "1.4.2"
+mslnk = "0.1.8"
+
 [target.'cfg(not(windows))'.dependencies]
 wasmtime = "16.0"
 wasmtime-wasi = "16.0"
