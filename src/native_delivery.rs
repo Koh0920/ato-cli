@@ -31,10 +31,14 @@ const DEFAULT_DELIVERY_FRAMEWORK: &str = "tauri";
 const DELIVERY_STAGE: &str = "unsigned";
 const DEFAULT_DELIVERY_TARGET: &str = "darwin/arm64";
 const DEFAULT_FINALIZE_TOOL: &str = "codesign";
-const DEFAULT_LAUNCHER_DIR: &str = "Applications";
+const DEFAULT_MACOS_LAUNCHER_DIR: &str = "Applications";
+const DEFAULT_LINUX_DESKTOP_ENTRY_DIR: &str = ".local/share/applications";
+const DEFAULT_LINUX_BIN_DIR: &str = ".local/bin";
 const PROJECTIONS_DIR: &str = ".ato/native-delivery/projections";
-const PROJECTION_KIND: &str = "symlink";
+const PROJECTION_KIND_SYMLINK: &str = "symlink";
+const PROJECTION_KIND_LINUX_DESKTOP_ENTRY: &str = "linux-desktop-entry";
 const DEFAULT_DERIVED_APPS_DIR: &str = ".ato/apps";
+const LINUX_PROJECTION_EXEC_SEARCH_MAX_DEPTH: usize = 3;
 
 #[derive(Debug, Serialize)]
 pub struct FetchResult {
@@ -300,6 +304,10 @@ struct ProjectionMetadata {
     launcher_dir: PathBuf,
     projected_path: PathBuf,
     derived_app_path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    projected_command_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    projected_command_target: Option<PathBuf>,
     provenance_path: PathBuf,
     parent_digest: String,
     derived_digest: String,
@@ -320,6 +328,8 @@ struct ProjectionMetadata {
 struct ProjectionSource {
     derived_app_path: PathBuf,
     provenance_path: PathBuf,
+    projection_kind: ProjectionKind,
+    projected_command_target: Option<PathBuf>,
     parent_digest: String,
     derived_digest: String,
     scoped_id: Option<String>,
@@ -335,6 +345,30 @@ struct ProjectionSource {
 struct StoredProjection {
     metadata_path: PathBuf,
     metadata: ProjectionMetadata,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectionKind {
+    Symlink,
+    LinuxDesktopEntry,
+}
+
+impl ProjectionKind {
+    fn for_target(target: &str) -> Option<Self> {
+        match delivery_target_os_family(target) {
+            Some("darwin") => Some(Self::Symlink),
+            Some("windows") => Some(Self::Symlink),
+            Some("linux") => Some(Self::LinuxDesktopEntry),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Symlink => PROJECTION_KIND_SYMLINK,
+            Self::LinuxDesktopEntry => PROJECTION_KIND_LINUX_DESKTOP_ENTRY,
+        }
+    }
 }
 
 pub(crate) fn detect_build_strategy(manifest_dir: &Path) -> Result<Option<NativeBuildPlan>> {
@@ -982,7 +1016,7 @@ pub fn execute_project(
     launcher_dir: Option<&Path>,
 ) -> Result<ProjectResult> {
     if !host_supports_projection() {
-        bail!("ato project currently supports macOS and Windows hosts only");
+    bail!("ato project currently supports macOS, Linux, and Windows hosts only");
     }
 
     let launcher_dir = resolve_launcher_dir(launcher_dir)?;
@@ -992,7 +1026,7 @@ pub fn execute_project(
 
 pub fn execute_project_ls() -> Result<ProjectionListResult> {
     if !host_supports_projection() {
-        bail!("ato project ls currently supports macOS and Windows hosts only");
+    bail!("ato project ls currently supports macOS, Linux, and Windows hosts only");
     }
 
     list_projections(&projections_root()?)
@@ -1000,7 +1034,7 @@ pub fn execute_project_ls() -> Result<ProjectionListResult> {
 
 pub fn execute_unproject(reference: &str) -> Result<UnprojectResult> {
     if !host_supports_projection() {
-        bail!("ato unproject currently supports macOS and Windows hosts only");
+    bail!("ato unproject currently supports macOS, Linux, and Windows hosts only");
     }
 
     unproject_with_metadata_root(reference, &projections_root()?)
@@ -1104,6 +1138,21 @@ fn project_with_roots(
     launcher_dir: &Path,
     metadata_root: &Path,
 ) -> Result<ProjectResult> {
+    let projected_command_dir = resolve_projected_command_dir_for_host(launcher_dir)?;
+    project_with_roots_and_command_dir(
+        derived_app_path,
+        launcher_dir,
+        metadata_root,
+        &projected_command_dir,
+    )
+}
+
+fn project_with_roots_and_command_dir(
+    derived_app_path: &Path,
+    launcher_dir: &Path,
+    metadata_root: &Path,
+    projected_command_dir: &Path,
+) -> Result<ProjectResult> {
     let source = load_projection_source(derived_app_path)?;
     fs::create_dir_all(launcher_dir).with_context(|| {
         format!(
@@ -1119,13 +1168,22 @@ fn project_with_roots(
     })?;
 
     let launcher_dir = absolute_path(launcher_dir)?;
-    let app_name = source
-        .derived_app_path
-        .file_name()
-        .ok_or_else(|| anyhow::anyhow!("Derived app path has no terminal name"))?
-        .to_os_string();
-    let projected_base_path = launcher_dir.join(&app_name);
-    let projected_candidates = projection_candidate_paths(&projected_base_path);
+    let projected_command_dir = absolute_path(projected_command_dir)?;
+    let display_name =
+        projection_display_name(&source.derived_app_path, source.scoped_id.as_deref())?;
+    let command_name =
+        projection_command_name(&source.derived_app_path, source.scoped_id.as_deref())?;
+    let projected_path = projection_output_path(
+        source.projection_kind,
+        &launcher_dir,
+        &source.derived_app_path,
+        &command_name,
+    )?;
+    let projected_candidates = projection_candidate_paths(&projected_path);
+    let projected_command_path = source
+        .projected_command_target
+        .as_ref()
+        .map(|_| projected_command_dir.join(&command_name));
 
     let existing = load_projection_records(metadata_root)?;
     for record in &existing {
@@ -1166,37 +1224,27 @@ fn project_with_roots(
                 record.metadata.projection_id
             );
         }
+        if let (Some(existing_command_path), Some(projected_command_path)) = (
+            record.metadata.projected_command_path.as_ref(),
+            projected_command_path.as_ref(),
+        ) {
+            if paths_match(existing_command_path, projected_command_path)? {
+                bail!(
+                    "Projection command conflict: '{}' is already managed by projection {}",
+                    projected_command_path.display(),
+                    record.metadata.projection_id
+                );
+            }
+        }
     }
 
-    if let Some(projected_path) =
-        find_existing_projection_path(&projected_base_path, &source.derived_app_path)?
-    {
-        let projection_id = build_projection_id(
-            &source.derived_app_path,
-            &projected_path,
-            &source.derived_digest,
-        );
-        let metadata_path = metadata_root.join(format!("{}.json", projection_id));
-        return Ok(ProjectResult {
-            projection_id,
-            metadata_path,
-            launcher_dir,
-            projected_path,
-            derived_app_path: source.derived_app_path.clone(),
-            parent_digest: source.parent_digest.clone(),
-            derived_digest: source.derived_digest.clone(),
-            state: "ok".to_string(),
-            problems: Vec::new(),
-            created: false,
-            schema_version: DELIVERY_SCHEMA_VERSION.to_string(),
-        });
-    }
-
-    if let Some(conflict_path) = first_existing_projection_candidate(&projected_base_path)? {
-        if is_managed_projection_to(&conflict_path, &source.derived_app_path)? {
+    if source.projection_kind == ProjectionKind::Symlink {
+        if let Some(existing_path) =
+            find_existing_projection_path(&projected_path, &source.derived_app_path)?
+        {
             let projection_id = build_projection_id(
                 &source.derived_app_path,
-                &conflict_path,
+                &existing_path,
                 &source.derived_digest,
             );
             let metadata_path = metadata_root.join(format!("{}.json", projection_id));
@@ -1204,7 +1252,7 @@ fn project_with_roots(
                 projection_id,
                 metadata_path,
                 launcher_dir,
-                projected_path: conflict_path,
+                projected_path: existing_path,
                 derived_app_path: source.derived_app_path.clone(),
                 parent_digest: source.parent_digest.clone(),
                 derived_digest: source.derived_digest.clone(),
@@ -1214,36 +1262,104 @@ fn project_with_roots(
                 schema_version: DELIVERY_SCHEMA_VERSION.to_string(),
             });
         }
+    }
+
+    if let Some(conflict_path) = first_existing_projection_candidate(&projected_path)? {
         bail!(
             "Projection name conflict: launcher path already exists: {}",
             conflict_path.display()
         );
     }
+    if let (Some(projected_command_path), Some(projected_command_target)) = (
+        projected_command_path.as_ref(),
+        source.projected_command_target.as_ref(),
+    ) {
+        fs::create_dir_all(&projected_command_dir).with_context(|| {
+            format!(
+                "Failed to create projection command directory: {}",
+                projected_command_dir.display()
+            )
+        })?;
+        if projected_command_path.exists() || fs::symlink_metadata(projected_command_path).is_ok() {
+            if !is_managed_projection_to(projected_command_path, projected_command_target)? {
+                bail!(
+                    "Projection command conflict: command path already exists: {}",
+                    projected_command_path.display()
+                );
+            }
+        }
+    }
 
+    let source_projection_kind = source.projection_kind;
+    let mut created_projected_path: Option<PathBuf> = None;
+    let mut created_command_path = false;
+    let mut written_metadata_path: Option<PathBuf> = None;
     let result = (|| -> Result<ProjectResult> {
-        let projected_path =
-            create_projection_symlink(&source.derived_app_path, &projected_base_path)
+        let projected_path = match source.projection_kind {
+            ProjectionKind::Symlink => {
+                let created =
+                    create_projection_symlink(&source.derived_app_path, &projected_path)
+                        .with_context(|| {
+                            format!(
+                                "Failed to create projection {} -> {}",
+                                projected_path.display(),
+                                source.derived_app_path.display()
+                            )
+                        })?;
+                created_projected_path = Some(created.clone());
+                created
+            }
+            ProjectionKind::LinuxDesktopEntry => {
+                let projected_command_path = projected_command_path
+                    .as_ref()
+                    .context("linux command path missing")?;
+                let projected_command_target = source
+                    .projected_command_target
+                    .as_ref()
+                    .context("linux command target missing")?;
+                if !is_managed_projection_to(projected_command_path, projected_command_target)? {
+                    create_projection_symlink(projected_command_target, projected_command_path)
+                        .with_context(|| {
+                            format!(
+                                "Failed to create command symlink {} -> {}",
+                                projected_command_path.display(),
+                                projected_command_target.display()
+                            )
+                        })?;
+                    created_command_path = true;
+                }
+                fs::write(
+                    &projected_path,
+                    render_linux_desktop_entry(
+                        &display_name,
+                        projected_command_path,
+                        &source.derived_app_path,
+                    ),
+                )
                 .with_context(|| {
-                    format!(
-                        "Failed to create projection {} -> {}",
-                        projected_base_path.display(),
-                        source.derived_app_path.display()
-                    )
+                    format!("Failed to write desktop entry {}", projected_path.display())
                 })?;
+                created_projected_path = Some(projected_path.clone());
+                projected_path.clone()
+            }
+        };
         let projection_id = build_projection_id(
             &source.derived_app_path,
             &projected_path,
             &source.derived_digest,
         );
         let metadata_path = metadata_root.join(format!("{}.json", projection_id));
+        written_metadata_path = Some(metadata_path.clone());
         let metadata = ProjectionMetadata {
             schema_version: DELIVERY_SCHEMA_VERSION.to_string(),
             projection_id: projection_id.clone(),
-            projection_kind: PROJECTION_KIND.to_string(),
+            projection_kind: source.projection_kind.as_str().to_string(),
             projected_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
             launcher_dir: launcher_dir.clone(),
             projected_path: projected_path.clone(),
             derived_app_path: source.derived_app_path.clone(),
+            projected_command_path: projected_command_path.clone(),
+            projected_command_target: source.projected_command_target.clone(),
             provenance_path: source.provenance_path.clone(),
             parent_digest: source.parent_digest.clone(),
             derived_digest: source.derived_digest.clone(),
@@ -1273,8 +1389,16 @@ fn project_with_roots(
     })();
 
     if result.is_err() {
-        if let Some(path) = first_existing_projection_candidate(&projected_base_path)? {
-            let _ = remove_projection_path(&path);
+        if let Some(path) = created_projected_path.as_ref() {
+            let _ = remove_projected_path(path, source_projection_kind.as_str());
+        }
+        if created_command_path {
+            if let Some(projected_command_path) = projected_command_path.as_ref() {
+                let _ = remove_projection_path(projected_command_path);
+            }
+        }
+        if let Some(metadata_path) = written_metadata_path.as_ref() {
+            let _ = fs::remove_file(metadata_path);
         }
     }
     result
@@ -1301,7 +1425,27 @@ fn unproject_with_metadata_root(reference: &str, metadata_root: &Path) -> Result
     let status = inspect_projection(&record.metadata, &record.metadata_path)?;
     let schema_version = record.metadata.schema_version.clone();
 
-    let removed_projected_path = remove_projection_path(&record.metadata.projected_path)?;
+    let removed_projected_path = remove_projected_path(
+        &record.metadata.projected_path,
+        &record.metadata.projection_kind,
+    )
+    .with_context(|| {
+        format!(
+            "Failed to remove projected path: {}",
+            record.metadata.projected_path.display()
+        )
+    })?;
+
+    if let Some(projected_command_path) = record.metadata.projected_command_path.as_ref() {
+        remove_projected_path(projected_command_path, PROJECTION_KIND_SYMLINK).with_context(
+            || {
+                format!(
+                    "Failed to remove projection command path: {}",
+                    projected_command_path.display()
+                )
+            },
+        )?;
+    }
 
     fs::remove_file(&record.metadata_path).with_context(|| {
         format!(
@@ -1460,25 +1604,7 @@ fn load_fetch_metadata(fetched_dir: &Path) -> Result<FetchMetadata> {
 
 fn load_projection_source(derived_app_path: &Path) -> Result<ProjectionSource> {
     let absolute_path = absolute_path(derived_app_path)?;
-    if !absolute_path.is_dir() {
-        bail!(
-            "Projection input must be a finalized .app directory: {}",
-            absolute_path.display()
-        );
-    }
-    if absolute_path.extension().and_then(|ext| ext.to_str()) != Some("app") {
-        bail!(
-            "Projection input must be a .app bundle: {}",
-            absolute_path.display()
-        );
-    }
-    let derived_app_path = fs::canonicalize(&absolute_path).with_context(|| {
-        format!(
-            "Failed to canonicalize finalized app path: {}",
-            absolute_path.display()
-        )
-    })?;
-    let derived_dir = derived_app_path.parent().ok_or_else(|| {
+    let derived_dir = absolute_path.parent().ok_or_else(|| {
         anyhow::anyhow!("Projection input must be an ato finalize output with a parent directory")
     })?;
     let provenance_path = derived_dir.join(PROVENANCE_FILE);
@@ -1501,10 +1627,39 @@ fn load_projection_source(derived_app_path: &Path) -> Result<ProjectionSource> {
     }
     if !supports_projection_target(&provenance.target) {
         bail!(
-            "Projection input target '{}' is unsupported; expected a darwin/<arch> or windows/<arch> target",
+            "Projection input target '{}' is unsupported; expected a darwin/<arch>, linux/<arch>, or windows/<arch> target",
             provenance.target
         );
     }
+    if !host_supports_projection_target(&provenance.target) {
+        let expected_target = host_projection_os_family()
+            .map(|family| format!("{family}/<arch>"))
+            .unwrap_or_else(|| "darwin/<arch>, linux/<arch>, or windows/<arch>".to_string());
+        bail!(
+            "Projection input target '{}' is unsupported on this host; expected a {} target",
+            provenance.target,
+            expected_target
+        );
+    }
+    let projection_kind = ProjectionKind::for_target(&provenance.target).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Projection input target '{}' is unsupported",
+            provenance.target
+        )
+    })?;
+    validate_projection_input_shape(&absolute_path, &provenance.target, projection_kind)?;
+    let derived_app_path = fs::canonicalize(&absolute_path).with_context(|| {
+        format!(
+            "Failed to canonicalize finalized app path: {}",
+            absolute_path.display()
+        )
+    })?;
+    let projected_command_target = match projection_kind {
+        ProjectionKind::Symlink => None,
+        ProjectionKind::LinuxDesktopEntry => {
+            Some(resolve_linux_projection_command_target(&derived_app_path)?)
+        }
+    };
 
     let actual_digest = compute_tree_digest(&derived_app_path)?;
     if actual_digest != provenance.derived_digest {
@@ -1518,6 +1673,8 @@ fn load_projection_source(derived_app_path: &Path) -> Result<ProjectionSource> {
     Ok(ProjectionSource {
         derived_app_path,
         provenance_path,
+        projection_kind,
+        projected_command_target,
         parent_digest: provenance.parent_digest,
         derived_digest: provenance.derived_digest,
         scoped_id: provenance.scoped_id,
@@ -1528,6 +1685,101 @@ fn load_projection_source(derived_app_path: &Path) -> Result<ProjectionSource> {
         target: provenance.target,
         finalized_at: provenance.finalized_at,
     })
+}
+
+fn validate_projection_input_shape(
+    path: &Path,
+    target: &str,
+    projection_kind: ProjectionKind,
+) -> Result<()> {
+    if !path.is_dir() {
+        bail!(
+            "Projection input must be a finalized directory artifact: {}",
+            path.display()
+        );
+    }
+    if projection_kind == ProjectionKind::Symlink
+        && delivery_target_os_family(target) == Some("darwin")
+        && path.extension().and_then(|ext| ext.to_str()) != Some("app")
+    {
+        bail!("Projection input must be a .app bundle: {}", path.display());
+    }
+    Ok(())
+}
+
+fn resolve_linux_projection_command_target(derived_app_path: &Path) -> Result<PathBuf> {
+    let preferred = derived_app_path.join(
+        derived_app_path
+            .file_stem()
+            .or_else(|| derived_app_path.file_name())
+            .ok_or_else(|| anyhow::anyhow!("Derived app path has no terminal name"))?,
+    );
+    if preferred.is_file() && is_executable_file(&preferred)? {
+        return Ok(preferred);
+    }
+
+    let mut candidates = Vec::new();
+    for entry in WalkDir::new(derived_app_path)
+        .min_depth(1)
+        .max_depth(LINUX_PROJECTION_EXEC_SEARCH_MAX_DEPTH)
+    {
+        let entry = entry.with_context(|| {
+            format!(
+                "Failed to inspect projection command candidates in {}",
+                derived_app_path.display()
+            )
+        })?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.into_path();
+        if is_executable_file(&path)? {
+            candidates.push(path);
+        }
+    }
+    candidates.sort();
+    match candidates.len() {
+        1 => Ok(candidates.remove(0)),
+        0 => bail!(
+            "Projection input is missing an executable command within {} levels of {}",
+            LINUX_PROJECTION_EXEC_SEARCH_MAX_DEPTH,
+            derived_app_path.display()
+        ),
+        _ => {
+            let joined = candidates
+                .iter()
+                .map(|path| {
+                    path.strip_prefix(derived_app_path)
+                        .unwrap_or(path)
+                        .display()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "Projection input contains multiple executable command candidates within {} levels of {}: {}",
+                LINUX_PROJECTION_EXEC_SEARCH_MAX_DEPTH,
+                derived_app_path.display(),
+                joined
+            )
+        }
+    }
+}
+
+fn is_executable_file(path: &Path) -> Result<bool> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("Failed to stat executable candidate {}", path.display()))?;
+    if !metadata.is_file() {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    {
+        return Ok(metadata.permissions().mode() & 0o111 != 0);
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(true)
+    }
 }
 
 fn load_projection_records(metadata_root: &Path) -> Result<Vec<StoredProjection>> {
@@ -1604,7 +1856,10 @@ fn inspect_projection(
             metadata.schema_version
         ));
     }
-    if metadata.projection_kind != PROJECTION_KIND {
+    if !matches!(
+        metadata.projection_kind.as_str(),
+        PROJECTION_KIND_SYMLINK | PROJECTION_KIND_LINUX_DESKTOP_ENTRY
+    ) {
         problems.push(format!(
             "unsupported_projection_kind:{}",
             metadata.projection_kind
@@ -1614,13 +1869,25 @@ fn inspect_projection(
         problems.push(format!("unsupported_target:{}", metadata.target));
     }
 
-    match inspect_projection_path(&metadata.projected_path, &metadata.derived_app_path)? {
-        ProjectionPathStatus::MatchesTarget => {}
-        ProjectionPathStatus::TargetMismatch => {
-            problems.push("projected_symlink_target_mismatch".to_string())
+    inspect_projected_path(metadata, &mut problems)?;
+
+    if let Some(projected_command_path) = metadata.projected_command_path.as_ref() {
+        let Some(projected_command_target) = metadata.projected_command_target.as_ref() else {
+            problems.push("projected_command_target_missing".to_string());
+            return finalize_projection_status(metadata, metadata_path, problems);
+        };
+        match inspect_projection_path(projected_command_path, projected_command_target)? {
+            ProjectionPathStatus::MatchesTarget => {}
+            ProjectionPathStatus::TargetMismatch => {
+                problems.push("projected_command_target_mismatch".to_string())
+            }
+            ProjectionPathStatus::Replaced => {
+                problems.push("projected_command_replaced".to_string())
+            }
+            ProjectionPathStatus::Missing => problems.push("projected_command_missing".to_string()),
         }
-        ProjectionPathStatus::Replaced => problems.push("projected_path_replaced".to_string()),
-        ProjectionPathStatus::Missing => problems.push("projected_path_missing".to_string()),
+    } else if metadata.projection_kind == PROJECTION_KIND_LINUX_DESKTOP_ENTRY {
+        problems.push("projected_command_missing".to_string());
     }
 
     if !metadata.derived_app_path.exists() {
@@ -1634,6 +1901,80 @@ fn inspect_projection(
         }
     }
 
+    finalize_projection_status(metadata, metadata_path, problems)
+}
+
+fn inspect_projected_path(metadata: &ProjectionMetadata, problems: &mut Vec<String>) -> Result<()> {
+    match metadata.projection_kind.as_str() {
+        PROJECTION_KIND_SYMLINK => {
+            match inspect_projection_path(&metadata.projected_path, &metadata.derived_app_path)? {
+                ProjectionPathStatus::MatchesTarget => {}
+                ProjectionPathStatus::TargetMismatch => {
+                    problems.push("projected_symlink_target_mismatch".to_string())
+                }
+                ProjectionPathStatus::Replaced => {
+                    problems.push("projected_path_replaced".to_string())
+                }
+                ProjectionPathStatus::Missing => {
+                    problems.push("projected_path_missing".to_string())
+                }
+            }
+            Ok(())
+        }
+        PROJECTION_KIND_LINUX_DESKTOP_ENTRY => inspect_linux_desktop_entry(metadata, problems),
+        _ => Ok(()),
+    }
+}
+
+fn inspect_linux_desktop_entry(
+    metadata: &ProjectionMetadata,
+    problems: &mut Vec<String>,
+) -> Result<()> {
+    match fs::symlink_metadata(&metadata.projected_path) {
+        Ok(projected_meta) if projected_meta.is_file() => {
+            let Some(projected_command_path) = metadata.projected_command_path.as_ref() else {
+                problems.push("projected_command_missing".to_string());
+                return Ok(());
+            };
+            let expected = render_linux_desktop_entry(
+                &projection_display_name(
+                    &metadata.derived_app_path,
+                    metadata.scoped_id.as_deref(),
+                )?,
+                projected_command_path,
+                &metadata.derived_app_path,
+            );
+            let actual = fs::read_to_string(&metadata.projected_path).with_context(|| {
+                format!(
+                    "Failed to read desktop entry: {}",
+                    metadata.projected_path.display()
+                )
+            })?;
+            if actual != expected {
+                problems.push("projected_desktop_entry_mismatch".to_string());
+            }
+        }
+        Ok(_) => problems.push("projected_path_replaced".to_string()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            problems.push("projected_path_missing".to_string())
+        }
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "Failed to inspect projected path: {}",
+                    metadata.projected_path.display()
+                )
+            })
+        }
+    }
+    Ok(())
+}
+
+fn finalize_projection_status(
+    metadata: &ProjectionMetadata,
+    metadata_path: &Path,
+    problems: Vec<String>,
+) -> Result<ProjectionStatus> {
     Ok(ProjectionStatus {
         projection_id: metadata.projection_id.clone(),
         metadata_path: metadata_path.to_path_buf(),
@@ -1997,8 +2338,24 @@ fn delivery_target_os_family(target: &str) -> Option<&str> {
 fn supports_projection_target(target: &str) -> bool {
     matches!(
         delivery_target_os_family(target),
-        Some("darwin" | "windows")
+        Some("darwin" | "linux" | "windows")
     )
+}
+
+fn host_projection_os_family() -> Option<&'static str> {
+    if cfg!(target_os = "macos") {
+        Some("darwin")
+    } else if cfg!(target_os = "linux") {
+        Some("linux")
+    } else if cfg!(windows) {
+        Some("windows")
+    } else {
+        None
+    }
+}
+
+fn host_supports_projection_target(target: &str) -> bool {
+    delivery_target_os_family(target) == host_projection_os_family()
 }
 
 fn resolve_native_build_working_dir(
@@ -2881,7 +3238,23 @@ fn resolve_launcher_dir(launcher_dir: Option<&Path>) -> Result<PathBuf> {
         Some(path) => absolute_path(path),
         None => Ok(dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join(DEFAULT_LAUNCHER_DIR)),
+            .join(default_launcher_dir_for_host())),
+    }
+}
+
+fn default_launcher_dir_for_host() -> &'static str {
+    match host_projection_os_family() {
+        Some("linux") => DEFAULT_LINUX_DESKTOP_ENTRY_DIR,
+        _ => DEFAULT_MACOS_LAUNCHER_DIR,
+    }
+}
+
+fn resolve_projected_command_dir_for_host(launcher_dir: &Path) -> Result<PathBuf> {
+    match host_projection_os_family() {
+        Some("linux") => Ok(dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(DEFAULT_LINUX_BIN_DIR)),
+        _ => absolute_path(launcher_dir),
     }
 }
 
@@ -3200,12 +3573,137 @@ fn is_projection_shortcut(path: &Path, metadata: &fs::Metadata) -> bool {
             .unwrap_or(false)
 }
 
+fn host_supports_projection() -> bool {
+    host_projection_os_family().is_some()
+}
+
 pub(crate) fn host_supports_finalize() -> bool {
     cfg!(target_os = "macos")
 }
 
-pub(crate) fn host_supports_projection() -> bool {
-    cfg!(target_os = "macos") || cfg!(windows)
+fn projection_output_path(
+    projection_kind: ProjectionKind,
+    launcher_dir: &Path,
+    derived_app_path: &Path,
+    command_name: &str,
+) -> Result<PathBuf> {
+    Ok(match projection_kind {
+        ProjectionKind::Symlink => launcher_dir.join(
+            derived_app_path
+                .file_name()
+                .ok_or_else(|| anyhow::anyhow!("Derived app path has no terminal name"))?,
+        ),
+        ProjectionKind::LinuxDesktopEntry => launcher_dir.join(format!("{command_name}.desktop")),
+    })
+}
+
+fn projection_display_name(derived_app_path: &Path, scoped_id: Option<&str>) -> Result<String> {
+    let raw = derived_app_path
+        .file_stem()
+        .or_else(|| derived_app_path.file_name())
+        .and_then(|value| value.to_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            scoped_id
+                .and_then(|value| value.rsplit('/').next())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .ok_or_else(|| anyhow::anyhow!("Derived app path has no usable launcher name"))?;
+    Ok(raw)
+}
+
+fn projection_command_name(derived_app_path: &Path, scoped_id: Option<&str>) -> Result<String> {
+    let seed = scoped_id
+        .and_then(|value| value.rsplit('/').next())
+        .or_else(|| {
+            derived_app_path
+                .file_stem()
+                .or_else(|| derived_app_path.file_name())
+                .and_then(|value| value.to_str())
+        })
+        .ok_or_else(|| anyhow::anyhow!("Derived app path has no usable command name"))?;
+    Ok(sanitize_projection_segment(seed))
+}
+
+fn sanitize_projection_segment(value: &str) -> String {
+    let mut out = String::new();
+    let mut previous_dash = false;
+    for ch in value.chars() {
+        let normalized = if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+            ch.to_ascii_lowercase()
+        } else {
+            '-'
+        };
+        if normalized == '-' {
+            if !previous_dash {
+                out.push('-');
+            }
+            previous_dash = true;
+        } else {
+            out.push(normalized);
+            previous_dash = false;
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "ato-app".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn render_linux_desktop_entry(
+    display_name: &str,
+    projected_command_path: &Path,
+    derived_app_path: &Path,
+) -> String {
+    format!(
+        "[Desktop Entry]\nType=Application\nVersion=1.0\nName={}\nExec={}\nPath={}\nTerminal=false\n",
+        escape_desktop_entry_string_value(display_name),
+        escape_desktop_entry_exec_value(projected_command_path),
+        escape_desktop_entry_string_value(&derived_app_path.to_string_lossy()),
+    )
+}
+
+fn escape_desktop_entry_string_value(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
+fn escape_desktop_entry_exec_value(path: &Path) -> String {
+    escape_desktop_entry_string_value(&path.to_string_lossy())
+        .replace(' ', "\\ ")
+        .replace('"', "\\\"")
+        .replace('$', "\\$")
+        .replace('`', "\\`")
+}
+
+fn remove_projected_path(path: &Path, projection_kind: &str) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            fs::remove_file(path)?;
+            Ok(true)
+        }
+        Ok(metadata)
+            if projection_kind == PROJECTION_KIND_LINUX_DESKTOP_ENTRY && metadata.is_file() =>
+        {
+            fs::remove_file(path)?;
+            Ok(true)
+        }
+        Ok(_) => bail!(
+            "Refusing to remove unexpected projected path: {}",
+            path.display()
+        ),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err.into()),
+    }
 }
 
 fn random_hex(len_bytes: usize) -> String {
@@ -4058,21 +4556,48 @@ input = "dist/time-management-desktop.app"
     }
 
     fn sample_finalized_app(root: &Path) -> Result<(PathBuf, PathBuf)> {
-        sample_finalized_app_with_target(root, "darwin/arm64")
+        sample_finalized_app_with_target(root, sample_supported_projection_target())
     }
 
     fn sample_finalized_app_with_target(root: &Path, target: &str) -> Result<(PathBuf, PathBuf)> {
         let derived_dir = root.join("derived-output");
-        let derived_app = derived_dir.join("MyApp.app");
-        fs::create_dir_all(derived_app.join("Contents/MacOS"))?;
-        fs::write(derived_app.join("Contents/MacOS/MyApp"), b"signed-app")?;
-        #[cfg(unix)]
-        {
-            let binary = derived_app.join("Contents/MacOS/MyApp");
-            let mut permissions = fs::metadata(&binary)?.permissions();
-            permissions.set_mode(0o755);
-            fs::set_permissions(&binary, permissions)?;
-        }
+        let derived_app = if delivery_target_os_family(target) == Some("linux") {
+            let derived_app = derived_dir.join("my-app");
+            let binary = derived_app.join("my-app");
+            fs::create_dir_all(&derived_app)?;
+            fs::write(&binary, b"#!/bin/sh\necho signed-app\n")?;
+            #[cfg(unix)]
+            {
+                let mut permissions = fs::metadata(&binary)?.permissions();
+                permissions.set_mode(0o755);
+                fs::set_permissions(&binary, permissions)?;
+            }
+            derived_app
+        } else if delivery_target_os_family(target) == Some("windows") {
+            let derived_app = derived_dir.join("MyApp");
+            let binary = derived_app.join("MyApp.exe");
+            fs::create_dir_all(&derived_app)?;
+            fs::write(&binary, b"signed-app")?;
+            #[cfg(unix)]
+            {
+                let mut permissions = fs::metadata(&binary)?.permissions();
+                permissions.set_mode(0o755);
+                fs::set_permissions(&binary, permissions)?;
+            }
+            derived_app
+        } else {
+            let derived_app = derived_dir.join("MyApp.app");
+            fs::create_dir_all(derived_app.join("Contents/MacOS"))?;
+            fs::write(derived_app.join("Contents/MacOS/MyApp"), b"signed-app")?;
+            #[cfg(unix)]
+            {
+                let binary = derived_app.join("Contents/MacOS/MyApp");
+                let mut permissions = fs::metadata(&binary)?.permissions();
+                permissions.set_mode(0o755);
+                fs::set_permissions(&binary, permissions)?;
+            }
+            derived_app
+        };
         let provenance = LocalDerivationProvenance {
             schema_version: DELIVERY_SCHEMA_VERSION.to_string(),
             scoped_id: None,
@@ -4089,6 +4614,121 @@ input = "dist/time-management-desktop.app"
         };
         write_json_pretty(&derived_dir.join(PROVENANCE_FILE), &provenance)?;
         Ok((derived_dir, derived_app))
+    }
+
+    fn sample_supported_projection_target() -> &'static str {
+        match host_projection_os_family() {
+            Some("linux") => "linux/x86_64",
+            Some("windows") => "windows/x86_64",
+            _ => "darwin/arm64",
+        }
+    }
+
+    fn sample_projection_launcher_dir(root: &Path) -> PathBuf {
+        root.join("launcher")
+    }
+
+    fn sample_projection_command_dir(root: &Path) -> PathBuf {
+        root.join("bin")
+    }
+
+    fn sample_projection_binary_path(derived_app: &Path) -> PathBuf {
+        if path_has_extension(derived_app, "app") {
+            derived_app.join("Contents/MacOS/MyApp")
+        } else {
+            let windows_binary = derived_app.join("MyApp.exe");
+            if windows_binary.exists() {
+                windows_binary
+            } else {
+                derived_app.join("my-app")
+            }
+        }
+    }
+
+    #[test]
+    fn sanitize_projection_segment_normalizes_special_characters() {
+        assert_eq!(sanitize_projection_segment("My App"), "my-app");
+        assert_eq!(sanitize_projection_segment("---"), "ato-app");
+        assert_eq!(sanitize_projection_segment("my___app"), "my___app");
+        assert_eq!(sanitize_projection_segment("My.App"), "my-app");
+        assert_eq!(sanitize_projection_segment("My...App"), "my-app");
+    }
+
+    #[test]
+    fn projection_name_helpers_prefer_scoped_slug_when_available() -> Result<()> {
+        let derived_app_path = Path::new("Time Management Desktop.app");
+        assert_eq!(
+            projection_display_name(derived_app_path, Some("koh0920/time-management-desktop"))?,
+            "Time Management Desktop"
+        );
+        assert_eq!(
+            projection_command_name(derived_app_path, Some("koh0920/time-management-desktop"))?,
+            "time-management-desktop"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn render_linux_desktop_entry_escapes_special_characters() {
+        let rendered = render_linux_desktop_entry(
+            "My App\nTabbed\tName",
+            Path::new("My App/bin/my\"app"),
+            Path::new("My App/root"),
+        );
+        assert!(rendered.contains("Name=My App\\nTabbed\\tName"));
+        assert!(rendered.contains("Exec=My\\ App/bin/my\\\"app"));
+        assert!(rendered.contains("Path=My App/root"));
+    }
+
+    #[test]
+    fn resolve_linux_projection_command_target_prefers_named_binary() -> Result<()> {
+        let tmp = tempdir()?;
+        let app_dir = tmp.path().join("my-app");
+        let preferred = app_dir.join("my-app");
+        let other = app_dir.join("bin/helper");
+        fs::create_dir_all(other.parent().context("helper parent missing")?)?;
+        fs::write(&preferred, b"#!/bin/sh\n")?;
+        fs::write(&other, b"#!/bin/sh\n")?;
+        #[cfg(unix)]
+        {
+            for path in [&preferred, &other] {
+                let mut permissions = fs::metadata(path)?.permissions();
+                permissions.set_mode(0o755);
+                fs::set_permissions(path, permissions)?;
+            }
+        }
+
+        assert_eq!(
+            resolve_linux_projection_command_target(&app_dir)?,
+            preferred
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_linux_projection_command_target_rejects_multiple_candidates() -> Result<()> {
+        let tmp = tempdir()?;
+        let app_dir = tmp.path().join("my-app");
+        let first = app_dir.join("bin/alpha");
+        let second = app_dir.join("bin/beta");
+        fs::create_dir_all(first.parent().context("bin parent missing")?)?;
+        fs::write(&first, b"#!/bin/sh\n")?;
+        fs::write(&second, b"#!/bin/sh\n")?;
+        #[cfg(unix)]
+        {
+            for path in [&first, &second] {
+                let mut permissions = fs::metadata(path)?.permissions();
+                permissions.set_mode(0o755);
+                fs::set_permissions(path, permissions)?;
+            }
+        }
+
+        let err = resolve_linux_projection_command_target(&app_dir)
+            .expect_err("multiple executable candidates should fail");
+        assert!(err
+            .to_string()
+            .contains("multiple executable command candidates"));
+        Ok(())
     }
 
     #[test]
@@ -4550,11 +5190,11 @@ input = "dist/time-management-desktop.app"
     }
 
     #[test]
-    fn supports_projection_target_accepts_darwin_and_windows() {
+    fn supports_projection_target_accepts_supported_platforms() {
         assert!(supports_projection_target("darwin/arm64"));
         assert!(supports_projection_target("darwin/x86_64"));
+        assert!(supports_projection_target("linux/x86_64"));
         assert!(supports_projection_target("windows/x86_64"));
-        assert!(!supports_projection_target("linux/x86_64"));
         assert!(!supports_projection_target(""));
     }
 
@@ -4701,18 +5341,37 @@ input = "dist/time-management-desktop.app"
     fn project_creates_projection_metadata_without_mutating_derived_artifact() -> Result<()> {
         let tmp = tempdir()?;
         let metadata_root = tmp.path().join("projection-metadata");
-        let launcher_dir = tmp.path().join("Applications");
+        let launcher_dir = sample_projection_launcher_dir(tmp.path());
+        let command_dir = sample_projection_command_dir(tmp.path());
         let (_derived_dir, derived_app) = sample_finalized_app(tmp.path())?;
         let digest_before = compute_tree_digest(&derived_app)?;
 
-        let result = project_with_roots(&derived_app, &launcher_dir, &metadata_root)?;
+        let result = project_with_roots_and_command_dir(
+            &derived_app,
+            &launcher_dir,
+            &metadata_root,
+            &command_dir,
+        )?;
 
         assert!(result.created);
         assert_eq!(result.state, "ok");
         assert_eq!(compute_tree_digest(&derived_app)?, digest_before);
         assert!(result.projected_path.exists());
-        #[cfg(not(windows))]
-        {
+        if cfg!(target_os = "linux") {
+            let projected_meta = fs::symlink_metadata(&result.projected_path)?;
+            assert!(projected_meta.is_file());
+            let desktop = fs::read_to_string(&result.projected_path)?;
+            assert!(desktop.contains("[Desktop Entry]"));
+            assert!(desktop.contains("Exec="));
+            let command_path = command_dir.join("my-app");
+            assert!(fs::symlink_metadata(&command_path)?
+                .file_type()
+                .is_symlink());
+            assert_eq!(
+                fs::read_link(&command_path)?,
+                sample_projection_binary_path(&derived_app)
+            );
+        } else if !cfg!(windows) {
             let symlink_meta = fs::symlink_metadata(&result.projected_path)?;
             assert!(symlink_meta.file_type().is_symlink());
         }
@@ -4722,27 +5381,55 @@ input = "dist/time-management-desktop.app"
 
     #[test]
     fn project_rejects_name_conflict() -> Result<()> {
+        if !host_supports_projection() {
+            return Ok(());
+        }
         let tmp = tempdir()?;
         let metadata_root = tmp.path().join("projection-metadata");
-        let launcher_dir = tmp.path().join("Applications");
+        let launcher_dir = sample_projection_launcher_dir(tmp.path());
+        let command_dir = sample_projection_command_dir(tmp.path());
         let (_derived_dir, derived_app) = sample_finalized_app(tmp.path())?;
         fs::create_dir_all(&launcher_dir)?;
-        fs::write(launcher_dir.join("MyApp.app"), b"occupied")?;
+        let conflict_path = if cfg!(target_os = "linux") {
+            launcher_dir.join("my-app.desktop")
+        } else {
+            launcher_dir.join("MyApp.app")
+        };
+        fs::write(conflict_path, b"occupied")?;
 
-        let err = project_with_roots(&derived_app, &launcher_dir, &metadata_root)
-            .expect_err("projection must reject name conflicts");
+        let err = project_with_roots_and_command_dir(
+            &derived_app,
+            &launcher_dir,
+            &metadata_root,
+            &command_dir,
+        )
+        .expect_err("projection must reject name conflicts");
         assert!(err.to_string().contains("Projection name conflict"));
         Ok(())
     }
 
     #[test]
     fn project_list_reports_broken_projection_when_target_missing() -> Result<()> {
+        if !host_supports_projection() {
+            return Ok(());
+        }
         let tmp = tempdir()?;
         let metadata_root = tmp.path().join("projection-metadata");
-        let launcher_dir = tmp.path().join("Applications");
+        let launcher_dir = sample_projection_launcher_dir(tmp.path());
+        let command_dir = sample_projection_command_dir(tmp.path());
         let (_derived_dir, derived_app) = sample_finalized_app(tmp.path())?;
-        let result = project_with_roots(&derived_app, &launcher_dir, &metadata_root)?;
-        fs::rename(&derived_app, tmp.path().join("MyApp-orphaned.app"))?;
+        let result = project_with_roots_and_command_dir(
+            &derived_app,
+            &launcher_dir,
+            &metadata_root,
+            &command_dir,
+        )?;
+        let orphaned_app = tmp.path().join(if cfg!(target_os = "linux") {
+            "my-app-orphaned"
+        } else {
+            "MyApp-orphaned.app"
+        });
+        fs::rename(&derived_app, orphaned_app)?;
 
         let listing = list_projections(&metadata_root)?;
         assert_eq!(listing.total, 1);
@@ -4756,51 +5443,116 @@ input = "dist/time-management-desktop.app"
     }
 
     #[test]
-    fn unproject_removes_symlink_and_metadata_even_when_target_missing() -> Result<()> {
+    fn linux_project_list_reports_missing_command_symlink() -> Result<()> {
+        if !cfg!(target_os = "linux") {
+            return Ok(());
+        }
         let tmp = tempdir()?;
         let metadata_root = tmp.path().join("projection-metadata");
-        let launcher_dir = tmp.path().join("Applications");
+        let launcher_dir = sample_projection_launcher_dir(tmp.path());
+        let command_dir = sample_projection_command_dir(tmp.path());
+        let (_derived_dir, derived_app) =
+            sample_finalized_app_with_target(tmp.path(), "linux/x86_64")?;
+        let result = project_with_roots_and_command_dir(
+            &derived_app,
+            &launcher_dir,
+            &metadata_root,
+            &command_dir,
+        )?;
+        fs::remove_file(command_dir.join("my-app"))?;
+
+        let listing = list_projections(&metadata_root)?;
+        assert_eq!(listing.total, 1);
+        assert_eq!(listing.broken, 1);
+        assert_eq!(listing.projections[0].projection_id, result.projection_id);
+        assert!(listing.projections[0]
+            .problems
+            .iter()
+            .any(|problem| problem == "projected_command_missing"));
+        Ok(())
+    }
+
+    #[test]
+    fn unproject_removes_symlink_and_metadata_even_when_target_missing() -> Result<()> {
+        if !host_supports_projection() {
+            return Ok(());
+        }
+        let tmp = tempdir()?;
+        let metadata_root = tmp.path().join("projection-metadata");
+        let launcher_dir = sample_projection_launcher_dir(tmp.path());
+        let command_dir = sample_projection_command_dir(tmp.path());
         let (_derived_dir, derived_app) = sample_finalized_app(tmp.path())?;
-        let result = project_with_roots(&derived_app, &launcher_dir, &metadata_root)?;
-        fs::rename(&derived_app, tmp.path().join("MyApp-orphaned.app"))?;
+        let result = project_with_roots_and_command_dir(
+            &derived_app,
+            &launcher_dir,
+            &metadata_root,
+            &command_dir,
+        )?;
+        let orphaned_app = tmp.path().join(if cfg!(target_os = "linux") {
+            "my-app-orphaned"
+        } else {
+            "MyApp-orphaned.app"
+        });
+        fs::rename(&derived_app, orphaned_app)?;
 
         let unprojected = unproject_with_metadata_root(&result.projection_id, &metadata_root)?;
         assert!(unprojected.removed_projected_path);
         assert!(unprojected.removed_metadata);
         assert!(!result.projected_path.exists());
+        if cfg!(target_os = "linux") {
+            assert!(!command_dir.join("my-app").exists());
+        }
         assert!(!result.metadata_path.exists());
         Ok(())
     }
 
     #[test]
     fn project_rejects_digest_mismatch() -> Result<()> {
+        if !host_supports_projection() {
+            return Ok(());
+        }
         let tmp = tempdir()?;
         let metadata_root = tmp.path().join("projection-metadata");
-        let launcher_dir = tmp.path().join("Applications");
+        let launcher_dir = sample_projection_launcher_dir(tmp.path());
+        let command_dir = sample_projection_command_dir(tmp.path());
         let (derived_dir, derived_app) = sample_finalized_app(tmp.path())?;
-        fs::write(derived_app.join("Contents/MacOS/MyApp"), b"tampered-app")?;
+        fs::write(sample_projection_binary_path(&derived_app), b"tampered-app")?;
 
-        let err = project_with_roots(&derived_app, &launcher_dir, &metadata_root)
-            .expect_err("projection must reject digest mismatches");
+        let err = project_with_roots_and_command_dir(
+            &derived_app,
+            &launcher_dir,
+            &metadata_root,
+            &command_dir,
+        )
+        .expect_err("projection must reject digest mismatches");
         assert!(err.to_string().contains("Derived artifact digest mismatch"));
         assert!(derived_dir.join(PROVENANCE_FILE).exists());
         Ok(())
     }
 
     #[test]
-    fn project_rejects_unsupported_projection_targets_even_with_app_bundle_shape() -> Result<()> {
+    fn project_rejects_mismatched_host_targets_even_with_valid_shape() -> Result<()> {
         let tmp = tempdir()?;
         let metadata_root = tmp.path().join("projection-metadata");
-        let launcher_dir = tmp.path().join("Applications");
+        let launcher_dir = sample_projection_launcher_dir(tmp.path());
+        let command_dir = sample_projection_command_dir(tmp.path());
+        let unsupported_target = match host_projection_os_family() {
+            Some("linux") => "windows/x86_64",
+            Some("windows") => "linux/x86_64",
+            _ => "linux/x86_64",
+        };
         let (_derived_dir, derived_app) =
-            sample_finalized_app_with_target(tmp.path(), "linux/x86_64")?;
+            sample_finalized_app_with_target(tmp.path(), unsupported_target)?;
 
-        let err = project_with_roots(&derived_app, &launcher_dir, &metadata_root)
-            .expect_err("projection must fail closed for unsupported targets");
+        let err = project_with_roots_and_command_dir(
+            &derived_app,
+            &launcher_dir,
+            &metadata_root,
+            &command_dir,
+        )
+        .expect_err("projection must fail closed for unsupported targets");
 
-        assert!(err
-            .to_string()
-            .contains("expected a darwin/<arch> or windows/<arch> target"));
+        assert!(err.to_string().contains("unsupported on this host"));
         Ok(())
     }
 
