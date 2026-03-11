@@ -18,6 +18,10 @@ import {
   Plus,
   Zap,
 } from "lucide-react";
+import {
+  getPermissionModeMessage,
+  PermissionModeSelector,
+} from "../components/PermissionModeSelector";
 import { ReadmeRenderer } from "../components/ReadmeRenderer";
 import { getProcessStatusMeta } from "../types";
 import type {
@@ -171,6 +175,7 @@ export function DetailPage({
     capsule,
     selectedTarget,
   );
+  const selectedPermissionMessage = getPermissionModeMessage(selectedPermissionMode);
 
   useEffect(() => {
     if (tab !== "logs" || !logScrollRef.current) {
@@ -408,38 +413,26 @@ export function DetailPage({
 
                 {targetNeedsPermissionGrant ? (
                   <>
-                    <label className="env-row">
+                    <div className="env-row env-row-multiline">
                       <span className="env-key">PERMISSIONS</span>
-                      <select
-                        className="input env-input"
+                      <PermissionModeSelector
+                        name={`detail-permission-mode-${capsule.id}`}
                         value={selectedPermissionMode}
-                        onChange={(event) =>
-                          onPermissionModeChange(
-                            capsule.id,
-                            selectedTarget,
-                            event.target.value as RunPermissionMode,
-                          )
+                        onChange={(value) =>
+                          onPermissionModeChange(capsule.id, selectedTarget, value)
                         }
-                      >
-                        <option value="standard">Standard (blocked for Tier2)</option>
-                        <option value="sandbox">Sandbox</option>
-                        <option value="dangerous">Dangerous</option>
-                      </select>
-                    </label>
+                      />
+                    </div>
                     <p
                       className={`env-help ${
-                        selectedPermissionMode === "dangerous"
+                        selectedPermissionMessage.tone === "warn"
                           ? "env-help-warn"
-                          : selectedPermissionMode === "standard"
+                          : selectedPermissionMessage.tone === "error"
                             ? "env-help-error"
                             : ""
                       }`}
                     >
-                      {selectedPermissionMode === "dangerous"
-                        ? "Dangerous mode bypasses Ato runtime permission barriers for this target."
-                        : selectedPermissionMode === "sandbox"
-                          ? "Sandbox enables Tier2 execution using the native OS sandbox."
-                          : "This target needs Sandbox or Dangerous before GUI Run can proceed."}
+                      {selectedPermissionMessage.text}
                     </p>
                   </>
                 ) : (

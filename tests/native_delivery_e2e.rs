@@ -49,17 +49,101 @@ fn is_permission_denied(err: &anyhow::Error) -> bool {
     }
 }
 
-fn wait_for_well_known(base_url: &str) -> Result<()> {
+fn read_registry_log(path: &Path) -> String {
+    fs::read_to_string(path)
+        .map(|contents| contents.trim().to_string())
+        .unwrap_or_default()
+}
+
+fn parse_json_result(
+    stdout: &[u8],
+    expected_key: &str,
+    context: &str,
+) -> Result<serde_json::Value> {
+    let stdout_text = std::str::from_utf8(stdout).with_context(|| context.to_string())?;
+    let mut last_value = None;
+    for line in stdout_text.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if value.get(expected_key).is_some() {
+                return Ok(value);
+            }
+            if last_value.is_none() {
+                last_value = Some(value);
+            }
+        }
+    }
+
+    if let Some(value) = last_value {
+        return Ok(value);
+    }
+
+    serde_json::from_slice(stdout).with_context(|| context.to_string())
+}
+
+fn find_capsule_artifact(root: &Path, stem: &str) -> Result<PathBuf> {
+    let expected_name = format!("{stem}.capsule");
+    WalkDir::new(root)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.into_path())
+        .find(|path| {
+            path.is_file()
+                && path.file_name().and_then(|name| name.to_str()) == Some(expected_name.as_str())
+        })
+        .with_context(|| {
+            format!(
+                "failed to locate {} under {}",
+                expected_name,
+                root.display()
+            )
+        })
+}
+
+fn wait_for_well_known(
+    base_url: &str,
+    child: &mut std::process::Child,
+    stdout_log: &Path,
+    stderr_log: &Path,
+) -> Result<()> {
     let url = format!("{}/.well-known/capsule.json", base_url);
-    for _ in 0..60 {
-        if let Ok(resp) = reqwest::blocking::get(&url) {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(500))
+        .build()
+        .context("build local registry probe client")?;
+    for _ in 0..150 {
+        if let Some(status) = child
+            .try_wait()
+            .context("check local registry process status")?
+        {
+            let stdout = read_registry_log(stdout_log);
+            let stderr = read_registry_log(stderr_log);
+            anyhow::bail!(
+                "local registry exited before becoming ready: {} (status {})\nstdout:\n{}\nstderr:\n{}",
+                url,
+                status,
+                stdout,
+                stderr
+            );
+        }
+        if let Ok(resp) = client.get(&url).send() {
             if resp.status().is_success() {
                 return Ok(());
             }
         }
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(200));
     }
-    anyhow::bail!("local registry did not become ready: {}", url);
+    let stdout = read_registry_log(stdout_log);
+    let stderr = read_registry_log(stderr_log);
+    anyhow::bail!(
+        "local registry did not become ready: {}\nstdout:\n{}\nstderr:\n{}",
+        url,
+        stdout,
+        stderr
+    );
 }
 
 fn start_local_registry_or_skip(
@@ -85,7 +169,15 @@ fn start_local_registry_or_skip(
 fn start_local_registry(ato: &Path, data_dir: &Path) -> Result<(ServerGuard, String)> {
     let port = reserve_port();
     let base_url = format!("http://127.0.0.1:{}", port);
-    let child = Command::new(ato)
+    fs::create_dir_all(data_dir)
+        .with_context(|| format!("failed to create {}", data_dir.display()))?;
+    let stdout_log = data_dir.join("registry-stdout.log");
+    let stderr_log = data_dir.join("registry-stderr.log");
+    let stdout = fs::File::create(&stdout_log)
+        .with_context(|| format!("failed to create {}", stdout_log.display()))?;
+    let stderr = fs::File::create(&stderr_log)
+        .with_context(|| format!("failed to create {}", stderr_log.display()))?;
+    let mut child = Command::new(ato)
         .args([
             "registry",
             "serve",
@@ -97,12 +189,13 @@ fn start_local_registry(ato: &Path, data_dir: &Path) -> Result<(ServerGuard, Str
             data_dir.to_string_lossy().as_ref(),
         ])
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .env("ATO_LOCAL_REGISTRY_DISABLE_UI", "1")
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
         .spawn()
         .context("spawn local registry server")?;
+    wait_for_well_known(&base_url, &mut child, &stdout_log, &stderr_log)?;
     let guard = ServerGuard { child };
-    wait_for_well_known(&base_url)?;
     Ok((guard, base_url))
 }
 
@@ -136,7 +229,8 @@ fn require_success(output: Output, context: &str) -> Result<Output> {
 }
 
 fn command_on_path(program: &str) -> bool {
-    Command::new("which")
+    let lookup = if cfg!(windows) { "where" } else { "which" };
+    Command::new(lookup)
         .arg(program)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -157,6 +251,10 @@ fn command_available(program: &str, args: &[&str]) -> bool {
 
 fn sample_project_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".tmp/sample-native-capsule")
+}
+
+fn windows_fixture_project_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/native-delivery-tauri")
 }
 
 fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
@@ -229,6 +327,7 @@ fn assert_executable(path: &Path, context: &str) -> Result<()> {
             );
         }
     }
+    let _ = path;
     let _ = context;
     Ok(())
 }
@@ -321,6 +420,31 @@ fn prepare_sample_workspace(tmp: &TempDir) -> Result<PathBuf> {
             .with_context(|| format!("failed to write {}", cargo_toml.display()))?;
     }
     Ok(destination)
+}
+
+fn ensure_windows_tauri_icon(workspace: &Path) -> Result<()> {
+    let icon_path = workspace.join("src-tauri/icons/icon.ico");
+    if icon_path.exists() {
+        return Ok(());
+    }
+
+    if let Some(parent) = icon_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    // Minimal 1x1 BMP-backed ICO accepted by tauri-build on Windows.
+    const ICON_BYTES: &[u8] = &[
+        0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x20, 0x00, 0x30,
+        0x00, 0x00, 0x00, 0x16, 0x00, 0x00, 0x00, 0x28, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0x02, 0x00, 0x00, 0x00, 0x01, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    fs::write(&icon_path, ICON_BYTES)
+        .with_context(|| format!("failed to write {}", icon_path.display()))?;
+    Ok(())
 }
 
 fn build_sample_app(sample_dir: &Path) -> Result<PathBuf> {
@@ -459,6 +583,35 @@ path = "sample-native-capsule.app"
     fs::write(&artifact_path, out)
         .with_context(|| format!("failed to write {}", artifact_path.display()))?;
     Ok(artifact_path)
+}
+
+#[cfg(windows)]
+fn verify_authenticode_signature(path: &Path) -> Result<()> {
+    let path_arg = path.to_string_lossy().replace('\'', "''");
+    let command = format!(
+        "$signature = Get-AuthenticodeSignature -FilePath '{path_arg}'; if ($signature.SignerCertificate) {{ Write-Output signed }} else {{ throw 'missing signer certificate' }}"
+    );
+    let output = run_command(
+        "powershell.exe",
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &command,
+        ],
+        path.parent().unwrap_or_else(|| Path::new(".")),
+    )?;
+    let output = require_success(output, "Get-AuthenticodeSignature")?;
+    let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if status != "signed" {
+        anyhow::bail!("expected a signed Authenticode artifact, got '{status}'");
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn verify_authenticode_signature(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 #[test]
@@ -820,6 +973,166 @@ fn e2e_native_delivery_sample_tauri_unsigned_finalize() -> Result<()> {
         finalize_json["output_dir"].as_str(),
         "finalize must create a fresh derived directory each run"
     );
+
+    Ok(())
+}
+
+#[test]
+fn e2e_native_delivery_windows_build_publish_install_run() -> Result<()> {
+    if !cfg!(windows) {
+        eprintln!("skipping e2e_native_delivery_windows_build_publish_install_run: Windows only");
+        return Ok(());
+    }
+    if !windows_fixture_project_dir().exists() {
+        eprintln!(
+            "skipping e2e_native_delivery_windows_build_publish_install_run: fixture project missing"
+        );
+        return Ok(());
+    }
+    if !command_on_path("cargo") || !command_available("cargo", &["--version"]) {
+        eprintln!(
+            "skipping e2e_native_delivery_windows_build_publish_install_run: cargo unavailable"
+        );
+        return Ok(());
+    }
+    if !command_on_path("powershell.exe")
+        || !command_available(
+            "powershell.exe",
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$PSVersionTable.PSVersion.ToString()",
+            ],
+        )
+    {
+        eprintln!(
+            "skipping e2e_native_delivery_windows_build_publish_install_run: powershell unavailable"
+        );
+        return Ok(());
+    }
+
+    let ato = assert_cmd::cargo::cargo_bin("ato");
+    let tmp = TempDir::new().context("create temp dir")?;
+    let home_dir = tmp.path().join("home");
+    fs::create_dir_all(&home_dir)?;
+    let data_dir = tmp.path().join("registry-data");
+
+    let fixture_workspace = tmp.path().join("sample-native-capsule");
+    copy_tree(&windows_fixture_project_dir(), &fixture_workspace)?;
+    ensure_windows_tauri_icon(&fixture_workspace)?;
+
+    let Some((_guard, base_url)) = start_local_registry_or_skip(
+        &ato,
+        &data_dir,
+        "e2e_native_delivery_windows_build_publish_install_run",
+    )?
+    else {
+        return Ok(());
+    };
+
+    let build = run_ato_with_home(
+        &ato,
+        &[
+            "--json",
+            "build",
+            fixture_workspace.to_string_lossy().as_ref(),
+        ],
+        tmp.path(),
+        &home_dir,
+    )?;
+    let build = require_success(build, "build native Windows fixture capsule")?;
+    let build_json = parse_json_result(&build.stdout, "artifact", "parse build json")?;
+    if let Some(target) = build_json["target"].as_str() {
+        assert_eq!(target, "windows/x86_64");
+    }
+    let artifact_path = build_json["artifact"]
+        .as_str()
+        .map(PathBuf::from)
+        .map(Ok)
+        .unwrap_or_else(|| {
+            let default_artifact =
+                fixture_workspace.join("dist/sample-native-capsule-0.1.1.capsule");
+            if default_artifact.is_file() {
+                return Ok(default_artifact);
+            }
+            find_capsule_artifact(
+                &fixture_workspace.join("dist"),
+                "sample-native-capsule-0.1.1",
+            )
+        })?;
+    assert!(
+        artifact_path.is_file(),
+        "artifact missing: {}",
+        artifact_path.display()
+    );
+
+    let publish = run_ato_with_home(
+        &ato,
+        &[
+            "publish",
+            "--deploy",
+            "--registry",
+            &base_url,
+            "--artifact",
+            artifact_path.to_string_lossy().as_ref(),
+            "--scoped-id",
+            "local/sample-native-capsule",
+            "--json",
+        ],
+        tmp.path(),
+        &home_dir,
+    )?;
+    require_success(publish, "publish native Windows fixture capsule")?;
+
+    let install = run_ato_with_home(
+        &ato,
+        &[
+            "install",
+            "local/sample-native-capsule",
+            "--registry",
+            &base_url,
+            "--yes",
+            "--no-project",
+            "--json",
+        ],
+        tmp.path(),
+        &home_dir,
+    )?;
+    let install = require_success(install, "install native Windows fixture capsule")?;
+    let install_json =
+        parse_json_result(&install.stdout, "local_derivation", "parse install json")?;
+    let local_derivation = install_json["local_derivation"]
+        .as_object()
+        .context("install local_derivation missing")?;
+    assert_eq!(
+        local_derivation.get("performed").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    let derived_exe = PathBuf::from(
+        local_derivation
+            .get("derived_app_path")
+            .and_then(|v| v.as_str())
+            .context("install derived_app_path missing")?,
+    );
+    assert!(
+        derived_exe.is_file(),
+        "derived exe missing: {}",
+        derived_exe.display()
+    );
+    verify_authenticode_signature(&derived_exe)?;
+
+    let run_marker = tmp.path().join("run-marker.txt");
+    let output = Command::new(&derived_exe)
+        .current_dir(tmp.path())
+        .env("SAMPLE_NATIVE_CAPSULE_MARKER", &run_marker)
+        .env("SAMPLE_NATIVE_CAPSULE_EXIT_AFTER_MARK", "1")
+        .output()
+        .with_context(|| format!("failed to launch {}", derived_exe.display()))?;
+    require_success(output, "run installed native Windows fixture")?;
+    let marker_contents = fs::read_to_string(&run_marker)
+        .with_context(|| format!("failed to read {}", run_marker.display()))?;
+    assert_eq!(marker_contents, "sample-native-capsule\n");
 
     Ok(())
 }

@@ -1,4 +1,5 @@
 import { Box, ExternalLink, Globe, Package, Play, Search, Square, Trash2, Zap } from "lucide-react";
+import { PlatformBadge } from "./PlatformBadge";
 import { getProcessStatusMeta } from "../types";
 import type { Capsule, Process } from "../types";
 
@@ -87,9 +88,7 @@ export function CapsuleRow({
       <td>
         <div className="compat-list">
           {capsule.osArch.map((entry) => (
-            <span key={entry} className={`badge ${entry === platform ? "badge-accent" : "badge-muted"}`}>
-              {entry}
-            </span>
+            <PlatformBadge key={entry} osArch={entry} active={entry === platform} />
           ))}
         </div>
       </td>

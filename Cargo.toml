@@ -19,7 +19,7 @@ name = "ato"
 path = "src/main.rs"
 
 [dependencies]
-capsule-core = { path = "core" }
+capsule-core = { path = "core", version = "0.1.0" }
 anyhow = "1.0"
 blake3 = "1.5"
 clap = { version = "4.5", features = ["derive", "env"] }
@@ -84,6 +84,10 @@ assert_cmd = "2"
 predicates = "3"
 wat = "1.0"
 serial_test = "3"
+
+[target.'cfg(windows)'.dependencies]
+junction = "1.4.2"
+mslnk = "0.1.8"
 
 [target.'cfg(not(windows))'.dependencies]
 wasmtime = "16.0"
