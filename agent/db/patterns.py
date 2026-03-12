@@ -8,6 +8,7 @@ import subprocess
 
 
 def _canonical_repo_path(repo: Path) -> Path:
+    """Return a stable absolute repo path even when the path does not currently exist."""
     # We intentionally allow non-existent paths here because success-pattern
     # lookup/storage may run before a repo is fully materialized or after it has
     # been moved, and we still want a stable absolute identity string.
