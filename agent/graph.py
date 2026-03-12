@@ -140,8 +140,11 @@ def build_app(config: AtoConfig):
     if SqliteSaver is not None and checkpoint_db:
         checkpoint_path = Path(checkpoint_db).expanduser()
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-        compile_kwargs["checkpointer"] = SqliteSaver.from_conn_string(str(checkpoint_path))
-        compile_kwargs["interrupt_before"] = ["guard"]
+        try:
+            compile_kwargs["checkpointer"] = SqliteSaver.from_conn_string(str(checkpoint_path))
+            compile_kwargs["interrupt_before"] = ["guard"]
+        except Exception:
+            compile_kwargs = {}
     return workflow.compile(**compile_kwargs)
 
 

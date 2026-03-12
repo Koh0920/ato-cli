@@ -8,13 +8,17 @@ def _append_execution_log(state: dict, message: str) -> list[str]:
     return [*state.get("execution_log", []), message]
 
 
+def _normalize_manifest(content: str) -> str:
+    return "\n".join(line.rstrip() for line in content.strip().splitlines())
+
+
 def _resolve_repo_path(repo: Path, candidate: str) -> Path:
     path = Path(candidate)
     if not path.is_absolute():
         path = repo / path
     resolved_repo = repo.resolve()
     resolved_path = path.resolve()
-    if resolved_repo != resolved_path and resolved_repo not in resolved_path.parents:
+    if resolved_path != resolved_repo and not resolved_path.is_relative_to(resolved_repo):
         raise ValueError(f"Refusing to modify path outside repository: {candidate}")
     return resolved_path
 
@@ -23,8 +27,9 @@ def patch_node(state: dict) -> dict:
     edit = state.get("pending_code_edit") or {}
     if edit.get("type") == "capsule_toml":
         repo = Path(state["repo_path"])
-        new_manifest = edit.get("content") or state.get("capsule_toml", "")
-        if new_manifest == state.get("capsule_toml"):
+        new_manifest = str(edit.get("content") or state.get("capsule_toml", ""))
+        current_manifest = _normalize_manifest(str(state.get("capsule_toml", "")))
+        if _normalize_manifest(new_manifest) == current_manifest:
             return {
                 **state,
                 "patch_outcome": "give_up",
