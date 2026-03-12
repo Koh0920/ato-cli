@@ -6,6 +6,7 @@ from pathlib import Path
 import tomllib
 
 RUST_RELEASE_ENTRYPOINT_PREFIX = "./target/release/"
+MAX_LOG_EXCERPT_LEN = 400
 
 
 def _update_manifest_line(content: str, key: str, value: str) -> str:
@@ -113,7 +114,7 @@ def _build_manifest_fix(state: dict) -> dict | None:
                 }
 
     if "validation" in lowered_log or "capsule.toml" in lowered_log or "manifest" in lowered_log:
-        compact_log = " ".join(joined_log.split())[:400]
+        compact_log = " ".join(joined_log.split())[:MAX_LOG_EXCERPT_LEN]
         return {
             "type": "capsule_toml",
             "content": manifest,

@@ -93,11 +93,11 @@ fn execute_with_paths(
     ));
 
     let request = AgentRequest {
-        repo_path: repo_path.display().to_string(),
+        repo_path: repo_path.to_string_lossy().into_owned(),
         ato_binary: std::env::current_exe()
             .context("Failed to resolve current ato binary")?
-            .display()
-            .to_string(),
+            .to_string_lossy()
+            .into_owned(),
         provider: options.provider.clone(),
         model: options.model.clone(),
         api_key: resolve_api_key(&options.provider),
@@ -146,7 +146,13 @@ fn execute_with_paths(
             )
         })?;
 
-    fs::remove_file(&request_path).ok();
+    if let Err(error) = fs::remove_file(&request_path) {
+        futures::executor::block_on(reporter.warn(format!(
+            "⚠️  Failed to remove temporary agent request file {}: {}",
+            request_path.display(),
+            error
+        )))?;
+    }
 
     if !output.stdout.is_empty() {
         io::stdout()
