@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import shlex
 
 from tools.shell_tools import run_shell
 
@@ -10,7 +11,9 @@ def _commands_for_repo(state: dict) -> list[str]:
     commands: list[str] = []
     ato_binary = state["config"].get("ato_binary")
     if ato_binary:
-        commands.append(f'"{ato_binary}" validate "{repo / "capsule.toml"}"')
+        commands.append(
+            f"{shlex.quote(str(ato_binary))} validate {shlex.quote(str(repo / 'capsule.toml'))}"
+        )
 
     lang = state.get("detected_lang")
     if lang == "rust":
