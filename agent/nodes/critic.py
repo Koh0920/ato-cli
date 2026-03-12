@@ -3,6 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import tomllib
+
+RUST_RELEASE_ENTRYPOINT_PREFIX = "./target/release/"
 
 
 def _update_manifest_line(content: str, key: str, value: str) -> str:
@@ -21,6 +24,13 @@ def _update_manifest_line(content: str, key: str, value: str) -> str:
     return "\n".join(lines) + ("\n" if content.endswith("\n") else "")
 
 
+def _apply_manifest_updates(content: str, updates: list[tuple[str, str]]) -> str:
+    updated = content
+    for key, value in updates:
+        updated = _update_manifest_line(updated, key, value)
+    return updated
+
+
 def _load_package_json(repo: Path) -> dict:
     package_json = repo / "package.json"
     if not package_json.exists():
@@ -31,16 +41,33 @@ def _load_package_json(repo: Path) -> dict:
         return {}
 
 
+def _load_cli_target(manifest: str) -> dict:
+    try:
+        parsed = tomllib.loads(manifest)
+    except tomllib.TOMLDecodeError:
+        return {}
+    targets = parsed.get("targets") or {}
+    cli_target = targets.get("cli") or {}
+    return cli_target if isinstance(cli_target, dict) else {}
+
+
 def _build_manifest_fix(state: dict) -> dict | None:
     repo = Path(state["repo_path"])
     manifest = state.get("capsule_toml", "")
     detected_lang = state.get("detected_lang")
     joined_log = "\n".join(state.get("execution_log", []))
     lowered_log = joined_log.lower()
+    cli_target = _load_cli_target(manifest)
+    entrypoint = cli_target.get("entrypoint")
+    cmd = cli_target.get("cmd") or []
 
-    if detected_lang == "rust" and 'entrypoint = "./target/release/' in manifest:
-        updated = _update_manifest_line(manifest, "entrypoint", '"cargo"')
-        updated = _update_manifest_line(updated, "cmd", '["run"]')
+    if detected_lang == "rust" and isinstance(entrypoint, str) and entrypoint.startswith(
+        RUST_RELEASE_ENTRYPOINT_PREFIX
+    ):
+        updated = _apply_manifest_updates(
+            manifest,
+            [("entrypoint", '"cargo"'), ("cmd", '["run"]')],
+        )
         return {
             "type": "capsule_toml",
             "content": updated,
@@ -51,18 +78,22 @@ def _build_manifest_fix(state: dict) -> dict | None:
     if detected_lang == "node":
         package = _load_package_json(repo)
         scripts = package.get("scripts") or {}
-        if "node" in manifest and '"index.js"' in manifest and "start" in scripts:
-            updated = _update_manifest_line(manifest, "entrypoint", '"npm"')
-            updated = _update_manifest_line(updated, "cmd", '["start"]')
+        if entrypoint == "node" and cmd == ["index.js"] and "start" in scripts:
+            updated = _apply_manifest_updates(
+                manifest,
+                [("entrypoint", '"npm"'), ("cmd", '["start"]')],
+            )
             return {
                 "type": "capsule_toml",
                 "content": updated,
                 "reason": "Switch Node repositories to the package.json start script after index.js execution failed.",
                 "fingerprint": "node:npm-start",
             }
-        if "node" in manifest and '"index.js"' in manifest and "dev" in scripts:
-            updated = _update_manifest_line(manifest, "entrypoint", '"npm"')
-            updated = _update_manifest_line(updated, "cmd", '["run", "dev"]')
+        if entrypoint == "node" and cmd == ["index.js"] and "dev" in scripts:
+            updated = _apply_manifest_updates(
+                manifest,
+                [("entrypoint", '"npm"'), ("cmd", '["run", "dev"]')],
+            )
             return {
                 "type": "capsule_toml",
                 "content": updated,
@@ -70,7 +101,7 @@ def _build_manifest_fix(state: dict) -> dict | None:
                 "fingerprint": "node:npm-dev",
             }
 
-    if detected_lang == "python" and 'entrypoint = "main.py"' in manifest and not (repo / "main.py").exists():
+    if detected_lang == "python" and entrypoint == "main.py" and not (repo / "main.py").exists():
         for candidate in ("app.py", "manage.py"):
             if (repo / candidate).exists():
                 updated = _update_manifest_line(manifest, "entrypoint", f'"{candidate}"')

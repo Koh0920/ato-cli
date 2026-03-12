@@ -7,6 +7,13 @@ import sqlite3
 import subprocess
 
 
+def _canonical_repo_path(repo: Path) -> Path:
+    # We intentionally allow non-existent paths here because success-pattern
+    # lookup/storage may run before a repo is fully materialized or after it has
+    # been moved, and we still want a stable absolute identity string.
+    return repo.expanduser().resolve(strict=False)
+
+
 def _git_value(repo: Path, *args: str) -> str:
     try:
         completed = subprocess.run(
@@ -21,7 +28,7 @@ def _git_value(repo: Path, *args: str) -> str:
 
 
 def build_repo_identity(repo: Path, detected_lang: str = "", test_framework: str = "") -> dict[str, str]:
-    canonical_repo = repo.resolve() if repo.exists() else repo
+    canonical_repo = _canonical_repo_path(repo)
     return {
         "repo_path": str(canonical_repo),
         "repo_name": canonical_repo.name,
@@ -53,7 +60,7 @@ def init_db(db_path: str) -> None:
 
 def build_env_hash(repo: Path, target_env: dict, capsule_toml: str) -> str:
     digest = hashlib.sha256()
-    digest.update(str(repo.resolve() if repo.exists() else repo).encode("utf-8"))
+    digest.update(str(_canonical_repo_path(repo)).encode("utf-8"))
     digest.update(json.dumps(target_env, sort_keys=True).encode("utf-8"))
     digest.update(capsule_toml.encode("utf-8"))
     return digest.hexdigest()

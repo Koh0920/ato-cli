@@ -17,6 +17,9 @@ ATO_TOOLS = [
         "type": "function",
         "function": {
             "name": "edit_capsule_toml",
+            # capsule.toml repairs stay auto-approved in the MVP because they are
+            # the only file mutations the agent is expected to make without
+            # explicit human review.
             "description": "Edit capsule.toml (auto-approved)",
             "parameters": {
                 "type": "object",

@@ -111,6 +111,8 @@ fn execute_with_paths(
             capsule: "auto".to_string(),
             code: resolve_code_approval_policy(&options).to_string(),
         },
+        // Used by the Python LangGraph layer when SqliteSaver is available so each
+        // agent cycle can persist checkpoints for resumable sessions.
         checkpoint_db: ato_home.join("checkpoints.db").display().to_string(),
         patterns_db: ato_home
             .join("agent")
@@ -159,9 +161,14 @@ fn execute_with_paths(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let requirements_path = script
+            .parent()
+            .map(|dir| dir.join("requirements.txt"))
+            .unwrap_or_else(|| PathBuf::from("agent/requirements.txt"));
         if stderr.contains("ModuleNotFoundError") || stderr.contains("No module named") {
             bail!(
-                "Python agent dependencies are missing. Install them with `pip install -r agent/requirements.txt` or set ATO_AGENT_PYTHON to a Python environment that already has the agent dependencies.\n{}",
+                "Python agent dependencies are missing. Install them with `pip install -r {}` or set ATO_AGENT_PYTHON to a Python environment that already has the agent dependencies.\n{}",
+                requirements_path.display(),
                 stderr.trim()
             );
         }
