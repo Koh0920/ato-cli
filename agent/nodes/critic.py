@@ -113,15 +113,6 @@ def _build_manifest_fix(state: dict) -> dict | None:
                     "fingerprint": f"python:{candidate}",
                 }
 
-    if "validation" in lowered_log or "capsule.toml" in lowered_log or "manifest" in lowered_log:
-        compact_log = " ".join(joined_log.split())[:MAX_LOG_EXCERPT_LEN]
-        return {
-            "type": "capsule_toml",
-            "content": manifest,
-            "reason": f"Validation failed but no safe manifest mutation heuristic matched: {compact_log}",
-            "fingerprint": hashlib.sha256(compact_log.encode("utf-8")).hexdigest(),
-        }
-
     return None
 
 

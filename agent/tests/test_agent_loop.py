@@ -15,6 +15,7 @@ from config import AtoConfig  # type: ignore  # noqa: E402
 from db.patterns import init_db, lookup_success_pattern, store_success_pattern  # type: ignore  # noqa: E402
 import graph  # type: ignore  # noqa: E402
 from nodes.critic import critic_node  # type: ignore  # noqa: E402
+from nodes.executor import _commands_for_repo  # type: ignore  # noqa: E402
 from nodes.guard import guard_node  # type: ignore  # noqa: E402
 from nodes.patcher import patch_node, route_after_patch  # type: ignore  # noqa: E402
 
@@ -145,6 +146,23 @@ class AgentLoopTests(unittest.TestCase):
 
             self.assertEqual(updated["next_action"], "give_up")
 
+    def test_critic_gives_up_when_no_safe_validation_fix_exists(self) -> None:
+        manifest = RUST_MANIFEST.replace('./target/release/demo', 'demo.py')
+        state = {
+            "repo_path": "/tmp/repo",
+            "capsule_toml": manifest,
+            "execution_log": ["$ ato validate capsule.toml\nvalidation failed: unknown unsupported field"],
+            "correction_count": 0,
+            "max_corrections": 3,
+            "detected_lang": "rust",
+            "repair_history": [],
+        }
+
+        updated = critic_node(state)
+
+        self.assertEqual(updated["next_action"], "give_up")
+        self.assertEqual(updated["pending_code_edit"]["type"], "code")
+
     def test_guard_fails_closed_without_tty(self) -> None:
         state = {
             "pending_code_edit": {
@@ -162,6 +180,23 @@ class AgentLoopTests(unittest.TestCase):
             updated = guard_node(state)
 
         self.assertFalse(updated["user_approved"])
+
+    def test_executor_quotes_validate_command_paths(self) -> None:
+        with TemporaryDirectory() as root_dir:
+            repo = Path(root_dir) / "repo with space"
+            repo.mkdir()
+            state = {
+                "repo_path": str(repo),
+                "config": {"ato_binary": "/tmp/ato binary"},
+                "detected_lang": "",
+            }
+
+            commands = _commands_for_repo(state)
+
+            self.assertEqual(
+                commands[0],
+                "'/tmp/ato binary' validate '{}'".format(repo / "capsule.toml"),
+            )
 
     def test_success_pattern_lookup_uses_repo_identity(self) -> None:
         with TemporaryDirectory() as root_dir:

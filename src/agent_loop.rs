@@ -78,7 +78,7 @@ fn execute_with_paths(
         .canonicalize()
         .with_context(|| format!("Failed to resolve repository path: {}", repo_path.display()))?;
 
-    let request_dir = ato_home.join("agent").join("requests");
+    let request_dir = repo_path.join(".tmp").join("agent").join("requests");
     fs::create_dir_all(&request_dir).with_context(|| {
         format!(
             "Failed to create agent request directory: {}",
