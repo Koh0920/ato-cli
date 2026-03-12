@@ -11,7 +11,9 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agent import main as agent_main  # type: ignore  # noqa: E402
+from config import AtoConfig  # type: ignore  # noqa: E402
 from db.patterns import init_db, lookup_success_pattern, store_success_pattern  # type: ignore  # noqa: E402
+import graph  # type: ignore  # noqa: E402
 from nodes.critic import critic_node  # type: ignore  # noqa: E402
 from nodes.guard import guard_node  # type: ignore  # noqa: E402
 from nodes.patcher import patch_node, route_after_patch  # type: ignore  # noqa: E402
@@ -40,6 +42,46 @@ entrypoint = "./target/release/demo"
 
 
 class AgentLoopTests(unittest.TestCase):
+    def test_build_app_uses_checkpoint_without_interrupting_guard(self) -> None:
+        compile_kwargs: dict = {}
+
+        class FakeWorkflow:
+            def __init__(self, _state_type) -> None:
+                pass
+
+            def add_node(self, *_args, **_kwargs) -> None:
+                return None
+
+            def set_entry_point(self, *_args, **_kwargs) -> None:
+                return None
+
+            def add_edge(self, *_args, **_kwargs) -> None:
+                return None
+
+            def add_conditional_edges(self, *_args, **_kwargs) -> None:
+                return None
+
+            def compile(self, **kwargs):
+                compile_kwargs.update(kwargs)
+                return object()
+
+        with TemporaryDirectory() as tmp_dir:
+            checkpoint_path = Path(tmp_dir) / "checkpoints.db"
+            config = AtoConfig(
+                repo_path=tmp_dir,
+                ato_binary="/bin/echo",
+                checkpoint_db=str(checkpoint_path),
+            )
+            with mock.patch.object(graph, "StateGraph", FakeWorkflow), mock.patch.object(
+                graph,
+                "SqliteSaver",
+                mock.Mock(from_conn_string=mock.Mock(return_value="checkpointer")),
+            ):
+                graph.build_app(config)
+
+        self.assertEqual(compile_kwargs.get("checkpointer"), "checkpointer")
+        self.assertNotIn("interrupt_before", compile_kwargs)
+
     def test_critic_generates_rust_manifest_fix(self) -> None:
         with TemporaryDirectory() as repo_dir:
             repo = Path(repo_dir)
