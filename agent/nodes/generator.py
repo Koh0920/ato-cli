@@ -70,6 +70,8 @@ def generate_node(state: dict) -> dict:
             state["config"].get("patterns_db", ""),
             repo,
             state.get("target_env") or {},
+            detected_lang=state.get("detected_lang") or "",
+            test_framework=state.get("test_framework") or "",
         )
         if matched:
             capsule_toml = matched

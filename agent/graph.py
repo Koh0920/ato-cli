@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from pathlib import Path
+import time
 from typing import Annotated, Any, TypedDict
+
+SqliteSaver = None
 
 try:
     from langgraph.graph import END, StateGraph
@@ -12,13 +16,18 @@ except (ImportError, ModuleNotFoundError):  # pragma: no cover - fallback path i
     def add_messages(existing: list[Any], new: list[Any]) -> list[Any]:
         return [*existing, *new]
 
+try:
+    from langgraph.checkpoint.sqlite import SqliteSaver  # type: ignore[assignment]
+except (ImportError, ModuleNotFoundError):  # pragma: no cover - optional runtime feature
+    SqliteSaver = None
+
 from config import AtoConfig
 from nodes.analyzer import analyze_node
 from nodes.critic import critic_node, route_after_critic
 from nodes.executor import execute_node, route_after_execute
 from nodes.generator import generate_node
 from nodes.guard import guard_node, route_after_guard
-from nodes.patcher import patch_node
+from nodes.patcher import patch_node, route_after_patch
 
 
 class AgentState(TypedDict, total=False):
@@ -38,10 +47,14 @@ class AgentState(TypedDict, total=False):
     test_files: list[str]
     config: dict[str, Any]
     manifest_preexisting: bool
+    repair_history: list[str]
+    patch_outcome: str
+    session_id: str
     next_action: str
 
 
 def create_initial_state(config: AtoConfig) -> AgentState:
+    session_id = f"ato-agent-{int(time.time() * 1000)}"
     return {
         "messages": [],
         "repo_path": config.repo_path,
@@ -67,10 +80,13 @@ def create_initial_state(config: AtoConfig) -> AgentState:
             "api_key": config.api_key,
         },
         "manifest_preexisting": False,
+        "repair_history": [],
+        "patch_outcome": "execute",
+        "session_id": session_id,
     }
 
 
-def build_app():
+def build_app(config: AtoConfig):
     if StateGraph is None:
         return None
 
@@ -110,15 +126,33 @@ def build_app():
             "ignored": END,
         },
     )
-    workflow.add_edge("patch", "execute")
-    return workflow.compile()
+    workflow.add_conditional_edges(
+        "patch",
+        route_after_patch,
+        {
+            "execute": "execute",
+            "give_up": END,
+        },
+    )
+
+    compile_kwargs: dict[str, Any] = {}
+    checkpoint_db = config.checkpoint_db
+    if SqliteSaver is not None and checkpoint_db:
+        checkpoint_path = Path(checkpoint_db).expanduser()
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        compile_kwargs["checkpointer"] = SqliteSaver.from_conn_string(str(checkpoint_path))
+        compile_kwargs["interrupt_before"] = ["guard"]
+    return workflow.compile(**compile_kwargs)
 
 
 def run_agent(config: AtoConfig) -> AgentState:
     state = create_initial_state(config)
-    app = build_app()
+    app = build_app(config)
     if app is not None:
-        return app.invoke(state)
+        return app.invoke(
+            state,
+            config={"configurable": {"thread_id": state["session_id"]}},
+        )
     return run_linear_loop(state)
 
 
@@ -141,3 +175,5 @@ def run_linear_loop(state: AgentState) -> AgentState:
             if guard_result == "rejected":
                 continue
         state = patch_node(state)
+        if route_after_patch(state) == "give_up":
+            return state
