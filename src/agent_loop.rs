@@ -209,7 +209,27 @@ fn resolve_agent_script() -> Result<PathBuf> {
     }
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let current_exe = std::env::current_exe().ok();
+    let exe_parent = current_exe
+        .as_ref()
+        .and_then(|path| path.parent().map(Path::to_path_buf));
     let candidates = [
+        exe_parent
+            .as_ref()
+            .map(|dir| dir.join("agent/agent.py"))
+            .unwrap_or_else(|| manifest_dir.join("agent/agent.py")),
+        exe_parent
+            .as_ref()
+            .and_then(|dir| dir.parent().map(|parent| parent.join("agent/agent.py")))
+            .unwrap_or_else(|| manifest_dir.join("agent/agent.py")),
+        exe_parent
+            .as_ref()
+            .and_then(|dir| {
+                dir.parent()
+                    .and_then(|parent| parent.parent())
+                    .map(|parent| parent.join("agent/agent.py"))
+            })
+            .unwrap_or_else(|| manifest_dir.join("agent/agent.py")),
         manifest_dir.join("agent/agent.py"),
         std::env::current_dir()
             .unwrap_or_else(|_| manifest_dir.clone())

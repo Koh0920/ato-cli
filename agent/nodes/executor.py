@@ -27,7 +27,10 @@ def _commands_for_repo(state: dict) -> list[str]:
 def execute_node(state: dict) -> dict:
     repo = Path(state["repo_path"])
     manifest_path = repo / "capsule.toml"
-    manifest_path.write_text(state.get("capsule_toml", ""), encoding="utf-8")
+    new_manifest = state.get("capsule_toml", "")
+    current_manifest = manifest_path.read_text(encoding="utf-8") if manifest_path.exists() else None
+    if current_manifest != new_manifest:
+        manifest_path.write_text(new_manifest, encoding="utf-8")
 
     logs: list[str] = []
     results: dict[str, dict] = {}

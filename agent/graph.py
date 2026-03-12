@@ -5,7 +5,7 @@ from typing import Annotated, Any, TypedDict
 try:
     from langgraph.graph import END, StateGraph
     from langgraph.graph.message import add_messages
-except Exception:  # pragma: no cover - fallback path is for environments without langgraph
+except (ImportError, ModuleNotFoundError):  # pragma: no cover - fallback path is for environments without langgraph
     END = "__end__"
     StateGraph = None
 
