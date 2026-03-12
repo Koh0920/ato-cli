@@ -20,12 +20,32 @@ def main() -> int:
     args = parse_args()
     config = load_config(args.config_path)
     manifest_path = Path(config.repo_path) / "capsule.toml"
+    requirements_path = Path(__file__).with_name("requirements.txt")
 
     Path(config.patterns_db).parent.mkdir(parents=True, exist_ok=True)
     Path(config.checkpoint_db).parent.mkdir(parents=True, exist_ok=True)
     init_db(config.patterns_db)
 
-    result = run_agent(config)
+    try:
+        result = run_agent(config)
+    except ModuleNotFoundError as error:
+        missing = getattr(error, "name", None) or str(error)
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": (
+                        f"Missing Python dependency `{missing}` for ato agent mode. "
+                        "Install the agent dependencies with "
+                        f"`pip install -r {requirements_path}` "
+                        "or point ATO_AGENT_PYTHON at an environment that already has them."
+                    ),
+                },
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        return 1
     if result.get("all_tests_passed"):
         store_success_pattern(config.patterns_db, config, result)
     elif not result.get("manifest_preexisting") and manifest_path.exists():

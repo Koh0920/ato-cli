@@ -1,5 +1,97 @@
 from __future__ import annotations
 
+import hashlib
+import json
+from pathlib import Path
+
+
+def _update_manifest_line(content: str, key: str, value: str) -> str:
+    lines = content.splitlines()
+    replacement = f'{key} = {value}'
+    for index, line in enumerate(lines):
+        if line.strip().startswith(f"{key} = "):
+            lines[index] = replacement
+            return "\n".join(lines) + ("\n" if content.endswith("\n") else "")
+    target_index = 0
+    for index, line in enumerate(lines):
+        if line.strip() == "[storage]":
+            target_index = index
+            break
+    lines.insert(target_index, replacement)
+    return "\n".join(lines) + ("\n" if content.endswith("\n") else "")
+
+
+def _load_package_json(repo: Path) -> dict:
+    package_json = repo / "package.json"
+    if not package_json.exists():
+        return {}
+    try:
+        return json.loads(package_json.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+
+
+def _build_manifest_fix(state: dict) -> dict | None:
+    repo = Path(state["repo_path"])
+    manifest = state.get("capsule_toml", "")
+    detected_lang = state.get("detected_lang")
+    joined_log = "\n".join(state.get("execution_log", []))
+    lowered_log = joined_log.lower()
+
+    if detected_lang == "rust" and 'entrypoint = "./target/release/' in manifest:
+        updated = _update_manifest_line(manifest, "entrypoint", '"cargo"')
+        updated = _update_manifest_line(updated, "cmd", '["run"]')
+        return {
+            "type": "capsule_toml",
+            "content": updated,
+            "reason": "Rust repository runs should fall back to `cargo run` when no release binary exists.",
+            "fingerprint": "rust:cargo-run-fallback",
+        }
+
+    if detected_lang == "node":
+        package = _load_package_json(repo)
+        scripts = package.get("scripts") or {}
+        if "node" in manifest and '"index.js"' in manifest and "start" in scripts:
+            updated = _update_manifest_line(manifest, "entrypoint", '"npm"')
+            updated = _update_manifest_line(updated, "cmd", '["start"]')
+            return {
+                "type": "capsule_toml",
+                "content": updated,
+                "reason": "Switch Node repositories to the package.json start script after index.js execution failed.",
+                "fingerprint": "node:npm-start",
+            }
+        if "node" in manifest and '"index.js"' in manifest and "dev" in scripts:
+            updated = _update_manifest_line(manifest, "entrypoint", '"npm"')
+            updated = _update_manifest_line(updated, "cmd", '["run", "dev"]')
+            return {
+                "type": "capsule_toml",
+                "content": updated,
+                "reason": "Switch Node repositories to the package.json dev script after index.js execution failed.",
+                "fingerprint": "node:npm-dev",
+            }
+
+    if detected_lang == "python" and 'entrypoint = "main.py"' in manifest and not (repo / "main.py").exists():
+        for candidate in ("app.py", "manage.py"):
+            if (repo / candidate).exists():
+                updated = _update_manifest_line(manifest, "entrypoint", f'"{candidate}"')
+                return {
+                    "type": "capsule_toml",
+                    "content": updated,
+                    "reason": f"Switch Python entrypoint to `{candidate}` because `main.py` is absent.",
+                    "fingerprint": f"python:{candidate}",
+                }
+
+    if "validation" in lowered_log or "capsule.toml" in lowered_log or "manifest" in lowered_log:
+        compact_log = " ".join(joined_log.split())[:400]
+        return {
+            "type": "capsule_toml",
+            "content": manifest,
+            "reason": f"Validation failed but no safe manifest mutation heuristic matched: {compact_log}",
+            "fingerprint": hashlib.sha256(compact_log.encode("utf-8")).hexdigest(),
+        }
+
+    return None
+
 
 def critic_node(state: dict) -> dict:
     correction_count = int(state.get("correction_count", 0)) + 1
@@ -11,17 +103,17 @@ def critic_node(state: dict) -> dict:
             "next_action": "give_up",
         }
 
-    joined_log = "\n".join(state.get("execution_log", [])).lower()
-    if "capsule.toml" in joined_log or "manifest" in joined_log or correction_count == 1:
+    repair_history = list(state.get("repair_history", []))
+    pending = _build_manifest_fix(state)
+    if pending and pending.get("content") != state.get("capsule_toml") and pending.get("fingerprint") not in repair_history:
         next_action = "capsule_fix"
-        pending = {"type": "capsule_toml"}
     else:
-        next_action = "code_fix"
+        next_action = "give_up"
         pending = {
             "type": "code",
             "path": "",
             "content": "",
-            "reason": "Tests failed after manifest generation; a source-code change may be required.",
+            "reason": "No new safe automatic repair was derived from the latest failure logs.",
         }
 
     return {
