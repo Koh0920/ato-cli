@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import time
 from typing import Annotated, Any, TypedDict
+import warnings
 
 SqliteSaver = None
 
@@ -142,7 +143,12 @@ def build_app(config: AtoConfig):
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             compile_kwargs["checkpointer"] = SqliteSaver.from_conn_string(str(checkpoint_path))
-        except Exception:
+        except Exception as error:
+            warnings.warn(
+                f"Failed to initialize LangGraph checkpoint database at {checkpoint_path}: {error}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             compile_kwargs = {}
     return workflow.compile(**compile_kwargs)
 
