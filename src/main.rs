@@ -77,6 +77,7 @@ impl Drop for SidecarCleanup {
     }
 }
 
+mod agent_loop;
 mod ato_error_jsonl;
 mod auth;
 mod binding;
@@ -232,6 +233,14 @@ enum Commands {
         #[arg(long)]
         registry: Option<String>,
 
+        /// LLM provider for repository agent mode (default: anthropic)
+        #[arg(long, default_value = "anthropic", value_parser = ["anthropic", "openai"])]
+        provider: String,
+
+        /// Override the provider-default model for repository agent mode
+        #[arg(long)]
+        model: Option<String>,
+
         /// Explicitly bind a manifest [state.<name>] entry using STATE=/absolute/path or STATE=state-...
         #[arg(long = "state", value_name = "STATE=/ABS/PATH|STATE=state-...")]
         state: Vec<String>,
@@ -267,6 +276,14 @@ enum Commands {
         /// Allow installing/running unverified signatures in non-production environments
         #[arg(long, default_value_t = false)]
         allow_unverified: bool,
+
+        /// Ignore agent-proposed source code edits and stop after manifest-only fixes
+        #[arg(long, default_value_t = false)]
+        no_code_fix: bool,
+
+        /// Auto-approve agent edits, including source-code changes
+        #[arg(long, default_value_t = false)]
+        auto_approve: bool,
     },
 
     #[command(
@@ -1630,6 +1647,8 @@ fn run() -> Result<()> {
             background,
             nacelle,
             registry,
+            provider,
+            model,
             state,
             enforcement,
             sandbox_mode,
@@ -1638,6 +1657,8 @@ fn run() -> Result<()> {
             dangerously_skip_permissions,
             yes,
             allow_unverified,
+            no_code_fix,
+            auto_approve,
         } => execute_run_like_command(
             path,
             target,
@@ -1645,6 +1666,8 @@ fn run() -> Result<()> {
             background,
             nacelle,
             registry,
+            provider,
+            model,
             state,
             enforcement,
             sandbox_mode,
@@ -1653,6 +1676,8 @@ fn run() -> Result<()> {
             dangerously_skip_permissions,
             yes,
             allow_unverified,
+            no_code_fix,
+            auto_approve,
             skill,
             from_skill,
             None,
@@ -1692,6 +1717,8 @@ fn run() -> Result<()> {
             background,
             nacelle,
             registry,
+            "anthropic".to_string(),
+            None,
             state,
             enforcement,
             sandbox_mode,
@@ -1699,6 +1726,8 @@ fn run() -> Result<()> {
             unsafe_bypass_sandbox_legacy,
             dangerously_skip_permissions,
             yes,
+            false,
+            false,
             false,
             None,
             None,
@@ -3521,6 +3550,8 @@ fn execute_run_like_command(
     background: bool,
     nacelle: Option<PathBuf>,
     registry: Option<String>,
+    provider: String,
+    model: Option<String>,
     state: Vec<String>,
     enforcement: EnforcementMode,
     sandbox_mode: bool,
@@ -3529,6 +3560,8 @@ fn execute_run_like_command(
     dangerously_skip_permissions: bool,
     yes: bool,
     allow_unverified: bool,
+    no_code_fix: bool,
+    auto_approve: bool,
     skill: Option<String>,
     from_skill: Option<PathBuf>,
     deprecation_warning: Option<&str>,
@@ -3592,6 +3625,25 @@ fn execute_run_like_command(
         registry.as_deref(),
         reporter.clone(),
     ))?;
+
+    if agent_loop::should_launch_for_path(&path) {
+        if watch {
+            anyhow::bail!("Agent-assisted repository runs do not support --watch yet");
+        }
+        if background {
+            anyhow::bail!("Agent-assisted repository runs do not support --background yet");
+        }
+        return agent_loop::execute(
+            &path,
+            agent_loop::AgentRunOptions {
+                provider,
+                model,
+                no_code_fix,
+                auto_approve,
+            },
+            reporter,
+        );
+    }
 
     let sandbox_requested = sandbox_mode || unsafe_mode_legacy || unsafe_bypass_sandbox_legacy;
     let effective_enforcement = enforce_sandbox_mode_flags(
