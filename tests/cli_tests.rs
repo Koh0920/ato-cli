@@ -1260,7 +1260,10 @@ fn test_run_command_accepts_default_path() {
     let script_path = helper.path().join("fake-agent.sh");
     fs::write(
         &script_path,
-        "#!/bin/sh\ncp \"$1\" \"$ATO_CAPTURE_CONFIG\"\nprintf 'agent stub ran\\n'\n",
+        r#"#!/bin/sh
+cp "$1" "$ATO_CAPTURE_CONFIG"
+printf 'agent stub ran\n'
+"#,
     )
     .unwrap();
 
@@ -1334,7 +1337,10 @@ edition = "2021"
     let script_path = helper.path().join("fake-agent.sh");
     fs::write(
         &script_path,
-        "#!/bin/sh\ncp \"$1\" \"$ATO_CAPTURE_CONFIG\"\nprintf 'agent stub ran\\n'\n",
+        r#"#!/bin/sh
+cp "$1" "$ATO_CAPTURE_CONFIG"
+printf 'agent stub ran\n'
+"#,
     )
     .unwrap();
 
@@ -1391,7 +1397,10 @@ fn test_run_repo_without_capsule_honors_no_code_fix() {
     let script_path = helper.path().join("fake-agent.sh");
     fs::write(
         &script_path,
-        "#!/bin/sh\ncp \"$1\" \"$ATO_CAPTURE_CONFIG\"\nprintf 'agent stub ran\\n'\n",
+        r#"#!/bin/sh
+cp "$1" "$ATO_CAPTURE_CONFIG"
+printf 'agent stub ran\n'
+"#,
     )
     .unwrap();
 

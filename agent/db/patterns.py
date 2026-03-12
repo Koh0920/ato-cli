@@ -45,7 +45,7 @@ def lookup_success_pattern(db_path: str, repo: Path, target_env: dict) -> str | 
 
 
 def store_success_pattern(db_path: str, config, state: dict) -> None:
-    if not db_path:
+    if not db_path or not state.get("all_tests_passed"):
         return
     capsule_toml = state.get("capsule_toml", "")
     repo = Path(config.repo_path)

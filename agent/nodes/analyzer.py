@@ -17,24 +17,24 @@ def _detect_language(repo: Path) -> str:
 
 def _detect_test_files(repo: Path, lang: str) -> tuple[str, list[str]]:
     if lang == "rust":
-        files = sorted(str(path.relative_to(repo)) for path in repo.glob("tests/**/*.rs"))
+        rust_files = sorted(str(path.relative_to(repo)) for path in repo.glob("tests/**/*.rs"))
         if (repo / "src").exists():
-            files.extend(
+            rust_files.extend(
                 sorted(str(path.relative_to(repo)) for path in repo.glob("src/**/*test*.rs"))
             )
-        return "cargo test", files
+        return "cargo test", rust_files
     if lang == "node":
         patterns = ["tests/**/*.test.*", "src/**/*.test.*", "src/**/*.spec.*"]
-        files: list[str] = []
+        node_files: list[str] = []
         for pattern in patterns:
-            files.extend(sorted(str(path.relative_to(repo)) for path in repo.glob(pattern)))
-        return "npm test", files
+            node_files.extend(sorted(str(path.relative_to(repo)) for path in repo.glob(pattern)))
+        return "npm test", node_files
     if lang == "python":
-        files = sorted(str(path.relative_to(repo)) for path in repo.glob("tests/test_*.py"))
-        return "pytest", files
+        python_files = sorted(str(path.relative_to(repo)) for path in repo.glob("tests/test_*.py"))
+        return "pytest", python_files
     if lang == "go":
-        files = sorted(str(path.relative_to(repo)) for path in repo.glob("**/*_test.go"))
-        return "go test", files
+        go_files = sorted(str(path.relative_to(repo)) for path in repo.glob("**/*_test.go"))
+        return "go test", go_files
     return "unknown", []
 
 

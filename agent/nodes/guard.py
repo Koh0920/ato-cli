@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 
 def guard_node(state: dict) -> dict:
     edit = state.get("pending_code_edit") or {}
@@ -13,6 +15,8 @@ def guard_node(state: dict) -> dict:
         return {**state, "user_approved": None}
     if code_policy == "auto":
         return {**state, "user_approved": True}
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        return {**state, "user_approved": False}
 
     path = edit.get("path") or "<repo>"
     reason = edit.get("reason") or "no reason provided"
