@@ -1248,11 +1248,48 @@ fn test_finalize_requires_opt_in_flag() {
 
 #[test]
 fn test_run_command_accepts_default_path() {
-    let mut cmd = Command::cargo_bin("ato").unwrap();
-    cmd.arg("run")
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("required").not());
+    let repo = tempdir().unwrap();
+    fs::write(
+        repo.path().join("package.json"),
+        r#"{"name":"demo","version":"0.1.0"}"#,
+    )
+    .unwrap();
+
+    let helper = tempdir().unwrap();
+    let capture_path = helper.path().join("captured-config.json");
+    let script_path = helper.path().join("fake-agent.sh");
+    fs::write(
+        &script_path,
+        r#"#!/bin/sh
+cp "$1" "$ATO_CAPTURE_CONFIG"
+printf 'agent stub ran\n'
+"#,
+    )
+    .unwrap();
+
+    let home = tempdir().unwrap();
+    let output = Command::cargo_bin("ato")
+        .unwrap()
+        .current_dir(repo.path())
+        .arg("run")
+        .env("ATO_AGENT_PYTHON", "/bin/sh")
+        .env("ATO_AGENT_SCRIPT", &script_path)
+        .env("ATO_CAPTURE_CONFIG", &capture_path)
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("required"),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -1265,6 +1302,10 @@ fn test_run_help_shows_yes_flag() {
         .stdout(predicate::str::contains("--skill <SKILL>"))
         .stdout(predicate::str::contains("--yes"))
         .stdout(predicate::str::contains("--registry"))
+        .stdout(predicate::str::contains("--provider"))
+        .stdout(predicate::str::contains("--model"))
+        .stdout(predicate::str::contains("--no-code-fix"))
+        .stdout(predicate::str::contains("--auto-approve"))
         .stdout(predicate::str::contains("default: https://api.ato.run"));
 }
 
@@ -1297,6 +1338,117 @@ fn test_run_skill_conflicts_with_from_skill() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
+fn test_run_repo_without_capsule_launches_agent_subprocess() {
+    let repo = tempdir().unwrap();
+    fs::write(
+        repo.path().join("Cargo.toml"),
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2021"
+"#,
+    )
+    .unwrap();
+    fs::create_dir_all(repo.path().join("src")).unwrap();
+    fs::write(repo.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+
+    let helper = tempdir().unwrap();
+    let capture_path = helper.path().join("captured-config.json");
+    let script_path = helper.path().join("fake-agent.sh");
+    fs::write(
+        &script_path,
+        r#"#!/bin/sh
+cp "$1" "$ATO_CAPTURE_CONFIG"
+printf 'agent stub ran\n'
+"#,
+    )
+    .unwrap();
+
+    let home = tempdir().unwrap();
+    let output = Command::cargo_bin("ato")
+        .unwrap()
+        .args([
+            "run",
+            repo.path().to_str().unwrap(),
+            "--provider",
+            "openai",
+            "--model",
+            "gpt-4o",
+            "--auto-approve",
+        ])
+        .env("ATO_AGENT_PYTHON", "/bin/sh")
+        .env("ATO_AGENT_SCRIPT", &script_path)
+        .env("ATO_CAPTURE_CONFIG", &capture_path)
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("agent stub ran"),
+        "stdout={}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let captured: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&capture_path).unwrap()).unwrap();
+    assert_eq!(captured["provider"], "openai");
+    assert_eq!(captured["model"], "gpt-4o");
+    assert_eq!(captured["approval_policy"]["code"], "auto");
+    assert_eq!(captured["repo_path"], repo.path().to_str().unwrap());
+}
+
+#[test]
+fn test_run_repo_without_capsule_honors_no_code_fix() {
+    let repo = tempdir().unwrap();
+    fs::write(
+        repo.path().join("package.json"),
+        r#"{"name":"demo","version":"0.1.0"}"#,
+    )
+    .unwrap();
+
+    let helper = tempdir().unwrap();
+    let capture_path = helper.path().join("captured-config.json");
+    let script_path = helper.path().join("fake-agent.sh");
+    fs::write(
+        &script_path,
+        r#"#!/bin/sh
+cp "$1" "$ATO_CAPTURE_CONFIG"
+printf 'agent stub ran\n'
+"#,
+    )
+    .unwrap();
+
+    let home = tempdir().unwrap();
+    let output = Command::cargo_bin("ato")
+        .unwrap()
+        .args(["run", repo.path().to_str().unwrap(), "--no-code-fix"])
+        .env("ATO_AGENT_PYTHON", "/bin/sh")
+        .env("ATO_AGENT_SCRIPT", &script_path)
+        .env("ATO_CAPTURE_CONFIG", &capture_path)
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let captured: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&capture_path).unwrap()).unwrap();
+    assert_eq!(captured["approval_policy"]["code"], "ignore");
+    assert_eq!(captured["provider"], "anthropic");
 }
 
 #[test]

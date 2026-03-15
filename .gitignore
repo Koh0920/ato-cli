@@ -20,6 +20,8 @@ tmp/
 
 # Logs
 *.log
+*.pyc
+__pycache__/
 
 # Build artifacts
 **/build/
