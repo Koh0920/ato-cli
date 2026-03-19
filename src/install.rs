@@ -10,7 +10,6 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use rand::RngCore;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::Write;
 use std::io::{Cursor, Read};
@@ -25,6 +24,11 @@ use capsule_core::resource::cas::LocalCasIndex;
 use capsule_core::types::identity::public_key_to_did;
 use capsule_core::types::CapsuleManifest;
 
+use crate::artifact_hash::{
+    compute_blake3_label as compute_blake3, compute_sha256_hex as compute_sha256, equals_hash,
+    normalize_hash_for_compare,
+};
+use crate::capsule_archive::extract_payload_tar_from_capsule;
 use crate::registry::RegistryResolver;
 use crate::runtime_tree;
 
@@ -1852,7 +1856,7 @@ pub async fn install_app(
         urlencoding::encode(&scoped_ref.publisher),
         urlencoding::encode(&scoped_ref.slug)
     );
-    let capsule: CapsuleDetail = with_ato_token(client.get(&capsule_url))
+    let capsule: CapsuleDetail = crate::registry_http::with_ato_token(client.get(&capsule_url))
         .send()
         .await
         .with_context(|| format!("Failed to connect to registry: {}", registry))?
@@ -2518,7 +2522,7 @@ async fn sync_v3_chunks_from_manifest(
             return Ok(V3SyncOutcome::SkippedDisabledCas(reason));
         }
     };
-    let token = current_ato_token();
+    let token = crate::registry_http::current_ato_token();
     let concurrency = sync_concurrency_limit();
     sync_v3_chunks_from_manifest_with_options(client, registry, manifest, cas, token, concurrency)
         .await
@@ -2741,7 +2745,7 @@ pub async fn fetch_capsule_detail(
         urlencoding::encode(&scoped_ref.publisher),
         urlencoding::encode(&scoped_ref.slug)
     );
-    let capsule: CapsuleDetail = with_ato_token(client.get(&capsule_url))
+    let capsule: CapsuleDetail = crate::registry_http::with_ato_token(client.get(&capsule_url))
         .send()
         .await
         .with_context(|| format!("Failed to connect to registry: {}", registry))?
@@ -2779,7 +2783,7 @@ pub async fn fetch_capsule_manifest_toml(
         urlencoding::encode(&scoped_ref.publisher),
         urlencoding::encode(&scoped_ref.slug)
     );
-    let response = with_ato_token(client.get(&capsule_url))
+    let response = crate::registry_http::with_ato_token(client.get(&capsule_url))
         .send()
         .await
         .with_context(|| format!("Failed to connect to registry: {}", registry))?;
@@ -2840,7 +2844,7 @@ async fn resolve_manifest_target(
             urlencoding::encode(&scoped_ref.slug),
             urlencoding::encode(version)
         );
-        let response = with_ato_token(client.get(&endpoint))
+        let response = crate::registry_http::with_ato_token(client.get(&endpoint))
             .send()
             .await
             .with_context(|| "Failed to resolve versioned manifest hash")?;
@@ -2897,7 +2901,7 @@ async fn resolve_manifest_target(
     }
 
     let epoch_endpoint = format!("{}/v1/manifest/epoch/resolve", base);
-    let epoch_response = with_ato_token(
+    let epoch_response = crate::registry_http::with_ato_token(
         client
             .post(&epoch_endpoint)
             .json(&serde_json::json!({ "scoped_id": scoped_ref.scoped_id })),
@@ -3007,7 +3011,7 @@ async fn download_capsule_artifact_via_distribution(
     }
 
     let has_token = has_ato_token();
-    let distribution_response = with_ato_token(client.get(&distribution_url))
+    let distribution_response = crate::registry_http::with_ato_token(client.get(&distribution_url))
         .send()
         .await
         .with_context(|| "Failed to resolve distribution fallback for install")?;
@@ -3113,7 +3117,7 @@ async fn install_manifest_delta_path_inner(
         base,
         urlencoding::encode(&target_manifest_hash)
     );
-    let manifest_response = with_ato_token(client.get(&manifest_endpoint))
+    let manifest_response = crate::registry_http::with_ato_token(client.get(&manifest_endpoint))
         .send()
         .await
         .with_context(|| "Failed to fetch manifest document for delta install")?;
@@ -3261,7 +3265,7 @@ async fn negotiate_manifest(
     has_token: bool,
 ) -> Result<ManifestNegotiateResponse> {
     let endpoint = format!("{}/v1/manifest/negotiate", base);
-    let response = with_ato_token(client.post(&endpoint).json(request))
+    let response = crate::registry_http::with_ato_token(client.post(&endpoint).json(request))
         .send()
         .await
         .with_context(|| "Failed to call manifest negotiate")?;
@@ -3325,7 +3329,7 @@ async fn download_required_chunks(
             base,
             urlencoding::encode(chunk_hash)
         );
-        let response = with_ato_token(client.get(&endpoint))
+        let response = crate::registry_http::with_ato_token(client.get(&endpoint))
             .send()
             .await
             .with_context(|| format!("Failed to fetch required chunk {}", chunk_hash))?;
@@ -3359,10 +3363,12 @@ async fn refresh_lease(
     has_token: bool,
 ) -> Result<ManifestLeaseRefreshResponse> {
     let endpoint = format!("{}/v1/manifest/leases/refresh", base);
-    let response = with_ato_token(client.post(&endpoint).json(&ManifestLeaseRefreshRequest {
-        lease_id: lease_id.to_string(),
-        ttl_secs: Some(LEASE_REFRESH_INTERVAL_SECS),
-    }))
+    let response = crate::registry_http::with_ato_token(client.post(&endpoint).json(
+        &ManifestLeaseRefreshRequest {
+            lease_id: lease_id.to_string(),
+            ttl_secs: Some(LEASE_REFRESH_INTERVAL_SECS),
+        },
+    ))
     .send()
     .await
     .with_context(|| "Failed to refresh manifest lease")?;
@@ -3393,9 +3399,11 @@ async fn release_lease_best_effort(
         "{}/v1/manifest/leases/release",
         registry.trim_end_matches('/')
     );
-    let _ = with_ato_token(client.post(&endpoint).json(&ManifestLeaseReleaseRequest {
-        lease_id: lease_id.to_string(),
-    }))
+    let _ = crate::registry_http::with_ato_token(client.post(&endpoint).json(
+        &ManifestLeaseReleaseRequest {
+            lease_id: lease_id.to_string(),
+        },
+    ))
     .send()
     .await;
     Ok(())
@@ -3491,34 +3499,6 @@ fn append_capsule_entry(
         .append_data(&mut header, path, Cursor::new(bytes))
         .with_context(|| format!("Failed to append {} to reconstructed artifact", path))?;
     Ok(())
-}
-
-fn compute_blake3(data: &[u8]) -> String {
-    use blake3::Hasher;
-    let mut hasher = Hasher::new();
-    hasher.update(data);
-    let hash = hasher.finalize();
-    format!("blake3:{}", hex::encode(hash.as_bytes()))
-}
-
-fn compute_sha256(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hex::encode(hasher.finalize())
-}
-
-fn equals_hash(expected: &str, got_raw: &str) -> bool {
-    let normalized_expected = expected
-        .strip_prefix("sha256:")
-        .or_else(|| expected.strip_prefix("blake3:"))
-        .unwrap_or(expected)
-        .to_lowercase();
-    let normalized_got = got_raw
-        .strip_prefix("sha256:")
-        .or_else(|| got_raw.strip_prefix("blake3:"))
-        .unwrap_or(got_raw)
-        .to_lowercase();
-    normalized_expected == normalized_got
 }
 
 #[derive(Debug, Deserialize)]
@@ -3641,7 +3621,7 @@ async fn verify_manifest_supply_chain(
         )
         .await?
     } else {
-        let response = with_ato_token(
+        let response = crate::registry_http::with_ato_token(
             client
                 .post(&endpoint)
                 .json(&serde_json::json!({ "scoped_id": scoped_ref.scoped_id })),
@@ -3697,7 +3677,7 @@ async fn verify_manifest_supply_chain(
         base,
         urlencoding::encode(&target_manifest_hash)
     );
-    let manifest_response = with_ato_token(client.get(&manifest_endpoint))
+    let manifest_response = crate::registry_http::with_ato_token(client.get(&manifest_endpoint))
         .send()
         .await
         .with_context(|| "Failed to fetch manifest payload")?;
@@ -3759,14 +3739,6 @@ async fn verify_manifest_supply_chain(
     Ok(())
 }
 
-fn with_ato_token(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-    if let Some(token) = current_ato_token() {
-        request.header("authorization", format!("Bearer {}", token))
-    } else {
-        request
-    }
-}
-
 fn artifact_request_builder(
     client: &reqwest::Client,
     registry: &str,
@@ -3774,7 +3746,7 @@ fn artifact_request_builder(
 ) -> reqwest::RequestBuilder {
     let request = client.get(artifact_url);
     if should_attach_ato_token_to_artifact_url(registry, artifact_url) {
-        with_ato_token(request)
+        crate::registry_http::with_ato_token(request)
     } else {
         request
     }
@@ -3794,11 +3766,7 @@ fn should_attach_ato_token_to_artifact_url(registry: &str, artifact_url: &str) -
 }
 
 fn has_ato_token() -> bool {
-    current_ato_token().is_some()
-}
-
-fn current_ato_token() -> Option<String> {
-    crate::auth::current_session_token()
+    crate::registry_http::current_ato_token().is_some()
 }
 
 fn verify_epoch_signature(epoch: &ManifestEpochResolveResponse) -> Result<()> {
@@ -3868,31 +3836,6 @@ fn extract_manifest_toml_from_capsule(bytes: &[u8]) -> Result<String> {
         }
     }
     bail!("Invalid artifact: capsule.toml not found in .capsule archive")
-}
-
-fn extract_payload_tar_from_capsule(bytes: &[u8]) -> Result<Vec<u8>> {
-    let mut archive = tar::Archive::new(Cursor::new(bytes));
-    let entries = archive
-        .entries()
-        .context("Failed to read .capsule archive entries")?;
-    for entry in entries {
-        let mut entry = entry.context("Invalid .capsule entry")?;
-        let path = entry.path().context("Failed to read archive entry path")?;
-        if path.to_string_lossy() == "payload.tar.zst" {
-            let mut payload_zst = Vec::new();
-            entry
-                .read_to_end(&mut payload_zst)
-                .context("Failed to read payload.tar.zst from artifact")?;
-            let mut decoder = zstd::stream::Decoder::new(Cursor::new(payload_zst))
-                .with_context(|| "Failed to decode payload.tar.zst")?;
-            let mut payload_tar = Vec::new();
-            decoder
-                .read_to_end(&mut payload_tar)
-                .context("Failed to read payload.tar bytes")?;
-            return Ok(payload_tar);
-        }
-    }
-    bail!("Invalid artifact: payload.tar.zst not found in .capsule archive")
 }
 
 fn compute_manifest_hash_without_signatures(manifest: &CapsuleManifest) -> Result<String> {
@@ -3996,14 +3939,6 @@ fn verify_manifest_merkle_root(manifest: &CapsuleManifest) -> Result<()> {
         );
     }
     Ok(())
-}
-
-fn normalize_hash_for_compare(value: &str) -> String {
-    value
-        .trim()
-        .trim_start_matches("sha256:")
-        .trim_start_matches("blake3:")
-        .to_ascii_lowercase()
 }
 
 fn epoch_guard_path() -> PathBuf {

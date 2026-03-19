@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 
 use anyhow::{bail, Context, Result};
-use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone)]
@@ -20,15 +19,9 @@ pub struct RegistryDeleteResult {
     pub removed_version: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct RegistryErrorPayload {
-    #[serde(default)]
-    message: Option<String>,
-}
-
 pub fn delete_capsule(args: RegistryDeleteArgs) -> Result<RegistryDeleteResult> {
     let scoped = crate::install::parse_capsule_ref(&args.scoped_id)?;
-    let base_url = normalize_registry_url(&args.registry_url)?;
+    let base_url = crate::registry_http::normalize_registry_url(&args.registry_url, "--registry")?;
     let endpoint = build_delete_endpoint(
         &base_url,
         &scoped.publisher,
@@ -40,11 +33,7 @@ pub fn delete_capsule(args: RegistryDeleteArgs) -> Result<RegistryDeleteResult> 
         .build()
         .context("Failed to create registry delete client")?
         .delete(&endpoint);
-    let request = if let Some(token) = read_ato_token() {
-        request.header("authorization", format!("Bearer {}", token))
-    } else {
-        request
-    };
+    let request = crate::registry_http::with_blocking_ato_token(request);
 
     let response = request
         .send()
@@ -53,7 +42,7 @@ pub fn delete_capsule(args: RegistryDeleteArgs) -> Result<RegistryDeleteResult> 
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().unwrap_or_default();
-        let message = parse_error_message(status, &body);
+        let message = crate::registry_http::parse_error_message(status, &body);
         bail!("Registry delete failed ({}): {}", status.as_u16(), message);
     }
 
@@ -79,28 +68,4 @@ fn build_delete_endpoint(
         endpoint.push_str(&urlencoding::encode(version));
     }
     endpoint
-}
-
-fn normalize_registry_url(raw: &str) -> Result<String> {
-    crate::registry_http::normalize_registry_url(raw, "--registry")
-}
-
-fn parse_error_message(status: StatusCode, body: &str) -> String {
-    let parsed = serde_json::from_str::<RegistryErrorPayload>(body).ok();
-    if let Some(message) = parsed
-        .and_then(|payload| payload.message)
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-    {
-        return message;
-    }
-    let raw = body.trim();
-    if raw.is_empty() {
-        return format!("HTTP {}", status.as_u16());
-    }
-    raw.to_string()
-}
-
-fn read_ato_token() -> Option<String> {
-    crate::auth::current_session_token()
 }

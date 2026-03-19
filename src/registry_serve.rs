@@ -26,6 +26,9 @@ use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
 
+use crate::artifact_hash::{
+    compute_blake3_label as compute_blake3, compute_sha256_label as compute_sha256, equals_hash,
+};
 use crate::binding;
 use crate::process_manager::{ProcessInfo, ProcessManager, ProcessStatus};
 use crate::publish_artifact::{
@@ -4567,30 +4570,6 @@ fn validate_file_name(value: &str) -> Result<()> {
         bail!("file_name must be a .capsule file name");
     }
     Ok(())
-}
-
-fn compute_sha256(data: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    format!("sha256:{}", hex::encode(hasher.finalize()))
-}
-
-fn compute_blake3(data: &[u8]) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(data);
-    format!("blake3:{}", hex::encode(hasher.finalize().as_bytes()))
-}
-
-fn equals_hash(expected: &str, got: &str) -> bool {
-    let normalize = |value: &str| {
-        value
-            .trim()
-            .trim_start_matches("sha256:")
-            .trim_start_matches("blake3:")
-            .to_ascii_lowercase()
-    };
-    normalize(expected) == normalize(got)
 }
 
 fn json_error(status: StatusCode, error: &str, message: &str) -> axum::response::Response {

@@ -91,9 +91,11 @@ impl Drop for SidecarCleanup {
     }
 }
 
+mod artifact_hash;
 mod ato_error_jsonl;
 mod auth;
 mod binding;
+mod capsule_archive;
 mod commands;
 mod common;
 mod consent_store;
@@ -3567,7 +3569,7 @@ fn resolve_publish_target_from_sources(
 }
 
 fn resolve_explicit_publish_target(raw: &str) -> Result<ResolvedPublishTarget> {
-    let normalized = normalize_registry_url(raw)?;
+    let normalized = crate::registry_http::normalize_registry_url(raw, "registry")?;
     if is_legacy_dock_publish_registry(&normalized) {
         anyhow::bail!(
             "Registry URL `{}` is no longer supported. Personal Dock publish now uses `https://api.ato.run`; `/d/<handle>` is a UI page, not a registry.",
@@ -3584,10 +3586,6 @@ fn resolve_explicit_publish_target(raw: &str) -> Result<ResolvedPublishTarget> {
         },
         publisher_handle: None,
     })
-}
-
-fn normalize_registry_url(raw: &str) -> Result<String> {
-    crate::registry_http::normalize_registry_url(raw, "registry")
 }
 
 fn is_official_publish_registry(url: &str) -> bool {

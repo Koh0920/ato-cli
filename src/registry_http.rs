@@ -1,6 +1,8 @@
 use std::net::{IpAddr, Ipv4Addr};
 
 use anyhow::{bail, Context, Result};
+use reqwest::StatusCode;
+use serde::Deserialize;
 
 pub fn normalize_registry_url(raw: &str, label: &str) -> Result<String> {
     let trimmed = raw.trim();
@@ -36,6 +38,44 @@ pub fn blocking_client_builder(base_url: &str) -> reqwest::blocking::ClientBuild
         builder = builder.no_proxy();
     }
     builder
+}
+
+pub fn with_ato_token(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    if let Some(token) = current_ato_token() {
+        request.header("authorization", format!("Bearer {}", token))
+    } else {
+        request
+    }
+}
+
+pub fn with_blocking_ato_token(
+    request: reqwest::blocking::RequestBuilder,
+) -> reqwest::blocking::RequestBuilder {
+    if let Some(token) = current_ato_token() {
+        request.header("authorization", format!("Bearer {}", token))
+    } else {
+        request
+    }
+}
+
+pub fn current_ato_token() -> Option<String> {
+    crate::auth::current_session_token()
+}
+
+pub fn parse_error_message(status: StatusCode, body: &str) -> String {
+    let parsed = serde_json::from_str::<RegistryErrorPayload>(body).ok();
+    if let Some(message) = parsed
+        .and_then(|payload| payload.message)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return message;
+    }
+    let raw = body.trim();
+    if raw.is_empty() {
+        return format!("HTTP {}", status.as_u16());
+    }
+    raw.to_string()
 }
 
 fn should_bypass_proxy(base_url: &str) -> bool {
@@ -80,9 +120,18 @@ fn is_shared_cgnat(ip: Ipv4Addr) -> bool {
     first == 100 && (64..=127).contains(&second)
 }
 
+#[derive(Debug, Deserialize)]
+struct RegistryErrorPayload {
+    #[serde(default)]
+    message: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_shared_cgnat, normalize_registry_url, should_bypass_proxy_for_host};
+    use super::{
+        is_shared_cgnat, normalize_registry_url, parse_error_message, should_bypass_proxy_for_host,
+    };
+    use reqwest::StatusCode;
     use std::net::Ipv4Addr;
 
     #[test]
@@ -112,5 +161,18 @@ mod tests {
         assert!(is_shared_cgnat(Ipv4Addr::new(100, 68, 86, 84)));
         assert!(!is_shared_cgnat(Ipv4Addr::new(100, 63, 255, 255)));
         assert!(!is_shared_cgnat(Ipv4Addr::new(100, 128, 0, 1)));
+    }
+
+    #[test]
+    fn parse_error_message_prefers_json_message() {
+        let body = r#"{"message":" capsule already exists "}"#;
+        let message = parse_error_message(StatusCode::CONFLICT, body);
+        assert_eq!(message, "capsule already exists");
+    }
+
+    #[test]
+    fn parse_error_message_falls_back_to_status_when_empty() {
+        let message = parse_error_message(StatusCode::BAD_REQUEST, "   ");
+        assert_eq!(message, "HTTP 400");
     }
 }

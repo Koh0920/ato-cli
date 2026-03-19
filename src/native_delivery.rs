@@ -8,6 +8,8 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use walkdir::WalkDir;
 
+use crate::artifact_hash::compute_blake3_label as compute_blake3;
+use crate::capsule_archive::extract_payload_tar_from_capsule;
 use crate::install;
 use crate::registry::RegistryResolver;
 
@@ -2633,32 +2635,6 @@ fn current_ato_token() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn extract_payload_tar_from_capsule(bytes: &[u8]) -> Result<Vec<u8>> {
-    let mut archive = tar::Archive::new(Cursor::new(bytes));
-    let entries = archive
-        .entries()
-        .context("Failed to read .capsule archive entries")?;
-    for entry in entries {
-        let mut entry = entry.context("Invalid .capsule entry")?;
-        let path = entry.path().context("Failed to read .capsule entry path")?;
-        if path.to_string_lossy() != "payload.tar.zst" {
-            continue;
-        }
-        let mut payload_zst = Vec::new();
-        entry
-            .read_to_end(&mut payload_zst)
-            .context("Failed to read payload.tar.zst from artifact")?;
-        let mut decoder = zstd::stream::Decoder::new(Cursor::new(payload_zst))
-            .context("Failed to decode payload.tar.zst")?;
-        let mut payload_tar = Vec::new();
-        decoder
-            .read_to_end(&mut payload_tar)
-            .context("Failed to read payload.tar bytes")?;
-        return Ok(payload_tar);
-    }
-    bail!("Invalid artifact: payload.tar.zst not found in .capsule archive")
-}
-
 fn unpack_payload_tar(payload_tar: &[u8], destination: &Path) -> Result<()> {
     let mut archive = tar::Archive::new(Cursor::new(payload_tar));
     let entries = archive
@@ -3244,10 +3220,6 @@ fn digest_dir_name(digest: &str) -> Result<String> {
         bail!("Digest label is empty");
     }
     Ok(normalized)
-}
-
-fn compute_blake3(bytes: &[u8]) -> String {
-    format!("blake3:{}", blake3::hash(bytes).to_hex())
 }
 
 fn fetches_root() -> Result<PathBuf> {
