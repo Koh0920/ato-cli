@@ -1,4 +1,6 @@
 use anyhow::{Context, Result};
+use capsule_core::execution_plan::error::AtoExecutionError;
+use capsule_core::CapsuleReporter;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use colored::Colorize;
 use serde::Serialize;
@@ -8,8 +10,6 @@ use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
-use capsule_core::execution_plan::error::AtoExecutionError;
-use capsule_core::CapsuleReporter;
 
 fn print_animated_logo() {
     let logo = r#"
@@ -110,6 +110,7 @@ mod inference_feedback;
 mod ingress_proxy;
 mod init;
 mod install;
+mod install_command_orchestration;
 mod ipc;
 mod keygen;
 mod local_input;
@@ -1971,137 +1972,23 @@ fn run() -> Result<()> {
             no_project,
             json,
             keep_failed_artifacts,
-        } => {
-            if skip_verify_legacy {
-                anyhow::bail!(
-                    "--skip-verify is no longer supported. Signature/hash verification is always required."
-                );
-            }
-            let projection_preference = if project {
-                install::ProjectionPreference::Force
-            } else if no_project {
-                install::ProjectionPreference::Skip
-            } else {
-                install::ProjectionPreference::Prompt
-            };
-            let can_prompt = !json
-                && can_prompt_interactively(
-                    std::io::stdin().is_terminal(),
-                    std::io::stderr().is_terminal(),
-                );
-            let rt = tokio::runtime::Runtime::new()?;
-
-            if let Some(repository) = from_gh_repo {
-                if registry.is_some() {
-                    anyhow::bail!("--registry cannot be used with --from-gh-repo");
-                }
-                if version.is_some() {
-                    anyhow::bail!("--version cannot be used with --from-gh-repo");
-                }
-                let result = rt.block_on(run_install_orchestration::install_github_repository(
-                    &repository,
-                    output,
-                    yes,
-                    projection_preference,
-                    json,
-                    can_prompt,
-                    keep_failed_artifacts,
-                ))?;
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&result)?);
-                } else if progressive_ui::can_use_progressive_ui(false) {
-                } else {
-                    println!("\n✅ Installation complete!");
-                    println!("   Capsule: {}", result.slug);
-                    println!("   Version: {}", result.version);
-                    println!("   Path:    {}", result.path.display());
-                    println!("   Hash:    {}", result.content_hash);
-                }
-                return Ok(());
-            }
-
-            rt.block_on(async {
-
-                let slug = slug.ok_or_else(|| {
-                    anyhow::anyhow!("capsule slug is required when not using --from-gh-repo")
-                })?;
-                if install::is_slug_only_ref(&slug) {
-                    let suggestions = install::suggest_scoped_capsules(
-                        &slug,
-                        registry.as_deref(),
-                        5,
-                    )
-                    .await?;
-                    if suggestions.is_empty() {
-                        anyhow::bail!(
-                            "scoped_id_required: '{}' is ambiguous. Use publisher/slug (for example: koh0920/{})",
-                            slug,
-                            slug
-                        );
-                    }
-                    let mut message = format!(
-                        "scoped_id_required: '{}' requires publisher scope.\n\nDid you mean one of these?",
-                        slug
-                    );
-                    for suggestion in suggestions {
-                        message.push_str(&format!(
-                            "\n  - {}  ({} downloads)",
-                            suggestion.scoped_id, suggestion.downloads
-                        ));
-                    }
-                    message.push_str("\n\nRun `ato search ");
-                    message.push_str(&slug);
-                    message.push_str("` to see more options.");
-                    anyhow::bail!(message);
-                }
-
-                let result = install::install_app(
-                    &slug,
-                    registry.as_deref(),
-                    version.as_deref(),
-                    output,
-                    default,
-                    yes,
-                    projection_preference,
-                    allow_unverified,
-                    false,
-                    json,
-                    can_prompt,
-                )
-                .await?;
-
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&result)?);
-                } else if progressive_ui::can_use_progressive_ui(false) {
-                } else {
-                    println!("\n✅ Installation complete!");
-                    println!("   Capsule: {}", result.slug);
-                    println!("   Version: {}", result.version);
-                    println!("   Path:    {}", result.path.display());
-                    println!("   Hash:    {}", result.content_hash);
-                    if let Some(launchable) = &result.launchable {
-                        match launchable {
-                            install::LaunchableTarget::CapsuleArchive { path } => {
-                                println!("   Launch:  ato run {}", path.display());
-                            }
-                            install::LaunchableTarget::DerivedApp { path } => {
-                                println!("   App:     {}", path.display());
-                            }
-                        }
-                    }
-                    if let Some(projection) = &result.projection {
-                        if projection.performed {
-                            if let Some(projected_path) = &projection.projected_path {
-                                println!("   Launcher: {}", projected_path.display());
-                            }
-                        } else if no_project {
-                            println!("   Launcher: skipped");
-                        }
-                    }
-                }
-                Ok(())
-            })
-        }
+        } => install_command_orchestration::execute_install_command(
+            install_command_orchestration::InstallCommandArgs {
+                slug,
+                from_gh_repo,
+                registry,
+                version,
+                default,
+                yes,
+                skip_verify_legacy,
+                allow_unverified,
+                output,
+                project,
+                no_project,
+                json,
+                keep_failed_artifacts,
+            },
+        ),
 
         Commands::Search {
             query,
