@@ -5,7 +5,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use colored::Colorize;
 use serde_json::json;
 use std::cmp::Ordering;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
@@ -92,7 +92,9 @@ mod artifact_hash;
 mod ato_error_jsonl;
 mod auth;
 mod binding;
+mod build_validate_orchestration;
 mod capsule_archive;
+mod catalog_registry_orchestration;
 mod commands;
 mod common;
 mod consent_store;
@@ -1717,7 +1719,9 @@ fn run() -> Result<()> {
             execute_engine_command(command, cli.nacelle, reporter.clone())
         }
 
-        Commands::Registry { command } => execute_registry_command(command),
+        Commands::Registry { command } => {
+            catalog_registry_orchestration::execute_registry_command(command)
+        }
 
         Commands::Setup {
             engine,
@@ -1787,30 +1791,26 @@ fn run() -> Result<()> {
             keep_failed_artifacts,
             timings,
             strict_v3,
-        } => {
-            let result = commands::build::execute_pack_command(
+        } => build_validate_orchestration::execute_build_like_command(
+            build_validate_orchestration::BuildLikeCommandArgs {
                 dir,
                 init,
                 key,
                 standalone,
                 force_large_payload,
+                enforcement: enforcement.as_str().to_string(),
                 keep_failed_artifacts,
-                strict_v3,
-                enforcement.as_str().to_string(),
-                reporter.clone(),
                 timings,
-                cli.json,
-                cli.nacelle,
-            )?;
-            if cli.json {
-                println!("{}", serde_json::to_string_pretty(&result)?);
-            }
-            Ok(())
-        }
+                strict_v3,
+                json: cli.json,
+                nacelle: cli.nacelle,
+                deprecation_warning: None,
+                reporter: reporter.clone(),
+            },
+        ),
 
         Commands::Validate { path, json } => {
-            commands::validate::execute(path, cli.json || json)?;
-            Ok(())
+            build_validate_orchestration::execute_validate_command(path, cli.json || json)
         }
 
         Commands::Update => {
@@ -1871,27 +1871,23 @@ fn run() -> Result<()> {
             keep_failed_artifacts,
             timings,
             strict_v3,
-        } => {
-            eprintln!("⚠️  'ato pack' is deprecated. Use 'ato build' instead.");
-            let result = commands::build::execute_pack_command(
+        } => build_validate_orchestration::execute_build_like_command(
+            build_validate_orchestration::BuildLikeCommandArgs {
                 dir,
                 init,
                 key,
                 standalone,
                 force_large_payload,
+                enforcement: enforcement.as_str().to_string(),
                 keep_failed_artifacts,
-                strict_v3,
-                enforcement.as_str().to_string(),
-                reporter.clone(),
                 timings,
-                cli.json,
-                cli.nacelle,
-            )?;
-            if cli.json {
-                println!("{}", serde_json::to_string_pretty(&result)?);
-            }
-            Ok(())
-        }
+                strict_v3,
+                json: cli.json,
+                nacelle: cli.nacelle,
+                deprecation_warning: Some("⚠️  'ato pack' is deprecated. Use 'ato build' instead."),
+                reporter: reporter.clone(),
+            },
+        ),
 
         Commands::Scaffold {
             command:
@@ -2000,16 +1996,18 @@ fn run() -> Result<()> {
             json,
             no_tui,
             show_manifest,
-        } => execute_search_command(
-            query,
-            category,
-            tags,
-            limit,
-            cursor,
-            registry,
-            json,
-            no_tui,
-            show_manifest,
+        } => catalog_registry_orchestration::execute_search_command(
+            catalog_registry_orchestration::SearchCommandArgs {
+                query,
+                category,
+                tags,
+                limit,
+                cursor,
+                registry,
+                json,
+                no_tui,
+                show_manifest,
+            },
         ),
 
         Commands::Fetch {
@@ -2192,7 +2190,7 @@ fn run() -> Result<()> {
                     ConfigRegistryCommands::List { json } => RegistryCommands::List { json },
                     ConfigRegistryCommands::ClearCache => RegistryCommands::ClearCache,
                 };
-                execute_registry_command(mapped)
+                catalog_registry_orchestration::execute_registry_command(mapped)
             }
         },
 
@@ -2259,16 +2257,18 @@ fn run() -> Result<()> {
                     no_tui,
                     show_manifest,
                 },
-        } => execute_search_command(
-            query,
-            category,
-            tags,
-            limit,
-            cursor,
-            registry,
-            json,
-            no_tui,
-            show_manifest,
+        } => catalog_registry_orchestration::execute_search_command(
+            catalog_registry_orchestration::SearchCommandArgs {
+                query,
+                category,
+                tags,
+                limit,
+                cursor,
+                registry,
+                json,
+                no_tui,
+                show_manifest,
+            },
         ),
 
         Commands::Source { command } => match command {
@@ -2277,14 +2277,21 @@ fn run() -> Result<()> {
                 sync_run_id,
                 registry,
                 json,
-            } => execute_source_sync_status_command(source_id, sync_run_id, registry, json),
+            } => catalog_registry_orchestration::execute_source_sync_status_command(
+                source_id,
+                sync_run_id,
+                registry,
+                json,
+            ),
             SourceCommands::Rebuild {
                 source_id,
                 reference,
                 wait,
                 registry,
                 json,
-            } => execute_source_rebuild_command(source_id, reference, wait, registry, json),
+            } => catalog_registry_orchestration::execute_source_rebuild_command(
+                source_id, reference, wait, registry, json,
+            ),
         },
 
         Commands::Ps { all, json } => {
@@ -2447,86 +2454,6 @@ fn execute_engine_command(
             Ok(())
         }
     }
-}
-
-fn execute_registry_command(command: RegistryCommands) -> Result<()> {
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
-        match command {
-            RegistryCommands::Resolve { domain, json } => {
-                let resolver = registry::RegistryResolver::default();
-                match resolver.resolve(&domain).await {
-                    Ok(info) => {
-                        if json {
-                            println!("{}", serde_json::to_string_pretty(&info)?);
-                        } else {
-                            println!("📡 Registry for {}:", domain);
-                            println!("   URL:    {}", info.url);
-                            if let Some(name) = &info.name {
-                                println!("   Name:   {}", name);
-                            }
-                            if let Some(key) = &info.public_key {
-                                println!("   Key:    {}", key);
-                            }
-                            println!("   Source: {:?}", info.source);
-                        }
-                    }
-                    Err(e) => {
-                        if json {
-                            println!(r#"{{"error": "{}"}}"#, e);
-                        } else {
-                            eprintln!("❌ Failed to resolve registry: {}", e);
-                        }
-                    }
-                }
-                Ok(())
-            }
-            RegistryCommands::List { json } => {
-                let resolver = registry::RegistryResolver::default();
-                let info = resolver.resolve_for_app("default").await?;
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&[&info])?);
-                } else {
-                    println!("📋 Configured registries:");
-                    println!(
-                        "   • {} ({})",
-                        info.url,
-                        format!("{:?}", info.source).to_lowercase()
-                    );
-                }
-                Ok(())
-            }
-            RegistryCommands::ClearCache => {
-                let cache = registry::RegistryCache::new();
-                cache.clear()?;
-                println!("✅ Registry cache cleared");
-                Ok(())
-            }
-            RegistryCommands::Serve {
-                port,
-                data_dir,
-                host,
-                auth_token,
-            } => {
-                if host != "127.0.0.1"
-                    && auth_token
-                        .as_deref()
-                        .map(str::trim)
-                        .unwrap_or("")
-                        .is_empty()
-                {
-                    anyhow::bail!("--auth-token is required when --host is not 127.0.0.1");
-                }
-                registry_serve::serve(registry_serve::RegistryServerConfig {
-                    host,
-                    port,
-                    data_dir,
-                    auth_token,
-                })
-                .await
-            }
-        }
-    })
 }
 
 fn execute_state_command(command: StateCommands) -> Result<()> {
@@ -3371,110 +3298,6 @@ fn execute_open_command(
     }))
 }
 
-fn execute_source_sync_status_command(
-    source_id: String,
-    sync_run_id: String,
-    registry: Option<String>,
-    json: bool,
-) -> Result<()> {
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
-        let result =
-            source::fetch_sync_run_status(&source_id, &sync_run_id, registry.as_deref(), json)
-                .await?;
-        if json {
-            println!("{}", serde_json::to_string_pretty(&result)?);
-        }
-        Ok(())
-    })
-}
-
-fn execute_source_rebuild_command(
-    source_id: String,
-    reference: Option<String>,
-    wait: bool,
-    registry: Option<String>,
-    json: bool,
-) -> Result<()> {
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
-        let result = source::rebuild_source(
-            &source_id,
-            reference.as_deref(),
-            wait,
-            registry.as_deref(),
-            json,
-        )
-        .await?;
-        if json {
-            println!("{}", serde_json::to_string_pretty(&result)?);
-        }
-        Ok(())
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn execute_search_command(
-    query: Option<String>,
-    category: Option<String>,
-    tags: Vec<String>,
-    limit: Option<usize>,
-    cursor: Option<String>,
-    registry: Option<String>,
-    json: bool,
-    no_tui: bool,
-    show_manifest: bool,
-) -> Result<()> {
-    if should_use_search_tui(
-        std::io::stdin().is_terminal(),
-        std::io::stdout().is_terminal(),
-        json,
-        no_tui,
-    ) {
-        let selected = tui::run_search_tui(tui::SearchTuiArgs {
-            query: query.clone(),
-            category: category.clone(),
-            tags: tags.clone(),
-            limit,
-            cursor: cursor.clone(),
-            registry: registry.clone(),
-            show_manifest,
-        })?;
-        if let Some(scoped_id) = selected {
-            println!("{}", scoped_id);
-        }
-        return Ok(());
-    }
-
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
-        let result = search::search_capsules(
-            query.as_deref(),
-            category.as_deref(),
-            Some(tags.as_slice()),
-            limit,
-            cursor.as_deref(),
-            registry.as_deref(),
-            json,
-        )
-        .await?;
-
-        if json {
-            println!("{}", serde_json::to_string_pretty(&result)?);
-        }
-        Ok(())
-    })
-}
-
-fn should_use_search_tui(
-    stdin_is_tty: bool,
-    stdout_is_tty: bool,
-    json: bool,
-    no_tui: bool,
-) -> bool {
-    tui::can_launch_tui(stdin_is_tty, stdout_is_tty) && !json && !no_tui
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3630,11 +3453,21 @@ mod tests {
 
     #[test]
     fn search_tui_gate_requires_tty_and_flags_allowing_tui() {
-        assert!(should_use_search_tui(true, true, false, false));
-        assert!(!should_use_search_tui(false, true, false, false));
-        assert!(!should_use_search_tui(true, false, false, false));
-        assert!(!should_use_search_tui(true, true, true, false));
-        assert!(!should_use_search_tui(true, true, false, true));
+        assert!(catalog_registry_orchestration::should_use_search_tui(
+            true, true, false, false,
+        ));
+        assert!(!catalog_registry_orchestration::should_use_search_tui(
+            false, true, false, false,
+        ));
+        assert!(!catalog_registry_orchestration::should_use_search_tui(
+            true, false, false, false,
+        ));
+        assert!(!catalog_registry_orchestration::should_use_search_tui(
+            true, true, true, false,
+        ));
+        assert!(!catalog_registry_orchestration::should_use_search_tui(
+            true, true, false, true,
+        ));
     }
 
     #[test]
