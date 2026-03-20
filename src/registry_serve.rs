@@ -41,6 +41,16 @@ use crate::registry_store::{
 };
 use crate::state::{ensure_registered_state_binding_in_store, load_manifest};
 
+mod auth;
+mod http;
+mod routes;
+mod ui;
+
+use auth::*;
+use http::*;
+use routes::*;
+use ui::*;
+
 const README_CANDIDATES: [&str; 4] = ["README.md", "README.mdx", "README.txt", "README"];
 const README_MAX_BYTES: usize = 512 * 1024;
 const LOCAL_REGISTRY_DISABLE_UI_ENV: &str = "ATO_LOCAL_REGISTRY_DISABLE_UI";
@@ -492,132 +502,7 @@ pub async fn serve(config: RegistryServerConfig) -> Result<()> {
 
     let ui_enabled = std::env::var_os(LOCAL_REGISTRY_DISABLE_UI_ENV).is_none();
 
-    let mut app = Router::new();
-    app = app.route("/.well-known/capsule.json", get(handle_well_known));
-    app = app.route("/v1/capsules", get(handle_search_capsules));
-    app = app.route("/v1/manifest/capsules", get(handle_search_capsules));
-    app = app.route(
-        "/v1/manifest/capsules/by/:publisher/:slug",
-        get(handle_get_capsule),
-    );
-    app = app.route("/v1/capsules/by/:publisher/:slug", get(handle_get_capsule));
-    app = app.route(
-        "/v1/manifest/capsules/by/:publisher/:slug/distributions",
-        get(handle_distributions),
-    );
-    app = app.route(
-        "/v1/capsules/by/:publisher/:slug/distributions",
-        get(handle_distributions),
-    );
-    app = app.route(
-        "/v1/manifest/capsules/by/:publisher/:slug/download",
-        get(handle_download),
-    );
-    app = app.route(
-        "/v1/capsules/by/:publisher/:slug/download",
-        get(handle_download),
-    );
-    app = app.route("/v1/manifest/negotiate", post(handle_manifest_negotiate));
-    app = app.route(
-        "/v1/manifest/resolve/:publisher/:slug/:version",
-        get(handle_manifest_resolve_version),
-    );
-    app = app.route(
-        "/v1/manifest/documents/:manifest_hash",
-        get(handle_manifest_get_manifest),
-    );
-    app = app.route(
-        "/v1/manifest/chunks/:chunk_hash",
-        get(handle_manifest_get_chunk),
-    );
-    app = app.route(
-        "/v1/manifest/epoch/resolve",
-        post(handle_manifest_epoch_resolve),
-    );
-    app = app.route(
-        "/v1/manifest/leases/refresh",
-        post(handle_manifest_lease_refresh),
-    );
-    app = app.route(
-        "/v1/manifest/leases/release",
-        post(handle_manifest_lease_release),
-    );
-    app = app.route("/v1/manifest/keys/rotate", post(handle_manifest_key_rotate));
-    app = app.route("/v1/manifest/keys/revoke", post(handle_manifest_key_revoke));
-    app = app.route("/v1/manifest/rollback", post(handle_manifest_rollback));
-    app = app.route("/v1/manifest/yank", post(handle_manifest_yank));
-    app = app.route(
-        "/v1/artifacts/:publisher/:slug/:version/:file_name",
-        get(handle_get_artifact),
-    );
-    app = app.route("/v1/sync/negotiate", post(handle_sync_negotiate));
-    app = app.route("/v1/sync/commit", post(handle_sync_commit));
-    app = app.route("/v1/chunks/:raw_hash", put(handle_put_chunk));
-    app = app.route("/v1/chunks/:raw_hash", get(handle_get_chunk));
-    app = app.route(
-        "/v1/releases/:publisher/:slug/:version/manifest",
-        get(handle_get_release_manifest),
-    );
-    app = app.route(
-        "/v1/local/capsules/:publisher/:slug/:version",
-        put(handle_put_local_capsule),
-    );
-    app = app.route(
-        "/v1/local/capsules/by/:publisher/:slug/store-metadata",
-        get(handle_get_store_metadata).put(handle_put_store_metadata),
-    );
-    app = app.route(
-        "/v1/local/capsules/by/:publisher/:slug/runtime-config",
-        get(handle_get_runtime_config).put(handle_put_runtime_config),
-    );
-    app = app.route(
-        "/v1/local/capsules/by/:publisher/:slug/store-icon",
-        get(handle_get_store_icon),
-    );
-    app = app.route(
-        "/v1/local/capsules/by/:publisher/:slug",
-        delete(handle_delete_local_capsule),
-    );
-    app = app.route(
-        "/v1/local/capsules/by/:publisher/:slug/run",
-        post(handle_run_local_capsule),
-    );
-    app = app.route(
-        "/v1/local/states",
-        get(handle_list_persistent_states).post(handle_register_persistent_state),
-    );
-    app = app.route(
-        "/v1/local/states/:state_id",
-        get(handle_get_persistent_state),
-    );
-    app = app.route(
-        "/v1/local/bindings",
-        get(handle_list_service_bindings).post(handle_register_service_binding),
-    );
-    app = app.route(
-        "/v1/local/bindings/resolve",
-        get(handle_resolve_service_binding),
-    );
-    app = app.route(
-        "/v1/local/bindings/:binding_id",
-        get(handle_get_service_binding),
-    );
-    app = app.route("/v1/local/processes", get(handle_list_local_processes));
-    app = app.route("/v1/local/url-ready", get(handle_local_url_ready));
-    app = app.route(
-        "/v1/local/processes/:id/stop",
-        post(handle_stop_local_process),
-    );
-    app = app.route(
-        "/v1/local/processes/:id/logs",
-        get(handle_get_process_logs).delete(handle_clear_process_logs),
-    );
-
-    if ui_enabled {
-        app = app.fallback(handle_ui_request);
-    }
-
-    let mut app = app.with_state(state);
+    let mut app = build_app_router(ui_enabled).with_state(state);
 
     if std::env::var_os("ATO_LOCAL_REGISTRY_DEV_CORS").is_some() {
         app = app.layer(
@@ -743,81 +628,6 @@ async fn handle_well_known(State(state): State<AppState>, headers: HeaderMap) ->
         "version": "1",
         "write_auth_required": write_auth_required
     }))
-}
-
-async fn handle_ui_request(uri: Uri) -> impl IntoResponse {
-    let path = uri.path();
-    if path == "/v1" || path.starts_with("/v1/") {
-        return json_error(StatusCode::NOT_FOUND, "not_found", "API route not found");
-    }
-
-    if let Some(response) = ui_asset_response(path) {
-        return response;
-    }
-
-    if let Some(response) = ui_embedded_response("index.html", true) {
-        return response;
-    }
-
-    let html = "<!doctype html><html><head><meta charset=\"utf-8\"><title>Web UI unavailable</title></head><body style=\"font-family:sans-serif;padding:24px\"><h2>Web UI assets are missing</h2><p>Build <code>apps/ato-store-local</code> and rebuild <code>ato</code>.</p><pre>npm install --prefix apps/ato-store-local\ncargo build</pre></body></html>";
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        [
-            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-            (header::CACHE_CONTROL, "no-cache"),
-        ],
-        html,
-    )
-        .into_response()
-}
-
-fn ui_asset_response(request_path: &str) -> Option<axum::response::Response> {
-    let normalized = normalize_ui_path(request_path)?;
-    ui_embedded_response(&normalized, false)
-}
-
-fn normalize_ui_path(request_path: &str) -> Option<String> {
-    let path = request_path.trim_start_matches('/');
-    if path.is_empty() {
-        return Some("index.html".to_string());
-    }
-    if path.contains('\\') || path.contains("..") {
-        return None;
-    }
-    Some(path.to_string())
-}
-
-fn ui_embedded_response(path: &str, force_html: bool) -> Option<axum::response::Response> {
-    let file = LocalRegistryUiAssets::get(path)?;
-    let mime = if force_html {
-        "text/html; charset=utf-8".to_string()
-    } else {
-        mime_guess::from_path(path)
-            .first_or_octet_stream()
-            .essence_str()
-            .to_string()
-    };
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_str(&mime)
-            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
-    );
-    headers.insert(
-        header::CACHE_CONTROL,
-        cache_control_for_ui_path(path, force_html),
-    );
-    Some((StatusCode::OK, headers, file.data.into_owned()).into_response())
-}
-
-fn cache_control_for_ui_path(path: &str, force_html: bool) -> HeaderValue {
-    if force_html || path == "index.html" {
-        return HeaderValue::from_static("no-cache");
-    }
-    if path.starts_with("assets/") {
-        return HeaderValue::from_static("public, max-age=31536000, immutable");
-    }
-    HeaderValue::from_static("public, max-age=300")
 }
 
 fn display_access_host(bind_host: &str) -> &str {
@@ -3689,95 +3499,6 @@ fn cleanup_removed_artifacts(
     }
 }
 
-fn validate_write_auth(headers: &HeaderMap, expected_token: Option<&str>) -> Result<(), String> {
-    let Some(expected) = expected_token.map(str::trim).filter(|v| !v.is_empty()) else {
-        return Ok(());
-    };
-
-    let actual = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::trim)
-        .filter(|v| !v.is_empty());
-
-    if constant_time_token_eq(expected.as_bytes(), actual.unwrap_or("").as_bytes()) {
-        return Ok(());
-    }
-
-    Err("Bearer token is required for upload".to_string())
-}
-
-fn validate_read_auth(headers: &HeaderMap, expected_token: Option<&str>) -> Result<(), String> {
-    let Some(expected) = expected_token.map(str::trim).filter(|v| !v.is_empty()) else {
-        return Ok(());
-    };
-
-    let actual = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::trim)
-        .filter(|v| !v.is_empty());
-
-    if constant_time_token_eq(expected.as_bytes(), actual.unwrap_or("").as_bytes()) {
-        return Ok(());
-    }
-
-    Err("Bearer token is required for manifest read API".to_string())
-}
-
-fn constant_time_token_eq(expected: &[u8], actual: &[u8]) -> bool {
-    use sha2::{Digest, Sha256};
-
-    let expected_digest = Sha256::digest(expected);
-    let actual_digest = Sha256::digest(actual);
-    expected_digest[..].ct_eq(&actual_digest[..]).into()
-}
-
-fn resolve_public_base_url(headers: &HeaderMap, fallback: &str) -> String {
-    let scheme = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|v| *v == "http" || *v == "https")
-        .unwrap_or("http");
-
-    let host = headers
-        .get("x-forwarded-host")
-        .or_else(|| headers.get(header::HOST))
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(|v| v.split(',').next().unwrap_or(v).trim().to_string());
-
-    if let Some(host) = host {
-        return format!("{}://{}", scheme, host);
-    }
-
-    fallback.to_string()
-}
-
-fn normalize_registry_base_url_for_local_run(request_base_url: &str, listen_url: &str) -> String {
-    rewrite_wildcard_registry_host(request_base_url).unwrap_or_else(|| {
-        rewrite_wildcard_registry_host(listen_url).unwrap_or_else(|| request_base_url.to_string())
-    })
-}
-
-fn rewrite_wildcard_registry_host(raw: &str) -> Option<String> {
-    let mut url = reqwest::Url::parse(raw).ok()?;
-    let host = url.host_str()?.to_string();
-    let replacement = match host.as_str() {
-        "0.0.0.0" => "127.0.0.1",
-        "::" | "[::]" => "::1",
-        _ => return Some(raw.to_string()),
-    };
-    url.set_host(Some(replacement)).ok()?;
-    Some(url.to_string().trim_end_matches('/').to_string())
-}
-
 #[cfg(test)]
 fn truncate_for_error(message: &str, max_chars: usize) -> String {
     if message.chars().count() <= max_chars {
@@ -4007,22 +3728,6 @@ fn existing_release_outcome(
     }
 
     ExistingReleaseOutcome::Conflict("same version is already published (sha256 mismatch)")
-}
-
-fn get_required_header(headers: &HeaderMap, key: &str) -> Result<String> {
-    headers
-        .get(key)
-        .and_then(|value| value.to_str().ok())
-        .map(|v| v.to_string())
-        .ok_or_else(|| anyhow::anyhow!("required header '{}' is missing", key))
-}
-
-fn parse_required_u32_header(headers: &HeaderMap, key: &str) -> Result<u32> {
-    let value = get_required_header(headers, key)?;
-    value
-        .trim()
-        .parse::<u32>()
-        .with_context(|| format!("invalid '{}' header value: {}", key, value))
 }
 
 fn verify_uploaded_chunk(
@@ -4570,17 +4275,6 @@ fn validate_file_name(value: &str) -> Result<()> {
         bail!("file_name must be a .capsule file name");
     }
     Ok(())
-}
-
-fn json_error(status: StatusCode, error: &str, message: &str) -> axum::response::Response {
-    (
-        status,
-        Json(json!({
-            "error": error,
-            "message": message
-        })),
-    )
-        .into_response()
 }
 
 impl Default for RegistryIndex {
