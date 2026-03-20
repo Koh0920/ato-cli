@@ -3,7 +3,6 @@ use capsule_core::execution_plan::error::AtoExecutionError;
 use capsule_core::CapsuleReporter;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use colored::Colorize;
-use serde_json::json;
 use std::cmp::Ordering;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -149,6 +148,7 @@ mod skill;
 mod skill_resolver;
 mod source;
 mod state;
+mod support_command_orchestration;
 mod tui;
 mod verify;
 
@@ -1715,9 +1715,11 @@ fn run() -> Result<()> {
             },
         ),
 
-        Commands::Engine { command } => {
-            execute_engine_command(command, cli.nacelle, reporter.clone())
-        }
+        Commands::Engine { command } => support_command_orchestration::execute_engine_command(
+            command,
+            cli.nacelle,
+            reporter.clone(),
+        ),
 
         Commands::Registry { command } => {
             catalog_registry_orchestration::execute_registry_command(command)
@@ -1727,7 +1729,12 @@ fn run() -> Result<()> {
             engine,
             version,
             skip_verify,
-        } => execute_setup_command(engine, version, skip_verify, reporter.clone()),
+        } => support_command_orchestration::execute_setup_command(
+            engine,
+            version,
+            skip_verify,
+            reporter.clone(),
+        ),
 
         Commands::Open {
             path,
@@ -2161,13 +2168,17 @@ fn run() -> Result<()> {
         Commands::Config { command } => match command {
             ConfigCommands::Engine { command } => match command {
                 ConfigEngineCommands::Features => {
-                    execute_engine_command(EngineCommands::Features, cli.nacelle, reporter.clone())
+                    support_command_orchestration::execute_engine_command(
+                        EngineCommands::Features,
+                        cli.nacelle,
+                        reporter.clone(),
+                    )
                 }
                 ConfigEngineCommands::Register {
                     name,
                     path,
                     default,
-                } => execute_engine_command(
+                } => support_command_orchestration::execute_engine_command(
                     EngineCommands::Register {
                         name,
                         path,
@@ -2180,7 +2191,12 @@ fn run() -> Result<()> {
                     engine,
                     version,
                     skip_verify,
-                } => execute_setup_command(engine, version, skip_verify, reporter.clone()),
+                } => support_command_orchestration::execute_setup_command(
+                    engine,
+                    version,
+                    skip_verify,
+                    reporter.clone(),
+                ),
             },
             ConfigCommands::Registry { command } => {
                 let mapped = match command {
@@ -2343,9 +2359,13 @@ fn run() -> Result<()> {
             reporter.clone(),
         ),
 
-        Commands::State { command } => execute_state_command(command),
+        Commands::State { command } => {
+            support_command_orchestration::execute_state_command(command)
+        }
 
-        Commands::Binding { command } => execute_binding_command(command),
+        Commands::Binding { command } => {
+            support_command_orchestration::execute_binding_command(command)
+        }
 
         Commands::Guest { sync_path } => {
             commands::guest::execute(commands::guest::GuestArgs { sync_path })
@@ -2390,181 +2410,6 @@ fn run() -> Result<()> {
 
         Commands::Auth => auth::status(),
     }
-}
-
-fn execute_engine_command(
-    command: EngineCommands,
-    nacelle_override: Option<PathBuf>,
-    reporter: std::sync::Arc<reporters::CliReporter>,
-) -> Result<()> {
-    match command {
-        EngineCommands::Features => {
-            let nacelle =
-                capsule_core::engine::discover_nacelle(capsule_core::engine::EngineRequest {
-                    explicit_path: nacelle_override,
-                    manifest_path: None,
-                })?;
-            let payload = json!({ "spec_version": "0.1.0" });
-            let resp = capsule_core::engine::run_internal(&nacelle, "features", &payload)?;
-            let body = serde_json::to_string_pretty(&resp)?;
-            futures::executor::block_on(reporter.notify(body))?;
-            Ok(())
-        }
-        EngineCommands::Register {
-            name,
-            path,
-            default,
-        } => {
-            let resolved_path = if let Some(p) = path {
-                p
-            } else if let Ok(env_path) = std::env::var("NACELLE_PATH") {
-                PathBuf::from(env_path)
-            } else {
-                anyhow::bail!("Missing --path and NACELLE_PATH is not set");
-            };
-
-            let validated =
-                capsule_core::engine::discover_nacelle(capsule_core::engine::EngineRequest {
-                    explicit_path: Some(resolved_path),
-                    manifest_path: None,
-                })?;
-
-            let mut cfg = capsule_core::config::load_config()?;
-            cfg.engines.insert(
-                name.clone(),
-                capsule_core::config::EngineRegistration {
-                    path: validated.display().to_string(),
-                },
-            );
-            if default {
-                cfg.default_engine = Some(name.clone());
-            }
-            capsule_core::config::save_config(&cfg)?;
-
-            futures::executor::block_on(reporter.notify(format!(
-                "✅ Registered engine '{}' -> {}",
-                name,
-                validated.display()
-            )))?;
-            if default {
-                futures::executor::block_on(
-                    reporter.notify("✅ Set as default engine".to_string()),
-                )?;
-            }
-            Ok(())
-        }
-    }
-}
-
-fn execute_state_command(command: StateCommands) -> Result<()> {
-    match command {
-        StateCommands::List {
-            owner_scope,
-            state_name,
-            json,
-        } => state::list_states(owner_scope.as_deref(), state_name.as_deref(), json),
-        StateCommands::Inspect { state_ref, json } => state::inspect_state(&state_ref, json),
-        StateCommands::Register {
-            manifest,
-            state_name,
-            path,
-            json,
-        } => state::register_state_from_manifest(
-            &manifest,
-            &state_name,
-            path.to_string_lossy().as_ref(),
-            json,
-        ),
-    }
-}
-
-fn execute_binding_command(command: BindingCommands) -> Result<()> {
-    match command {
-        BindingCommands::List {
-            owner_scope,
-            service_name,
-            json,
-        } => binding::list_bindings(owner_scope.as_deref(), service_name.as_deref(), json),
-        BindingCommands::Inspect { binding_ref, json } => {
-            binding::inspect_binding(&binding_ref, json)
-        }
-        BindingCommands::Resolve {
-            owner_scope,
-            service_name,
-            binding_kind,
-            caller_service,
-            json,
-        } => binding::resolve_binding(
-            &owner_scope,
-            &service_name,
-            &binding_kind,
-            caller_service.as_deref(),
-            json,
-        ),
-        BindingCommands::BootstrapTls {
-            binding_ref,
-            install_system_trust,
-            yes,
-            json,
-        } => binding::bootstrap_ingress_tls(&binding_ref, install_system_trust, yes, json),
-        BindingCommands::ServeIngress {
-            binding_ref,
-            manifest,
-            upstream_url,
-        } => binding::serve_ingress_binding(&binding_ref, &manifest, upstream_url.as_deref()),
-        BindingCommands::RegisterIngress {
-            manifest,
-            service_name,
-            url,
-            json,
-        } => binding::register_ingress_binding_from_manifest(&manifest, &service_name, &url, json),
-        BindingCommands::RegisterService {
-            manifest,
-            service_name,
-            url,
-            process_id,
-            port,
-            json,
-        } => match (url.as_deref(), process_id.as_deref()) {
-            (Some(url), _) => {
-                binding::register_service_binding_from_manifest(&manifest, &service_name, url, json)
-            }
-            (None, Some(process_id)) => binding::register_service_binding_from_process(
-                process_id,
-                &service_name,
-                port,
-                json,
-            ),
-            (None, None) => anyhow::bail!("register-service requires either --url or --process-id"),
-        },
-        BindingCommands::SyncProcess { process_id, json } => {
-            binding::sync_service_bindings_from_process(&process_id, json)
-        }
-    }
-}
-
-fn execute_setup_command(
-    engine: String,
-    version: Option<String>,
-    skip_verify: bool,
-    reporter: std::sync::Arc<reporters::CliReporter>,
-) -> Result<()> {
-    let capsule_reporter: &dyn capsule_core::CapsuleReporter = reporter.as_ref();
-    let install = engine_manager::install_engine_release(
-        &engine,
-        version.as_deref(),
-        skip_verify,
-        capsule_reporter,
-    )?;
-
-    futures::executor::block_on(reporter.notify(format!(
-        "✅ Engine {} {} installed at {}",
-        engine,
-        install.version,
-        install.path.display()
-    )))?;
-
-    Ok(())
 }
 
 async fn resolve_installed_capsule_archive(
