@@ -44,12 +44,14 @@ use crate::state::{ensure_registered_state_binding_in_store, load_manifest};
 mod auth;
 mod http;
 mod local_api;
+mod local_service;
 mod routes;
 mod ui;
 
 use auth::*;
 use http::*;
 use local_api::*;
+use local_service::*;
 use routes::*;
 use ui::*;
 
@@ -2785,7 +2787,7 @@ async fn handle_delete_local_capsule(
 }
 
 fn process_log_path(id: &str) -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from(".").join(".tmp"));
     home.join(".ato").join("logs").join(format!("{id}.log"))
 }
 

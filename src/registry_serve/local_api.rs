@@ -82,9 +82,8 @@ pub(super) async fn handle_list_persistent_states(
         .filter(|value| !value.is_empty());
 
     let _guard = state.lock.lock().await;
-    match open_local_state_store(&state)
-        .and_then(|store| store.list_persistent_states(owner_scope, state_name))
-    {
+    let service = LocalRegistryService::new(&state);
+    match service.list_persistent_states(owner_scope, state_name) {
         Ok(records) => (StatusCode::OK, Json(records)).into_response(),
         Err(err) => json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -113,9 +112,8 @@ pub(super) async fn handle_get_persistent_state(
     }
 
     let _guard = state.lock.lock().await;
-    match open_local_state_store(&state)
-        .and_then(|store| store.find_persistent_state_by_id(state_id))
-    {
+    let service = LocalRegistryService::new(&state);
+    match service.get_persistent_state(state_id) {
         Ok(Some(record)) => (StatusCode::OK, Json(record)).into_response(),
         Ok(None) => json_error(
             StatusCode::NOT_FOUND,
@@ -151,9 +149,8 @@ pub(super) async fn handle_list_service_bindings(
         .filter(|value| !value.is_empty());
 
     let _guard = state.lock.lock().await;
-    match binding::open_binding_store()
-        .and_then(|store| store.list_service_bindings(owner_scope, service_name))
-    {
+    let service = LocalRegistryService::new(&state);
+    match service.list_service_bindings(owner_scope, service_name) {
         Ok(records) => (StatusCode::OK, Json(records)).into_response(),
         Err(err) => json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -182,9 +179,8 @@ pub(super) async fn handle_get_service_binding(
     }
 
     let _guard = state.lock.lock().await;
-    match binding::open_binding_store()
-        .and_then(|store| store.find_service_binding_by_id(binding_id))
-    {
+    let service = LocalRegistryService::new(&state);
+    match service.get_service_binding(binding_id) {
         Ok(Some(record)) => (StatusCode::OK, Json(record)).into_response(),
         Ok(None) => json_error(
             StatusCode::NOT_FOUND,
@@ -246,7 +242,8 @@ pub(super) async fn handle_resolve_service_binding(
     };
 
     let _guard = state.lock.lock().await;
-    match binding::resolve_binding_record(owner_scope, service_name, binding_kind, caller_service) {
+    let service = LocalRegistryService::new(&state);
+    match service.resolve_service_binding(owner_scope, service_name, binding_kind, caller_service) {
         Ok(record) => (StatusCode::OK, Json(record)).into_response(),
         Err(err) => {
             let message = err.to_string();
@@ -296,14 +293,8 @@ pub(super) async fn handle_register_persistent_state(
     }
 
     let _guard = state.lock.lock().await;
-    let result = load_manifest(Path::new(manifest)).and_then(|manifest| {
-        ensure_registered_state_binding_in_store(
-            &manifest,
-            state_name,
-            path,
-            &open_local_state_store(&state)?,
-        )
-    });
+    let service = LocalRegistryService::new(&state);
+    let result = service.register_persistent_state(Path::new(manifest), state_name, path);
     match result {
         Ok(record) => (StatusCode::CREATED, Json(record)).into_response(),
         Err(err) => json_error(
@@ -312,10 +303,6 @@ pub(super) async fn handle_register_persistent_state(
             &err.to_string(),
         ),
     }
-}
-
-fn open_local_state_store(state: &AppState) -> Result<RegistryStore> {
-    RegistryStore::open(&state.data_dir.join("state"))
 }
 
 pub(super) async fn handle_register_service_binding(

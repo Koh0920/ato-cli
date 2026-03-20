@@ -11,6 +11,7 @@ use walkdir::WalkDir;
 use crate::artifact_hash::compute_blake3_label as compute_blake3;
 use crate::capsule_archive::extract_payload_tar_from_capsule;
 use crate::install;
+use crate::registry_http;
 use crate::registry::RegistryResolver;
 
 #[cfg(windows)]
@@ -548,7 +549,7 @@ pub async fn execute_fetch(
         urlencoding::encode(&scoped_ref.publisher),
         urlencoding::encode(&scoped_ref.slug)
     );
-    let detail: CapsuleDetail = with_ato_token(client.get(&detail_url))
+    let detail: CapsuleDetail = registry_http::with_ato_token(client.get(&detail_url))
         .send()
         .await
         .with_context(|| format!("Failed to connect to registry: {}", registry))?
@@ -589,7 +590,7 @@ pub async fn execute_fetch(
         urlencoding::encode(&scoped_ref.slug),
         urlencoding::encode(&target_version)
     );
-    let artifact_bytes = with_ato_token(client.get(&download_url))
+    let artifact_bytes = registry_http::with_ato_token(client.get(&download_url))
         .send()
         .await
         .with_context(|| {
@@ -751,7 +752,7 @@ fn merge_registry_override(
         .filter(|value| !value.is_empty());
     match (explicit, inline) {
         (Some(left), Some(right))
-            if normalize_registry_url(left) != normalize_registry_url(right) =>
+            if normalized_registry_url_for_compare(left) != normalized_registry_url_for_compare(right) =>
         {
             bail!(
                 "conflicting_registry_request: ref specifies registry '{}' but --registry requested '{}'",
@@ -765,8 +766,9 @@ fn merge_registry_override(
     }
 }
 
-fn normalize_registry_url(input: &str) -> String {
-    input.trim().trim_end_matches('/').to_ascii_lowercase()
+fn normalized_registry_url_for_compare(input: &str) -> String {
+    registry_http::normalize_registry_url(input, "registry")
+        .unwrap_or_else(|_| input.trim().trim_end_matches('/').to_ascii_lowercase())
 }
 
 fn default_delivery_schema_version() -> String {
@@ -1861,26 +1863,11 @@ fn strip_codesign_signature(tool: &str, app_path: &Path) -> Result<()> {
 
 async fn resolve_registry_url(registry_url: Option<&str>) -> Result<String> {
     if let Some(url) = registry_url {
-        return Ok(url.to_string());
+        return registry_http::normalize_registry_url(url, "registry");
     }
     let resolver = RegistryResolver::default();
     let info = resolver.resolve("localhost").await?;
-    Ok(info.url)
-}
-
-fn with_ato_token(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-    if let Some(token) = current_ato_token() {
-        request.header("authorization", format!("Bearer {}", token))
-    } else {
-        request
-    }
-}
-
-fn current_ato_token() -> Option<String> {
-    std::env::var("ATO_TOKEN")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+    registry_http::normalize_registry_url(&info.url, "resolved registry")
 }
 
 fn unpack_payload_tar(payload_tar: &[u8], destination: &Path) -> Result<()> {
