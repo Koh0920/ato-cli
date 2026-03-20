@@ -247,10 +247,6 @@ pub fn preview_root() -> Result<PathBuf> {
     Ok(home.join(DEFAULT_PREVIEW_DIR))
 }
 
-pub fn preview_session_layout(preview_id: &str) -> Result<PreviewStorageLayout> {
-    PreviewStorageLayout::for_preview_id(preview_id)
-}
-
 pub fn load_preview_session_for_manifest(manifest_path: &Path) -> Result<Option<PreviewSession>> {
     if manifest_path.file_name().and_then(|value| value.to_str())
         != Some(PREVIEW_MANIFEST_FILE_NAME)
@@ -566,8 +562,8 @@ fn summarize_preview_toml(manifest_text: &str) -> PreviewTomlSummary {
 mod tests {
     use super::{
         draft_requires_manual_review, github_draft_manual_review_reason, preview_root,
-        preview_session_layout, required_env_from_preview_toml, DerivedExecutionPlan,
-        PreviewPromotionEligibility, PreviewSession, PreviewTargetKind, ENV_PREVIEW_ROOT,
+        required_env_from_preview_toml, DerivedExecutionPlan, PreviewPromotionEligibility,
+        PreviewSession, PreviewStorageLayout, PreviewTargetKind, ENV_PREVIEW_ROOT,
     };
     use crate::install::{
         GitHubInstallDraftCapsuleToml, GitHubInstallDraftHint, GitHubInstallDraftRepo,
@@ -621,7 +617,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let _guard = EnvVarGuard::set(ENV_PREVIEW_ROOT, temp.path());
 
-        let layout = preview_session_layout("preview-test").expect("layout");
+        let layout = PreviewStorageLayout::for_preview_id("preview-test").expect("layout");
         assert_eq!(layout.session_root, temp.path().join("preview-test"));
         assert_eq!(
             layout.metadata_path,
