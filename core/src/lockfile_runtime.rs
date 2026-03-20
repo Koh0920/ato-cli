@@ -1,3 +1,5 @@
+//! Lockfile runtime/tool resolution, generation, and artifact prefetch helpers.
+
 use super::*;
 
 pub(super) async fn generate_uv_lock(

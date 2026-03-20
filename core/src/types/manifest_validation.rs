@@ -1,3 +1,5 @@
+//! Manifest validation rules and state/service helper logic.
+
 use super::*;
 
 impl CapsuleManifest {

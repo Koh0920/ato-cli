@@ -24,10 +24,10 @@ use crate::orchestration::startup_order_from_dependencies;
 use crate::schema_registry::SchemaRegistry;
 
 use manifest_v03::*;
+pub(crate) use manifest_validation::is_valid_mount_path;
 pub use manifest_validation::ValidationError;
 #[cfg(test)]
 pub(crate) use manifest_validation::{is_kebab_case, is_semver};
-pub(crate) use manifest_validation::is_valid_mount_path;
 
 /// Capsule Type - defines the fundamental nature of the Capsule
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

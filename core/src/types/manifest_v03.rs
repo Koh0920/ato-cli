@@ -1,3 +1,5 @@
+//! v0.3/CHML manifest normalization and workspace expansion helpers.
+
 use super::*;
 
 fn normalize_v03_capsule_type(value: &str) -> String {

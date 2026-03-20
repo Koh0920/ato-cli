@@ -1,3 +1,5 @@
+//! Lockfile support helpers for tool bootstrap, downloads, and atomic filesystem writes.
+
 use super::*;
 
 pub(super) struct PnpmCommand {
