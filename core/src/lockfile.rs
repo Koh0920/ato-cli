@@ -931,210 +931,328 @@ async fn generate_lockfile(
     let language = detect_language(manifest_raw);
     if let Some(lang) = language.as_deref() {
         if lang == "python" {
-            let version = required_runtime_version
-                .clone()
-                .or_else(|| read_runtime_version(manifest_raw))
-                .unwrap_or_else(|| read_language_version(manifest_raw, "python", "3.11"));
-            let step_started = Instant::now();
-            let python_lockfile =
-                generate_uv_lock(manifest_dir, manifest_raw, reporter.clone()).await?;
-            maybe_report_timing(
+            configure_python_lockfile(
+                manifest_raw,
+                manifest_dir,
                 &reporter,
                 timings,
-                "lockfile.generate_uv_lock",
-                step_started.elapsed(),
+                &target_key,
+                &runtime_platforms,
+                required_runtime_version.as_deref(),
+                &mut runtimes,
+                &mut tools,
+                &mut targets,
             )
             .await?;
-            let step_started = Instant::now();
-            let runtime =
-                resolve_python_runtime(&version, &runtime_platforms, reporter.clone()).await?;
-            maybe_report_timing(
-                &reporter,
-                timings,
-                "lockfile.resolve_python_runtime",
-                step_started.elapsed(),
-            )
-            .await?;
-            runtimes.python = Some(runtime);
-            if python_lockfile.is_some() {
-                let python_artifacts = match prepare_python_artifacts(
-                    manifest_raw,
-                    manifest_dir,
-                    &target_key,
-                    &version,
-                    reporter.clone(),
-                )
-                .await
-                {
-                    Ok(artifacts) if !artifacts.is_empty() => Some(artifacts),
-                    Ok(_) => None,
-                    Err(err) => {
-                        reporter
-                            .warn(format!("⚠️  Failed to prefetch Python artifacts: {}", err))
-                            .await?;
-                        None
-                    }
-                };
-                let target_entry = targets.entry(target_key.clone()).or_default();
-                target_entry.python_lockfile = Some("uv.lock".to_string());
-                if let Some(artifacts) = python_artifacts {
-                    target_entry.artifacts.extend(artifacts);
-                }
-                let step_started = Instant::now();
-                tools.uv =
-                    Some(resolve_uv_tool_targets(&runtime_platforms, reporter.clone()).await?);
-                maybe_report_timing(
-                    &reporter,
-                    timings,
-                    "lockfile.resolve_uv_tool_targets",
-                    step_started.elapsed(),
-                )
-                .await?;
-            }
         } else if lang == "node" {
-            let version = required_runtime_version
-                .clone()
-                .or_else(|| read_runtime_version(manifest_raw))
-                .unwrap_or_else(|| read_language_version(manifest_raw, "node", "20"));
-            let step_started = Instant::now();
-            let node_lockfile =
-                generate_pnpm_lock(manifest_dir, manifest_raw, &version, reporter.clone()).await?;
-            maybe_report_timing(
+            configure_node_lockfile(
+                manifest_raw,
+                manifest_dir,
                 &reporter,
                 timings,
-                "lockfile.generate_pnpm_lock",
-                step_started.elapsed(),
+                &target_key,
+                &runtime_platforms,
+                required_runtime_version.as_deref(),
+                &mut runtimes,
+                &mut tools,
+                &mut targets,
             )
             .await?;
-            let step_started = Instant::now();
-            let runtime =
-                resolve_node_runtime(&version, &runtime_platforms, reporter.clone()).await?;
-            maybe_report_timing(
-                &reporter,
-                timings,
-                "lockfile.resolve_node_runtime",
-                step_started.elapsed(),
-            )
-            .await?;
-            runtimes.node = Some(runtime);
-            if runtimes.deno.is_none() {
-                let deno_version = read_language_version(manifest_raw, "deno", "2.6.8");
-                let step_started = Instant::now();
-                let deno_runtime =
-                    resolve_deno_runtime(&deno_version, &runtime_platforms, reporter.clone())
-                        .await?;
-                maybe_report_timing(
-                    &reporter,
-                    timings,
-                    "lockfile.resolve_deno_runtime",
-                    step_started.elapsed(),
-                )
-                .await?;
-                runtimes.deno = Some(deno_runtime);
-            }
-            if node_lockfile.is_some() {
-                let node_artifacts = match prepare_node_artifacts(
-                    manifest_raw,
-                    manifest_dir,
-                    &target_key,
-                    &version,
-                    reporter.clone(),
-                )
-                .await
-                {
-                    Ok(artifacts) if !artifacts.is_empty() => Some(artifacts),
-                    Ok(_) => None,
-                    Err(err) => {
-                        reporter
-                            .warn(format!("⚠️  Failed to prefetch Node artifacts: {}", err))
-                            .await?;
-                        None
-                    }
-                };
-                let target_entry = targets.entry(target_key.clone()).or_default();
-                target_entry.node_lockfile = Some(format!("locks/{}/pnpm-lock.yaml", target_key));
-                if let Some(artifacts) = node_artifacts {
-                    target_entry.artifacts.extend(artifacts);
-                }
-                tools.pnpm = Some(resolve_pnpm_tool_targets(&runtime_platforms));
-            }
         } else if lang == "deno" {
-            let version = required_runtime_version
-                .clone()
-                .or_else(|| read_runtime_version(manifest_raw))
-                .unwrap_or_else(|| read_language_version(manifest_raw, "deno", "2.6.8"));
-            let step_started = Instant::now();
-            let runtime =
-                resolve_deno_runtime(&version, &runtime_platforms, reporter.clone()).await?;
-            maybe_report_timing(
+            configure_deno_lockfile(
+                manifest_raw,
+                manifest_dir,
                 &reporter,
                 timings,
-                "lockfile.resolve_deno_runtime",
-                step_started.elapsed(),
+                &runtime_platforms,
+                required_runtime_version.as_deref(),
+                &runtime_tools,
+                &mut runtimes,
+                &mut tools,
             )
             .await?;
-            runtimes.deno = Some(runtime);
-
-            if let Some(node_version) = runtime_tools.get("node") {
-                let step_started = Instant::now();
-                let runtime =
-                    resolve_node_runtime(node_version, &runtime_platforms, reporter.clone())
-                        .await?;
-                maybe_report_timing(
-                    &reporter,
-                    timings,
-                    "lockfile.resolve_node_runtime",
-                    step_started.elapsed(),
-                )
-                .await?;
-                runtimes.node = Some(runtime);
-            }
-            if let Some(python_version) = runtime_tools.get("python") {
-                let step_started = Instant::now();
-                let runtime =
-                    resolve_python_runtime(python_version, &runtime_platforms, reporter.clone())
-                        .await?;
-                maybe_report_timing(
-                    &reporter,
-                    timings,
-                    "lockfile.resolve_python_runtime",
-                    step_started.elapsed(),
-                )
-                .await?;
-                runtimes.python = Some(runtime);
-
-                let step_started = Instant::now();
-                tools.uv =
-                    Some(resolve_uv_tool_targets(&runtime_platforms, reporter.clone()).await?);
-                maybe_report_timing(
-                    &reporter,
-                    timings,
-                    "lockfile.resolve_uv_tool_targets",
-                    step_started.elapsed(),
-                )
-                .await?;
-            }
-
-            // runtime=web/static は静的配信用途であり、Deno runtime 自体は必要だが
-            // プロジェクト依存の deno.lock 生成は不要（かつ monorepo で誤検出しやすい）。
-            let is_web_static = selected_target_runtime(manifest_raw).as_deref() == Some("web")
-                && selected_target_driver(manifest_raw).as_deref() == Some("static");
-            let skip_deno_lock_generation = selected_target_cmd_contains(manifest_raw, "--no-lock");
-            if !is_web_static && !skip_deno_lock_generation {
-                let step_started = Instant::now();
-                let _ = generate_deno_lock(manifest_dir, manifest_raw, &version, reporter.clone())
-                    .await?;
-                maybe_report_timing(
-                    &reporter,
-                    timings,
-                    "lockfile.generate_deno_lock",
-                    step_started.elapsed(),
-                )
-                .await?;
-            }
         }
     }
 
+    ensure_orchestration_target_runtimes(
+        manifest_raw,
+        &reporter,
+        &runtime_platforms,
+        &mut runtimes,
+        &mut tools,
+    )
+    .await?;
+
+    let tools = if tools.uv.is_none() && tools.pnpm.is_none() {
+        None
+    } else {
+        Some(tools)
+    };
+
+    Ok(CapsuleLock {
+        version: "1".to_string(),
+        meta: LockMeta {
+            created_at: Utc::now().to_rfc3339(),
+            manifest_hash: semantic_manifest_hash_from_text(manifest_text)?,
+        },
+        allowlist,
+        capsule_dependencies,
+        injected_data: HashMap::new(),
+        tools,
+        runtimes: if runtimes.python.is_none() && runtimes.node.is_none() && runtimes.deno.is_none()
+        {
+            None
+        } else {
+            Some(runtimes)
+        },
+        targets,
+    })
+}
+
+async fn configure_python_lockfile(
+    manifest_raw: &toml::Value,
+    manifest_dir: &Path,
+    reporter: &Arc<dyn CapsuleReporter + 'static>,
+    timings: bool,
+    target_key: &str,
+    runtime_platforms: &[RuntimePlatform],
+    required_runtime_version: Option<&str>,
+    runtimes: &mut RuntimeSection,
+    tools: &mut ToolSection,
+    targets: &mut HashMap<String, TargetEntry>,
+) -> Result<()> {
+    let version = required_runtime_version
+        .map(str::to_string)
+        .or_else(|| read_runtime_version(manifest_raw))
+        .unwrap_or_else(|| read_language_version(manifest_raw, "python", "3.11"));
+    let step_started = Instant::now();
+    let python_lockfile = generate_uv_lock(manifest_dir, manifest_raw, reporter.clone()).await?;
+    maybe_report_timing(
+        reporter,
+        timings,
+        "lockfile.generate_uv_lock",
+        step_started.elapsed(),
+    )
+    .await?;
+    let step_started = Instant::now();
+    let runtime = resolve_python_runtime(&version, runtime_platforms, reporter.clone()).await?;
+    maybe_report_timing(
+        reporter,
+        timings,
+        "lockfile.resolve_python_runtime",
+        step_started.elapsed(),
+    )
+    .await?;
+    runtimes.python = Some(runtime);
+
+    if python_lockfile.is_some() {
+        let python_artifacts = match prepare_python_artifacts(
+            manifest_raw,
+            manifest_dir,
+            target_key,
+            &version,
+            reporter.clone(),
+        )
+        .await
+        {
+            Ok(artifacts) if !artifacts.is_empty() => Some(artifacts),
+            Ok(_) => None,
+            Err(err) => {
+                reporter
+                    .warn(format!("⚠️  Failed to prefetch Python artifacts: {}", err))
+                    .await?;
+                None
+            }
+        };
+        let target_entry = targets.entry(target_key.to_string()).or_default();
+        target_entry.python_lockfile = Some("uv.lock".to_string());
+        if let Some(artifacts) = python_artifacts {
+            target_entry.artifacts.extend(artifacts);
+        }
+        let step_started = Instant::now();
+        tools.uv = Some(resolve_uv_tool_targets(runtime_platforms, reporter.clone()).await?);
+        maybe_report_timing(
+            reporter,
+            timings,
+            "lockfile.resolve_uv_tool_targets",
+            step_started.elapsed(),
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn configure_node_lockfile(
+    manifest_raw: &toml::Value,
+    manifest_dir: &Path,
+    reporter: &Arc<dyn CapsuleReporter + 'static>,
+    timings: bool,
+    target_key: &str,
+    runtime_platforms: &[RuntimePlatform],
+    required_runtime_version: Option<&str>,
+    runtimes: &mut RuntimeSection,
+    tools: &mut ToolSection,
+    targets: &mut HashMap<String, TargetEntry>,
+) -> Result<()> {
+    let version = required_runtime_version
+        .map(str::to_string)
+        .or_else(|| read_runtime_version(manifest_raw))
+        .unwrap_or_else(|| read_language_version(manifest_raw, "node", "20"));
+    let step_started = Instant::now();
+    let node_lockfile =
+        generate_pnpm_lock(manifest_dir, manifest_raw, &version, reporter.clone()).await?;
+    maybe_report_timing(
+        reporter,
+        timings,
+        "lockfile.generate_pnpm_lock",
+        step_started.elapsed(),
+    )
+    .await?;
+    let step_started = Instant::now();
+    let runtime = resolve_node_runtime(&version, runtime_platforms, reporter.clone()).await?;
+    maybe_report_timing(
+        reporter,
+        timings,
+        "lockfile.resolve_node_runtime",
+        step_started.elapsed(),
+    )
+    .await?;
+    runtimes.node = Some(runtime);
+
+    if runtimes.deno.is_none() {
+        let deno_version = read_language_version(manifest_raw, "deno", "2.6.8");
+        let step_started = Instant::now();
+        let deno_runtime =
+            resolve_deno_runtime(&deno_version, runtime_platforms, reporter.clone()).await?;
+        maybe_report_timing(
+            reporter,
+            timings,
+            "lockfile.resolve_deno_runtime",
+            step_started.elapsed(),
+        )
+        .await?;
+        runtimes.deno = Some(deno_runtime);
+    }
+
+    if node_lockfile.is_some() {
+        let node_artifacts = match prepare_node_artifacts(
+            manifest_raw,
+            manifest_dir,
+            target_key,
+            &version,
+            reporter.clone(),
+        )
+        .await
+        {
+            Ok(artifacts) if !artifacts.is_empty() => Some(artifacts),
+            Ok(_) => None,
+            Err(err) => {
+                reporter
+                    .warn(format!("⚠️  Failed to prefetch Node artifacts: {}", err))
+                    .await?;
+                None
+            }
+        };
+        let target_entry = targets.entry(target_key.to_string()).or_default();
+        target_entry.node_lockfile = Some(format!("locks/{}/pnpm-lock.yaml", target_key));
+        if let Some(artifacts) = node_artifacts {
+            target_entry.artifacts.extend(artifacts);
+        }
+        tools.pnpm = Some(resolve_pnpm_tool_targets(runtime_platforms));
+    }
+
+    Ok(())
+}
+
+async fn configure_deno_lockfile(
+    manifest_raw: &toml::Value,
+    manifest_dir: &Path,
+    reporter: &Arc<dyn CapsuleReporter + 'static>,
+    timings: bool,
+    runtime_platforms: &[RuntimePlatform],
+    required_runtime_version: Option<&str>,
+    runtime_tools: &HashMap<String, String>,
+    runtimes: &mut RuntimeSection,
+    tools: &mut ToolSection,
+) -> Result<()> {
+    let version = required_runtime_version
+        .map(str::to_string)
+        .or_else(|| read_runtime_version(manifest_raw))
+        .unwrap_or_else(|| read_language_version(manifest_raw, "deno", "2.6.8"));
+    let step_started = Instant::now();
+    let runtime = resolve_deno_runtime(&version, runtime_platforms, reporter.clone()).await?;
+    maybe_report_timing(
+        reporter,
+        timings,
+        "lockfile.resolve_deno_runtime",
+        step_started.elapsed(),
+    )
+    .await?;
+    runtimes.deno = Some(runtime);
+
+    if let Some(node_version) = runtime_tools.get("node") {
+        let step_started = Instant::now();
+        let runtime =
+            resolve_node_runtime(node_version, runtime_platforms, reporter.clone()).await?;
+        maybe_report_timing(
+            reporter,
+            timings,
+            "lockfile.resolve_node_runtime",
+            step_started.elapsed(),
+        )
+        .await?;
+        runtimes.node = Some(runtime);
+    }
+    if let Some(python_version) = runtime_tools.get("python") {
+        let step_started = Instant::now();
+        let runtime =
+            resolve_python_runtime(python_version, runtime_platforms, reporter.clone()).await?;
+        maybe_report_timing(
+            reporter,
+            timings,
+            "lockfile.resolve_python_runtime",
+            step_started.elapsed(),
+        )
+        .await?;
+        runtimes.python = Some(runtime);
+
+        let step_started = Instant::now();
+        tools.uv = Some(resolve_uv_tool_targets(runtime_platforms, reporter.clone()).await?);
+        maybe_report_timing(
+            reporter,
+            timings,
+            "lockfile.resolve_uv_tool_targets",
+            step_started.elapsed(),
+        )
+        .await?;
+    }
+
+    let is_web_static = selected_target_runtime(manifest_raw).as_deref() == Some("web")
+        && selected_target_driver(manifest_raw).as_deref() == Some("static");
+    let skip_deno_lock_generation = selected_target_cmd_contains(manifest_raw, "--no-lock");
+    if !is_web_static && !skip_deno_lock_generation {
+        let step_started = Instant::now();
+        let _ = generate_deno_lock(manifest_dir, manifest_raw, &version, reporter.clone()).await?;
+        maybe_report_timing(
+            reporter,
+            timings,
+            "lockfile.generate_deno_lock",
+            step_started.elapsed(),
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn ensure_orchestration_target_runtimes(
+    manifest_raw: &toml::Value,
+    reporter: &Arc<dyn CapsuleReporter + 'static>,
+    runtime_platforms: &[RuntimePlatform],
+    runtimes: &mut RuntimeSection,
+    tools: &mut ToolSection,
+) -> Result<()> {
     for target_label in orchestration_service_target_labels(manifest_raw) {
         if selected_target_label(manifest_raw)
             .as_deref()
@@ -1166,88 +1284,111 @@ async fn generate_lockfile(
         let runtime_tools = read_runtime_tools_from_target(target);
 
         if matches!(driver.as_deref(), Some("node")) && runtimes.node.is_none() {
-            let version = runtime_version.clone().unwrap_or_else(|| "20".to_string());
-            runtimes.node =
-                Some(resolve_node_runtime(&version, &runtime_platforms, reporter.clone()).await?);
+            ensure_node_runtime_if_missing(
+                runtimes,
+                runtime_version.as_deref().unwrap_or("20"),
+                runtime_platforms,
+                reporter,
+            )
+            .await?;
         }
 
         if matches!(driver.as_deref(), Some("python")) && runtimes.python.is_none() {
-            let version = runtime_version
-                .clone()
-                .unwrap_or_else(|| "3.11".to_string());
-            runtimes.python =
-                Some(resolve_python_runtime(&version, &runtime_platforms, reporter.clone()).await?);
-            if tools.uv.is_none() {
-                tools.uv =
-                    Some(resolve_uv_tool_targets(&runtime_platforms, reporter.clone()).await?);
-            }
+            ensure_python_runtime_if_missing(
+                runtimes,
+                runtime_version.as_deref().unwrap_or("3.11"),
+                runtime_platforms,
+                reporter,
+            )
+            .await?;
+            ensure_uv_tool_if_missing(tools, runtime_platforms, reporter).await?;
         }
 
         if matches!(driver.as_deref(), Some("deno")) && runtimes.deno.is_none() {
-            let version = runtime_version
-                .clone()
-                .unwrap_or_else(|| "2.6.8".to_string());
-            runtimes.deno =
-                Some(resolve_deno_runtime(&version, &runtime_platforms, reporter.clone()).await?);
+            ensure_deno_runtime_if_missing(
+                runtimes,
+                runtime_version.as_deref().unwrap_or("2.6.8"),
+                runtime_platforms,
+                reporter,
+            )
+            .await?;
         }
 
         if runtime.as_deref() == Some("web")
             && matches!(driver.as_deref(), Some("static"))
             && runtimes.deno.is_none()
         {
-            let version = runtime_version
-                .clone()
-                .unwrap_or_else(|| "2.6.8".to_string());
-            runtimes.deno =
-                Some(resolve_deno_runtime(&version, &runtime_platforms, reporter.clone()).await?);
+            ensure_deno_runtime_if_missing(
+                runtimes,
+                runtime_version.as_deref().unwrap_or("2.6.8"),
+                runtime_platforms,
+                reporter,
+            )
+            .await?;
         }
 
         if let Some(node_version) = runtime_tools.get("node") {
-            if runtimes.node.is_none() {
-                runtimes.node = Some(
-                    resolve_node_runtime(node_version, &runtime_platforms, reporter.clone())
-                        .await?,
-                );
-            }
+            ensure_node_runtime_if_missing(runtimes, node_version, runtime_platforms, reporter)
+                .await?;
         }
         if let Some(python_version) = runtime_tools.get("python") {
-            if runtimes.python.is_none() {
-                runtimes.python = Some(
-                    resolve_python_runtime(python_version, &runtime_platforms, reporter.clone())
-                        .await?,
-                );
-            }
-            if tools.uv.is_none() {
-                tools.uv =
-                    Some(resolve_uv_tool_targets(&runtime_platforms, reporter.clone()).await?);
-            }
+            ensure_python_runtime_if_missing(runtimes, python_version, runtime_platforms, reporter)
+                .await?;
+            ensure_uv_tool_if_missing(tools, runtime_platforms, reporter).await?;
         }
     }
 
-    let tools = if tools.uv.is_none() && tools.pnpm.is_none() {
-        None
-    } else {
-        Some(tools)
-    };
+    Ok(())
+}
 
-    Ok(CapsuleLock {
-        version: "1".to_string(),
-        meta: LockMeta {
-            created_at: Utc::now().to_rfc3339(),
-            manifest_hash: semantic_manifest_hash_from_text(manifest_text)?,
-        },
-        allowlist,
-        capsule_dependencies,
-        injected_data: HashMap::new(),
-        tools,
-        runtimes: if runtimes.python.is_none() && runtimes.node.is_none() && runtimes.deno.is_none()
-        {
-            None
-        } else {
-            Some(runtimes)
-        },
-        targets,
-    })
+async fn ensure_node_runtime_if_missing(
+    runtimes: &mut RuntimeSection,
+    version: &str,
+    runtime_platforms: &[RuntimePlatform],
+    reporter: &Arc<dyn CapsuleReporter + 'static>,
+) -> Result<()> {
+    if runtimes.node.is_none() {
+        runtimes.node =
+            Some(resolve_node_runtime(version, runtime_platforms, reporter.clone()).await?);
+    }
+    Ok(())
+}
+
+async fn ensure_python_runtime_if_missing(
+    runtimes: &mut RuntimeSection,
+    version: &str,
+    runtime_platforms: &[RuntimePlatform],
+    reporter: &Arc<dyn CapsuleReporter + 'static>,
+) -> Result<()> {
+    if runtimes.python.is_none() {
+        runtimes.python =
+            Some(resolve_python_runtime(version, runtime_platforms, reporter.clone()).await?);
+    }
+    Ok(())
+}
+
+async fn ensure_deno_runtime_if_missing(
+    runtimes: &mut RuntimeSection,
+    version: &str,
+    runtime_platforms: &[RuntimePlatform],
+    reporter: &Arc<dyn CapsuleReporter + 'static>,
+) -> Result<()> {
+    if runtimes.deno.is_none() {
+        runtimes.deno =
+            Some(resolve_deno_runtime(version, runtime_platforms, reporter.clone()).await?);
+    }
+    Ok(())
+}
+
+async fn ensure_uv_tool_if_missing(
+    tools: &mut ToolSection,
+    runtime_platforms: &[RuntimePlatform],
+    reporter: &Arc<dyn CapsuleReporter + 'static>,
+) -> Result<()> {
+    if tools.uv.is_none() {
+        tools.uv = Some(resolve_uv_tool_targets(runtime_platforms, reporter.clone()).await?);
+    }
+    Ok(())
 }
 
 fn semantic_manifest_hash(manifest: &CapsuleManifest) -> Result<String> {

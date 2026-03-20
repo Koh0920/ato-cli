@@ -4,20 +4,7 @@ pub(crate) async fn resolve_registry_url(
     registry_url: Option<&str>,
     emit_log: bool,
 ) -> Result<String> {
-    if let Some(url) = registry_url {
-        return Ok(url.to_string());
-    }
-
-    let resolver = RegistryResolver::default();
-    let info = resolver.resolve("localhost").await?;
-    if emit_log {
-        eprintln!(
-            "📡 Using registry: {} ({})",
-            info.url,
-            format!("{:?}", info.source).to_lowercase()
-        );
-    }
-    Ok(info.url)
+    crate::registry_url::resolve_registry_url_with_log(registry_url, emit_log).await
 }
 
 pub(crate) async fn resolve_manifest_target(

@@ -72,6 +72,7 @@ mod env;
 mod error_codes;
 mod executors;
 mod external_capsule;
+mod fs_copy;
 mod gen_ci;
 mod guest_protocol;
 mod inference_feedback;
@@ -104,6 +105,7 @@ mod registry_delete;
 mod registry_http;
 mod registry_serve;
 mod registry_store;
+mod registry_url;
 mod registry_yank;
 mod reporters;
 mod run_install_orchestration;
@@ -111,6 +113,7 @@ mod runtime_manager;
 mod runtime_overrides;
 mod runtime_tree;
 mod scaffold;
+mod scoped_id_prompt;
 mod search;
 mod sign;
 mod skill;
@@ -238,48 +241,6 @@ fn run() -> Result<()> {
             reporter.clone(),
         ),
 
-        Commands::Open {
-            path,
-            target,
-            watch,
-            background,
-            nacelle,
-            registry,
-            state,
-            inject,
-            enforcement,
-            sandbox_mode,
-            unsafe_mode_legacy,
-            unsafe_bypass_sandbox_legacy,
-            dangerously_skip_permissions,
-            compatibility_fallback,
-            yes,
-        } => run_install_orchestration::execute_run_like_command(
-            run_install_orchestration::RunLikeCommandArgs {
-                path,
-                target,
-                watch,
-                background,
-                nacelle,
-                registry,
-                state,
-                inject,
-                enforcement,
-                sandbox_mode,
-                unsafe_mode_legacy,
-                unsafe_bypass_sandbox_legacy,
-                dangerously_skip_permissions,
-                compatibility_fallback,
-                yes,
-                keep_failed_artifacts: false,
-                allow_unverified: false,
-                skill: None,
-                from_skill: None,
-                deprecation_warning: Some("⚠️  'ato open' is deprecated. Use 'ato run' instead."),
-                reporter: reporter.clone(),
-            },
-        ),
-
         Commands::Init => init::execute_prompt(init::PromptArgs { path: None }, reporter.clone()),
 
         Commands::New { name, template } => new::execute(
@@ -369,34 +330,6 @@ fn run() -> Result<()> {
                 reporter.clone(),
             ),
         },
-
-        Commands::Pack {
-            dir,
-            init,
-            key,
-            standalone,
-            force_large_payload,
-            enforcement,
-            keep_failed_artifacts,
-            timings,
-            strict_v3,
-        } => build_validate_orchestration::execute_build_like_command(
-            build_validate_orchestration::BuildLikeCommandArgs {
-                dir,
-                init,
-                key,
-                standalone,
-                force_large_payload,
-                enforcement: enforcement.as_str().to_string(),
-                keep_failed_artifacts,
-                timings,
-                strict_v3,
-                json: cli.json,
-                nacelle: cli.nacelle,
-                deprecation_warning: Some("⚠️  'ato pack' is deprecated. Use 'ato build' instead."),
-                reporter: reporter.clone(),
-            },
-        ),
 
         Commands::Scaffold {
             command:
@@ -831,21 +764,6 @@ fn run() -> Result<()> {
             reporter.clone(),
         ),
 
-        Commands::Close {
-            id,
-            name,
-            all,
-            force,
-        } => commands::close::execute(
-            commands::close::CloseArgs {
-                id,
-                name,
-                all,
-                force,
-            },
-            reporter.clone(),
-        ),
-
         Commands::Logs {
             id,
             name,
@@ -909,8 +827,6 @@ fn run() -> Result<()> {
         Commands::Logout => auth::logout(),
 
         Commands::Whoami => auth::status(),
-
-        Commands::Auth => auth::status(),
     }
 }
 

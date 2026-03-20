@@ -102,7 +102,8 @@ pub(crate) struct Cli {
 pub(crate) enum Commands {
     #[command(
         next_help_heading = "Primary Commands",
-        about = "Run a capsule app or local project"
+        about = "Run a capsule app or local project",
+        alias = "open"
     )]
     Run {
         /// Local path (./, ../, ~/, /...), store scoped ID (publisher/slug), or GitHub repo (github.com/owner/repo). Default: current directory
@@ -256,7 +257,8 @@ pub(crate) enum Commands {
 
     #[command(
         next_help_heading = "Primary Commands",
-        about = "Build project into a capsule archive"
+        about = "Build project into a capsule archive",
+        alias = "pack"
     )]
     Build {
         #[arg(default_value = ".")]
@@ -405,7 +407,11 @@ pub(crate) enum Commands {
         json: bool,
     },
 
-    #[command(next_help_heading = "Management", about = "Stop a running capsule")]
+    #[command(
+        next_help_heading = "Management",
+        about = "Stop a running capsule",
+        alias = "close"
+    )]
     Stop {
         #[arg(long)]
         id: Option<String>,
@@ -463,7 +469,8 @@ pub(crate) enum Commands {
 
     #[command(
         next_help_heading = "Auth",
-        about = "Show current authentication status"
+        about = "Show current authentication status",
+        alias = "auth"
     )]
     Whoami,
 
@@ -555,43 +562,6 @@ pub(crate) enum Commands {
     },
 
     #[command(hide = true)]
-    Open {
-        path: PathBuf,
-        #[arg(short = 't', long = "target")]
-        target: Option<String>,
-        #[arg(long)]
-        watch: bool,
-        #[arg(long)]
-        background: bool,
-        #[arg(long)]
-        nacelle: Option<PathBuf>,
-        #[arg(long)]
-        registry: Option<String>,
-        #[arg(long = "state", value_name = "STATE=/ABS/PATH|STATE=state-...")]
-        state: Vec<String>,
-        #[arg(long = "inject", value_name = "KEY=VALUE")]
-        inject: Vec<String>,
-        #[arg(long, value_enum, default_value_t = EnforcementMode::Strict)]
-        enforcement: EnforcementMode,
-        #[arg(long = "sandbox", default_value_t = false)]
-        sandbox_mode: bool,
-        #[arg(long = "unsafe", hide = true, default_value_t = false)]
-        unsafe_mode_legacy: bool,
-        #[arg(long = "unsafe-bypass-sandbox", hide = true, default_value_t = false)]
-        unsafe_bypass_sandbox_legacy: bool,
-        #[arg(
-            short = 'U',
-            long = "dangerously-skip-permissions",
-            default_value_t = false
-        )]
-        dangerously_skip_permissions: bool,
-        #[arg(long = "compatibility-fallback", value_enum)]
-        compatibility_fallback: Option<CompatibilityFallbackBackend>,
-        #[arg(short = 'y', long = "yes", default_value_t = false)]
-        yes: bool,
-    },
-
-    #[command(hide = true)]
     New {
         name: String,
         #[arg(long, default_value = "python")]
@@ -606,28 +576,6 @@ pub(crate) enum Commands {
         force: bool,
         #[arg(long, default_value_t = false)]
         json: bool,
-    },
-
-    #[command(hide = true)]
-    Pack {
-        #[arg(default_value = ".")]
-        dir: PathBuf,
-        #[arg(long)]
-        init: bool,
-        #[arg(long)]
-        key: Option<PathBuf>,
-        #[arg(long, value_enum, default_value_t = EnforcementMode::Strict)]
-        enforcement: EnforcementMode,
-        #[arg(long)]
-        standalone: bool,
-        #[arg(long, hide = true, default_value_t = false)]
-        force_large_payload: bool,
-        #[arg(long, hide = true, default_value_t = false)]
-        keep_failed_artifacts: bool,
-        #[arg(long, hide = true, default_value_t = false)]
-        timings: bool,
-        #[arg(long, hide = true, default_value_t = false)]
-        strict_v3: bool,
     },
 
     #[command(hide = true)]
@@ -675,18 +623,6 @@ pub(crate) enum Commands {
     },
 
     #[command(hide = true)]
-    Close {
-        #[arg(long)]
-        id: Option<String>,
-        #[arg(long)]
-        name: Option<String>,
-        #[arg(long, default_value_t = false)]
-        all: bool,
-        #[arg(long, default_value_t = false)]
-        force: bool,
-    },
-
-    #[command(hide = true)]
     Guest {
         #[arg()]
         sync_path: PathBuf,
@@ -697,9 +633,6 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         command: IpcCommands,
     },
-
-    #[command(hide = true)]
-    Auth,
 }
 
 #[derive(Subcommand)]

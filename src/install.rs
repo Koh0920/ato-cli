@@ -29,7 +29,6 @@ use crate::artifact_hash::{
     normalize_hash_for_compare,
 };
 use crate::capsule_archive::extract_payload_tar_from_capsule;
-use crate::registry::RegistryResolver;
 use crate::runtime_tree;
 
 #[path = "install/github_archive.rs"]
@@ -344,7 +343,7 @@ pub struct CapsuleFilesystemPermissions {
 }
 
 #[derive(Debug, Deserialize)]
-struct CapsuleDetail {
+pub(crate) struct CapsuleDetail {
     id: String,
     #[serde(default, alias = "scopedId", alias = "scoped_id")]
     scoped_id: Option<String>,
@@ -354,8 +353,8 @@ struct CapsuleDetail {
     price: u64,
     currency: String,
     #[serde(rename = "latestVersion", alias = "latest_version", default)]
-    latest_version: Option<String>,
-    releases: Vec<ReleaseInfo>,
+    pub(crate) latest_version: Option<String>,
+    pub(crate) releases: Vec<ReleaseInfo>,
     #[serde(default)]
     manifest_toml: Option<String>,
     #[serde(default)]
@@ -365,8 +364,8 @@ struct CapsuleDetail {
 }
 
 #[derive(Debug, Deserialize)]
-struct ReleaseInfo {
-    version: String,
+pub(crate) struct ReleaseInfo {
+    pub(crate) version: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -982,19 +981,7 @@ pub async fn install_app(
     let registry = resolve_registry_url(registry_url, !json_output).await?;
 
     let client = reqwest::Client::new();
-    let capsule_url = format!(
-        "{}/v1/capsules/by/{}/{}",
-        registry,
-        urlencoding::encode(&scoped_ref.publisher),
-        urlencoding::encode(&scoped_ref.slug)
-    );
-    let capsule: CapsuleDetail = crate::registry_http::with_ato_token(client.get(&capsule_url))
-        .send()
-        .await
-        .with_context(|| format!("Failed to connect to registry: {}", registry))?
-        .json()
-        .await
-        .with_context(|| format!("Capsule not found: {}", scoped_ref.scoped_id))?;
+    let capsule = fetch_capsule_detail_record(&client, &registry, &scoped_ref).await?;
 
     if capsule.price > 0 {
         bail!(
@@ -1017,27 +1004,14 @@ pub async fn install_app(
         }
     }
 
-    let target_version_owned = match requested_version.as_deref() {
-        Some(explicit) => explicit.to_string(),
-        None => capsule
-            .latest_version
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "No installable version available for '{}'. This capsule has no published release version.",
-                    scoped_ref.scoped_id
-                )
-            })?,
-    };
+    let target_version_owned = select_requested_or_latest_version(
+        requested_version.as_deref(),
+        capsule.latest_version.as_deref(),
+        &scoped_ref.scoped_id,
+        "installable",
+    )?;
     let target_version = target_version_owned.as_str();
-    capsule
-        .releases
-        .iter()
-        .find(|r| r.version == target_version)
-        .with_context(|| format!("Version {} not found", target_version))?;
+    ensure_release_exists(&capsule.releases, target_version)?;
     let (bytes, normalized_file_name) = match install_manifest_delta_path(
         &client,
         &registry,
@@ -1093,6 +1067,96 @@ pub async fn install_app(
         InstallSource::Registry(registry),
     )
     .await
+}
+
+pub(crate) async fn fetch_capsule_detail_record(
+    client: &reqwest::Client,
+    registry: &str,
+    scoped_ref: &ScopedCapsuleRef,
+) -> Result<CapsuleDetail> {
+    let capsule_url = format!(
+        "{}/v1/capsules/by/{}/{}",
+        registry,
+        urlencoding::encode(&scoped_ref.publisher),
+        urlencoding::encode(&scoped_ref.slug)
+    );
+    crate::registry_http::with_ato_token(client.get(&capsule_url))
+        .send()
+        .await
+        .with_context(|| format!("Failed to connect to registry: {}", registry))?
+        .json()
+        .await
+        .with_context(|| format!("Capsule not found: {}", scoped_ref.scoped_id))
+}
+
+pub(crate) fn select_requested_or_latest_version(
+    requested_version: Option<&str>,
+    latest_version: Option<&str>,
+    scoped_id: &str,
+    availability_label: &str,
+) -> Result<String> {
+    match requested_version {
+        Some(explicit) => Ok(explicit.to_string()),
+        None => latest_version
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No {} version available for '{}'. This capsule has no published release version.",
+                    availability_label,
+                    scoped_id
+                )
+            }),
+    }
+}
+
+pub(crate) fn ensure_release_exists(releases: &[ReleaseInfo], target_version: &str) -> Result<()> {
+    releases
+        .iter()
+        .find(|release| release.version == target_version)
+        .with_context(|| format!("Version {} not found", target_version))?;
+    Ok(())
+}
+
+pub(crate) async fn download_capsule_artifact_bytes(
+    client: &reqwest::Client,
+    registry: &str,
+    scoped_ref: &ScopedCapsuleRef,
+    target_version: &str,
+) -> Result<Vec<u8>> {
+    let download_url = format!(
+        "{}/v1/capsules/by/{}/{}/download?version={}",
+        registry.trim_end_matches('/'),
+        urlencoding::encode(&scoped_ref.publisher),
+        urlencoding::encode(&scoped_ref.slug),
+        urlencoding::encode(target_version)
+    );
+    crate::registry_http::with_ato_token(client.get(&download_url))
+        .send()
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to download artifact for {}@{}",
+                scoped_ref.scoped_id, target_version
+            )
+        })?
+        .error_for_status()
+        .with_context(|| {
+            format!(
+                "Artifact download failed for {}@{}",
+                scoped_ref.scoped_id, target_version
+            )
+        })?
+        .bytes()
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to read artifact body for {}@{}",
+                scoped_ref.scoped_id, target_version
+            )
+        })
+        .map(|bytes| bytes.to_vec())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1509,19 +1573,7 @@ pub async fn fetch_capsule_detail(
     let scoped_ref = parse_capsule_ref(capsule_ref)?;
     let registry = resolve_registry_url(registry_url, false).await?;
     let client = reqwest::Client::new();
-    let capsule_url = format!(
-        "{}/v1/capsules/by/{}/{}",
-        registry,
-        urlencoding::encode(&scoped_ref.publisher),
-        urlencoding::encode(&scoped_ref.slug)
-    );
-    let capsule: CapsuleDetail = crate::registry_http::with_ato_token(client.get(&capsule_url))
-        .send()
-        .await
-        .with_context(|| format!("Failed to connect to registry: {}", registry))?
-        .json()
-        .await
-        .with_context(|| format!("Capsule not found: {}", scoped_ref.scoped_id))?;
+    let capsule = fetch_capsule_detail_record(&client, &registry, &scoped_ref).await?;
 
     Ok(CapsuleDetailSummary {
         scoped_id: capsule

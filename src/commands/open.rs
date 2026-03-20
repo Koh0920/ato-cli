@@ -294,7 +294,7 @@ async fn copy_source_files(
 
         if file_name == "source" && path.is_dir() {
             let dest = extract_dir.join("source");
-            copy_dir_recursive(&path, &dest)?;
+            crate::fs_copy::copy_path_recursive(&path, &dest)?;
             debug!("Copied source/");
         } else if path.is_file() {
             let dest = extract_dir.join(&file_name);
@@ -302,7 +302,7 @@ async fn copy_source_files(
             debug!(file = %file_name.to_string_lossy(), "Copied file into extracted capsule");
         } else if path.is_dir() && !is_hidden(&file_name) {
             let dest = extract_dir.join(&file_name);
-            copy_dir_recursive(&path, &dest)?;
+            crate::fs_copy::copy_path_recursive(&path, &dest)?;
             debug!(dir = %file_name.to_string_lossy(), "Copied directory into extracted capsule");
         }
     }
@@ -385,26 +385,6 @@ fn is_source_file(file_name: &std::ffi::OsString) -> bool {
 fn is_hidden(file_name: &std::ffi::OsString) -> bool {
     let bytes = file_name.as_os_str().as_encoded_bytes();
     bytes.first() == Some(&b'.') && bytes.len() > 1
-}
-
-fn copy_dir_recursive(from: &Path, to: &Path) -> Result<()> {
-    if !to.exists() {
-        fs::create_dir_all(to)?;
-    }
-
-    for entry in fs::read_dir(from)? {
-        let entry = entry?;
-        let path = entry.path();
-        let dest = to.join(entry.file_name());
-
-        if path.is_dir() {
-            copy_dir_recursive(&path, &dest)?;
-        } else {
-            fs::copy(&path, &dest)?;
-        }
-    }
-
-    Ok(())
 }
 
 async fn execute_normal_mode(args: OpenArgs) -> Result<()> {

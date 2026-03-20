@@ -192,30 +192,11 @@ pub(crate) async fn resolve_run_target_or_install(
         Err(error) => {
             if install::is_slug_only_ref(&raw) {
                 let effective_registry = registry.unwrap_or(crate::DEFAULT_RUN_REGISTRY_URL);
-                let suggestions =
-                    install::suggest_scoped_capsules(&raw, Some(effective_registry), 5).await?;
-                if suggestions.is_empty() {
-                    anyhow::bail!(
-                        "scoped_id_required: '{}' is not valid for `ato run`. Use publisher/slug (for example: koh0920/{}).",
-                        raw,
-                        raw.trim()
-                    );
-                }
-
-                let mut message = format!(
-                    "scoped_id_required: '{}' is ambiguous. Specify publisher/slug.\n\nDid you mean one of these?",
-                    raw
+                anyhow::bail!(
+                    "{}",
+                    crate::scoped_id_prompt::run_scoped_id_prompt(&raw, Some(effective_registry))
+                        .await?
                 );
-                for suggestion in suggestions {
-                    message.push_str(&format!(
-                        "\n  - {}  ({} downloads)",
-                        suggestion.scoped_id, suggestion.downloads
-                    ));
-                }
-                message.push_str("\n\nRun `ato search ");
-                message.push_str(raw.trim());
-                message.push_str("` to see more options.");
-                anyhow::bail!(message);
             }
             return Err(error).context(
                 "Invalid run target. Use a local path or existing .capsule file, or publisher/slug for store capsules.",

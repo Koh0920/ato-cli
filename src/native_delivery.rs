@@ -11,7 +11,6 @@ use walkdir::WalkDir;
 use crate::artifact_hash::compute_blake3_label as compute_blake3;
 use crate::capsule_archive::extract_payload_tar_from_capsule;
 use crate::install;
-use crate::registry::RegistryResolver;
 use crate::registry_http;
 
 #[path = "native_delivery/filesystem.rs"]
@@ -167,18 +166,6 @@ struct FetchMetadata {
     fetched_at: String,
     parent_digest: String,
     artifact_blake3: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct CapsuleDetail {
-    #[serde(rename = "latestVersion", alias = "latest_version", default)]
-    latest_version: Option<String>,
-    releases: Vec<ReleaseInfo>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ReleaseInfo {
-    version: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -545,81 +532,24 @@ pub async fn execute_fetch(
     let scoped_ref = request.scoped_ref;
     let requested_version =
         install::merge_requested_version(request.version.as_deref(), resolved.version.as_deref())?;
-    let registry = resolve_registry_url(resolved.registry_url.as_deref()).await?;
+    let registry = crate::registry_url::resolve_normalized_registry_url(
+        resolved.registry_url.as_deref(),
+        "registry",
+        "resolved registry",
+    )
+    .await?;
     let client = reqwest::Client::new();
-
-    let detail_url = format!(
-        "{}/v1/capsules/by/{}/{}",
-        registry.trim_end_matches('/'),
-        urlencoding::encode(&scoped_ref.publisher),
-        urlencoding::encode(&scoped_ref.slug)
-    );
-    let detail: CapsuleDetail = registry_http::with_ato_token(client.get(&detail_url))
-        .send()
-        .await
-        .with_context(|| format!("Failed to connect to registry: {}", registry))?
-        .error_for_status()
-        .with_context(|| format!("Capsule not found: {}", scoped_ref.scoped_id))?
-        .json()
-        .await
-        .with_context(|| {
-            format!(
-                "Invalid capsule detail payload for {}",
-                scoped_ref.scoped_id
-            )
-        })?;
-
-    let target_version = match requested_version.as_deref() {
-        Some(explicit) => explicit.to_string(),
-        None => detail
-            .latest_version
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-            .ok_or_else(|| anyhow::anyhow!(
-                "No fetchable version available for '{}'. This capsule has no published release version.",
-                scoped_ref.scoped_id
-            ))?,
-    };
-    detail
-        .releases
-        .iter()
-        .find(|release| release.version == target_version)
-        .with_context(|| format!("Version {} not found", target_version))?;
-
-    let download_url = format!(
-        "{}/v1/capsules/by/{}/{}/download?version={}",
-        registry.trim_end_matches('/'),
-        urlencoding::encode(&scoped_ref.publisher),
-        urlencoding::encode(&scoped_ref.slug),
-        urlencoding::encode(&target_version)
-    );
-    let artifact_bytes = registry_http::with_ato_token(client.get(&download_url))
-        .send()
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to download artifact for {}@{}",
-                scoped_ref.scoped_id, target_version
-            )
-        })?
-        .error_for_status()
-        .with_context(|| {
-            format!(
-                "Artifact download failed for {}@{}",
-                scoped_ref.scoped_id, target_version
-            )
-        })?
-        .bytes()
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to read artifact body for {}@{}",
-                scoped_ref.scoped_id, target_version
-            )
-        })?
-        .to_vec();
+    let detail = install::fetch_capsule_detail_record(&client, &registry, &scoped_ref).await?;
+    let target_version = install::select_requested_or_latest_version(
+        requested_version.as_deref(),
+        detail.latest_version.as_deref(),
+        &scoped_ref.scoped_id,
+        "fetchable",
+    )?;
+    install::ensure_release_exists(&detail.releases, &target_version)?;
+    let artifact_bytes =
+        install::download_capsule_artifact_bytes(&client, &registry, &scoped_ref, &target_version)
+            .await?;
 
     materialize_fetch_cache(
         &scoped_ref.scoped_id,
@@ -1748,11 +1678,8 @@ fn run_native_build_command(command: &NativeBuildCommand) -> Result<()> {
     let mut process = Command::new(&command.program);
     process
         .args(&command.args)
-        .current_dir(&command.working_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let output = process.output().with_context(|| {
+        .current_dir(&command.working_dir);
+    let output = run_captured_command(&mut process, || {
         format!(
             "Failed to execute native delivery build command '{}' in {}",
             format_native_build_command(command),
@@ -1763,20 +1690,10 @@ fn run_native_build_command(command: &NativeBuildCommand) -> Result<()> {
         return Ok(());
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let details = if !stderr.trim().is_empty() {
-        stderr.trim().to_string()
-    } else {
-        stdout.trim().to_string()
-    };
+    let details = command_output_details(&output);
     bail!(
         "Native delivery build command failed with status {}: {}{}",
-        output
-            .status
-            .code()
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "signal".to_string()),
+        command_exit_status(&output),
         format_native_build_command(command),
         if details.is_empty() {
             String::new()
@@ -1796,33 +1713,18 @@ fn staged_delivery_config(plan: &NativeBuildPlan) -> Result<DeliveryConfig> {
 fn run_finalize_command(derived_dir: &Path, config: &DeliveryConfig) -> Result<()> {
     let tool = config.finalize.tool.trim();
     let mut command = Command::new(tool);
-    command
-        .args(&config.finalize.args)
-        .current_dir(derived_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let output = command
-        .output()
-        .with_context(|| format!("Failed to execute {} in {}", tool, derived_dir.display()))?;
+    command.args(&config.finalize.args).current_dir(derived_dir);
+    let output = run_captured_command(&mut command, || {
+        format!("Failed to execute {} in {}", tool, derived_dir.display())
+    })?;
     if output.status.success() {
         return Ok(());
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let details = if !stderr.trim().is_empty() {
-        stderr.trim().to_string()
-    } else {
-        stdout.trim().to_string()
-    };
+    let details = command_output_details(&output);
     bail!(
         "{} failed with status {}{}",
         tool,
-        output
-            .status
-            .code()
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "signal".to_string()),
+        command_exit_status(&output),
         if details.is_empty() {
             String::new()
         } else {
@@ -1832,25 +1734,16 @@ fn run_finalize_command(derived_dir: &Path, config: &DeliveryConfig) -> Result<(
 }
 
 fn strip_codesign_signature(tool: &str, app_path: &Path) -> Result<()> {
-    let output = Command::new(tool)
-        .arg("--remove-signature")
-        .arg(app_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .with_context(|| format!("Failed to execute {} for {}", tool, app_path.display()))?;
+    let mut command = Command::new(tool);
+    command.arg("--remove-signature").arg(app_path);
+    let output = run_captured_command(&mut command, || {
+        format!("Failed to execute {} for {}", tool, app_path.display())
+    })?;
     if output.status.success() {
         return Ok(());
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let details = if !stderr.trim().is_empty() {
-        stderr.trim().to_string()
-    } else {
-        stdout.trim().to_string()
-    };
+    let details = command_output_details(&output);
     if details.contains("not signed at all") || details.contains("code object is not signed") {
         return Ok(());
     }
@@ -1867,13 +1760,34 @@ fn strip_codesign_signature(tool: &str, app_path: &Path) -> Result<()> {
     )
 }
 
-async fn resolve_registry_url(registry_url: Option<&str>) -> Result<String> {
-    if let Some(url) = registry_url {
-        return registry_http::normalize_registry_url(url, "registry");
+fn run_captured_command(
+    command: &mut Command,
+    context: impl FnOnce() -> String,
+) -> Result<std::process::Output> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(context)
+}
+
+fn command_output_details(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.trim().is_empty() {
+        return stderr.trim().to_string();
     }
-    let resolver = RegistryResolver::default();
-    let info = resolver.resolve("localhost").await?;
-    registry_http::normalize_registry_url(&info.url, "resolved registry")
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout.trim().to_string()
+}
+
+fn command_exit_status(output: &std::process::Output) -> String {
+    output
+        .status
+        .code()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "signal".to_string())
 }
 
 #[cfg(test)]

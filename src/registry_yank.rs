@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 

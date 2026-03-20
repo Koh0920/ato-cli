@@ -62,29 +62,11 @@ pub(crate) fn execute_install_command(args: InstallCommandArgs) -> Result<()> {
             anyhow::anyhow!("capsule slug is required when not using --from-gh-repo")
         })?;
         if install::is_slug_only_ref(&slug) {
-            let suggestions =
-                install::suggest_scoped_capsules(&slug, args.registry.as_deref(), 5).await?;
-            if suggestions.is_empty() {
-                anyhow::bail!(
-                    "scoped_id_required: '{}' is ambiguous. Use publisher/slug (for example: koh0920/{})",
-                    slug,
-                    slug
-                );
-            }
-            let mut message = format!(
-                "scoped_id_required: '{}' requires publisher scope.\n\nDid you mean one of these?",
-                slug
+            anyhow::bail!(
+                "{}",
+                crate::scoped_id_prompt::install_scoped_id_prompt(&slug, args.registry.as_deref(),)
+                    .await?
             );
-            for suggestion in suggestions {
-                message.push_str(&format!(
-                    "\n  - {}  ({} downloads)",
-                    suggestion.scoped_id, suggestion.downloads
-                ));
-            }
-            message.push_str("\n\nRun `ato search ");
-            message.push_str(&slug);
-            message.push_str("` to see more options.");
-            anyhow::bail!(message);
         }
 
         let result = install::install_app(
