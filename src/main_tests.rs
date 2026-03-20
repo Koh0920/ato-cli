@@ -28,7 +28,9 @@ fn select_capsule_file_is_deterministic() {
     std::fs::write(version_dir.join("zeta.capsule"), b"z").unwrap();
     std::fs::write(version_dir.join("alpha.capsule"), b"a").unwrap();
 
-    let selected = select_capsule_file_in_version(&version_dir).unwrap().unwrap();
+    let selected = select_capsule_file_in_version(&version_dir)
+        .unwrap()
+        .unwrap();
     assert_eq!(
         selected.file_name().and_then(|name| name.to_str()),
         Some("alpha.capsule")
@@ -227,7 +229,8 @@ fn state_command_parses_register_and_inspect_forms() {
         other => panic!("unexpected command: {:?}", std::mem::discriminant(&other)),
     }
 
-    let inspect = Cli::try_parse_from(["ato", "state", "inspect", "state-demo"]).expect("parse inspect");
+    let inspect =
+        Cli::try_parse_from(["ato", "state", "inspect", "state-demo"]).expect("parse inspect");
     match inspect.command {
         Commands::State {
             command: StateCommands::Inspect { state_ref, json },
@@ -245,8 +248,7 @@ fn parse_sha256_for_artifact_supports_sha256sums_format() {
 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  nacelle-v1.2.3-darwin-arm64
 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  nacelle-v1.2.3-linux-x64
 ";
-    let parsed =
-        crate::engine_manager::parse_sha256_for_artifact(body, "nacelle-v1.2.3-linux-x64");
+    let parsed = crate::engine_manager::parse_sha256_for_artifact(body, "nacelle-v1.2.3-linux-x64");
     assert_eq!(
         parsed.as_deref(),
         Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
@@ -293,8 +295,7 @@ fn dangerous_skip_permissions_allows_with_explicit_opt_in_env() {
     std::env::set_var("CAPSULE_ALLOW_UNSAFE", "1");
 
     let reporter = std::sync::Arc::new(reporters::CliReporter::new(true));
-    let result =
-        enforce_sandbox_mode_flags(EnforcementMode::Strict, false, true, None, reporter);
+    let result = enforce_sandbox_mode_flags(EnforcementMode::Strict, false, true, None, reporter);
     assert!(result.is_ok());
 
     std::env::remove_var("CAPSULE_ALLOW_UNSAFE");
@@ -511,9 +512,8 @@ fn resolve_publish_target_uses_logged_in_default_when_no_explicit_target_exists(
 
 #[test]
 fn resolve_publish_target_errors_without_login_or_registry_override() {
-    let err =
-        publish_command_orchestration::resolve_publish_target_from_sources(None, None, None)
-            .expect_err("must fail without any publish target");
+    let err = publish_command_orchestration::resolve_publish_target_from_sources(None, None, None)
+        .expect_err("must fail without any publish target");
 
     assert!(err.to_string().contains("Run `ato login`"));
     assert!(err.to_string().contains("--registry https://api.ato.run"));
@@ -533,15 +533,15 @@ fn resolve_publish_target_rejects_legacy_dock_registry_urls() {
 
 #[test]
 fn is_legacy_dock_publish_registry_detects_dock_path_prefix() {
-    assert!(publish_command_orchestration::is_legacy_dock_publish_registry(
-        "https://ato.run/d/koh0920"
-    ));
-    assert!(publish_command_orchestration::is_legacy_dock_publish_registry(
-        "https://ato.run/publish/d/koh0920"
-    ));
     assert!(
-        !publish_command_orchestration::is_legacy_dock_publish_registry("https://api.ato.run")
+        publish_command_orchestration::is_legacy_dock_publish_registry("https://ato.run/d/koh0920")
     );
+    assert!(
+        publish_command_orchestration::is_legacy_dock_publish_registry(
+            "https://ato.run/publish/d/koh0920"
+        )
+    );
+    assert!(!publish_command_orchestration::is_legacy_dock_publish_registry("https://api.ato.run"));
 }
 
 #[test]
@@ -550,9 +550,8 @@ fn publish_validate_rejects_allow_existing_without_deploy() {
     args.allow_existing = true;
     let selected =
         publish_command_orchestration::select_publish_phases(false, true, false, false, false);
-    let err =
-        publish_command_orchestration::validate_publish_phase_options(&args, selected, false)
-            .expect_err("must fail closed");
+    let err = publish_command_orchestration::validate_publish_phase_options(&args, selected, false)
+        .expect_err("must fail closed");
     assert!(err.to_string().contains("--allow-existing"));
 }
 
@@ -562,9 +561,8 @@ fn publish_validate_rejects_fix_for_private_registry() {
     args.fix = true;
     let selected =
         publish_command_orchestration::select_publish_phases(false, false, true, false, false);
-    let err =
-        publish_command_orchestration::validate_publish_phase_options(&args, selected, false)
-            .expect_err("must fail closed");
+    let err = publish_command_orchestration::validate_publish_phase_options(&args, selected, false)
+        .expect_err("must fail closed");
     assert!(err.to_string().contains("--fix"));
 }
 
@@ -573,9 +571,8 @@ fn publish_validate_requires_artifact_or_build_for_private_deploy_only() {
     let args = test_publish_args();
     let selected =
         publish_command_orchestration::select_publish_phases(false, false, true, false, false);
-    let err =
-        publish_command_orchestration::validate_publish_phase_options(&args, selected, false)
-            .expect_err("must fail closed");
+    let err = publish_command_orchestration::validate_publish_phase_options(&args, selected, false)
+        .expect_err("must fail closed");
     assert!(err.to_string().contains("--deploy requires --artifact"));
 }
 
@@ -669,7 +666,9 @@ fn github_build_error_requires_manual_intervention_for_stale_bun_lock() {
     );
 
     assert!(github_build_error_requires_manual_intervention(&error));
-    assert!(github_build_error_manual_review_reason(&error).contains("bun install --frozen-lockfile"));
+    assert!(
+        github_build_error_manual_review_reason(&error).contains("bun install --frozen-lockfile")
+    );
 }
 
 #[test]

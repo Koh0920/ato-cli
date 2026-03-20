@@ -24,7 +24,8 @@ impl LocalRegistryService {
         &self,
         state_id: &str,
     ) -> Result<Option<crate::registry_store::PersistentStateRecord>> {
-        self.open_state_store()?.find_persistent_state_by_id(state_id)
+        self.open_state_store()?
+            .find_persistent_state_by_id(state_id)
     }
 
     pub(super) fn register_persistent_state(

@@ -401,7 +401,10 @@ pub(crate) enum Commands {
         force: bool,
     },
 
-    #[command(next_help_heading = "Management", about = "Show logs of a running capsule")]
+    #[command(
+        next_help_heading = "Management",
+        about = "Show logs of a running capsule"
+    )]
     Logs {
         #[arg(long)]
         id: Option<String>,
@@ -442,7 +445,10 @@ pub(crate) enum Commands {
     #[command(next_help_heading = "Auth", about = "Logout")]
     Logout,
 
-    #[command(next_help_heading = "Auth", about = "Show current authentication status")]
+    #[command(
+        next_help_heading = "Auth",
+        about = "Show current authentication status"
+    )]
     Whoami,
 
     #[command(next_help_heading = "Advanced Commands", about = "Manage signing keys")]
@@ -693,7 +699,9 @@ pub(crate) enum InspectCommands {
 
 #[derive(Subcommand)]
 pub(crate) enum ProjectCommands {
-    #[command(about = "List experimental projection state and detect broken projections read-only")]
+    #[command(
+        about = "List experimental projection state and detect broken projections read-only"
+    )]
     Ls {
         #[arg(long)]
         json: bool,

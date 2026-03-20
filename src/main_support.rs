@@ -13,9 +13,7 @@ use crate::preview;
 use crate::progressive_ui;
 use crate::reporters;
 use crate::tui;
-use crate::{
-    CompatibilityFallbackBackend, DEFAULT_RUN_REGISTRY_URL, EnforcementMode,
-};
+use crate::{CompatibilityFallbackBackend, EnforcementMode, DEFAULT_RUN_REGISTRY_URL};
 
 pub(crate) async fn resolve_installed_capsule_archive(
     scoped_ref: &install::ScopedCapsuleRef,
@@ -39,7 +37,9 @@ pub(crate) async fn resolve_installed_capsule_archive(
         return Ok(None);
     }
 
-    let scoped_slug_dir = store_root.join(&scoped_ref.publisher).join(&scoped_ref.slug);
+    let scoped_slug_dir = store_root
+        .join(&scoped_ref.publisher)
+        .join(&scoped_ref.slug);
     if scoped_slug_dir.exists() {
         return resolve_installed_capsule_archive_in_store(
             &store_root.join(&scoped_ref.publisher),
@@ -53,7 +53,11 @@ pub(crate) async fn resolve_installed_capsule_archive(
         install::suggest_scoped_capsules(&scoped_ref.slug, Some(effective_registry), 10).await?;
     let scoped_matches: Vec<_> = suggestions
         .iter()
-        .filter(|candidate| candidate.scoped_id.ends_with(&format!("/{}", scoped_ref.slug)))
+        .filter(|candidate| {
+            candidate
+                .scoped_id
+                .ends_with(&format!("/{}", scoped_ref.slug))
+        })
         .collect();
     let unique_match =
         scoped_matches.len() == 1 && scoped_matches[0].scoped_id == scoped_ref.scoped_id;
