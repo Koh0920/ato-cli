@@ -1136,244 +1136,142 @@ async fn complete_install_from_bytes(
         }
     }
 
-    let target_version = version.as_str();
     let native_spec = crate::native_delivery::detect_install_requires_local_derivation(&bytes)?;
     if let Some(_native_spec) = native_spec {
-        if !crate::native_delivery::host_supports_finalize() {
-            bail!(
-                "This app requires local finalize, but this host does not support native finalize (macOS hosts only)."
-            );
-        }
-
-        let finalize_allowed = if yes {
-            true
-        } else if can_prompt_interactively && !json_output {
-            prompt_for_confirmation(
-                "This app requires local setup to run on this machine.\nRun local finalize now? [Y/n] ",
-                true,
-            )?
-        } else {
-            false
-        };
-
-        if !finalize_allowed {
-            bail!(
-                "This app requires local finalize, but no interactive consent is available. Re-run with --yes."
-            );
-        }
-
-        let fetch_result = crate::native_delivery::materialize_fetch_cache_from_artifact(
-            &scoped_ref.scoped_id,
-            target_version,
-            source.cache_label(),
-            &bytes,
-        )?;
-
-        if !json_output {
-            eprintln!("Running local finalize...");
-        }
-        let finalize_result =
-            crate::native_delivery::finalize_fetched_artifact(&fetch_result.cache_dir)?;
-
-        let output_path = persist_installed_artifact(
-            output_dir.clone(),
-            &scoped_ref.publisher,
-            &scoped_ref.slug,
-            target_version,
-            &normalized_file_name,
-            &bytes,
-            &computed_blake3,
-        )?;
-        let promotion =
-            persist_promotion_info(&output_path, promotion_source.as_ref(), &computed_blake3)?;
-        if promotion.is_some() {
-            let _ = runtime_tree::prepare_promoted_runtime_for_capsule(&output_path)?;
-        }
-
-        let projection = match projection_preference {
-            ProjectionPreference::Skip => {
-                if !json_output {
-                    eprintln!("Launcher projection skipped.");
-                }
-                ProjectionInfo {
-                    performed: false,
-                    projection_id: None,
-                    projected_path: None,
-                    state: Some("skipped".to_string()),
-                    schema_version: Some(
-                        crate::native_delivery::delivery_schema_version().to_string(),
-                    ),
-                    metadata_path: None,
-                }
-            }
-            ProjectionPreference::Force => {
-                match crate::native_delivery::execute_project(
-                    &finalize_result.derived_app_path,
-                    None,
-                ) {
-                    Ok(result) => ProjectionInfo {
-                        performed: true,
-                        projection_id: Some(result.projection_id),
-                        projected_path: Some(result.projected_path),
-                        state: Some(result.state),
-                        schema_version: Some(
-                            crate::native_delivery::delivery_schema_version().to_string(),
-                        ),
-                        metadata_path: Some(result.metadata_path),
-                    },
-                    Err(err) => {
-                        if !json_output {
-                            eprintln!("Launcher projection failed: {err}");
-                            eprintln!(
-                                "Run `ato project {}` to try again later.",
-                                finalize_result.derived_app_path.display()
-                            );
-                        }
-                        ProjectionInfo {
-                            performed: false,
-                            projection_id: None,
-                            projected_path: None,
-                            state: Some("failed".to_string()),
-                            schema_version: Some(
-                                crate::native_delivery::delivery_schema_version().to_string(),
-                            ),
-                            metadata_path: None,
-                        }
-                    }
-                }
-            }
-            ProjectionPreference::Prompt => {
-                let should_project = if yes {
-                    true
-                } else if can_prompt_interactively && !json_output {
-                    prompt_for_confirmation(
-                        "This app can also be added to your Applications launcher.\nCreate a launcher projection? [y/N] ",
-                        false,
-                    )?
-                } else {
-                    false
-                };
-                if should_project {
-                    match crate::native_delivery::execute_project(
-                        &finalize_result.derived_app_path,
-                        None,
-                    ) {
-                        Ok(result) => ProjectionInfo {
-                            performed: true,
-                            projection_id: Some(result.projection_id),
-                            projected_path: Some(result.projected_path),
-                            state: Some(result.state),
-                            schema_version: Some(
-                                crate::native_delivery::delivery_schema_version().to_string(),
-                            ),
-                            metadata_path: Some(result.metadata_path),
-                        },
-                        Err(err) => {
-                            if !json_output {
-                                eprintln!("Launcher projection failed: {err}");
-                                eprintln!(
-                                    "Run `ato project {}` to try again later.",
-                                    finalize_result.derived_app_path.display()
-                                );
-                            }
-                            ProjectionInfo {
-                                performed: false,
-                                projection_id: None,
-                                projected_path: None,
-                                state: Some("failed".to_string()),
-                                schema_version: Some(
-                                    crate::native_delivery::delivery_schema_version().to_string(),
-                                ),
-                                metadata_path: None,
-                            }
-                        }
-                    }
-                } else {
-                    if !json_output {
-                        eprintln!("Launcher projection skipped.");
-                    }
-                    ProjectionInfo {
-                        performed: false,
-                        projection_id: None,
-                        projected_path: None,
-                        state: Some("skipped".to_string()),
-                        schema_version: Some(
-                            crate::native_delivery::delivery_schema_version().to_string(),
-                        ),
-                        metadata_path: None,
-                    }
-                }
-            }
-        };
-
-        return Ok(InstallResult {
+        return complete_native_install_from_bytes(
             capsule_id,
-            scoped_id: scoped_ref.scoped_id.clone(),
-            publisher: scoped_ref.publisher,
-            slug: display_slug,
+            scoped_ref,
+            display_slug,
             version,
-            path: output_path,
-            content_hash: computed_blake3,
-            install_kind: InstallKind::NativeRequiresLocalDerivation,
-            launchable: Some(LaunchableTarget::DerivedApp {
-                path: finalize_result.derived_app_path.clone(),
-            }),
-            local_derivation: Some(LocalDerivationInfo {
-                schema_version: crate::native_delivery::delivery_schema_version().to_string(),
-                performed: true,
-                fetched_dir: fetch_result.cache_dir,
-                derived_app_path: Some(finalize_result.derived_app_path),
-                provenance_path: Some(finalize_result.provenance_path),
-                parent_digest: Some(finalize_result.parent_digest),
-                derived_digest: Some(finalize_result.derived_digest),
-            }),
-            projection: Some(projection),
-            promotion,
-        });
+            &bytes,
+            &normalized_file_name,
+            output_dir,
+            yes,
+            projection_preference,
+            json_output,
+            can_prompt_interactively,
+            promotion_source,
+            &source,
+            &computed_blake3,
+        );
     }
 
-    let output_path = persist_installed_artifact(
-        output_dir,
-        &scoped_ref.publisher,
-        &scoped_ref.slug,
-        target_version,
-        &normalized_file_name,
+    complete_standard_install_from_bytes(
+        capsule_id,
+        scoped_ref,
+        display_slug,
+        version,
         &bytes,
+        &normalized_file_name,
+        output_dir,
+        json_output,
+        keep_progressive_flow_open,
+        promotion_source,
         &computed_blake3,
+    )
+}
+
+fn complete_native_install_from_bytes(
+    capsule_id: String,
+    scoped_ref: ScopedCapsuleRef,
+    display_slug: String,
+    version: String,
+    bytes: &[u8],
+    normalized_file_name: &str,
+    output_dir: Option<PathBuf>,
+    yes: bool,
+    projection_preference: ProjectionPreference,
+    json_output: bool,
+    can_prompt_interactively: bool,
+    promotion_source: Option<PromotionSourceInfo>,
+    source: &InstallSource,
+    computed_blake3: &str,
+) -> Result<InstallResult> {
+    ensure_local_finalize_allowed(yes, can_prompt_interactively, json_output)?;
+
+    let fetch_result = crate::native_delivery::materialize_fetch_cache_from_artifact(
+        &scoped_ref.scoped_id,
+        version.as_str(),
+        source.cache_label(),
+        bytes,
     )?;
-    let promotion =
-        persist_promotion_info(&output_path, promotion_source.as_ref(), &computed_blake3)?;
-    if promotion.is_some() {
-        let _ = runtime_tree::prepare_promoted_runtime_for_capsule(&output_path)?;
-    }
 
     if !json_output {
-        if crate::progressive_ui::can_use_progressive_ui(false) {
-            crate::progressive_ui::show_note(
-                "Installed 1 capsule",
-                format!(
-                    "{}\nSaved to    :\n{}\nRun with    :\n  ato run {}",
-                    scoped_ref.scoped_id,
-                    crate::progressive_ui::format_path_for_note(&output_path),
-                    output_path.display()
-                ),
-            )?;
-            if keep_progressive_flow_open && crate::progressive_ui::is_flow_active() {
-                crate::progressive_ui::show_step(format!(
-                    "Installed and linked: {}",
-                    output_path.display()
-                ))?;
-            } else {
-                crate::progressive_ui::show_outro(format!(
-                    "Done! Run persistently with: ato run {}",
-                    output_path.display()
-                ))?;
-            }
-        } else {
-            eprintln!("✅ Installed to: {}", output_path.display());
-            eprintln!("   To run: ato run {}", output_path.display());
-        }
+        eprintln!("Running local finalize...");
     }
+    let finalize_result =
+        crate::native_delivery::finalize_fetched_artifact(&fetch_result.cache_dir)?;
+    let (output_path, promotion) = persist_installed_capsule_with_promotion(
+        output_dir,
+        &scoped_ref,
+        version.as_str(),
+        normalized_file_name,
+        bytes,
+        computed_blake3,
+        promotion_source.as_ref(),
+    )?;
+    let projection = maybe_create_projection(
+        &finalize_result.derived_app_path,
+        projection_preference,
+        yes,
+        can_prompt_interactively,
+        json_output,
+    )?;
+
+    Ok(InstallResult {
+        capsule_id,
+        scoped_id: scoped_ref.scoped_id.clone(),
+        publisher: scoped_ref.publisher,
+        slug: display_slug,
+        version,
+        path: output_path,
+        content_hash: computed_blake3.to_string(),
+        install_kind: InstallKind::NativeRequiresLocalDerivation,
+        launchable: Some(LaunchableTarget::DerivedApp {
+            path: finalize_result.derived_app_path.clone(),
+        }),
+        local_derivation: Some(LocalDerivationInfo {
+            schema_version: native_delivery_schema_version(),
+            performed: true,
+            fetched_dir: fetch_result.cache_dir,
+            derived_app_path: Some(finalize_result.derived_app_path),
+            provenance_path: Some(finalize_result.provenance_path),
+            parent_digest: Some(finalize_result.parent_digest),
+            derived_digest: Some(finalize_result.derived_digest),
+        }),
+        projection: Some(projection),
+        promotion,
+    })
+}
+
+fn complete_standard_install_from_bytes(
+    capsule_id: String,
+    scoped_ref: ScopedCapsuleRef,
+    display_slug: String,
+    version: String,
+    bytes: &[u8],
+    normalized_file_name: &str,
+    output_dir: Option<PathBuf>,
+    json_output: bool,
+    keep_progressive_flow_open: bool,
+    promotion_source: Option<PromotionSourceInfo>,
+    computed_blake3: &str,
+) -> Result<InstallResult> {
+    let (output_path, promotion) = persist_installed_capsule_with_promotion(
+        output_dir,
+        &scoped_ref,
+        version.as_str(),
+        normalized_file_name,
+        bytes,
+        computed_blake3,
+        promotion_source.as_ref(),
+    )?;
+    emit_standard_install_success(
+        &scoped_ref.scoped_id,
+        &output_path,
+        json_output,
+        keep_progressive_flow_open,
+    )?;
 
     Ok(InstallResult {
         capsule_id,
@@ -1382,7 +1280,7 @@ async fn complete_install_from_bytes(
         slug: display_slug,
         version,
         path: output_path.clone(),
-        content_hash: computed_blake3,
+        content_hash: computed_blake3.to_string(),
         install_kind: InstallKind::Standard,
         launchable: Some(LaunchableTarget::CapsuleArchive {
             path: output_path.clone(),
@@ -1391,6 +1289,192 @@ async fn complete_install_from_bytes(
         projection: None,
         promotion,
     })
+}
+
+fn ensure_local_finalize_allowed(
+    yes: bool,
+    can_prompt_interactively: bool,
+    json_output: bool,
+) -> Result<()> {
+    if !crate::native_delivery::host_supports_finalize() {
+        bail!(
+            "This app requires local finalize, but this host does not support native finalize (macOS hosts only)."
+        );
+    }
+
+    let finalize_allowed = if yes {
+        true
+    } else if can_prompt_interactively && !json_output {
+        prompt_for_confirmation(
+            "This app requires local setup to run on this machine.\nRun local finalize now? [Y/n] ",
+            true,
+        )?
+    } else {
+        false
+    };
+
+    if !finalize_allowed {
+        bail!(
+            "This app requires local finalize, but no interactive consent is available. Re-run with --yes."
+        );
+    }
+
+    Ok(())
+}
+
+fn persist_installed_capsule_with_promotion(
+    output_dir: Option<PathBuf>,
+    scoped_ref: &ScopedCapsuleRef,
+    target_version: &str,
+    normalized_file_name: &str,
+    bytes: &[u8],
+    computed_blake3: &str,
+    promotion_source: Option<&PromotionSourceInfo>,
+) -> Result<(PathBuf, Option<PromotionInfo>)> {
+    let output_path = persist_installed_artifact(
+        output_dir,
+        &scoped_ref.publisher,
+        &scoped_ref.slug,
+        target_version,
+        normalized_file_name,
+        bytes,
+        computed_blake3,
+    )?;
+    let promotion = persist_promotion_info(&output_path, promotion_source, computed_blake3)?;
+    if promotion.is_some() {
+        let _ = runtime_tree::prepare_promoted_runtime_for_capsule(&output_path)?;
+    }
+    Ok((output_path, promotion))
+}
+
+fn emit_standard_install_success(
+    scoped_id: &str,
+    output_path: &Path,
+    json_output: bool,
+    keep_progressive_flow_open: bool,
+) -> Result<()> {
+    if json_output {
+        return Ok(());
+    }
+
+    if crate::progressive_ui::can_use_progressive_ui(false) {
+        crate::progressive_ui::show_note(
+            "Installed 1 capsule",
+            format!(
+                "{}\nSaved to    :\n{}\nRun with    :\n  ato run {}",
+                scoped_id,
+                crate::progressive_ui::format_path_for_note(output_path),
+                output_path.display()
+            ),
+        )?;
+        if keep_progressive_flow_open && crate::progressive_ui::is_flow_active() {
+            crate::progressive_ui::show_step(format!(
+                "Installed and linked: {}",
+                output_path.display()
+            ))?;
+        } else {
+            crate::progressive_ui::show_outro(format!(
+                "Done! Run persistently with: ato run {}",
+                output_path.display()
+            ))?;
+        }
+    } else {
+        eprintln!("✅ Installed to: {}", output_path.display());
+        eprintln!("   To run: ato run {}", output_path.display());
+    }
+
+    Ok(())
+}
+
+fn native_delivery_schema_version() -> String {
+    crate::native_delivery::delivery_schema_version().to_string()
+}
+
+fn skipped_projection_info(json_output: bool) -> ProjectionInfo {
+    if !json_output {
+        eprintln!("Launcher projection skipped.");
+    }
+    ProjectionInfo {
+        performed: false,
+        projection_id: None,
+        projected_path: None,
+        state: Some("skipped".to_string()),
+        schema_version: Some(native_delivery_schema_version()),
+        metadata_path: None,
+    }
+}
+
+fn failed_projection_info(
+    derived_app_path: &Path,
+    err: &anyhow::Error,
+    json_output: bool,
+) -> ProjectionInfo {
+    if !json_output {
+        eprintln!("Launcher projection failed: {err}");
+        eprintln!(
+            "Run `ato project {}` to try again later.",
+            derived_app_path.display()
+        );
+    }
+    ProjectionInfo {
+        performed: false,
+        projection_id: None,
+        projected_path: None,
+        state: Some("failed".to_string()),
+        schema_version: Some(native_delivery_schema_version()),
+        metadata_path: None,
+    }
+}
+
+fn successful_projection_info(result: crate::native_delivery::ProjectResult) -> ProjectionInfo {
+    ProjectionInfo {
+        performed: true,
+        projection_id: Some(result.projection_id),
+        projected_path: Some(result.projected_path),
+        state: Some(result.state),
+        schema_version: Some(native_delivery_schema_version()),
+        metadata_path: Some(result.metadata_path),
+    }
+}
+
+fn run_projection_best_effort(derived_app_path: &Path, json_output: bool) -> ProjectionInfo {
+    match crate::native_delivery::execute_project(derived_app_path, None) {
+        Ok(result) => successful_projection_info(result),
+        Err(err) => failed_projection_info(derived_app_path, &err, json_output),
+    }
+}
+
+fn maybe_create_projection(
+    derived_app_path: &Path,
+    projection_preference: ProjectionPreference,
+    yes: bool,
+    can_prompt_interactively: bool,
+    json_output: bool,
+) -> Result<ProjectionInfo> {
+    match projection_preference {
+        ProjectionPreference::Skip => Ok(skipped_projection_info(json_output)),
+        ProjectionPreference::Force => {
+            Ok(run_projection_best_effort(derived_app_path, json_output))
+        }
+        ProjectionPreference::Prompt => {
+            let should_project = if yes {
+                true
+            } else if can_prompt_interactively && !json_output {
+                prompt_for_confirmation(
+                    "This app can also be added to your Applications launcher.\nCreate a launcher projection? [y/N] ",
+                    false,
+                )?
+            } else {
+                false
+            };
+
+            if should_project {
+                Ok(run_projection_best_effort(derived_app_path, json_output))
+            } else {
+                Ok(skipped_projection_info(json_output))
+            }
+        }
+    }
 }
 
 fn normalize_install_segment(value: &str) -> Result<String> {
