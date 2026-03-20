@@ -818,7 +818,7 @@ async fn execute_normal_mode(args: OpenArgs) -> Result<()> {
     match guard_result.executor_kind {
         ExecutorKind::Native => {
             let host_execution = args.dangerously_skip_permissions || host_fallback_requested;
-            let mut process = if host_execution {
+            let process = if host_execution {
                 crate::executors::source::execute_host(
                     &decision.plan,
                     args.reporter.clone(),
@@ -839,120 +839,37 @@ async fn execute_normal_mode(args: OpenArgs) -> Result<()> {
             };
 
             if args.background {
-                let pid = process.child.id();
-                let id = format!("capsule-{}", pid);
-                let now = SystemTime::now();
-
-                let info = crate::process_manager::ProcessInfo {
-                    id: id.clone(),
-                    name: decision
-                        .plan
-                        .manifest_path
-                        .file_stem()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("unknown")
-                        .to_string(),
-                    pid: pid as i32,
-                    workload_pid: process.workload_pid.map(|value| value as i32),
-                    status: if host_execution && process.event_rx.is_none() {
-                        crate::process_manager::ProcessStatus::Ready
-                    } else {
-                        crate::process_manager::ProcessStatus::Starting
-                    },
-                    runtime: process_runtime_label(
-                        &decision.plan,
-                        args.dangerously_skip_permissions,
-                        compatibility_host_mode,
-                    ),
-                    start_time: now,
-                    manifest_path: Some(decision.plan.manifest_path.clone()),
-                    scoped_id: run_scoped_id.clone(),
-                    target_label: Some(decision.plan.selected_target_label().to_string()),
-                    requested_port: None,
-                    log_path: process.log_path.clone(),
-                    ready_at: if host_execution && process.event_rx.is_none() {
-                        Some(now)
-                    } else {
-                        None
-                    },
-                    last_event: Some("spawned".to_string()),
-                    last_error: None,
-                    exit_code: None,
-                };
-
-                let pm = crate::process_manager::ProcessManager::new()?;
-                pm.write_pid(&info)?;
-
-                let (startup_outcome, event_rx) = if host_execution && process.event_rx.is_none() {
-                    (BackgroundStartupOutcome::Ready, None)
-                } else {
-                    wait_for_background_native_startup(&mut process, &pm, &id)?
-                };
-
-                cleanup_process_artifacts(&process.cleanup_paths);
-
-                match startup_outcome {
-                    BackgroundStartupOutcome::Ready => {
-                        let _ = process.child;
-                        let _ = event_rx;
-                        let _ = pm.read_pid(&id)?;
-                        args.reporter
-                            .notify(background_ready_message(&id, compatibility_host_mode))
-                            .await?;
-                    }
-                    BackgroundStartupOutcome::TimedOut => {
-                        let _ = process.child;
-                        let _ = event_rx;
-                        let _ = pm.read_pid(&id)?;
-                        args.reporter
-                            .warn(background_timeout_message(&id, compatibility_host_mode))
-                            .await?;
-                    }
-                    BackgroundStartupOutcome::FailedBeforeReady => {
-                        let state = pm.read_pid(&id).ok();
-                        let mut message = background_failure_prefix(&id, compatibility_host_mode);
-                        if let Some(state) = state {
-                            if let Some(error) = state.last_error {
-                                message.push_str(&format!(": {}", error));
-                            } else if let Some(code) = state.exit_code {
-                                message.push_str(&format!(": exit code {}", code));
-                            }
-                            if let Some(log_path) = state.log_path {
-                                message.push_str(&format!(". See logs at {}", log_path.display()));
-                            }
-                        }
-                        sidecar_cleanup.stop_now();
-                        anyhow::bail!(message);
-                    }
-                }
+                let runtime = process_runtime_label(
+                    &decision.plan,
+                    args.dangerously_skip_permissions,
+                    compatibility_host_mode,
+                );
+                let ready_without_events = host_execution && process.event_rx.is_none();
+                complete_background_source_process(
+                    process,
+                    &decision.plan,
+                    runtime,
+                    run_scoped_id.clone(),
+                    ready_without_events,
+                    compatibility_host_mode,
+                    &args.reporter,
+                )
+                .await?;
                 sidecar_cleanup.stop_now();
                 return Ok(());
             }
 
-            let run_spinner = if use_progressive_ui {
-                Some(crate::progressive_ui::start_spinner("Running Preview..."))
-            } else {
-                None
-            };
-            let readiness_notifier = spawn_foreground_native_event_reporter(
+            let exit_code = complete_foreground_source_process(
+                process,
                 args.reporter.clone(),
-                process.event_rx.take(),
                 !host_execution,
                 launch_ctx
                     .socket_paths()
                     .map(|paths| !paths.is_empty())
                     .unwrap_or(false),
-                run_spinner.clone(),
-            )?;
-            let exit_code = crate::executors::source::wait_for_exit(&mut process.child).await?;
-            if let Some(handle) = readiness_notifier {
-                let _ = handle.join();
-            }
-            if let Some(progress) = run_spinner {
-                progress.stop("Preview stopped.");
-            }
-            cleanup_process_artifacts(&process.cleanup_paths);
-
+                use_progressive_ui,
+            )
+            .await?;
             sidecar_cleanup.stop_now();
 
             if exit_code != 0 {
@@ -963,7 +880,7 @@ async fn execute_normal_mode(args: OpenArgs) -> Result<()> {
             }
         }
         ExecutorKind::NodeCompat if host_fallback_requested => {
-            let mut process = crate::executors::source::execute_host(
+            let process = crate::executors::source::execute_host(
                 &decision.plan,
                 args.reporter.clone(),
                 mode,
@@ -971,116 +888,33 @@ async fn execute_normal_mode(args: OpenArgs) -> Result<()> {
             )?;
 
             if args.background {
-                let pid = process.child.id();
-                let id = format!("capsule-{}", pid);
-                let now = SystemTime::now();
-
-                let info = crate::process_manager::ProcessInfo {
-                    id: id.clone(),
-                    name: decision
-                        .plan
-                        .manifest_path
-                        .file_stem()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("unknown")
-                        .to_string(),
-                    pid: pid as i32,
-                    workload_pid: process.workload_pid.map(|value| value as i32),
-                    status: if process.event_rx.is_none() {
-                        crate::process_manager::ProcessStatus::Ready
-                    } else {
-                        crate::process_manager::ProcessStatus::Starting
-                    },
-                    runtime: process_runtime_label(&decision.plan, false, compatibility_host_mode),
-                    start_time: now,
-                    manifest_path: Some(decision.plan.manifest_path.clone()),
-                    scoped_id: run_scoped_id.clone(),
-                    target_label: Some(decision.plan.selected_target_label().to_string()),
-                    requested_port: None,
-                    log_path: process.log_path.clone(),
-                    ready_at: if process.event_rx.is_none() {
-                        Some(now)
-                    } else {
-                        None
-                    },
-                    last_event: Some("spawned".to_string()),
-                    last_error: None,
-                    exit_code: None,
-                };
-
-                let pm = crate::process_manager::ProcessManager::new()?;
-                pm.write_pid(&info)?;
-
-                let (startup_outcome, event_rx) = if process.event_rx.is_none() {
-                    (BackgroundStartupOutcome::Ready, None)
-                } else {
-                    wait_for_background_native_startup(&mut process, &pm, &id)?
-                };
-
-                cleanup_process_artifacts(&process.cleanup_paths);
-
-                match startup_outcome {
-                    BackgroundStartupOutcome::Ready => {
-                        let _ = process.child;
-                        let _ = event_rx;
-                        let _ = pm.read_pid(&id)?;
-                        args.reporter
-                            .notify(background_ready_message(&id, compatibility_host_mode))
-                            .await?;
-                    }
-                    BackgroundStartupOutcome::TimedOut => {
-                        let _ = process.child;
-                        let _ = event_rx;
-                        let _ = pm.read_pid(&id)?;
-                        args.reporter
-                            .warn(background_timeout_message(&id, compatibility_host_mode))
-                            .await?;
-                    }
-                    BackgroundStartupOutcome::FailedBeforeReady => {
-                        let state = pm.read_pid(&id).ok();
-                        let mut message = background_failure_prefix(&id, compatibility_host_mode);
-                        if let Some(state) = state {
-                            if let Some(error) = state.last_error {
-                                message.push_str(&format!(": {}", error));
-                            } else if let Some(code) = state.exit_code {
-                                message.push_str(&format!(": exit code {}", code));
-                            }
-                            if let Some(log_path) = state.log_path {
-                                message.push_str(&format!(". See logs at {}", log_path.display()));
-                            }
-                        }
-                        sidecar_cleanup.stop_now();
-                        anyhow::bail!(message);
-                    }
-                }
+                let runtime = process_runtime_label(&decision.plan, false, compatibility_host_mode);
+                let ready_without_events = process.event_rx.is_none();
+                complete_background_source_process(
+                    process,
+                    &decision.plan,
+                    runtime,
+                    run_scoped_id.clone(),
+                    ready_without_events,
+                    compatibility_host_mode,
+                    &args.reporter,
+                )
+                .await?;
                 sidecar_cleanup.stop_now();
                 return Ok(());
             }
 
-            let run_spinner = if use_progressive_ui {
-                Some(crate::progressive_ui::start_spinner("Running Preview..."))
-            } else {
-                None
-            };
-            let readiness_notifier = spawn_foreground_native_event_reporter(
+            let exit_code = complete_foreground_source_process(
+                process,
                 args.reporter.clone(),
-                process.event_rx.take(),
                 false,
                 launch_ctx
                     .socket_paths()
                     .map(|paths| !paths.is_empty())
                     .unwrap_or(false),
-                run_spinner.clone(),
-            )?;
-            let exit_code = crate::executors::source::wait_for_exit(&mut process.child).await?;
-            if let Some(handle) = readiness_notifier {
-                let _ = handle.join();
-            }
-            if let Some(progress) = run_spinner {
-                progress.stop("Preview stopped.");
-            }
-            cleanup_process_artifacts(&process.cleanup_paths);
-
+                use_progressive_ui,
+            )
+            .await?;
             sidecar_cleanup.stop_now();
 
             if exit_code != 0 {

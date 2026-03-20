@@ -61,6 +61,150 @@ pub(super) fn background_failure_prefix(
     format!("Background capsule failed before readiness (ID: {id})")
 }
 
+fn background_process_name(plan: &capsule_core::router::ManifestData) -> String {
+    plan.manifest_path
+        .file_stem()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn background_process_info(
+    process: &crate::executors::source::CapsuleProcess,
+    plan: &capsule_core::router::ManifestData,
+    process_id: &str,
+    runtime: String,
+    scoped_id: Option<String>,
+    ready_without_events: bool,
+) -> crate::process_manager::ProcessInfo {
+    let now = SystemTime::now();
+    crate::process_manager::ProcessInfo {
+        id: process_id.to_string(),
+        name: background_process_name(plan),
+        pid: process.child.id() as i32,
+        workload_pid: process.workload_pid.map(|value| value as i32),
+        status: if ready_without_events {
+            crate::process_manager::ProcessStatus::Ready
+        } else {
+            crate::process_manager::ProcessStatus::Starting
+        },
+        runtime,
+        start_time: now,
+        manifest_path: Some(plan.manifest_path.clone()),
+        scoped_id,
+        target_label: Some(plan.selected_target_label().to_string()),
+        requested_port: None,
+        log_path: process.log_path.clone(),
+        ready_at: ready_without_events.then_some(now),
+        last_event: Some("spawned".to_string()),
+        last_error: None,
+        exit_code: None,
+    }
+}
+
+pub(super) async fn complete_background_source_process(
+    mut process: crate::executors::source::CapsuleProcess,
+    plan: &capsule_core::router::ManifestData,
+    runtime: String,
+    scoped_id: Option<String>,
+    ready_without_events: bool,
+    compatibility_host_mode: CompatibilityHostMode,
+    reporter: &Arc<CliReporter>,
+) -> Result<()> {
+    let process_id = format!("capsule-{}", process.child.id());
+    let info = background_process_info(
+        &process,
+        plan,
+        &process_id,
+        runtime,
+        scoped_id,
+        ready_without_events,
+    );
+
+    let process_manager = crate::process_manager::ProcessManager::new()?;
+    process_manager.write_pid(&info)?;
+
+    let (startup_outcome, event_rx) = if ready_without_events {
+        (BackgroundStartupOutcome::Ready, None)
+    } else {
+        wait_for_background_native_startup(&mut process, &process_manager, &process_id)?
+    };
+
+    cleanup_process_artifacts(&process.cleanup_paths);
+
+    match startup_outcome {
+        BackgroundStartupOutcome::Ready => {
+            let _ = process.child;
+            let _ = event_rx;
+            let _ = process_manager.read_pid(&process_id)?;
+            reporter
+                .notify(background_ready_message(
+                    &process_id,
+                    compatibility_host_mode,
+                ))
+                .await?;
+            Ok(())
+        }
+        BackgroundStartupOutcome::TimedOut => {
+            let _ = process.child;
+            let _ = event_rx;
+            let _ = process_manager.read_pid(&process_id)?;
+            reporter
+                .warn(background_timeout_message(
+                    &process_id,
+                    compatibility_host_mode,
+                ))
+                .await?;
+            Ok(())
+        }
+        BackgroundStartupOutcome::FailedBeforeReady => {
+            let state = process_manager.read_pid(&process_id).ok();
+            let mut message = background_failure_prefix(&process_id, compatibility_host_mode);
+            if let Some(state) = state {
+                if let Some(error) = state.last_error {
+                    message.push_str(&format!(": {}", error));
+                } else if let Some(code) = state.exit_code {
+                    message.push_str(&format!(": exit code {}", code));
+                }
+                if let Some(log_path) = state.log_path {
+                    message.push_str(&format!(". See logs at {}", log_path.display()));
+                }
+            }
+            anyhow::bail!(message);
+        }
+    }
+}
+
+pub(super) async fn complete_foreground_source_process(
+    mut process: crate::executors::source::CapsuleProcess,
+    reporter: Arc<CliReporter>,
+    sandbox_initialized: bool,
+    ipc_socket_mapped: bool,
+    use_progressive_ui: bool,
+) -> Result<i32> {
+    let run_spinner = if use_progressive_ui {
+        Some(crate::progressive_ui::start_spinner("Running Preview..."))
+    } else {
+        None
+    };
+    let readiness_notifier = spawn_foreground_native_event_reporter(
+        reporter,
+        process.event_rx.take(),
+        sandbox_initialized,
+        ipc_socket_mapped,
+        run_spinner.clone(),
+    )?;
+    let exit_code = crate::executors::source::wait_for_exit(&mut process.child).await?;
+    if let Some(handle) = readiness_notifier {
+        let _ = handle.join();
+    }
+    if let Some(progress) = run_spinner {
+        progress.stop("Preview stopped.");
+    }
+    cleanup_process_artifacts(&process.cleanup_paths);
+    Ok(exit_code)
+}
+
 pub(super) fn spawn_foreground_native_event_reporter(
     reporter: Arc<CliReporter>,
     event_rx: Option<Receiver<LifecycleEvent>>,
