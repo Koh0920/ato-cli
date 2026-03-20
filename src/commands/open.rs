@@ -22,12 +22,15 @@ use crate::executors::source::ExecuteMode;
 use crate::executors::target_runner::{self, TargetLaunchOptions};
 use crate::preview;
 use crate::provisioner::{self, AutoProvisioningOptions};
+use crate::registry_store::RegistryStore;
 use crate::reporters::CliReporter;
 use crate::runtime_manager;
 use crate::runtime_overrides;
 use crate::runtime_tree;
 use crate::state::{
-    ensure_registered_state_binding, parse_state_reference, resolve_registered_state_reference,
+    ensure_registered_state_binding, ensure_registered_state_binding_in_store,
+    parse_state_reference, resolve_registered_state_reference,
+    resolve_registered_state_reference_in_store,
 };
 use capsule_core::execution_plan::error::AtoExecutionError;
 use capsule_core::execution_plan::guard::ExecutorKind;
@@ -1186,6 +1189,14 @@ fn resolve_state_source_overrides(
     manifest: &CapsuleManifest,
     raw_bindings: &[String],
 ) -> Result<std::collections::HashMap<String, String>> {
+    resolve_state_source_overrides_with_store(manifest, raw_bindings, None)
+}
+
+fn resolve_state_source_overrides_with_store(
+    manifest: &CapsuleManifest,
+    raw_bindings: &[String],
+    store: Option<&RegistryStore>,
+) -> Result<std::collections::HashMap<String, String>> {
     let mut requested = std::collections::HashMap::new();
     for raw in raw_bindings {
         let (state_name, locator) = raw.split_once('=').ok_or_else(|| {
@@ -1255,9 +1266,19 @@ fn resolve_state_source_overrides(
             )
         })?;
         let record = if parse_state_reference(locator).is_some() {
-            resolve_registered_state_reference(manifest, state_name, locator)?
+            match store {
+                Some(store) => resolve_registered_state_reference_in_store(
+                    manifest, state_name, locator, store,
+                )?,
+                None => resolve_registered_state_reference(manifest, state_name, locator)?,
+            }
         } else {
-            ensure_registered_state_binding(manifest, state_name, locator)?
+            match store {
+                Some(store) => {
+                    ensure_registered_state_binding_in_store(manifest, state_name, locator, store)?
+                }
+                None => ensure_registered_state_binding(manifest, state_name, locator)?,
+            }
         };
 
         resolved.insert(state_name.clone(), record.backend_locator);
@@ -1381,44 +1402,14 @@ mod tests {
         initial_foreground_native_messages, plan_v03_provision_command,
         preflight_required_environment_variables, process_runtime_label,
         resolve_compatibility_host_mode, resolve_python_dependency_lock_path,
-        resolve_state_source_overrides, CompatibilityHostMode, ForegroundEventMessage,
+        resolve_state_source_overrides_with_store, CompatibilityHostMode, ForegroundEventMessage,
     };
+    use crate::registry_store::RegistryStore;
     use capsule_core::execution_plan::guard::ExecutorKind;
     use capsule_core::lifecycle::LifecycleEvent;
     use capsule_core::router::{ExecutionProfile, ManifestData};
     use capsule_core::types::CapsuleManifest;
-    use std::ffi::OsString;
     use std::path::PathBuf;
-    use std::sync::{Mutex, OnceLock};
-
-    /// Serialize tests that mutate process-global environment variables like `HOME`.
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    /// RAII helper that restores the previous `HOME` environment variable on drop.
-    struct HomeGuard {
-        previous: Option<OsString>,
-    }
-
-    impl HomeGuard {
-        fn set(path: &std::path::Path) -> Self {
-            let previous = std::env::var_os("HOME");
-            std::env::set_var("HOME", path);
-            Self { previous }
-        }
-    }
-
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            if let Some(previous) = self.previous.take() {
-                std::env::set_var("HOME", previous);
-            } else {
-                std::env::remove_var("HOME");
-            }
-        }
-    }
 
     #[test]
     fn resolve_python_dependency_lock_path_prefers_source_uv_lock() {
@@ -1642,9 +1633,8 @@ mod tests {
 
     #[test]
     fn resolve_state_source_overrides_registers_persistent_state_binding() {
-        let _guard = env_lock().lock().unwrap();
-        let home = tempfile::tempdir().expect("home");
-        let _home_guard = HomeGuard::set(home.path());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = RegistryStore::open(&tmp.path().join("state-store")).expect("open store");
 
         let manifest = CapsuleManifest::from_toml(
             r#"
@@ -1675,23 +1665,29 @@ target = "/var/lib/app"
         )
         .unwrap();
 
-        let bind_dir = home.path().join("bind").join("data");
-        let overrides =
-            resolve_state_source_overrides(&manifest, &[format!("data={}", bind_dir.display())])
-                .expect("state override");
+        let bind_dir = tmp.path().join("bind").join("data");
+        let overrides = resolve_state_source_overrides_with_store(
+            &manifest,
+            &[format!("data={}", bind_dir.display())],
+            Some(&store),
+        )
+        .expect("state override");
 
         assert_eq!(
             overrides.get("data").map(|value| value.as_str()),
             Some(bind_dir.canonicalize().unwrap().to_string_lossy().as_ref())
         );
-        assert!(home.path().join(".ato/state/registry.sqlite3").exists());
+        assert!(tmp
+            .path()
+            .join("state-store")
+            .join("registry.sqlite3")
+            .exists());
     }
 
     #[test]
     fn resolve_state_source_overrides_accepts_state_id_binding() {
-        let _guard = env_lock().lock().unwrap();
-        let home = tempfile::tempdir().expect("home");
-        let _home_guard = HomeGuard::set(home.path());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = RegistryStore::open(&tmp.path().join("state-store")).expect("open store");
 
         let manifest = CapsuleManifest::from_toml(
             r#"
@@ -1722,30 +1718,34 @@ target = "/var/lib/app"
         )
         .unwrap();
 
-        let bind_dir = home.path().join("bind").join("data");
-        let first =
-            resolve_state_source_overrides(&manifest, &[format!("data={}", bind_dir.display())])
-                .expect("initial state registration");
-        let record = crate::state::open_state_store()
-            .expect("open state store")
+        let bind_dir = tmp.path().join("bind").join("data");
+        let first = resolve_state_source_overrides_with_store(
+            &manifest,
+            &[format!("data={}", bind_dir.display())],
+            Some(&store),
+        )
+        .expect("initial state registration");
+        let record = store
             .list_persistent_states(Some("demo-app"), Some("data"))
             .expect("list states")
             .into_iter()
             .next()
             .expect("registered state");
 
-        let second =
-            resolve_state_source_overrides(&manifest, &[format!("data={}", record.state_id)])
-                .expect("state id bind");
+        let second = resolve_state_source_overrides_with_store(
+            &manifest,
+            &[format!("data={}", record.state_id)],
+            Some(&store),
+        )
+        .expect("state id bind");
 
         assert_eq!(first, second);
     }
 
     #[test]
     fn resolve_state_source_overrides_rejects_incompatible_registry_entry() {
-        let _guard = env_lock().lock().unwrap();
-        let home = tempfile::tempdir().expect("home");
-        let _home_guard = HomeGuard::set(home.path());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = RegistryStore::open(&tmp.path().join("state-store")).expect("open store");
 
         let manifest_a = CapsuleManifest::from_toml(
             r#"
@@ -1804,13 +1804,20 @@ target = "/var/lib/app"
         )
         .unwrap();
 
-        let bind_dir = home.path().join("bind").join("data");
-        resolve_state_source_overrides(&manifest_a, &[format!("data={}", bind_dir.display())])
-            .expect("first bind");
+        let bind_dir = tmp.path().join("bind").join("data");
+        resolve_state_source_overrides_with_store(
+            &manifest_a,
+            &[format!("data={}", bind_dir.display())],
+            Some(&store),
+        )
+        .expect("first bind");
 
-        let err =
-            resolve_state_source_overrides(&manifest_b, &[format!("data={}", bind_dir.display())])
-                .expect_err("incompatible bind must fail");
+        let err = resolve_state_source_overrides_with_store(
+            &manifest_b,
+            &[format!("data={}", bind_dir.display())],
+            Some(&store),
+        )
+        .expect_err("incompatible bind must fail");
         assert!(err
             .to_string()
             .contains("producer/purpose/schema_id must match exactly"));

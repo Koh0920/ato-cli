@@ -261,8 +261,10 @@ pub(crate) enum Commands {
     Build {
         #[arg(default_value = ".")]
         dir: PathBuf,
+        /// Initialize capsule.toml interactively
         #[arg(long)]
         init: bool,
+        /// Path to signing key
         #[arg(long)]
         key: Option<PathBuf>,
         #[arg(long, value_enum, default_value_t = EnforcementMode::Strict)]
@@ -319,8 +321,10 @@ pub(crate) enum Commands {
         limit: Option<usize>,
         #[arg(long)]
         cursor: Option<String>,
+        /// Registry URL (default: https://api.ato.run)
         #[arg(long)]
         registry: Option<String>,
+        /// Emit machine-readable JSON output
         #[arg(long)]
         json: bool,
         #[arg(long, default_value_t = false)]
@@ -334,11 +338,15 @@ pub(crate) enum Commands {
         about = "Fetch an artifact into local cache for debugging or manual workflows"
     )]
     Fetch {
+        /// Capsule reference such as publisher/slug or localhost:8080/slug:version
         capsule_ref: String,
+        /// Registry URL override
         #[arg(long)]
         registry: Option<String>,
+        /// Version override when <CAPSULE_REF> omits :version
         #[arg(long)]
         version: Option<String>,
+        /// Emit machine-readable JSON output
         #[arg(long)]
         json: bool,
     },
@@ -348,23 +356,28 @@ pub(crate) enum Commands {
         about = "Perform local derivation for a fetched native artifact. Most users should use `ato install`."
     )]
     Finalize {
+        /// Path to fetched artifact directory
         fetched_artifact_dir: PathBuf,
         #[arg(long, default_value_t = false)]
         allow_external_finalize: bool,
+        /// Output directory for the finalized app
         #[arg(long)]
         output_dir: PathBuf,
+        /// Emit machine-readable JSON output
         #[arg(long)]
         json: bool,
     },
 
     #[command(
         next_help_heading = "Advanced Commands",
-        about = "Add a finalized app to launcher surfaces (experimental)"
+        about = "Add a finalized app to launcher surfaces (experimental). Typically used after `ato finalize`."
     )]
     Project {
+        /// Path to the finalized app produced by ato finalize
         derived_app_path: Option<PathBuf>,
         #[arg(long)]
         launcher_dir: Option<PathBuf>,
+        /// Emit machine-readable JSON output
         #[arg(long)]
         json: bool,
         #[command(subcommand)]
@@ -376,7 +389,9 @@ pub(crate) enum Commands {
         about = "Remove an experimental launcher projection without mutating the finalized artifact"
     )]
     Unproject {
+        /// Projection ID or projected path
         projection_ref: String,
+        /// Emit machine-readable JSON output
         #[arg(long)]
         json: bool,
     },
@@ -385,6 +400,7 @@ pub(crate) enum Commands {
     Ps {
         #[arg(long, default_value_t = false)]
         all: bool,
+        /// Emit machine-readable JSON output
         #[arg(long)]
         json: bool,
     },
@@ -529,6 +545,7 @@ pub(crate) enum Commands {
 
     #[command(hide = true)]
     Setup {
+        /// Engine name to install
         #[arg(long, default_value = "nacelle")]
         engine: String,
         #[arg(long)]
@@ -689,9 +706,12 @@ pub(crate) enum Commands {
 pub(crate) enum InspectCommands {
     #[command(about = "Inspect runtime requirements from capsule.toml")]
     Requirements {
+        /// Local capsule path or scoped package reference such as publisher/slug
         target: String,
+        /// Registry URL override
         #[arg(long)]
         registry: Option<String>,
+        /// Emit machine-readable JSON output
         #[arg(long)]
         json: bool,
     },
@@ -759,7 +779,9 @@ pub(crate) enum ConfigEngineCommands {
         #[arg(long, default_value_t = false)]
         default: bool,
     },
+    #[command(about = "Download and install an engine")]
     Install {
+        /// Engine name to install
         #[arg(long, default_value = "nacelle")]
         engine: String,
         #[arg(long)]
@@ -785,25 +807,34 @@ pub(crate) enum ConfigRegistryCommands {
 
 #[derive(Subcommand)]
 pub(crate) enum IpcCommands {
+    #[command(about = "Show status of running IPC services")]
     Status {
+        /// Emit machine-readable JSON output
         #[arg(long)]
         json: bool,
     },
+    #[command(about = "Start an IPC service")]
     Start {
+        /// Capsule path or directory
         #[arg(default_value = ".")]
         path: PathBuf,
+        /// Emit machine-readable JSON output
         #[arg(long)]
         json: bool,
     },
+    #[command(about = "Stop a running IPC service")]
     Stop {
         #[arg(long)]
         name: String,
         #[arg(long, default_value_t = false)]
         force: bool,
+        /// Emit machine-readable JSON output
         #[arg(long)]
         json: bool,
     },
+    #[command(about = "Validate and send a JSON-RPC invoke request")]
     Invoke {
+        /// Capsule path or directory
         #[arg(default_value = ".")]
         path: PathBuf,
         #[arg(long)]
@@ -816,6 +847,7 @@ pub(crate) enum IpcCommands {
         id: String,
         #[arg(long)]
         max_message_size: Option<usize>,
+        /// Emit machine-readable JSON output
         #[arg(long)]
         json: bool,
     },
