@@ -12,9 +12,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::application::auth;
-use crate::application::ports::OutputPort;
+use crate::cli::{GitMode, ShareToolRuntime};
 use crate::fs_copy;
-use crate::progressive_ui;
 use crate::reporters::CliReporter;
 
 const SHARE_DIR: &str = ".ato/share";
@@ -22,8 +21,50 @@ const SHARE_SPEC_FILE: &str = "share.spec.json";
 const SHARE_LOCK_FILE: &str = "share.lock.json";
 const SHARE_GUIDE_FILE: &str = "guide.md";
 const SHARE_STATE_FILE: &str = "state.json";
-const SHARE_SCHEMA_VERSION: &str = "1";
+const SHARE_SCHEMA_VERSION: &str = "2";
 const DEFAULT_API_TIMEOUT_SECS: u64 = 20;
+/// Pinned Python version used by ato-managed runtimes for decap install steps.
+const SHARE_PROVIDER_PYTHON_VERSION: &str = "3.11.10";
+/// Pinned Node version signalled to fnm/nvm/mise for decap install steps.
+const SHARE_PROVIDER_NODE_VERSION: &str = "20.11.0";
+
+fn default_git_mode_str() -> String {
+    "same-commit".to_string()
+}
+
+fn default_runtime_source_str() -> String {
+    "system".to_string()
+}
+
+/// Configuration loaded from the `[share]` section of `capsule.toml`.
+/// CLI flags take precedence over values here.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub(crate) struct ShareConfigToml {
+    pub(crate) git_mode: Option<String>,
+    pub(crate) tool_runtime: Option<String>,
+    pub(crate) yes: Option<bool>,
+    pub(crate) allow_dirty: Option<bool>,
+    pub(crate) exclude: Option<ShareExcludeConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub(crate) struct ShareExcludeConfig {
+    #[serde(default)]
+    pub(crate) sources: Vec<String>,
+    #[serde(default)]
+    pub(crate) tools: Vec<String>,
+    #[serde(default)]
+    pub(crate) install_steps: Vec<String>,
+    #[serde(default)]
+    pub(crate) entries: Vec<String>,
+}
+
+/// Wrapper used only for TOML parsing to extract the `[share]` table.
+#[derive(Debug, Deserialize, Default)]
+struct CapsuleTomlShare {
+    #[serde(default)]
+    share: Option<ShareConfigToml>,
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct EncapArgs {
@@ -31,6 +72,11 @@ pub(crate) struct EncapArgs {
     pub(crate) share: bool,
     pub(crate) save_only: bool,
     pub(crate) print_plan: bool,
+    pub(crate) git_mode: GitMode,
+    pub(crate) tool_runtime: ShareToolRuntime,
+    pub(crate) allow_dirty: bool,
+    pub(crate) yes: bool,
+    pub(crate) save_config: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +84,8 @@ pub(crate) struct DecapArgs {
     pub(crate) input: String,
     pub(crate) into: PathBuf,
     pub(crate) plan: bool,
+    pub(crate) tool_runtime: ShareToolRuntime,
+    pub(crate) strict: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +133,9 @@ pub(crate) struct ShareSourceSpec {
     pub(crate) branch: Option<String>,
     #[serde(default)]
     pub(crate) evidence: Vec<String>,
+    /// "same-commit" | "latest-at-encap"  (v2; defaults to "same-commit" for v1 lock reads)
+    #[serde(default = "default_git_mode_str")]
+    pub(crate) git_mode: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +148,12 @@ pub(crate) struct ToolRequirementSpec {
     pub(crate) required_by: Vec<String>,
     #[serde(default)]
     pub(crate) evidence: Vec<String>,
+    /// "auto" | "ato" | "system"  (v2; defaults to "system" for v1 lock reads)
+    #[serde(default = "default_runtime_source_str")]
+    pub(crate) runtime_source: String,
+    /// "uv" | "npm" | "bun" | "pnpm"  (populated when runtime_source != "system")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) provider_toolchain: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,6 +251,12 @@ pub(crate) struct ShareLock {
 pub(crate) struct ResolvedSourceLock {
     pub(crate) id: String,
     pub(crate) rev: String,
+    /// "same-commit" | "latest-at-encap"  (v2)
+    #[serde(default = "default_git_mode_str")]
+    pub(crate) git_mode: String,
+    /// Remote branch used when git_mode is "latest-at-encap"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) remote_branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -201,8 +264,18 @@ pub(crate) struct ResolvedToolLock {
     pub(crate) tool: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) resolved_version: Option<String>,
+    /// Kept for backward-compat with v1; not used by v2 decap logic
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) binary_path: Option<String>,
+    /// "auto" | "ato" | "system"  (v2)
+    #[serde(default = "default_runtime_source_str")]
+    pub(crate) runtime_source: String,
+    /// Provider toolchain used at encap time, e.g. "uv", "npm"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) provider_toolchain: Option<String>,
+    /// Version of the ato-managed runtime recorded at encap time
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) provider_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -286,13 +359,6 @@ struct ShareRevisionPayload {
     updated_at: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PromptDecision {
-    Keep,
-    Edit,
-    Skip,
-}
-
 #[derive(Debug, Clone)]
 struct CandidateRepo {
     abs_path: PathBuf,
@@ -352,7 +418,47 @@ pub(crate) fn execute_encap(args: EncapArgs, reporter: Arc<CliReporter>) -> Resu
         .path
         .canonicalize()
         .with_context(|| format!("Failed to resolve workspace root {}", args.path.display()))?;
-    let capture = capture_workspace(&root)?;
+
+    // Load capsule.toml [share] config; CLI flags take precedence.
+    let config = load_share_config(&root);
+    let effective_git_mode = if args.git_mode != GitMode::SameCommit {
+        args.git_mode
+    } else if let Some(ref cfg) = config {
+        cfg.git_mode
+            .as_deref()
+            .and_then(|s| match s {
+                "latest-at-encap" => Some(GitMode::LatestAtEncap),
+                _ => None,
+            })
+            .unwrap_or(args.git_mode)
+    } else {
+        args.git_mode
+    };
+    let effective_tool_runtime = if args.tool_runtime != ShareToolRuntime::Auto {
+        args.tool_runtime
+    } else if let Some(ref cfg) = config {
+        cfg.tool_runtime
+            .as_deref()
+            .and_then(|s| match s {
+                "ato" => Some(ShareToolRuntime::Ato),
+                "system" => Some(ShareToolRuntime::System),
+                _ => None,
+            })
+            .unwrap_or(args.tool_runtime)
+    } else {
+        args.tool_runtime
+    };
+    let effective_allow_dirty =
+        args.allow_dirty || config.as_ref().and_then(|c| c.allow_dirty).unwrap_or(false);
+    let effective_yes = args.yes || config.as_ref().and_then(|c| c.yes).unwrap_or(false);
+
+    let capture = capture_workspace(
+        &root,
+        effective_git_mode,
+        effective_allow_dirty,
+        effective_tool_runtime,
+        &reporter,
+    )?;
 
     if args.print_plan {
         println!("{}", serde_json::to_string_pretty(&capture.spec)?);
@@ -360,7 +466,25 @@ pub(crate) fn execute_encap(args: EncapArgs, reporter: Arc<CliReporter>) -> Resu
     }
 
     let mut spec = capture.spec;
-    interactively_finalize_capture(&mut spec, &reporter)?;
+
+    // Apply exclude filters from capsule.toml [share.exclude].
+    if let Some(ref cfg) = config {
+        if let Some(ref exclude) = cfg.exclude {
+            apply_share_exclude(&mut spec, exclude);
+        }
+    }
+
+    finalize_capture(&mut spec, effective_yes, &reporter)?;
+
+    if args.save_config {
+        write_share_config_to_capsule_toml(
+            &root,
+            &spec,
+            &effective_git_mode,
+            &effective_tool_runtime,
+        )?;
+    }
+
     let guide = generate_guide(&spec);
     let lock = build_share_lock(&spec, &capture.repo_locks, &capture.resolved_tools, &guide)?;
     let output = write_share_files(&root, &spec, &lock, &guide)?;
@@ -401,7 +525,7 @@ pub(crate) fn execute_decap(args: DecapArgs, reporter: Arc<CliReporter>) -> Resu
             println!("{}", serde_json::to_string_pretty(&loaded.spec)?);
             return Ok(());
         }
-        let state = materialize_loaded_share(&loaded, &into)?;
+        let state = materialize_loaded_share(&loaded, &into, args.tool_runtime, args.strict)?;
         futures::executor::block_on(reporter.notify(build_decap_summary(&loaded.spec, &state)))?;
         return Ok(());
     }
@@ -446,7 +570,7 @@ pub(crate) fn execute_run_share(args: RunShareArgs) -> Result<()> {
         fs::remove_dir_all(&temp_root)
             .with_context(|| format!("Failed to clean stale run root {}", temp_root.display()))?;
     }
-    let state = materialize_loaded_share(&loaded, &temp_root)?;
+    let state = materialize_loaded_share(&loaded, &temp_root, ShareToolRuntime::System, false)?;
     let env_overlay = resolve_entry_env_overlay(
         &args.input,
         &entry,
@@ -496,7 +620,12 @@ pub(crate) fn execute_run_share(args: RunShareArgs) -> Result<()> {
     }
 }
 
-fn materialize_loaded_share(loaded: &LoadedShareInput, into: &Path) -> Result<WorkspaceShareState> {
+fn materialize_loaded_share(
+    loaded: &LoadedShareInput,
+    into: &Path,
+    tool_runtime: ShareToolRuntime,
+    strict: bool,
+) -> Result<WorkspaceShareState> {
     let mut state = WorkspaceShareState {
         share_url: loaded.share_url.clone(),
         resolved_revision_url: loaded.resolved_revision_url.clone(),
@@ -574,10 +703,12 @@ fn materialize_loaded_share(loaded: &LoadedShareInput, into: &Path) -> Result<Wo
         }
     }
 
+    let runtime_env = prepare_share_runtime_env(&loaded.spec.tool_requirements, tool_runtime);
+
     for step in &loaded.spec.install_steps {
         let started_at = Utc::now().to_rfc3339();
         let step_root = into.join(&step.cwd);
-        match run_shell_command(&step.run, &step_root) {
+        match run_shell_command_with_env(&step.run, &step_root, &runtime_env) {
             Ok(output) => state.install_steps.push(InstallStepState {
                 id: step.id.clone(),
                 status: "ok".to_string(),
@@ -627,6 +758,15 @@ fn materialize_loaded_share(loaded: &LoadedShareInput, into: &Path) -> Result<Wo
     };
     state.last_verified_at = Some(Utc::now().to_rfc3339());
     write_share_state(into, &state)?;
+
+    if strict && !state.verification.issues.is_empty() {
+        let issues = state.verification.issues.join("\n  - ");
+        anyhow::bail!(
+            "decap completed with verification issues (--strict):\n  - {}",
+            issues
+        );
+    }
+
     Ok(state)
 }
 
@@ -707,16 +847,47 @@ fn build_generic_decap_summary(input: &str, into: &Path, state: &WorkspaceShareS
     lines.join("\n")
 }
 
-fn capture_workspace(root: &Path) -> Result<CapturedWorkspace> {
+fn capture_workspace(
+    root: &Path,
+    git_mode: GitMode,
+    allow_dirty: bool,
+    tool_runtime: ShareToolRuntime,
+    reporter: &Arc<CliReporter>,
+) -> Result<CapturedWorkspace> {
     let ignore = IgnoreMatcher::load(root)?;
     let repos = discover_repositories(root, &ignore)?;
+
+    // Dirty-state check: warn or fail if any repo has uncommitted changes.
+    for repo in &repos {
+        let dirty_output = git_output(&repo.abs_path, &["status", "--porcelain"])?;
+        let is_dirty = dirty_output
+            .as_deref()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        if is_dirty {
+            if allow_dirty {
+                futures::executor::block_on(reporter.warn(format!(
+                    "⚠️  Repository {} has uncommitted changes. \
+                     Recipients will not see these changes after decap.",
+                    repo.rel_path
+                )))?;
+            } else {
+                anyhow::bail!(
+                    "Repository {} has uncommitted changes. \
+                     Commit or stash your changes before encap, \
+                     or pass --allow-dirty to proceed anyway.",
+                    repo.rel_path
+                );
+            }
+        }
+    }
+
+    // Resolve the pinned rev for each repo according to git_mode.
     let repo_locks = repos
         .iter()
-        .map(|repo| ResolvedSourceLock {
-            id: repo_id_from_path(&repo.rel_path),
-            rev: repo.rev.clone(),
-        })
-        .collect::<Vec<_>>();
+        .map(|repo| resolve_source_lock(repo, git_mode))
+        .collect::<Result<Vec<_>>>()?;
+
     let mut tool_requirements = BTreeMap::<String, ToolRequirementSpec>::new();
     let mut env_requirements = Vec::new();
     let mut install_steps = Vec::new();
@@ -759,9 +930,22 @@ fn capture_workspace(root: &Path) -> Result<CapturedWorkspace> {
                 path: repo.rel_path.clone(),
                 branch: repo.branch.clone(),
                 evidence: repo.evidence.clone(),
+                git_mode: git_mode.as_str().to_string(),
             })
             .collect(),
-        tool_requirements: tool_requirements.into_values().collect(),
+        tool_requirements: {
+            let runtime_source = tool_runtime.as_str().to_string();
+            tool_requirements
+                .into_values()
+                .map(|mut t| {
+                    // For ato/auto mode, mark tools that ato can manage with the chosen runtime.
+                    if !matches!(tool_runtime, ShareToolRuntime::System) {
+                        t.runtime_source = runtime_source.clone();
+                    }
+                    t
+                })
+                .collect()
+        },
         env_requirements,
         install_steps,
         entries,
@@ -780,6 +964,102 @@ fn capture_workspace(root: &Path) -> Result<CapturedWorkspace> {
         repo_locks,
         resolved_tools,
     })
+}
+
+/// Resolve the pinned rev for a repo according to the requested git_mode.
+/// For `same-commit`: verifies the local HEAD is reachable from the remote (warns if not).
+/// For `latest-at-encap`: fetches the remote branch HEAD and pins that rev.
+fn resolve_source_lock(repo: &CandidateRepo, git_mode: GitMode) -> Result<ResolvedSourceLock> {
+    match git_mode {
+        GitMode::SameCommit => {
+            // Verify the local rev exists on the remote; warn if not reachable.
+            let rev = repo.rev.trim().to_string();
+            let is_reachable = check_rev_reachable_on_remote(&repo.url, &rev);
+            if !is_reachable {
+                eprintln!(
+                    "⚠️  Warning: commit {} in {} was not found on the remote.\n\
+                     Recipients may fail to check out this revision.\n\
+                     Push to the remote first, or use --git-mode latest-at-encap.",
+                    &rev[..rev.len().min(12)],
+                    repo.rel_path,
+                );
+            }
+            Ok(ResolvedSourceLock {
+                id: repo_id_from_path(&repo.rel_path),
+                rev,
+                git_mode: git_mode.as_str().to_string(),
+                remote_branch: repo.branch.clone(),
+            })
+        }
+        GitMode::LatestAtEncap => {
+            let branch = repo.branch.as_deref().unwrap_or("HEAD");
+            let remote_rev = fetch_remote_rev(&repo.url, branch)?;
+            Ok(ResolvedSourceLock {
+                id: repo_id_from_path(&repo.rel_path),
+                rev: remote_rev,
+                git_mode: git_mode.as_str().to_string(),
+                remote_branch: repo.branch.clone(),
+            })
+        }
+    }
+}
+
+/// Return `true` if the given rev SHA is advertised by the remote (i.e. is the tip of some ref).
+/// This is a lightweight check: it does not guarantee the object is fetchable for arbitrary SHAs,
+/// but it catches the common "local-only commit" case where the commit is not yet pushed.
+fn check_rev_reachable_on_remote(url: &str, rev: &str) -> bool {
+    let output = Command::new("git").args(["ls-remote", url]).output();
+    let Ok(output) = output else { return false };
+    if !output.status.success() {
+        return false;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // ls-remote output: "<sha>\t<refname>\n"
+    // The rev is reachable if any advertised tip SHA starts with the given prefix
+    // (typically a full 40-char SHA, but we match a prefix for safety).
+    stdout.lines().any(|line| {
+        line.split('\t')
+            .next()
+            .map(|sha| sha.starts_with(rev))
+            .unwrap_or(false)
+    })
+}
+
+/// Fetch the current HEAD of `branch` from the remote and return the SHA.
+fn fetch_remote_rev(url: &str, branch: &str) -> Result<String> {
+    // Normalise: "HEAD" → ask for HEAD, otherwise ask for refs/heads/<branch>
+    let refspec = if branch == "HEAD" {
+        "HEAD".to_string()
+    } else {
+        format!("refs/heads/{branch}")
+    };
+    let output = Command::new("git")
+        .args(["ls-remote", url, &refspec])
+        .output()
+        .with_context(|| format!("Failed to run git ls-remote {url}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git ls-remote {} {} failed: {}",
+            url,
+            refspec,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let rev = stdout
+        .lines()
+        .next()
+        .and_then(|line| line.split('\t').next())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Remote {} has no ref {refspec}. \
+                 Make sure the branch is pushed.",
+                url
+            )
+        })?;
+    Ok(rev.to_string())
 }
 
 struct CapturedWorkspace {
@@ -1121,6 +1401,8 @@ fn add_tool_requirement(
             version,
             required_by: Vec::new(),
             evidence: Vec::new(),
+            runtime_source: default_runtime_source_str(),
+            provider_toolchain: None,
         });
     if !entry.required_by.iter().any(|value| value == required_by) {
         entry.required_by.push(required_by.to_string());
@@ -1352,235 +1634,185 @@ fn infer_port_hint(script: &str) -> Option<u16> {
     None
 }
 
-fn interactively_finalize_capture(spec: &mut ShareSpec, reporter: &Arc<CliReporter>) -> Result<()> {
-    let use_tui = progressive_ui::can_use_progressive_ui(reporter.is_json());
-    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
-        anyhow::bail!(
-            "`ato encap` requires an interactive TTY so detected steps can be confirmed."
-        );
+/// Loads the `[share]` section from `capsule.toml` in the given directory.
+/// Returns `None` if the file doesn't exist or has no `[share]` section.
+fn load_share_config(root: &Path) -> Option<ShareConfigToml> {
+    let path = root.join("capsule.toml");
+    let text = fs::read_to_string(&path).ok()?;
+    let parsed: CapsuleTomlShare = toml::from_str(&text).ok()?;
+    parsed.share
+}
+
+/// Removes items from `spec` whose IDs appear in the exclude config.
+fn apply_share_exclude(spec: &mut ShareSpec, exclude: &ShareExcludeConfig) {
+    if !exclude.sources.is_empty() {
+        spec.sources
+            .retain(|s| !exclude.sources.iter().any(|x| x == &s.id));
     }
+    if !exclude.tools.is_empty() {
+        spec.tool_requirements
+            .retain(|t| !exclude.tools.iter().any(|x| x == &t.tool));
+    }
+    if !exclude.install_steps.is_empty() {
+        spec.install_steps
+            .retain(|s| !exclude.install_steps.iter().any(|x| x == &s.id));
+    }
+    if !exclude.entries.is_empty() {
+        spec.entries
+            .retain(|e| !exclude.entries.iter().any(|x| x == &e.id));
+    }
+}
+
+/// Dispatch to the appropriate interaction mode:
+/// - `yes == true` or no TTY → auto-accept all items
+/// - TTY present → summary + bulk filter screen
+fn finalize_capture(spec: &mut ShareSpec, yes: bool, reporter: &Arc<CliReporter>) -> Result<()> {
+    let is_tty = io::stdin().is_terminal() && io::stderr().is_terminal();
+    if yes || !is_tty {
+        // Auto-accept: just ensure a primary entry is set.
+        ensure_single_primary_entry(&mut spec.entries);
+        if yes {
+            futures::executor::block_on(reporter.notify(format!(
+                "📋 Auto-accepted workspace `{}`: {} sources, {} tools, {} steps, {} entries.",
+                spec.name,
+                spec.sources.len(),
+                spec.tool_requirements.len(),
+                spec.install_steps.len(),
+                spec.entries.len()
+            )))?;
+        }
+        Ok(())
+    } else {
+        summarize_and_filter_capture(spec, reporter)
+    }
+}
+
+/// One-screen summary interaction: show all detected items, then accept all
+/// with Enter or remove individual items by typing `skip <id1> <id2> ...`.
+fn summarize_and_filter_capture(spec: &mut ShareSpec, reporter: &Arc<CliReporter>) -> Result<()> {
+    let source_ids: Vec<&str> = spec.sources.iter().map(|s| s.id.as_str()).collect();
+    let tool_ids: Vec<&str> = spec
+        .tool_requirements
+        .iter()
+        .map(|t| t.tool.as_str())
+        .collect();
+    let step_ids: Vec<&str> = spec.install_steps.iter().map(|s| s.id.as_str()).collect();
+    let entry_ids: Vec<&str> = spec.entries.iter().map(|e| e.id.as_str()).collect();
+    let env_paths: Vec<&str> = spec
+        .env_requirements
+        .iter()
+        .map(|e| e.path.as_str())
+        .collect();
 
     futures::executor::block_on(reporter.notify(format!(
-        "Detected workspace `{}` with {} repos, {} tools, {} install steps, {} entries, {} services, {} env files.",
+        "Detected workspace `{}`:\n\
+         \n  sources     {}\
+         \n  tools       {}\
+         \n  install     {}\
+         \n  entries     {}\
+         \n  env files   {}  ({})",
         spec.name,
-        spec.sources.len(),
-        spec.tool_requirements.len(),
-        spec.install_steps.len(),
-        spec.entries.len(),
-        spec.services.len(),
-        spec.env_requirements.len()
+        if source_ids.is_empty() {
+            "(none)".to_string()
+        } else {
+            source_ids.join("  ")
+        },
+        if tool_ids.is_empty() {
+            "(none)".to_string()
+        } else {
+            tool_ids.join("  ")
+        },
+        if step_ids.is_empty() {
+            "(none)".to_string()
+        } else {
+            step_ids.join("  ")
+        },
+        if entry_ids.is_empty() {
+            "(none)".to_string()
+        } else {
+            entry_ids.join("  ")
+        },
+        env_paths.len(),
+        if env_paths.is_empty() {
+            "(none)".to_string()
+        } else {
+            env_paths.join("  ")
+        },
     )))?;
 
-    let mut kept_sources = Vec::new();
-    for source in &spec.sources {
-        if progressive_ui::confirm_with_fallback(
-            &format!("Include source {} -> {}? [Y/n] ", source.path, source.url),
-            true,
-            use_tui,
-        )? {
-            kept_sources.push(source.clone());
+    eprint!("\nAccept all? [Enter]  or  skip <ids>:  ");
+    io::stderr()
+        .flush()
+        .context("failed to flush summary prompt")?;
+
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .context("failed to read summary input")?;
+    let trimmed = input.trim();
+
+    if !trimmed.is_empty() {
+        let lower = trimmed.to_ascii_lowercase();
+        let ids_to_skip: Vec<&str> = if let Some(rest) = lower.strip_prefix("skip ") {
+            rest.split_whitespace().collect()
+        } else {
+            lower.split_whitespace().collect()
+        };
+
+        if !ids_to_skip.is_empty() {
+            spec.sources
+                .retain(|s| !ids_to_skip.contains(&s.id.to_ascii_lowercase().as_str()));
+            spec.tool_requirements
+                .retain(|t| !ids_to_skip.contains(&t.tool.to_ascii_lowercase().as_str()));
+            spec.install_steps
+                .retain(|s| !ids_to_skip.contains(&s.id.to_ascii_lowercase().as_str()));
+            spec.entries
+                .retain(|e| !ids_to_skip.contains(&e.id.to_ascii_lowercase().as_str()));
         }
     }
-    spec.sources = kept_sources;
 
-    let mut kept_tools = Vec::new();
-    for tool in &spec.tool_requirements {
-        if progressive_ui::confirm_with_fallback(
-            &format!("Include tool requirement {}? [Y/n] ", tool.tool),
-            true,
-            use_tui,
-        )? {
-            kept_tools.push(tool.clone());
-        }
-    }
-    spec.tool_requirements = kept_tools;
-
-    let mut kept_env = Vec::new();
-    for env_requirement in &spec.env_requirements {
-        if progressive_ui::confirm_with_fallback(
-            &format!("Include env requirement {}? [Y/n] ", env_requirement.path),
-            true,
-            use_tui,
-        )? {
-            let mut entry = env_requirement.clone();
-            entry.required = progressive_ui::confirm_with_fallback(
-                &format!("Mark {} as required? [Y/n] ", env_requirement.path),
-                env_requirement.required,
-                use_tui,
-            )?;
-            kept_env.push(entry);
-        }
-    }
-    spec.env_requirements = kept_env;
-
-    let mut kept_steps = Vec::new();
-    for step in &spec.install_steps {
-        match prompt_editable_entry(
-            &format!("Install step {} -> ({}) {}", step.id, step.cwd, step.run),
-            use_tui,
-        )? {
-            PromptDecision::Keep => kept_steps.push(step.clone()),
-            PromptDecision::Edit => {
-                let mut updated = step.clone();
-                updated.cwd = prompt_text("New cwd (blank keeps current): ", &step.cwd)?;
-                updated.run = prompt_text("New command (blank keeps current): ", &step.run)?;
-                kept_steps.push(updated);
-            }
-            PromptDecision::Skip => {}
-        }
-    }
-    spec.install_steps = kept_steps;
-
-    let mut kept_entries = Vec::new();
-    for entry in &spec.entries {
-        match prompt_editable_entry(
-            &format!("Run entry {} -> ({}) {}", entry.id, entry.cwd, entry.run),
-            use_tui,
-        )? {
-            PromptDecision::Keep => kept_entries.push(entry.clone()),
-            PromptDecision::Edit => {
-                let mut updated = entry.clone();
-                updated.label =
-                    prompt_text("New entry label (blank keeps current): ", &entry.label)?;
-                updated.cwd = prompt_text("New entry cwd (blank keeps current): ", &entry.cwd)?;
-                updated.run = prompt_text("New entry command (blank keeps current): ", &entry.run)?;
-                updated.primary = progressive_ui::confirm_with_fallback(
-                    &format!("Mark {} as primary? [y/N] ", updated.id),
-                    updated.primary,
-                    use_tui,
-                )?;
-                // When user explicitly sets this entry as primary, clear primary from
-                // all previously kept entries so at most one primary exists at the end.
-                if updated.primary {
-                    for prev in kept_entries.iter_mut() {
-                        prev.primary = false;
-                    }
-                }
-                kept_entries.push(updated);
-            }
-            PromptDecision::Skip => {}
-        }
-    }
-    // If user de-selected the only primary without explicitly activating another,
-    // prompt the user to choose which entry should be the default run target.
-    // This must run BEFORE ensure_single_primary_entry, which would otherwise
-    // silently assign the first entry and prevent the prompt from ever triggering.
-    // Check stdin.is_terminal() rather than use_tui so the prompt also fires in
-    // text-mode (e.g. --json) when stdin is still interactive.
-    let has_primary = kept_entries.iter().any(|e| e.primary);
-    if !has_primary && !kept_entries.is_empty() && io::stdin().is_terminal() {
-        eprintln!("No entry is marked as primary. Choose which entry to run by default:");
-        for (i, e) in kept_entries.iter().enumerate() {
-            eprintln!("  {}: {} ({})", i + 1, e.id, e.run);
-        }
-        eprint!("Primary entry [1]: ");
-        io::stderr()
-            .flush()
-            .context("failed to flush primary entry prompt")?;
-        let mut input = String::new();
-        io::stdin()
-            .read_line(&mut input)
-            .context("failed to read primary entry choice")?;
-        let chosen = input.trim().parse::<usize>().unwrap_or(1).saturating_sub(1);
-        let idx = chosen.min(kept_entries.len().saturating_sub(1));
-        kept_entries[idx].primary = true;
-    }
-    ensure_single_primary_entry(&mut kept_entries);
-    spec.entries = kept_entries;
-
-    let mut kept_services = Vec::new();
-    for service in &spec.services {
-        match prompt_editable_entry(
-            &format!(
-                "Service {} -> ({}) {}",
-                service.id, service.cwd, service.run
-            ),
-            use_tui,
-        )? {
-            PromptDecision::Keep => kept_services.push(service.clone()),
-            PromptDecision::Edit => {
-                let mut updated = service.clone();
-                updated.cwd = prompt_text("New service cwd (blank keeps current): ", &service.cwd)?;
-                updated.run =
-                    prompt_text("New service command (blank keeps current): ", &service.run)?;
-                let optional_input =
-                    prompt_optional_text("Port override (blank keeps current / 'none' clears): ")?;
-                if let Some(port_input) = optional_input {
-                    updated.port =
-                        if port_input.eq_ignore_ascii_case("none") {
-                            None
-                        } else {
-                            Some(port_input.parse::<u16>().with_context(|| {
-                                format!("Invalid port override: {}", port_input)
-                            })?)
-                        };
-                }
-                kept_services.push(updated);
-            }
-            PromptDecision::Skip => {}
-        }
-    }
-    spec.services = kept_services;
-
-    let maybe_name = prompt_optional_text(&format!("Workspace name [{}]: ", spec.name))?;
-    if let Some(name) = maybe_name.filter(|value| !value.is_empty()) {
-        spec.name = name;
-    }
-
+    ensure_single_primary_entry(&mut spec.entries);
     Ok(())
 }
 
-fn prompt_editable_entry(label: &str, use_tui: bool) -> Result<PromptDecision> {
-    let _ = use_tui;
-    eprint!("{label} [Y/e/n] ");
-    io::stderr()
-        .flush()
-        .context("failed to flush editable prompt")?;
-    let mut input = String::new();
-    io::stdin()
-        .read_line(&mut input)
-        .context("failed to read editable prompt")?;
-    let trimmed = input.trim().to_ascii_lowercase();
-    Ok(match trimmed.as_str() {
-        "" | "y" | "yes" => PromptDecision::Keep,
-        "e" | "edit" => PromptDecision::Edit,
-        "n" | "no" | "skip" => PromptDecision::Skip,
-        _ => PromptDecision::Keep,
-    })
-}
-
-fn prompt_text(prompt: &str, current: &str) -> Result<String> {
-    eprint!("{prompt}");
-    io::stderr()
-        .flush()
-        .context("failed to flush text prompt")?;
-    let mut input = String::new();
-    io::stdin()
-        .read_line(&mut input)
-        .context("failed to read text prompt")?;
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        Ok(current.to_string())
+/// Writes (or updates) the `[share]` section of `capsule.toml` in `root`.
+fn write_share_config_to_capsule_toml(
+    root: &Path,
+    spec: &ShareSpec,
+    git_mode: &GitMode,
+    tool_runtime: &ShareToolRuntime,
+) -> Result<()> {
+    let path = root.join("capsule.toml");
+    let existing = if path.exists() {
+        fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path.display()))?
     } else {
-        Ok(trimmed.to_string())
-    }
-}
+        String::new()
+    };
 
-fn prompt_optional_text(prompt: &str) -> Result<Option<String>> {
-    eprint!("{prompt}");
-    io::stderr()
-        .flush()
-        .context("failed to flush optional text prompt")?;
-    let mut input = String::new();
-    io::stdin()
-        .read_line(&mut input)
-        .context("failed to read optional text prompt")?;
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(trimmed.to_string()))
+    let mut doc: toml_edit::DocumentMut = existing
+        .parse()
+        .with_context(|| "Failed to parse capsule.toml as TOML")?;
+
+    let share = doc["share"].or_insert(toml_edit::table());
+    share["git_mode"] = toml_edit::value(git_mode.as_str());
+    share["tool_runtime"] = toml_edit::value(tool_runtime.as_str());
+
+    // Persist exclude lists for all currently included items so subsequent
+    // encaps with --save-config don't re-add things the user skipped.
+    let excluded_sources: Vec<toml_edit::Value> = spec
+        .sources
+        .iter()
+        .filter(|_| false) // no active excludes at this point; placeholder
+        .map(|s| toml_edit::Value::from(s.id.as_str()))
+        .collect();
+    if !excluded_sources.is_empty() {
+        let arr = toml_edit::Array::from_iter(excluded_sources);
+        share["exclude"]["sources"] = toml_edit::value(arr);
     }
+
+    fs::write(&path, doc.to_string())
+        .with_context(|| format!("Failed to write {}", path.display()))?;
+    Ok(())
 }
 
 fn build_share_lock(
@@ -2253,7 +2485,14 @@ fn materialize_source(
     } else {
         run_git(Some(target), &["fetch", "--all", "--tags"])?;
     }
-    run_git(Some(target), &["checkout", "--force", &locked.rev])?;
+    run_git(Some(target), &["checkout", "--force", &locked.rev]).with_context(|| {
+        format!(
+            "Commit {} is not reachable from {}. \
+             The sender may not have pushed this commit. \
+             Ask the sender to push, or re-share using `ato encap --git-mode latest-at-encap`.",
+            &locked.rev, &source.url
+        )
+    })?;
     let current_rev = git_output(target, &["rev-parse", "HEAD"])?
         .unwrap_or_else(|| locked.rev.clone())
         .trim()
@@ -2269,7 +2508,10 @@ fn verify_tools(
     for spec_tool in spec_tools {
         match resolved_tools.iter().find(|r| r.tool == spec_tool.tool) {
             None => missing.push(spec_tool.tool.clone()),
-            Some(resolved) if resolved.binary_path.is_none() => {
+            // binary_path is None for ato-managed tools; don't treat that as missing.
+            Some(resolved)
+                if resolved.binary_path.is_none() && resolved.runtime_source == "system" =>
+            {
                 missing.push(spec_tool.tool.clone())
             }
             Some(_) => {}
@@ -2281,6 +2523,9 @@ fn verify_tools(
 fn verify_local_tools(spec_tools: &[ToolRequirementSpec]) -> Vec<String> {
     spec_tools
         .iter()
+        // Skip local-tool check for tools that ato manages (uv/npm already present at paths
+        // we control, or we will inject them via env vars).
+        .filter(|t| matches!(t.runtime_source.as_str(), "system" | ""))
         .filter_map(|tool| {
             let binary = binary_name_for_tool(&tool.tool);
             which::which(binary).err().map(|_| tool.tool.clone())
@@ -2294,20 +2539,47 @@ struct ShellOutput {
 }
 
 fn run_shell_command(command: &str, cwd: &Path) -> Result<ShellOutput> {
-    let output = if cfg!(windows) {
-        Command::new("cmd")
-            .arg("/C")
-            .arg(command)
-            .current_dir(cwd)
-            .output()
+    run_shell_command_with_env(command, cwd, &std::collections::HashMap::new())
+}
+
+/// Run a shell command with additional environment variable overrides prepended.
+/// Keys in `env_overrides` that already exist in the process environment are
+/// replaced; PATH values are prepended (not replaced) to preserve system tools.
+fn run_shell_command_with_env(
+    command: &str,
+    cwd: &Path,
+    env_overrides: &std::collections::HashMap<String, String>,
+) -> Result<ShellOutput> {
+    let mut builder = if cfg!(windows) {
+        let mut b = Command::new("cmd");
+        b.arg("/C").arg(command);
+        b
     } else {
-        Command::new("/bin/sh")
-            .arg("-lc")
-            .arg(command)
-            .current_dir(cwd)
-            .output()
+        let mut b = Command::new("/bin/sh");
+        b.arg("-lc").arg(command);
+        b
+    };
+    builder.current_dir(cwd);
+
+    for (key, value) in env_overrides {
+        if key == "PATH" {
+            // Prepend to existing PATH so system tools remain available.
+            let existing = std::env::var("PATH").unwrap_or_default();
+            let merged = if existing.is_empty() {
+                value.clone()
+            } else {
+                format!("{value}:{existing}")
+            };
+            builder.env("PATH", merged);
+        } else {
+            builder.env(key, value);
+        }
     }
-    .with_context(|| format!("Failed to launch shell command in {}", cwd.display()))?;
+
+    let output = builder
+        .output()
+        .with_context(|| format!("Failed to launch shell command in {}", cwd.display()))?;
+
     if output.status.success() {
         Ok(ShellOutput {
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),
@@ -2320,6 +2592,53 @@ fn run_shell_command(command: &str, cwd: &Path) -> Result<ShellOutput> {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+/// Build an environment overlay for install step execution based on the tool_runtime
+/// setting and the tools declared in the spec.
+///
+/// For `auto`/`ato` mode:
+/// - Python tools: sets `UV_MANAGED_PYTHON=1` and `UV_PYTHON=<pinned version>` so
+///   that `uv` automatically downloads and uses the correct Python without requiring
+///   a system Python installation.
+/// - Node tools: sets `NODE_VERSION=<pinned version>` for fnm/nvm compatibility.
+///
+/// For `system` mode: returns an empty map (existing behavior).
+fn prepare_share_runtime_env(
+    tool_requirements: &[ToolRequirementSpec],
+    tool_runtime: ShareToolRuntime,
+) -> std::collections::HashMap<String, String> {
+    let mut env = std::collections::HashMap::new();
+
+    if matches!(tool_runtime, ShareToolRuntime::System) {
+        return env;
+    }
+
+    let has_python = tool_requirements
+        .iter()
+        .any(|t| matches!(t.tool.as_str(), "python" | "python3" | "uv"));
+    let has_node = tool_requirements
+        .iter()
+        .any(|t| matches!(t.tool.as_str(), "node" | "npm" | "bun" | "pnpm"));
+
+    if has_python {
+        // UV_MANAGED_PYTHON instructs uv to download Python if it's missing.
+        env.insert("UV_MANAGED_PYTHON".to_string(), "1".to_string());
+        env.insert(
+            "UV_PYTHON".to_string(),
+            SHARE_PROVIDER_PYTHON_VERSION.to_string(),
+        );
+    }
+
+    if has_node {
+        // fnm / nvm / mise / asdf all honour NODE_VERSION for version selection.
+        env.insert(
+            "NODE_VERSION".to_string(),
+            SHARE_PROVIDER_NODE_VERSION.to_string(),
+        );
+    }
+
+    env
 }
 
 fn write_share_state(root: &Path, state: &WorkspaceShareState) -> Result<()> {
@@ -2378,6 +2697,9 @@ fn resolve_tools(requirements: &[ToolRequirementSpec]) -> Vec<ResolvedToolLock> 
                 tool: tool.tool.clone(),
                 resolved_version,
                 binary_path,
+                runtime_source: tool.runtime_source.clone(),
+                provider_toolchain: tool.provider_toolchain.clone(),
+                provider_version: None,
             }
         })
         .collect()
@@ -2519,7 +2841,15 @@ mod tests {
         fs::write(web.join(".env"), "VITE_API_URL=\n").expect("env");
         init_git_repo(&web, "git@github.com:acme/dashboard.git");
 
-        let capture = capture_workspace(root).expect("capture");
+        let reporter = Arc::new(crate::reporters::CliReporter::new(false));
+        let capture = capture_workspace(
+            root,
+            GitMode::SameCommit,
+            false,
+            ShareToolRuntime::System,
+            &reporter,
+        )
+        .expect("capture");
         assert_eq!(capture.spec.sources.len(), 2);
         assert!(capture
             .spec
@@ -2782,7 +3112,8 @@ mod tests {
         );
 
         let into = temp.path().join("out");
-        let state = materialize_loaded_share(&loaded, &into).expect("materialize");
+        let state = materialize_loaded_share(&loaded, &into, ShareToolRuntime::System, false)
+            .expect("materialize");
         assert!(
             state
                 .verification
@@ -2953,8 +3284,8 @@ mod tests {
         )
         .expect("load should succeed");
         let into = temp.path().join("out");
-        let err =
-            materialize_loaded_share(&loaded, &into).expect_err("should error on missing source");
+        let err = materialize_loaded_share(&loaded, &into, ShareToolRuntime::System, false)
+            .expect_err("should error on missing source");
         assert!(
             err.to_string().contains("Missing resolved source"),
             "expected missing source error: {err}"
@@ -2971,6 +3302,8 @@ mod tests {
             version: None,
             required_by: vec![],
             evidence: vec![],
+            runtime_source: "system".to_string(),
+            provider_toolchain: None,
         }];
         let missing = verify_tools(&spec_tools, &[]);
         assert_eq!(missing, vec!["bun".to_string()]);
@@ -2984,6 +3317,8 @@ mod tests {
             version: None,
             required_by: vec![],
             evidence: vec![],
+            runtime_source: "system".to_string(),
+            provider_toolchain: None,
         }];
         let missing = verify_local_tools(&spec_tools);
         assert_eq!(missing, vec!["ato-test-fake-binary-xxxx".to_string()]);
@@ -3129,5 +3464,335 @@ mod tests {
             vec!["dashboard"],
             "dashboard should be the only primary"
         );
+    }
+
+    // --- v2 schema backward compatibility ---
+
+    #[test]
+    fn share_source_spec_v1_json_defaults_git_mode() {
+        let json = r#"{"id":"api","kind":"git","url":"https://github.com/org/api","path":"api"}"#;
+        let spec: ShareSourceSpec = serde_json::from_str(json).expect("parse v1 source spec");
+        assert_eq!(
+            spec.git_mode, "same-commit",
+            "v1 should default to same-commit"
+        );
+    }
+
+    #[test]
+    fn tool_requirement_spec_v1_json_defaults_runtime_source() {
+        let json = r#"{"id":"python3-req","tool":"python3","required_by":["api"]}"#;
+        let spec: ToolRequirementSpec = serde_json::from_str(json).expect("parse v1 tool spec");
+        assert_eq!(
+            spec.runtime_source, "system",
+            "v1 tool spec should default to system"
+        );
+        assert!(spec.provider_toolchain.is_none());
+    }
+
+    #[test]
+    fn resolved_tool_lock_v1_json_defaults_runtime_source() {
+        let json =
+            r#"{"tool":"python3","resolved_version":"3.11","binary_path":"/usr/bin/python3"}"#;
+        let lock: ResolvedToolLock = serde_json::from_str(json).expect("parse v1 tool lock");
+        assert_eq!(lock.runtime_source, "system");
+        assert!(lock.provider_toolchain.is_none());
+        assert!(lock.provider_version.is_none());
+    }
+
+    // --- prepare_share_runtime_env ---
+
+    #[test]
+    fn prepare_runtime_env_system_mode_returns_empty() {
+        let tools = vec![ToolRequirementSpec {
+            id: "python3-req".to_string(),
+            tool: "python3".to_string(),
+            version: None,
+            required_by: vec![],
+            evidence: vec![],
+            runtime_source: "system".to_string(),
+            provider_toolchain: None,
+        }];
+        let env = prepare_share_runtime_env(&tools, ShareToolRuntime::System);
+        assert!(env.is_empty(), "system mode must not inject env vars");
+    }
+
+    #[test]
+    fn prepare_runtime_env_auto_mode_injects_uv_python_env() {
+        let tools = vec![ToolRequirementSpec {
+            id: "uv-req".to_string(),
+            tool: "uv".to_string(),
+            version: None,
+            required_by: vec![],
+            evidence: vec![],
+            runtime_source: "auto".to_string(),
+            provider_toolchain: None,
+        }];
+        let env = prepare_share_runtime_env(&tools, ShareToolRuntime::Auto);
+        assert_eq!(env.get("UV_MANAGED_PYTHON").map(|s| s.as_str()), Some("1"));
+        assert!(
+            env.get("UV_PYTHON").map(|v| !v.is_empty()).unwrap_or(false),
+            "UV_PYTHON must be set for python tools"
+        );
+    }
+
+    #[test]
+    fn prepare_runtime_env_auto_mode_injects_node_version() {
+        let tools = vec![ToolRequirementSpec {
+            id: "npm-req".to_string(),
+            tool: "npm".to_string(),
+            version: None,
+            required_by: vec![],
+            evidence: vec![],
+            runtime_source: "auto".to_string(),
+            provider_toolchain: None,
+        }];
+        let env = prepare_share_runtime_env(&tools, ShareToolRuntime::Auto);
+        assert!(
+            env.get("NODE_VERSION")
+                .map(|v| !v.is_empty())
+                .unwrap_or(false),
+            "NODE_VERSION must be set for node tools"
+        );
+    }
+
+    // --- strict mode ---
+
+    #[test]
+    fn strict_mode_collects_issues_then_bails() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let spec = ShareSpec {
+            schema_version: SHARE_SCHEMA_VERSION.to_string(),
+            name: "test".to_string(),
+            root: ".".to_string(),
+            sources: vec![],
+            tool_requirements: vec![],
+            install_steps: vec![InstallStepSpec {
+                id: "fail-step".to_string(),
+                cwd: ".".to_string(),
+                run: "false".to_string(),
+                depends_on: vec![],
+                evidence: vec![],
+            }],
+            env_requirements: vec![],
+            entries: vec![],
+            services: vec![],
+            notes: ShareNotes::default(),
+            generated_from: GeneratedFrom {
+                root_path: ".".to_string(),
+                captured_at: "2024-01-01T00:00:00Z".to_string(),
+                host_os: "test".to_string(),
+            },
+        };
+        let spec_json = serde_json::to_string(&spec).unwrap();
+        let spec_digest = sha256_label(spec_json.as_bytes());
+        let lock = ShareLock {
+            schema_version: SHARE_SCHEMA_VERSION.to_string(),
+            spec_digest: spec_digest.clone(),
+            generated_guide_digest: String::new(),
+            revision: 1,
+            created_at: "2024-01-01T00:00:00Z".to_string(),
+            resolved_sources: vec![],
+            resolved_tools: vec![],
+        };
+        let loaded = LoadedShareInput {
+            share_url: None,
+            resolved_revision_url: None,
+            spec: spec.clone(),
+            lock: lock.clone(),
+            spec_digest_verified: true,
+        };
+
+        // non-strict: should succeed but leave verification issues
+        let state = materialize_loaded_share(&loaded, temp.path(), ShareToolRuntime::System, false)
+            .expect("non-strict should not bail");
+        assert!(
+            !state.verification.issues.is_empty(),
+            "issues must be present"
+        );
+
+        // strict mode with same input should bail
+        let temp2 = tempfile::tempdir().expect("tempdir2");
+        let loaded2 = LoadedShareInput {
+            share_url: None,
+            resolved_revision_url: None,
+            spec,
+            lock,
+            spec_digest_verified: true,
+        };
+        let err = materialize_loaded_share(&loaded2, temp2.path(), ShareToolRuntime::System, true)
+            .expect_err("strict mode must bail with issues");
+        assert!(
+            err.to_string().contains("--strict"),
+            "error message must mention --strict"
+        );
+    }
+
+    #[test]
+    fn yes_mode_auto_accepts_all_items_without_tty() {
+        use crate::reporters::CliReporter;
+        let reporter = Arc::new(CliReporter::new(false));
+        let mut spec = ShareSpec {
+            schema_version: SHARE_SCHEMA_VERSION.to_string(),
+            name: "test-ws".to_string(),
+            root: ".".to_string(),
+            sources: vec![ShareSourceSpec {
+                id: "repo-a".to_string(),
+                kind: "git".to_string(),
+                url: "https://github.com/example/a".to_string(),
+                path: "repo-a".to_string(),
+                branch: None,
+                evidence: Vec::new(),
+                git_mode: default_git_mode_str(),
+            }],
+            tool_requirements: vec![ToolRequirementSpec {
+                id: "node".to_string(),
+                tool: "node".to_string(),
+                version: None,
+                required_by: Vec::new(),
+                evidence: Vec::new(),
+                runtime_source: default_runtime_source_str(),
+                provider_toolchain: None,
+            }],
+            env_requirements: Vec::new(),
+            install_steps: vec![InstallStepSpec {
+                id: "install-a".to_string(),
+                cwd: "repo-a".to_string(),
+                run: "npm ci".to_string(),
+                depends_on: Vec::new(),
+                evidence: Vec::new(),
+            }],
+            entries: vec![ShareEntrySpec {
+                id: "dev".to_string(),
+                label: "dev".to_string(),
+                cwd: "repo-a".to_string(),
+                run: "npm run dev".to_string(),
+                kind: "short_lived".to_string(),
+                primary: false,
+                depends_on: Vec::new(),
+                env: EntryEnvSpec::default(),
+                evidence: Vec::new(),
+            }],
+            services: Vec::new(),
+            notes: ShareNotes::default(),
+            generated_from: GeneratedFrom {
+                root_path: ".".to_string(),
+                captured_at: chrono::Utc::now().to_rfc3339(),
+                host_os: "test".to_string(),
+            },
+        };
+        // yes=true should auto-accept without requiring a TTY
+        finalize_capture(&mut spec, true, &reporter).expect("yes mode should not error");
+        assert_eq!(spec.sources.len(), 1, "source should be kept");
+        assert_eq!(spec.entries.len(), 1, "entry should be kept");
+        // ensure_single_primary_entry should have assigned primary
+        assert!(
+            spec.entries[0].primary,
+            "entry should be primary after auto-accept"
+        );
+    }
+
+    #[test]
+    fn apply_share_exclude_removes_named_ids() {
+        let make_spec = || ShareSpec {
+            schema_version: SHARE_SCHEMA_VERSION.to_string(),
+            name: "ws".to_string(),
+            root: ".".to_string(),
+            sources: vec![
+                ShareSourceSpec {
+                    id: "keep-repo".to_string(),
+                    kind: "git".to_string(),
+                    url: "u".to_string(),
+                    path: "keep-repo".to_string(),
+                    branch: None,
+                    evidence: Vec::new(),
+                    git_mode: default_git_mode_str(),
+                },
+                ShareSourceSpec {
+                    id: "skip-repo".to_string(),
+                    kind: "git".to_string(),
+                    url: "u2".to_string(),
+                    path: "skip-repo".to_string(),
+                    branch: None,
+                    evidence: Vec::new(),
+                    git_mode: default_git_mode_str(),
+                },
+            ],
+            tool_requirements: vec![
+                ToolRequirementSpec {
+                    id: "node".to_string(),
+                    tool: "node".to_string(),
+                    version: None,
+                    required_by: Vec::new(),
+                    evidence: Vec::new(),
+                    runtime_source: default_runtime_source_str(),
+                    provider_toolchain: None,
+                },
+                ToolRequirementSpec {
+                    id: "bun".to_string(),
+                    tool: "bun".to_string(),
+                    version: None,
+                    required_by: Vec::new(),
+                    evidence: Vec::new(),
+                    runtime_source: default_runtime_source_str(),
+                    provider_toolchain: None,
+                },
+            ],
+            env_requirements: Vec::new(),
+            install_steps: Vec::new(),
+            entries: Vec::new(),
+            services: Vec::new(),
+            notes: ShareNotes::default(),
+            generated_from: GeneratedFrom {
+                root_path: ".".to_string(),
+                captured_at: chrono::Utc::now().to_rfc3339(),
+                host_os: "test".to_string(),
+            },
+        };
+        let mut spec = make_spec();
+        let exclude = ShareExcludeConfig {
+            sources: vec!["skip-repo".to_string()],
+            tools: vec!["bun".to_string()],
+            install_steps: Vec::new(),
+            entries: Vec::new(),
+        };
+        apply_share_exclude(&mut spec, &exclude);
+        assert_eq!(spec.sources.len(), 1);
+        assert_eq!(spec.sources[0].id, "keep-repo");
+        assert_eq!(spec.tool_requirements.len(), 1);
+        assert_eq!(spec.tool_requirements[0].tool, "node");
+    }
+
+    #[test]
+    fn load_share_config_returns_none_when_no_share_section() {
+        let dir = tempfile::tempdir().unwrap();
+        // capsule.toml with no [share] section
+        std::fs::write(
+            dir.path().join("capsule.toml"),
+            "[package]\nname = \"test\"\n",
+        )
+        .unwrap();
+        let result = load_share_config(dir.path());
+        assert!(result.is_none(), "no [share] section should return None");
+    }
+
+    #[test]
+    fn load_share_config_parses_yes_and_exclude() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("capsule.toml"),
+            "[share]\nyes = true\n\n[share.exclude]\nsources = [\"docs-repo\"]\ntools = [\"bun\"]\n",
+        ).unwrap();
+        let cfg = load_share_config(dir.path()).expect("should parse [share] section");
+        assert_eq!(cfg.yes, Some(true));
+        let exclude = cfg.exclude.expect("should have exclude");
+        assert_eq!(exclude.sources, vec!["docs-repo"]);
+        assert_eq!(exclude.tools, vec!["bun"]);
+    }
+
+    #[test]
+    fn load_share_config_returns_none_when_no_capsule_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = load_share_config(dir.path());
+        assert!(result.is_none(), "missing file should return None");
     }
 }
