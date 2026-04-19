@@ -4,6 +4,89 @@ All notable changes to `ato-cli` will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.69] - 2026-04-19
+
+### What Changed
+
+
+#### Bug Fixes
+
+- Default native build working dir
+
+- Update native delivery tauri fixture
+
+- Refresh release lint and tests
+
+- Multi-lockfile pack, shrinkwrap support, legacy-peer-deps, pnpm version management
+
+- Add 'requires a lockfile' to soft preview advisory list
+
+- Multi-lockfile disambiguation, port inference from run scripts
+
+- Auto-install when no lockfile, prefer lockfile on ambiguity
+
+- Add HUSKY=0 LEFTHOOK=0 to build lifecycle env and always use non-strict install for source capsules
+
+- Skip .env.example secret prompt when key already in process env
+
+- Bump default Node runtime to 22.14.0, add Vite 8 version floor check
+
+- Include common config files in pack for source-mode capsules
+
+- Set LEFTHOOK=0 in provision and smoke install commands
+
+- Set HUSKY=0 in provision and smoke install commands
+
+- NodeCompat background mode — spawn_background with port readiness + extended deadline
+
+- Use source/ working dir for all lifecycle and provision commands
+
+- Fix pnpm env-clear ordering and disable manage-package-manager-versions
+
+- COREPACK_ENABLE_STRICT=0 and approve-builds in smoke provision; fix node package.json entrypoint
+
+- Add index.html and vite.config.* to pack include for Vite apps
+
+- Set npm_config_approve_builds=on for source install commands
+
+- Set COREPACK_ENABLE_STRICT=0 for build/provision commands
+
+- Remove --frozen-lockfile from BUILD provision step for source installs
+
+- Update test fixtures to v0.3 field names and target labels
+
+- Fix compat TOML re-validation in build lifecycle
+
+- Support schema_version 0.2 upgrade in normalization and remove legacy entrypoint/cmd from synthesized manifest
+
+- Normalize UI framework dev-server run commands
+
+- Remove frozen-lockfile from smoke shadow-workspace install
+
+- Skip required_env vars already set in process env
+
+- Increase background ready wait timeout 10s -> 30s
+
+- Use non-strict install for source/preview runs
+
+- Reject non-JS entrypoints from bare-node script inference
+
+- Auto-repair pack.include lockfile omissions and disambiguate multiple lockfiles
+
+- Treat soft package-script advisory warnings as non-blocking
+
+- Attach GitHub bearer token to public repository archive fetches
+
+
+#### Refactoring
+
+- V0.3移行の残りテスト修正 (33/37修正完了)
+
+- テストのインラインv0.2/v1.0マニフェストをv0.3に変換
+
+- テストフィクスチャのcapsule.tomlをv0.2からv0.3に変換
+
+
 ## [0.4.68] - 2026-04-17
 
 ### What Changed
